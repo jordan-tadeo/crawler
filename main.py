@@ -30,7 +30,7 @@ try:
         pygame.event.pump()
 
         # Read RT trigger (usually axis 5 on Xbox controllers)
-        rt_value = joystick.get_axis(3)  # Range: -1.0 to 1.0
+        rt_value = joystick.get_axis(2)  # Range: -1.0 to 1.0
         throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
         duty = 4 + (throttle * 5)    # Scale to 0–10% PWM
 
