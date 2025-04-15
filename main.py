@@ -41,7 +41,7 @@ try:
             last_snapshot = duty  # NEW
 
         # Print live line + frozen snapshot line
-        sys.stdout.write(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}      \n")  # overwrite
+        print(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}", end="", flush=True)  # overwrite
         if last_snapshot is not None:
             sys.stdout.write(f"🔸 Snapshot (A): PWM was {last_snapshot:.2f}     \r")
         else:
