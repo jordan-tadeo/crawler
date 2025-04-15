@@ -10,7 +10,7 @@ PWM_FREQ = 50       # 50Hz is standard for servos and ESCs
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SERVO_PIN, GPIO.OUT)
 pwm = GPIO.PWM(SERVO_PIN, PWM_FREQ)
-pwm.start(7.5)  # Neutral position
+pwm.start(0)  # Neutral position
 
 # === Controller Setup ===
 pygame.init()
@@ -28,7 +28,7 @@ try:
         # Read RT trigger (usually axis 5 on Xbox controllers)
         rt_value = joystick.get_axis(5)  # Range: -1.0 to 1.0
         throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
-        duty = 7.5 + (throttle * 2.5)    # Map to PWM: 7.5 (neutral) → 10 (full)
+        duty = (throttle * 2.5)    # Map to PWM: 7.5 (neutral) → 10 (full)
 
         pwm.ChangeDutyCycle(duty)
 
