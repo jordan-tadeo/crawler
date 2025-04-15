@@ -32,8 +32,7 @@ try:
         for i in range(50):
             duty = i    # Map to PWM: 7.5 (neutral) → 10 (full)
             time.sleep(1)
-
-        pwm.ChangeDutyCycle(duty)
+            pwm.ChangeDutyCycle(duty)
 
         # ✅ Clean one-line console output
         print(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}", end="", flush=True)
