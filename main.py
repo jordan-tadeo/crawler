@@ -31,6 +31,7 @@ try:
 
         for i in range(50):
             duty = i    # Map to PWM: 7.5 (neutral) → 10 (full)
+            time.sleep(1)
 
         pwm.ChangeDutyCycle(duty)
 
