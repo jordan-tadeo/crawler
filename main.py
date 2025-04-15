@@ -1,6 +1,7 @@
 import pygame
 import RPi.GPIO as GPIO
 import time
+import sys
 
 # === Constants ===
 SERVO_PIN = 18      # GPIO pin connected to ESC/servo signal wire
@@ -10,7 +11,7 @@ PWM_FREQ = 50       # 50Hz is standard for servos and ESCs
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SERVO_PIN, GPIO.OUT)
 pwm = GPIO.PWM(SERVO_PIN, PWM_FREQ)
-pwm.start(0)  # Neutral position
+pwm.start(7)  # Neutral position
 
 # === Controller Setup ===
 pygame.init()
@@ -20,12 +21,9 @@ joystick = pygame.joystick.Joystick(0)
 joystick.init()
 
 print("🎮 Controller connected. Use RT trigger to control throttle.")
+print("")  # For second line display
 
-def sweep_duty_cycle():
-    for duty in range(0, 101, 5):
-        pwm.ChangeDutyCycle(duty)
-        print(f"\rPWM: {duty:.2f}", end="", flush=True)
-        time.sleep(1)
+last_snapshot = None  # NEW
 
 try:
     while True:
@@ -34,13 +32,23 @@ try:
         # Read RT trigger (usually axis 5 on Xbox controllers)
         rt_value = joystick.get_axis(5)  # Range: -1.0 to 1.0
         throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
-        duty = (throttle * 10)    # Map to PWM: 7.5 (neutral) → 10 (full)
+        duty = (throttle * 10)    # Scale to 0–10% PWM
 
         pwm.ChangeDutyCycle(duty)
 
-        print(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}", end="", flush=True)
-        time.sleep(0.05)
+        # Detect A button press (button 0)
+        if joystick.get_button(0):
+            last_snapshot = duty  # NEW
 
+        # Print live line + frozen snapshot line
+        sys.stdout.write(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}      \n")  # overwrite
+        if last_snapshot is not None:
+            sys.stdout.write(f"🔸 Snapshot (A): PWM was {last_snapshot:.2f}     \r")
+        else:
+            sys.stdout.write("                                         \r")  # Clear line
+
+        sys.stdout.flush()
+        time.sleep(0.05)
 
 except KeyboardInterrupt:
     print("\nStopping... Resetting servo.")
