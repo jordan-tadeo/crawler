@@ -29,10 +29,11 @@ try:
         rt_value = joystick.get_axis(5)  # Range: -1.0 to 1.0
         throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
 
-        for i in range(50):
+        for i in range(0, 10, 0.5):
             duty = i    # Map to PWM: 7.5 (neutral) → 10 (full)
-            time.sleep(1)
+            print(i)
             pwm.ChangeDutyCycle(duty)
+            time.sleep(1)
 
         # ✅ Clean one-line console output
         print(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}", end="", flush=True)
