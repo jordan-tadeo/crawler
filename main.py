@@ -31,18 +31,16 @@ try:
     while True:
         pygame.event.pump()
 
-        # # Read RT trigger (usually axis 5 on Xbox controllers)
-        # rt_value = joystick.get_axis(5)  # Range: -1.0 to 1.0
-        # throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
-        # duty = (throttle * 100)    # Map to PWM: 7.5 (neutral) → 10 (full)
+        # Read RT trigger (usually axis 5 on Xbox controllers)
+        rt_value = joystick.get_axis(5)  # Range: -1.0 to 1.0
+        throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
+        duty = (throttle * 100)    # Map to PWM: 7.5 (neutral) → 10 (full)
 
-        # pwm.ChangeDutyCycle(duty)
+        pwm.ChangeDutyCycle(duty)
 
-        # # ✅ Clean one-line console output
-        # print(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}", end="", flush=True)
-        # time.sleep(0.05)
+        print(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}", end="", flush=True)
+        time.sleep(0.05)
 
-        sweep_duty_cycle()
 
 except KeyboardInterrupt:
     print("\nStopping... Resetting servo.")
