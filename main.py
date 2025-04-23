@@ -15,12 +15,14 @@ ESC_FULL_FORWARD = 10.0
 ESC_FULL_REVERSE = 5.0
 
 # === PCA9685 PWM for Servo ===
+ESC_CHANNEL = 3
 SERVO_CHANNEL = 15
 SERVO_FREQ = 50
 
 # === ESC Pulse Range (PCA-style, 0–4095) ===
 ESC_MIN_PULSE = 205
 ESC_MAX_PULSE = 410
+ESC_NEUTRAL = 307
 
 # === Setup GPIO for ESC control ===
 GPIO.setmode(GPIO.BCM)
@@ -45,10 +47,11 @@ def init_controller():
 
 # === ESC Control ===
 def set_esc_throttle(value):
-    # Convert normalized value (0.0 to 1.0) to PWM duty %
-    duty = ESC_NEUTRAL_DUTY + ((value/1.75) * (ESC_FULL_FORWARD - ESC_NEUTRAL_DUTY))
-    esc_pwm.ChangeDutyCycle(duty)
-    return duty
+    value = max(0.0, min(1.0, value))
+    pulse = int(ESC_NEUTRAL + (value * (ESC_MAX_PULSE - ESC_MIN_PULSE) / 2))
+    pulse = max(ESC_MIN_PULSE, min(ESC_MAX_PULSE, pulse))
+    pca.channels[ESC_CHANNEL].duty_cycle = pulse
+    return pulse
 
 # === Servo Control ===
 def set_servo_position(value):
