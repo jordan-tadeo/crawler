@@ -31,20 +31,25 @@ GPIO.setup(SERVO_PIN, GPIO.OUT)
 pwm = GPIO.PWM(SERVO_PIN, PWM_FREQ)
 pwm.start(7)  # Neutral position
 
-# === Controller Setup ===
-pygame.init()
-pygame.joystick.init()
+def connect_controller():
+    # === Controller Setup ===
+    pygame.init()
+    pygame.joystick.init()
 
-joystick = pygame.joystick.Joystick(0)
-joystick.init()
+    joystick = pygame.joystick.Joystick(0)
+    joystick.init()
 
-print("🎮 Controller connected. Use RT trigger to control throttle.")
-print("")  # For second line display
+    print("🎮 Controller connected. Use RT trigger to control throttle.")
+    print("")  # For second line display
+
+    return joystick
 
 last_snapshot = None  # NEW
 
 # control the steering servo
 def control_servo():
+    joystick = connect_controller()
+
     # Read RT trigger (usually axis 5 on Xbox controllers)
     rt_value = joystick.get_axis(2)  # Range: -1.0 to 1.0
     throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
