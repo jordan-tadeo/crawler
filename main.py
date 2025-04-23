@@ -42,7 +42,8 @@ def init_controller():
 # === ESC Control ===
 def set_esc_throttle(value):
     duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_FULL_REVERSE))
-    if not hasattr(set_esc_throttle, "last_duty") or abs(duty - set_esc_throttle.last_duty) >= 0.05:
+    if not hasattr(set_esc_throttle, "last_duty") or abs(duty - set_esc_throttle.last_duty) >= 0.1:
+        print("changing duty cycle")
         esc_pwm.ChangeDutyCycle(duty)
         set_esc_throttle.last_duty = duty
     return duty
