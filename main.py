@@ -14,8 +14,8 @@ PWM_FREQ = 50       # 50Hz is standard for servos and ESCs
 esc_channel = 15
 
 # Define pulse range for ESC 
-min_pulse = 100
-max_pulse = 500
+min_pulse = 205
+max_pulse = 410
 
 # Setup I2C bus and PCA9685
 i2c = busio.I2C(board.SCL, board.SDA)
@@ -73,7 +73,7 @@ def control_servo():
 def esc_sweep():
     # Send neutral (1.5ms pulse)
     print("Sending neutral (should arm ESC)")
-    pca.channels[esc_channel].duty_cycle = 1000
+    pca.channels[esc_channel].duty_cycle = 307
     time.sleep(10)
 
     for pulse in range(min_pulse, max_pulse, 5):
