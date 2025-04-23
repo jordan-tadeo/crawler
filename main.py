@@ -40,8 +40,8 @@ def init_controller():
 
 # === ESC Control ===
 def set_esc_throttle(value):
-    pulse = int(ESC_NEUTRAL_PW + value * (ESC_FULL_FORWARD_PW - ESC_FULL_REVERSE_PW))
-    if not hasattr(set_esc_throttle, "last_pulse") or abs(pulse - set_esc_throttle.last_pulse) >= 5:
+    pulse = int(ESC_NEUTRAL_PW + value * (ESC_FULL_FORWARD_PW - ESC_NEUTRAL_PW))
+    if not hasattr(set_esc_throttle, "last_pulse") or abs(pulse - set_esc_throttle.last_pulse) >= 2:
         pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
         set_esc_throttle.last_pulse = pulse
     return pulse
