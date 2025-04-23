@@ -15,7 +15,7 @@ print("Step 2: Starting calibration.")
 print("Step 3: Plug in ESC power NOW.")
 pca.channels[channel].duty_cycle = 410
 print("Sending FULL THROTTLE (410)")
-time.sleep(5)
+time.sleep(10)
 
 # Full brake (1.0ms = ~205)
 pca.channels[channel].duty_cycle = 205
