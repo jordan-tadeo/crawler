@@ -11,7 +11,7 @@ from adafruit_pca9685 import PCA9685
 SERVO_PIN = 18      # GPIO pin connected to ESC/servo signal wire
 PWM_FREQ = 50       # 50Hz is standard for servos and ESCs
 
-esc_channel = 0
+esc_channel = 15
 
 # Define pulse range for ESC 
 min_pulse = 204   # 1ms
