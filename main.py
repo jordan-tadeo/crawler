@@ -73,7 +73,7 @@ def control_loop():
 
             # Pan/Tilt (Right stick X/Y → axes 3/4)
             pan_raw = joystick.get_axis(3)
-            tilt_raw = joystick.get_axis(5)
+            tilt_raw = joystick.get_axis(6)
             pan_angle, tilt_angle = set_pan_tilt(pan_raw, tilt_raw)
 
             if joystick.get_button(0):  # A Button
