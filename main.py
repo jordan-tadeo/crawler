@@ -72,7 +72,7 @@ def control_loop():
             throttle_duty = set_esc_throttle(throttle_norm)
 
             # Steering (Left stick vertical, axis 1): -1 to 1
-            steering_raw = joystick.get_axis(0)
+            steering_raw = joystick.get_axis(1)
             steering_angle = set_servo_position(steering_raw)
 
             if joystick.get_button(0):  # A Button
