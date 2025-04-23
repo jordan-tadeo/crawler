@@ -6,25 +6,30 @@ import board
 import busio
 from adafruit_pca9685 import PCA9685
 
+# === GPIO PWM for ESC ===
+ESC_GPIO_PIN = 18  # GPIO pin for ESC signal
+ESC_PWM_FREQ = 50  # 50Hz standard for ESCs
+ESC_NEUTRAL_DUTY = 7.5
+ESC_FULL_FORWARD = 10.0
+ESC_FULL_REVERSE = 5.0
+
 # === PCA9685 PWM Channels ===
-ESC_CHANNEL = 3
 SERVO_CHANNEL = 15
 SERVO_FREQ = 50
 SERVO_MIN = 205
 SERVO_MAX = 410
 SERVO_NEUTRAL = 307
 
-# === ESC Pulse Range (PCA-style, 0–4095) ===
-ESC_MIN_PULSE = 205
-ESC_MAX_PULSE = 410
-ESC_NEUTRAL = 307
+# === Setup GPIO for ESC control ===
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(ESC_GPIO_PIN, GPIO.OUT)
+esc_pwm = GPIO.PWM(ESC_GPIO_PIN, ESC_PWM_FREQ)
+esc_pwm.start(ESC_NEUTRAL_DUTY)
 
 # === Setup I2C and PCA9685 ===
 i2c = busio.I2C(board.SCL, board.SDA)
 pca = PCA9685(i2c)
 pca.frequency = SERVO_FREQ
-pca.channels[ESC_CHANNEL].duty_cycle = ESC_NEUTRAL
-time.sleep(1)
 
 # === Initialize Pygame and Controller ===
 def init_controller():
@@ -37,11 +42,11 @@ def init_controller():
 
 # === ESC Control ===
 def set_esc_throttle(value):
-    value = max(0.0, min(1.0, value))
-    pulse = int(ESC_NEUTRAL + (value * (ESC_MAX_PULSE - ESC_MIN_PULSE) / 2))
-    pulse = max(ESC_MIN_PULSE, min(ESC_MAX_PULSE, pulse))
-    pca.channels[ESC_CHANNEL].duty_cycle = pulse
-    return pulse
+    if abs(value) < 0.05:
+        value = 0.0  # Deadzone to prevent twitching
+    duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_FULL_REVERSE))
+    esc_pwm.ChangeDutyCycle(duty)
+    return duty
 
 # === Servo Control ===
 def set_servo_position(value):
@@ -63,17 +68,17 @@ def control_loop():
             # Throttle (RT Trigger, axis 4): -1 to 1 → 0 to 1
             throttle_raw = joystick.get_axis(4)
             throttle_norm = max(0.0, (throttle_raw + 1) / 2)
-            throttle_pulse = set_esc_throttle(throttle_norm)
+            throttle_duty = set_esc_throttle(throttle_norm)
 
             # Steering (Left stick vertical, axis 1): -1 to 1
             steering_raw = joystick.get_axis(1)
             steering_pulse = set_servo_position(steering_raw)
 
             if joystick.get_button(0):  # A Button
-                last_snapshot = (throttle_pulse, steering_pulse)
+                last_snapshot = (throttle_duty, steering_pulse)
 
             # Display live status
-            status = f"Throttle: {throttle_pulse} | Steering Pulse: {steering_pulse}"
+            status = f"Throttle: {throttle_duty:.2f}% | Steering Pulse: {steering_pulse}"
             if last_snapshot:
                 status += f" | 🔸 Snapshot (A): {last_snapshot}"
             print(f"\r{status.ljust(80)}", end="", flush=True)
@@ -83,7 +88,9 @@ def control_loop():
     except KeyboardInterrupt:
         print("\n[Shutdown] Stopping ESC and Servo...")
     finally:
-        pca.channels[ESC_CHANNEL].duty_cycle = ESC_NEUTRAL
+        esc_pwm.ChangeDutyCycle(ESC_NEUTRAL_DUTY)
+        esc_pwm.stop()
+        GPIO.cleanup()
         pca.deinit()
 
 if __name__ == "__main__":
