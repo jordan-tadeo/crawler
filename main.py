@@ -8,13 +8,14 @@ from adafruit_pca9685 import PCA9685
 from adafruit_motor import servo
 
 # === GPIO PWM for ESC using pigpio ===
-ESC_GPIO_PIN = 18  # GPIO pin for ESC signal
-ESC_NEUTRAL_PW = 1575  # microseconds
+ESC_GPIO_PIN = 18
+ESC_NEUTRAL_PW = 1575
 ESC_FULL_FORWARD_PW = 2000
 ESC_FULL_REVERSE_PW = 1000
 
 # === PCA9685 PWM Channels ===
-SERVO_CHANNEL = 15
+PAN_CHANNEL = 15
+TILT_CHANNEL = 14
 SERVO_FREQ = 50
 
 # === Setup pigpio for ESC control ===
@@ -27,7 +28,8 @@ pi.set_mode(ESC_GPIO_PIN, pigpio.OUTPUT)
 i2c = busio.I2C(board.SCL, board.SDA)
 pca = PCA9685(i2c)
 pca.frequency = SERVO_FREQ
-steering_servo = servo.Servo(pca.channels[SERVO_CHANNEL], actuation_range=180)
+pan_servo = servo.Servo(pca.channels[PAN_CHANNEL], actuation_range=180)
+tilt_servo = servo.Servo(pca.channels[TILT_CHANNEL], actuation_range=180)
 
 # === Initialize Pygame and Controller ===
 def init_controller():
@@ -35,7 +37,7 @@ def init_controller():
     pygame.joystick.init()
     joystick = pygame.joystick.Joystick(0)
     joystick.init()
-    print("🎮 Controller connected. Use RT for throttle, LT for steering.")
+    print("🎮 Controller connected. RT = throttle, LT = steering, Right Stick = pan/tilt")
     return joystick
 
 # === ESC Control ===
@@ -44,12 +46,16 @@ def set_esc_throttle(value):
     pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
     return pulse
 
-# === Servo Control ===
-def set_servo_position(value):
-    value = max(-1.0, min(1.0, value))
-    angle = int((value + 1.0) * 90)  # map -1.0 to 1.0 → 0 to 180
-    steering_servo.angle = angle
-    return angle
+# === Servo Control: Pan & Tilt ===
+def set_pan_tilt(x_val, y_val):
+    # Clamp joystick range and convert to servo angles
+    x_val = max(-1.0, min(1.0, x_val))
+    y_val = max(-1.0, min(1.0, y_val))
+    pan_angle = int((x_val + 1.0) * 90)     # -1 to 1 → 0 to 180
+    tilt_angle = int((1.0 - y_val) * 90)    # -1 to 1 → 180 to 0 (invert)
+    pan_servo.angle = pan_angle
+    tilt_servo.angle = tilt_angle
+    return pan_angle, tilt_angle
 
 # === Main Control Loop ===
 def control_loop():
@@ -65,27 +71,29 @@ def control_loop():
             throttle_norm = max(0.0, (throttle_raw + 1) / 2)
             throttle_pulse = set_esc_throttle(throttle_norm)
 
-            # Steering (Left stick vertical, axis 1): -1 to 1
-            steering_raw = joystick.get_axis(1)
-            steering_angle = set_servo_position(steering_raw)
+            # Pan/Tilt (Right stick X/Y → axes 3/4)
+            pan_raw = joystick.get_axis(3)
+            tilt_raw = joystick.get_axis(4)
+            pan_angle, tilt_angle = set_pan_tilt(pan_raw, tilt_raw)
 
             if joystick.get_button(0):  # A Button
-                last_snapshot = (throttle_pulse, steering_angle)
+                last_snapshot = (throttle_pulse, pan_angle, tilt_angle)
 
-            # Display live status
-            status = f"Throttle: {throttle_pulse}µs | Steering Angle: {steering_angle}°"
+            status = (
+                f"Throttle: {throttle_pulse}µs | Pan: {pan_angle}° | Tilt: {tilt_angle}°"
+            )
             if last_snapshot:
                 status += f" | 🔸 Snapshot (A): {last_snapshot}"
-            print(f"\r{status.ljust(80)}", end="", flush=True)
+            print(f"\r{status.ljust(100)}", end="", flush=True)
 
             time.sleep(0.05)
 
     except KeyboardInterrupt:
-        print("\n[Shutdown] Stopping ESC and Servo...")
+        print("\n[Shutdown] Stopping ESC and Servos...")
     finally:
         pi.set_servo_pulsewidth(ESC_GPIO_PIN, ESC_NEUTRAL_PW)
         time.sleep(1)
-        pi.set_servo_pulsewidth(ESC_GPIO_PIN, 0)  # stop signal
+        pi.set_servo_pulsewidth(ESC_GPIO_PIN, 0)
         pi.stop()
         pca.deinit()
 
