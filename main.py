@@ -46,7 +46,7 @@ def init_controller():
 # === ESC Control ===
 def set_esc_throttle(value):
     # Convert normalized value (0.0 to 1.0) to PWM duty %
-    duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_FULL_REVERSE))
+    duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_NEUTRAL_DUTY))
     esc_pwm.ChangeDutyCycle(duty)
     return duty
 
