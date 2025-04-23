@@ -69,20 +69,20 @@ def control_loop():
         while True:
             pygame.event.pump()
 
-            # Throttle (RT Trigger, axis 5): -1 to 1 → 0 to 1
+            # Throttle (RT Trigger, axis 4): -1 to 1 → 0 to 1
             throttle_raw = joystick.get_axis(4)
             throttle_norm = max(0.0, (throttle_raw + 1) / 2)
-            throttle_duty = set_esc_throttle(throttle_norm)
+            throttle_pulse = set_esc_throttle(throttle_norm)
 
             # Steering (Left stick vertical, axis 1): -1 to 1
-            steering_raw = joystick.get_axis(2)
-            steering_angle = set_servo_position(steering_raw)
+            steering_raw = joystick.get_axis(1)
+            steering_pulse = set_servo_position(steering_raw)
 
             if joystick.get_button(0):  # A Button
-                last_snapshot = (throttle_duty, steering_angle)
+                last_snapshot = (throttle_pulse, steering_pulse)
 
             # Display live status
-            status = f"Throttle: {throttle_duty:.2f}% | Steering Angle: {steering_angle}°"
+            status = f"Throttle: {throttle_pulse} | Steering Pulse: {steering_pulse}"
             if last_snapshot:
                 status += f" | 🔸 Snapshot (A): {last_snapshot}"
             print(f"\r{status.ljust(80)}", end="", flush=True)
