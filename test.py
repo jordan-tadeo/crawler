@@ -1,30 +1,39 @@
+import RPi.GPIO as GPIO
 import time
-import board
-import busio
-from adafruit_pca9685 import PCA9685
 
-i2c = busio.I2C(board.SCL, board.SDA)
-pca = PCA9685(i2c)
-pca.frequency = 50
+ESC_PIN = 18  # GPIO18 = pin 12 (supports hardware PWM)
+PWM_FREQ = 50  # 50Hz for ESC input
 
-channel = 14
+# Setup GPIO
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(ESC_PIN, GPIO.OUT)
 
-# Full throttle (2.0ms = ~410)
-print("Step 1: Power OFF the ESC now if it's on.")
-print("Step 2: Starting calibration.")
-print("Step 3: Plug in ESC power NOW.")
-pca.channels[channel].duty_cycle = 410
-print("Sending FULL THROTTLE (410)")
-time.sleep(10)
+pwm = GPIO.PWM(ESC_PIN, PWM_FREQ)
+pwm.start(0)  # Start with 0% duty
 
-# Full brake (1.0ms = ~205)
-pca.channels[channel].duty_cycle = 205
-print("Sending FULL BRAKE (205)")
-time.sleep(5)
+def set_throttle(pulse_ms):
+    # Convert ms pulse width to 0–100% duty cycle at 50Hz
+    duty = (pulse_ms / 20.0) * 100
+    print(f"Setting throttle: {pulse_ms}ms -> {duty:.2f}% duty")
+    pwm.ChangeDutyCycle(duty)
 
-# Neutral (1.5ms = ~307)
-pca.channels[channel].duty_cycle = 307
-print("Sending NEUTRAL (320)")
-time.sleep(5)
+try:
+    print("Arming ESC with neutral signal...")
+    set_throttle(1.5)  # neutral
+    time.sleep(5)
 
-print("Calibration complete. ESC should be armed.")
+    print("Sending throttle...")
+    set_throttle(1.7)  # slight forward
+    time.sleep(3)
+
+    print("Back to neutral")
+    set_throttle(1.5)
+    time.sleep(2)
+
+    print("Full stop")
+    set_throttle(1.0)
+    time.sleep(2)
+
+finally:
+    pwm.stop()
+    GPIO.cleanup()
