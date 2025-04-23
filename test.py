@@ -18,8 +18,8 @@ try:
     pwm.ChangeDutyCycle(8.0)
     time.sleep(3)
 
-    print("Throttle up more (8.5%)")
-    pwm.ChangeDutyCycle(8.5)
+    print("Throttle up more (10%)")
+    pwm.ChangeDutyCycle(10)
     time.sleep(3)
 
     print("Back to neutral (7.5%)")
