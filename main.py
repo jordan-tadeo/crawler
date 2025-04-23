@@ -41,8 +41,10 @@ def init_controller():
 
 # === ESC Control ===
 def set_esc_throttle(value):
-    duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_NEUTRAL_DUTY))
-    esc_pwm.ChangeDutyCycle(duty)
+    duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_FULL_REVERSE))
+    if not hasattr(set_esc_throttle, "last_duty") or abs(duty - set_esc_throttle.last_duty) >= 0.05:
+        esc_pwm.ChangeDutyCycle(duty)
+        set_esc_throttle.last_duty = duty
     return duty
 
 # === Servo Control ===
@@ -67,7 +69,7 @@ def control_loop():
             throttle_duty = set_esc_throttle(throttle_norm)
 
             # Steering (Left stick vertical, axis 1): -1 to 1
-            steering_raw = joystick.get_axis(0)
+            steering_raw = joystick.get_axis(1)
             steering_angle = set_servo_position(steering_raw)
 
             if joystick.get_button(0):  # A Button
@@ -79,7 +81,7 @@ def control_loop():
                 status += f" | 🔸 Snapshot (A): {last_snapshot}"
             print(f"\r{status.ljust(80)}", end="", flush=True)
 
-            time.sleep(1)
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\n[Shutdown] Stopping ESC and Servo...")
