@@ -23,7 +23,7 @@ print("Sending FULL BRAKE (205)")
 time.sleep(5)
 
 # Neutral (1.5ms = ~307)
-pca.channels[channel].duty_cycle = 320
+pca.channels[channel].duty_cycle = 307
 print("Sending NEUTRAL (320)")
 time.sleep(5)
 
