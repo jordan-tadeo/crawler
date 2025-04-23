@@ -7,7 +7,7 @@ i2c = busio.I2C(board.SCL, board.SDA)
 pca = PCA9685(i2c)
 pca.frequency = 50
 
-channel = 15
+channel = 14
 
 # Full throttle (2.0ms = ~410)
 print("Step 1: Power OFF the ESC now if it's on.")
