@@ -9,7 +9,7 @@ from adafruit_motor import servo
 
 # === GPIO PWM for ESC using pigpio ===
 ESC_GPIO_PIN = 18  # GPIO pin for ESC signal
-ESC_NEUTRAL_PW = 1499  # microseconds
+ESC_NEUTRAL_PW = 1490  # microseconds
 ESC_FULL_FORWARD_PW = 2000
 ESC_FULL_REVERSE_PW = 1000
 
