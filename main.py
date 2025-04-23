@@ -41,7 +41,7 @@ def init_controller():
 
 # === ESC Control ===
 def set_esc_throttle(value):
-    duty = ESC_NEUTRAL_DUTY + (value * (ESC_NEUTRAL_DUTY - ESC_FULL_REVERSE))
+    duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_NEUTRAL_DUTY))
     esc_pwm.ChangeDutyCycle(duty)
     return duty
 
@@ -79,7 +79,7 @@ def control_loop():
                 status += f" | 🔸 Snapshot (A): {last_snapshot}"
             print(f"\r{status.ljust(80)}", end="", flush=True)
 
-            time.sleep(0.05)
+            time.sleep(0.01)
 
     except KeyboardInterrupt:
         print("\n[Shutdown] Stopping ESC and Servo...")
