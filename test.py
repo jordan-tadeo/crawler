@@ -1,34 +1,21 @@
-import RPi.GPIO as GPIO
+import board
+import busio
+from adafruit_pca9685 import PCA9685
+from adafruit_motor import servo
 import time
 
-ESC_PIN = 18
-PWM_FREQ = 50
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(ESC_PIN, GPIO.OUT)
+i2c = busio.I2C(board.SCL, board.SDA)
+pca = PCA9685(i2c)
+pca.frequency = 50
 
-pwm = GPIO.PWM(ESC_PIN, PWM_FREQ)
-pwm.start(7.5)  # Neutral
+pan_servo = servo.Servo(pca.channels[15], actuation_range=180)
+tilt_servo = servo.Servo(pca.channels[14], actuation_range=180)
 
-try:
-    print("Neutral (7.5%)")
-    time.sleep(3)
+# Send both to center
+print("Centering servos to 90°...")
+pan_servo.angle = 90
+tilt_servo.angle = 90
 
-    print("Full throttle (10.0%)")
-    pwm.ChangeDutyCycle(10.0)
-    time.sleep(3)
-
-    print("Neutral (7.5%)")
-    pwm.ChangeDutyCycle(7.5)
-    time.sleep(3)
-
-    print("Full reverse (5.0%)")
-    pwm.ChangeDutyCycle(5.0)
-    time.sleep(3)
-
-    print("Neutral again")
-    pwm.ChangeDutyCycle(7.5)
-    time.sleep(3)
-
-finally:
-    pwm.stop()
-    GPIO.cleanup()
+time.sleep(5)
+pca.deinit()
+print("Done.")
