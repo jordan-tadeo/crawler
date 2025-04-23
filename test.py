@@ -23,8 +23,8 @@ print("Sending FULL BRAKE (205)")
 time.sleep(5)
 
 # Neutral (1.5ms = ~307)
-pca.channels[channel].duty_cycle = 307
-print("Sending NEUTRAL (307)")
+pca.channels[channel].duty_cycle = 310
+print("Sending NEUTRAL (310)")
 time.sleep(5)
 
 print("Calibration complete. ESC should be armed.")
