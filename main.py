@@ -71,6 +71,11 @@ def control_servo():
         sys.stdout.write("                                         \r")  # Clear line
 
 def esc_sweep():
+    # Send neutral (1.5ms pulse)
+    print("Sending neutral (should arm ESC)")
+    pca.channels[esc_channel].duty_cycle = 307
+    time.sleep(5)
+
     for pulse in range(min_pulse, max_pulse, 5):
             pca.channels[esc_channel].duty_cycle = pulse
             print(f"Throttle value: {pulse}")
