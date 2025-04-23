@@ -5,6 +5,7 @@ import RPi.GPIO as GPIO
 import board
 import busio
 from adafruit_pca9685 import PCA9685
+from adafruit_motor import servo
 
 # === GPIO PWM for ESC ===
 ESC_GPIO_PIN = 18  # GPIO pin for ESC signal
@@ -16,7 +17,6 @@ ESC_FULL_REVERSE = 5.0
 # === PCA9685 PWM for Servo ===
 SERVO_CHANNEL = 15
 SERVO_FREQ = 50
-SERVO_NEUTRAL = 307  # 1.5ms pulse width
 
 # === ESC Pulse Range (PCA-style, 0–4095) ===
 ESC_MIN_PULSE = 205
@@ -32,6 +32,7 @@ esc_pwm.start(ESC_NEUTRAL_DUTY)
 i2c = busio.I2C(board.SCL, board.SDA)
 pca = PCA9685(i2c)
 pca.frequency = SERVO_FREQ
+steering_servo = servo.Servo(pca.channels[SERVO_CHANNEL], actuation_range=180)
 
 # === Initialize Pygame and Controller ===
 def init_controller():
@@ -51,10 +52,10 @@ def set_esc_throttle(value):
 
 # === Servo Control ===
 def set_servo_position(value):
-    # Convert normalized value (-1.0 to 1.0) to pulse width
-    pulse = int(SERVO_NEUTRAL + (value * 100))  # ±100 around neutral
-    pca.channels[SERVO_CHANNEL].duty_cycle = pulse
-    return pulse
+    # Convert normalized value (-1.0 to 1.0) to angle (0–180)
+    angle = int((value + 1.0) * 90)  # map -1.0–1.0 to 0–180
+    steering_servo.angle = angle
+    return angle
 
 # === Main Control Loop ===
 def control_loop():
@@ -70,15 +71,15 @@ def control_loop():
             throttle_norm = max(0.0, (throttle_raw + 1) / 2)
             throttle_duty = set_esc_throttle(throttle_norm)
 
-            # Steering (LT Trigger or axis 2): -1 to 1
+            # Steering (Left stick vertical, axis 1): -1 to 1
             steering_raw = joystick.get_axis(1)
-            servo_pulse = set_servo_position(steering_raw)
+            steering_angle = set_servo_position(steering_raw)
 
             if joystick.get_button(0):  # A Button
-                last_snapshot = (throttle_duty, servo_pulse)
+                last_snapshot = (throttle_duty, steering_angle)
 
             # Display live status
-            status = f"Throttle: {throttle_duty:.2f}% | Steering Pulse: {servo_pulse}"
+            status = f"Throttle: {throttle_duty:.2f}% | Steering Angle: {steering_angle}°"
             if last_snapshot:
                 status += f" | 🔸 Snapshot (A): {last_snapshot}"
             print(f"\r{status.ljust(80)}", end="", flush=True)
