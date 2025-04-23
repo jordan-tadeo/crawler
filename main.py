@@ -45,7 +45,7 @@ def init_controller():
 # === ESC Control ===
 def set_esc_throttle(value):
     # Convert normalized value (0.0 to 1.0) to PWM duty %
-    duty = ESC_FULL_REVERSE + (value * (ESC_FULL_FORWARD - ESC_FULL_REVERSE))
+    duty = ESC_NEUTRAL_DUTY + (value * (ESC_FULL_FORWARD - ESC_FULL_REVERSE))
     esc_pwm.ChangeDutyCycle(duty)
     return duty
 
@@ -66,12 +66,12 @@ def control_loop():
             pygame.event.pump()
 
             # Throttle (RT Trigger, axis 5): -1 to 1 → 0 to 1
-            throttle_raw = joystick.get_axis(5)
+            throttle_raw = joystick.get_axis(4)
             throttle_norm = max(0.0, (throttle_raw + 1) / 2)
             throttle_duty = set_esc_throttle(throttle_norm)
 
             # Steering (LT Trigger or axis 2): -1 to 1
-            steering_raw = joystick.get_axis(2)
+            steering_raw = joystick.get_axis(1)
             servo_pulse = set_servo_position(steering_raw)
 
             if joystick.get_button(0):  # A Button
