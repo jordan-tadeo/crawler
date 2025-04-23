@@ -1,102 +1,97 @@
-import pygame
-import RPi.GPIO as GPIO
 import time
 import sys
-import time
+import pygame
+import RPi.GPIO as GPIO
 import board
 import busio
 from adafruit_pca9685 import PCA9685
 
-# === Constants ===
-SERVO_PIN = 18      # GPIO pin connected to ESC/servo signal wire
-PWM_FREQ = 50       # 50Hz is standard for servos and ESCs
+# === GPIO PWM for ESC ===
+ESC_GPIO_PIN = 18  # GPIO pin for ESC signal
+ESC_PWM_FREQ = 50  # 50Hz standard for ESCs
+ESC_NEUTRAL_DUTY = 7.5
+ESC_FULL_FORWARD = 10.0
+ESC_FULL_REVERSE = 5.0
 
-esc_channel = 15
+# === PCA9685 PWM for Servo ===
+SERVO_CHANNEL = 15
+SERVO_FREQ = 50
+SERVO_NEUTRAL = 307  # 1.5ms pulse width
 
-# Define pulse range for ESC 
-min_pulse = 205
-max_pulse = 410
+# === ESC Pulse Range (PCA-style, 0–4095) ===
+ESC_MIN_PULSE = 205
+ESC_MAX_PULSE = 410
 
-# Setup I2C bus and PCA9685
+# === Setup GPIO for ESC control ===
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(ESC_GPIO_PIN, GPIO.OUT)
+esc_pwm = GPIO.PWM(ESC_GPIO_PIN, ESC_PWM_FREQ)
+esc_pwm.start(ESC_NEUTRAL_DUTY)
+
+# === Setup I2C and PCA9685 for Servo ===
 i2c = busio.I2C(board.SCL, board.SDA)
 pca = PCA9685(i2c)
+pca.frequency = SERVO_FREQ
 
-# Set frequency to 50Hz for ESC
-pca.frequency = 50
-
-
-# === GPIO Setup ===
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(SERVO_PIN, GPIO.OUT)
-pwm = GPIO.PWM(SERVO_PIN, PWM_FREQ)
-pwm.start(7)  # Neutral position
-
-def connect_controller():
-    # === Controller Setup ===
+# === Initialize Pygame and Controller ===
+def init_controller():
     pygame.init()
     pygame.joystick.init()
-
     joystick = pygame.joystick.Joystick(0)
     joystick.init()
-
-    print("🎮 Controller connected. Use RT trigger to control throttle.")
-    print("")  # For second line display
-
+    print("🎮 Controller connected. Use RT for throttle, LT for steering.")
     return joystick
 
-last_snapshot = None  # NEW
+# === ESC Control ===
+def set_esc_throttle(value):
+    # Convert normalized value (0.0 to 1.0) to PWM duty %
+    duty = ESC_FULL_REVERSE + (value * (ESC_FULL_FORWARD - ESC_FULL_REVERSE))
+    esc_pwm.ChangeDutyCycle(duty)
+    return duty
 
-# control the steering servo
-def control_servo():
-    joystick = connect_controller()
+# === Servo Control ===
+def set_servo_position(value):
+    # Convert normalized value (-1.0 to 1.0) to pulse width
+    pulse = int(SERVO_NEUTRAL + (value * 100))  # ±100 around neutral
+    pca.channels[SERVO_CHANNEL].duty_cycle = pulse
+    return pulse
 
-    pygame.event.pump()
+# === Main Control Loop ===
+def control_loop():
+    joystick = init_controller()
+    last_snapshot = None
 
-    # Read RT trigger (usually axis 5 on Xbox controllers)
-    rt_value = joystick.get_axis(2)  # Range: -1.0 to 1.0
-    throttle = (rt_value + 1) / 2    # Normalize to 0.0 to 1.0
-    duty = 4 + (throttle * 5)    # Scale to 0–10% PWM
+    try:
+        while True:
+            pygame.event.pump()
 
-    pwm.ChangeDutyCycle(duty)
+            # Throttle (RT Trigger, axis 5): -1 to 1 → 0 to 1
+            throttle_raw = joystick.get_axis(5)
+            throttle_norm = max(0.0, (throttle_raw + 1) / 2)
+            throttle_duty = set_esc_throttle(throttle_norm)
 
-    # Detect A button press (button 0)
-    if joystick.get_button(0):
-        last_snapshot = duty  # NEW
+            # Steering (LT Trigger or axis 2): -1 to 1
+            steering_raw = joystick.get_axis(2)
+            servo_pulse = set_servo_position(steering_raw)
 
-    # Print live line + frozen snapshot line
-    print(f"\rRT: {throttle:.2f} → PWM: {duty:.2f}", end="", flush=True)  # overwrite
-    if last_snapshot is not None:
-        sys.stdout.write(f"🔸 Snapshot (A): PWM was {last_snapshot:.2f}     \r")
-    else:
-        sys.stdout.write("                                         \r")  # Clear line
+            if joystick.get_button(0):  # A Button
+                last_snapshot = (throttle_duty, servo_pulse)
 
-def esc_sweep():
-    # Send neutral (1.5ms pulse)
-    print("Sending neutral (should arm ESC)")
-    pca.channels[esc_channel].duty_cycle = 308
-    time.sleep(10)
+            # Display live status
+            status = f"Throttle: {throttle_duty:.2f}% | Steering Pulse: {servo_pulse}"
+            if last_snapshot:
+                status += f" | 🔸 Snapshot (A): {last_snapshot}"
+            print(f"\r{status.ljust(80)}", end="", flush=True)
 
-    for pulse in range(min_pulse, max_pulse, 5):
-            pca.channels[esc_channel].duty_cycle = pulse
-            print(f"Throttle value: {pulse}")
-            time.sleep(0.1)
-    for pulse in range(max_pulse, min_pulse, -5):
-        pca.channels[esc_channel].duty_cycle = pulse
-        print(f"Throttle value: {pulse}")
-        time.sleep(0.1)
+            time.sleep(0.05)
 
+    except KeyboardInterrupt:
+        print("\n[Shutdown] Stopping ESC and Servo...")
+    finally:
+        esc_pwm.ChangeDutyCycle(ESC_NEUTRAL_DUTY)
+        esc_pwm.stop()
+        GPIO.cleanup()
+        pca.deinit()
 
-try:
-    while True:
-
-        esc_sweep()
-        
-        sys.stdout.flush()
-        time.sleep(0.05)
-
-except KeyboardInterrupt:
-    print("\nStopping... Resetting servo.")
-finally:
-    pwm.ChangeDutyCycle(7.5)  # Back to neutral
-    pwm.stop()
-    GPIO.cleanup()
+if __name__ == "__main__":
+    control_loop()
