@@ -5,36 +5,26 @@ import RPi.GPIO as GPIO
 import board
 import busio
 from adafruit_pca9685 import PCA9685
-from adafruit_motor import servo
 
-# === GPIO PWM for ESC ===
-ESC_GPIO_PIN = 18  # GPIO pin for ESC signal
-ESC_PWM_FREQ = 50  # 50Hz standard for ESCs
-ESC_NEUTRAL_DUTY = 7.5
-ESC_FULL_FORWARD = 10.0
-ESC_FULL_REVERSE = 5.0
-
-# === PCA9685 PWM for Servo ===
+# === PCA9685 PWM Channels ===
 ESC_CHANNEL = 3
 SERVO_CHANNEL = 15
 SERVO_FREQ = 50
+SERVO_MIN = 205
+SERVO_MAX = 410
+SERVO_NEUTRAL = 307
 
 # === ESC Pulse Range (PCA-style, 0–4095) ===
 ESC_MIN_PULSE = 205
 ESC_MAX_PULSE = 410
 ESC_NEUTRAL = 307
 
-# === Setup GPIO for ESC control ===
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(ESC_GPIO_PIN, GPIO.OUT)
-esc_pwm = GPIO.PWM(ESC_GPIO_PIN, ESC_PWM_FREQ)
-esc_pwm.start(ESC_NEUTRAL_DUTY)
-
-# === Setup I2C and PCA9685 for Servo ===
+# === Setup I2C and PCA9685 ===
 i2c = busio.I2C(board.SCL, board.SDA)
 pca = PCA9685(i2c)
 pca.frequency = SERVO_FREQ
-steering_servo = servo.Servo(pca.channels[SERVO_CHANNEL], actuation_range=180)
+pca.channels[ESC_CHANNEL].duty_cycle = ESC_NEUTRAL
+time.sleep(1)
 
 # === Initialize Pygame and Controller ===
 def init_controller():
@@ -55,10 +45,11 @@ def set_esc_throttle(value):
 
 # === Servo Control ===
 def set_servo_position(value):
-    # Convert normalized value (-1.0 to 1.0) to angle (0–180)
-    angle = int((value + 1.0) * 90)  # map -1.0–1.0 to 0–180
-    steering_servo.angle = angle
-    return angle
+    value = max(-1.0, min(1.0, value))
+    pulse = int(SERVO_NEUTRAL + value * ((SERVO_MAX - SERVO_MIN) / 2))
+    pulse = max(SERVO_MIN, min(SERVO_MAX, pulse))
+    pca.channels[SERVO_CHANNEL].duty_cycle = pulse
+    return pulse
 
 # === Main Control Loop ===
 def control_loop():
@@ -92,9 +83,7 @@ def control_loop():
     except KeyboardInterrupt:
         print("\n[Shutdown] Stopping ESC and Servo...")
     finally:
-        esc_pwm.ChangeDutyCycle(ESC_NEUTRAL_DUTY)
-        esc_pwm.stop()
-        GPIO.cleanup()
+        pca.channels[ESC_CHANNEL].duty_cycle = ESC_NEUTRAL
         pca.deinit()
 
 if __name__ == "__main__":
