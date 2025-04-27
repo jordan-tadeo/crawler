@@ -72,7 +72,7 @@ def control_loop():
             pygame.event.pump()
 
             # Throttle Forward (RT Trigger, axis 5): -1 to 1 => 0 to 1
-            forward_raw = joystick.get_axis(5)
+            forward_raw = joystick.get_axis(4)
             forward_norm = max(0.0, (forward_raw + 1) / 2)
 
             # Throttle Reverse (LT Trigger, axis 2): -1 to 1 => 0 to 1
@@ -81,16 +81,16 @@ def control_loop():
 
             throttle_pulse = set_esc_throttle(forward_norm, reverse_norm)
 
-            # Pan/Tilt (Right stick X/Y -> axes 3/4)
-            pan_raw = joystick.get_axis(3)
-            tilt_raw = joystick.get_axis(1)
-            pan_angle, tilt_angle = set_pan_tilt(pan_raw, tilt_raw)
+            # # Pan/Tilt (Right stick X/Y -> axes 3/4)
+            # pan_raw = joystick.get_axis(3)
+            # tilt_raw = joystick.get_axis(1)
+            # pan_angle, tilt_angle = set_pan_tilt(pan_raw, tilt_raw)
 
-            if joystick.get_button(0):  # A Button
-                last_snapshot = (throttle_pulse, pan_angle, tilt_angle)
+            # if joystick.get_button(0):  # A Button
+            #     last_snapshot = (throttle_pulse, pan_angle, tilt_angle)
 
             status = (
-                f"Throttle: {throttle_pulse}µs | Pan: {pan_angle}° | Tilt: {tilt_angle}°"
+                f"Throttle: {throttle_pulse}µs"# | Pan: {pan_angle}° | Tilt: {tilt_angle}°"
             )
             if last_snapshot:
                 status += f" | 🔸 Snapshot (A): {last_snapshot}"
