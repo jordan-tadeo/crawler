@@ -55,8 +55,8 @@ def set_esc_throttle(forward_value, reverse_value):
 
 # === Servo Control: Steering ===
 def set_steering(x_val):
-    x_val = max(-1.0, min(1.0, x_val))
-    steering_angle = -int((x_val + 1.0) * 90)
+    x_val = max(-1.0, min(1.0, -x_val))
+    steering_angle = int((x_val + 1.0) * 90)
     steering_servo.angle = steering_angle
     return steering_angle
 
