@@ -76,7 +76,7 @@ def control_loop():
             forward_norm = max(0.0, (forward_raw + 1) / 2)
 
             # Throttle Reverse (LT Trigger, axis 2): -1 to 1 => 0 to 1
-            reverse_raw = joystick.get_axis(2)
+            reverse_raw = joystick.get_axis(0)
             reverse_norm = max(0.0, (reverse_raw + 1) / 2)
 
             throttle_pulse = set_esc_throttle(forward_norm, reverse_norm)
