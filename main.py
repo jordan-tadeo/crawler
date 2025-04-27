@@ -90,7 +90,7 @@ def control_loop():
             throttle_pulse = set_esc_throttle(forward_norm, reverse_norm)
 
             # Steering (Left stick X axis -> axis 1)
-            steering_raw = joystick.get_axis(1)
+            steering_raw = joystick.get_axis(0)
             steering_angle = set_steering(steering_raw)
 
             # # Pan/Tilt (Right stick X/Y -> axes 3/0)
