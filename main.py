@@ -14,9 +14,9 @@ ESC_FULL_FORWARD_PW = 2000
 ESC_FULL_REVERSE_PW = 1000
 
 # === PCA9685 PWM Channels ===
-PAN_CHANNEL = 14
-TILT_CHANNEL = 15
-SERVO_CHANNEL = 0  # Add a servo for steering on a separate channel
+PAN_CHANNEL = 13
+TILT_CHANNEL = 14
+SERVO_CHANNEL = 15 
 SERVO_FREQ = 50
 
 # === Setup pigpio for ESC control ===
