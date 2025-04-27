@@ -37,22 +37,27 @@ def init_controller():
     pygame.joystick.init()
     joystick = pygame.joystick.Joystick(0)
     joystick.init()
-    print("🎮 Controller connected. RT = throttle, LT = steering, Right Stick = pan/tilt")
+    print("\U0001F3AE Controller connected. RT = forward, LT = reverse, Right Stick = pan/tilt")
     return joystick
 
 # === ESC Control ===
-def set_esc_throttle(value):
-    pulse = int(ESC_NEUTRAL_PW + value * (ESC_FULL_FORWARD_PW - ESC_NEUTRAL_PW))
+def set_esc_throttle(forward_value, reverse_value):
+    # Forward has priority if both triggers are pressed
+    if forward_value > 0.05:
+        pulse = int(ESC_NEUTRAL_PW + forward_value * (ESC_FULL_FORWARD_PW - ESC_NEUTRAL_PW))
+    elif reverse_value > 0.05:
+        pulse = int(ESC_NEUTRAL_PW - reverse_value * (ESC_NEUTRAL_PW - ESC_FULL_REVERSE_PW))
+    else:
+        pulse = ESC_NEUTRAL_PW
     pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
     return pulse
 
 # === Servo Control: Pan & Tilt ===
 def set_pan_tilt(x_val, y_val):
-    # Clamp joystick range and convert to servo angles
     x_val = max(-1.0, min(1.0, x_val))
     y_val = max(-1.0, min(1.0, y_val))
-    pan_angle = int((x_val + 1.0) * 90)     # -1 to 1 → 0 to 180
-    tilt_angle = int((1.0 - y_val) * 90)    # -1 to 1 → 180 to 0 (invert)
+    pan_angle = int((x_val + 1.0) * 90)
+    tilt_angle = int((1.0 - y_val) * 90)
     pan_servo.angle = pan_angle
     tilt_servo.angle = tilt_angle
     return pan_angle, tilt_angle
@@ -66,14 +71,19 @@ def control_loop():
         while True:
             pygame.event.pump()
 
-            # Throttle (RT Trigger, axis 4): -1 to 1 → 0 to 1
-            throttle_raw = joystick.get_axis(4)
-            throttle_norm = max(0.0, (throttle_raw + 1) / 2)
-            throttle_pulse = set_esc_throttle(throttle_norm)
+            # Throttle Forward (RT Trigger, axis 5): -1 to 1 => 0 to 1
+            forward_raw = joystick.get_axis(5)
+            forward_norm = max(0.0, (forward_raw + 1) / 2)
 
-            # Pan/Tilt (Right stick X/Y → axes 3/4)
+            # Throttle Reverse (LT Trigger, axis 2): -1 to 1 => 0 to 1
+            reverse_raw = joystick.get_axis(2)
+            reverse_norm = max(0.0, (reverse_raw + 1) / 2)
+
+            throttle_pulse = set_esc_throttle(forward_norm, reverse_norm)
+
+            # Pan/Tilt (Right stick X/Y -> axes 3/4)
             pan_raw = joystick.get_axis(3)
-            tilt_raw = joystick.get_axis(2)
+            tilt_raw = joystick.get_axis(1)
             pan_angle, tilt_angle = set_pan_tilt(pan_raw, tilt_raw)
 
             if joystick.get_button(0):  # A Button
