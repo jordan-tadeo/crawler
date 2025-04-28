@@ -4,7 +4,10 @@ class USBCamera:
     def __init__(self, camera_index=0, fps=30):
         self.camera_index = camera_index
         self.fps = fps
-        self.cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)  # Explicitly use the V4L2 backend
+        self.cap = cv2.VideoCapture(camera_index)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Failed to open camera at index {camera_index} with backend V4L2")
+        print(f"Camera initialized successfully at index {camera_index} with backend V4L2")
         self.set_fps(fps)
 
     def set_fps(self, fps):
