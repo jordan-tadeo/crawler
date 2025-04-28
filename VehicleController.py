@@ -26,7 +26,8 @@ class VehicleController:
     expect values between -1 and 1, where 0 is neutral.
     '''
 
-    def __init__(self):
+    def __init__(self, logger: Logger.Logger) -> None:
+        self.logger = logger
         # Setup pigpio for ESC control
         self.pi = pigpio.pi()
         if not self.pi.connected:
