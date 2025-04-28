@@ -47,7 +47,7 @@ async def control_loop():
 
             vehicle_state = new_vehicle_state
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
     except KeyboardInterrupt:
         print("\n[Shutdown] Stopping ESC and Servos...")
     finally:
