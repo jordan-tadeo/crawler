@@ -55,7 +55,7 @@ async def control_loop():
         vecon.close()
 
 if __name__ == "__main__":
-    usbcam = uc.USBCamera(camera_index=0, fps=30)
+    usbcam = uc.USBCamera(device_path="/dev/video0", fps=30)
     app = QApplication(sys.argv)
     dashboard = db.Dashboard()
     dashboard.show()
