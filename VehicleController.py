@@ -66,8 +66,8 @@ class VehicleController:
         '''
 
         # Restrict values to the range [-1, 1]
-        front = max(-1.0, min(1.0, front)) if front else 0
-        rear = max(-1.0, min(1.0, rear)) if rear else 0
+        front = max(-1.0, min(1.0, -front)) if front else 0
+        rear = max(-1.0, min(1.0, -rear)) if rear else 0
         
         # Map the range [-1, 1] to [0, 180] for servo angle
         front_angle = int((front + 1.0) * 90)
