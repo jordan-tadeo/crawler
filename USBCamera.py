@@ -1,7 +1,7 @@
 import cv2
 
 class USBCamera:
-    def __init__(self, camera_index=1, fps=30):
+    def __init__(self, camera_index=0, fps=30):
         self.camera_index = camera_index
         self.fps = fps
         self.cap = cv2.VideoCapture(camera_index)
