@@ -27,6 +27,12 @@ class Dashboard:
         self.usb_camera = USBCamera(camera_index=0, fps=30)
         self.update_usb_cam()
 
+        # Add keybinding to exit fullscreen or close the app
+        self.root.bind("<Escape>", self.exit_fullscreen)
+
+    def exit_fullscreen(self, event=None):
+        self.root.attributes("-fullscreen", False)
+
     def update_usb_cam(self):
         try:
             frame = self.usb_camera.get_frame()
