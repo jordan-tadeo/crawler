@@ -20,8 +20,7 @@ async def control_loop():
 
     await asyncio.sleep(1)  # Allow time for joystick to initialize
 
-    vehicle_state = vecon.get_state()
-    print(f"Initial State: {vehicle_state}")
+    vehicle_state = None
     try:
         while True:
             joystick.update_connection_status()
