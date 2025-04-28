@@ -55,12 +55,12 @@ async def control_loop():
         vecon.close()
 
 if __name__ == "__main__":
-    usbcam = uc.USBCamera(camera_index=1, fps=30)
+    usbcam = uc.USBCamera(camera_index=0, fps=30)
     app = QApplication(sys.argv)
     dashboard = db.Dashboard()
     dashboard.show()
 
-    usbcam.focus_sweep(0)
+    # usbcam.focus_sweep(0)
 
     # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
