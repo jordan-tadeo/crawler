@@ -1,6 +1,7 @@
 from PyQt5.QtWidgets import QApplication
 import sys
 import asyncio
+import threading
 import VehicleController as vc
 import Joystick as js
 import Logger as lg
@@ -59,7 +60,9 @@ if __name__ == "__main__":
     dashboard = db.Dashboard()
     dashboard.show()
 
+    # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(control_loop())
+    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(),))
+    asyncio_thread.start()
 
     sys.exit(app.exec_())
