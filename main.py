@@ -1,4 +1,4 @@
-import time
+import asyncio
 import pygame
 import VehicleController as vc
 import Joystick as js
@@ -7,7 +7,7 @@ import USBCamera as uc
 import Dashboard as db
 
 # === Main Control Loop ===
-def control_loop():
+async def control_loop():
     pygame.init()
 
     joystick = js.Joystick()
@@ -16,11 +16,13 @@ def control_loop():
     usbcam = uc.USBCamera(camera_index=0, fps=30)
 
     dashboard = db.Dashboard()
-    dashboard.run()
+
+    # Run the dashboard in a separate asyncio task
+    asyncio.create_task(asyncio.to_thread(dashboard.run))
 
     log = lg.Logger()
 
-    time.sleep(1)  # Allow time for joystick to initialize
+    await asyncio.sleep(1)  # Allow time for joystick to initialize
 
     vehicle_state = vecon.get_state()
     print(f"Initial State: {vehicle_state}")
@@ -31,8 +33,6 @@ def control_loop():
                 joystick.wait_for_connection()
             print(f"Vehicle State: {vehicle_state}", end="\r", flush=True)
 
-            dashboard.update_usb_cam()
-
             pygame.event.pump()
             throttle = joystick.read_throttle()
             steering_front = joystick.get_axis("LEFT_X")
@@ -40,7 +40,7 @@ def control_loop():
 
             if throttle and steering_front and steering_rear:
                 print(f"Throttle: {throttle:.2f}, Front Steering: {steering_front:.2f}, Rear Steering: {steering_rear:.2f}", end="\r", flush=True)
-            
+
             vecon.set_throttle(throttle)
             vecon.set_steering(steering_front, steering_rear)  
 
@@ -52,11 +52,11 @@ def control_loop():
 
             vehicle_state = new_vehicle_state
 
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
     except KeyboardInterrupt:
         print("\n[Shutdown] Stopping ESC and Servos...")
     finally:
         vecon.close()
 
 if __name__ == "__main__":
-    control_loop()
+    asyncio.run(control_loop())
