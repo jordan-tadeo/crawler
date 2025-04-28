@@ -31,7 +31,7 @@ class Joystick:
         self.connected = False
 
         if pygame.joystick.get_count() == 0:
-            raise RuntimeError("No joystick connected.")
+            self.wait_for_connection()
 
         try:
             self.joystick = pygame.joystick.Joystick(0)
