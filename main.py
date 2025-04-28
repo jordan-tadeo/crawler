@@ -1,5 +1,6 @@
+from PyQt5.QtWidgets import QApplication
+import sys
 import asyncio
-import pygame
 import VehicleController as vc
 import Joystick as js
 import Logger as lg
@@ -14,11 +15,6 @@ async def control_loop():
     vecon = vc.VehicleController()
 
     usbcam = uc.USBCamera(camera_index=0, fps=30)
-
-    dashboard = db.Dashboard()
-
-    # Run the dashboard in a separate asyncio task
-    asyncio.create_task(asyncio.to_thread(dashboard.run))
 
     log = lg.Logger()
 
@@ -59,4 +55,11 @@ async def control_loop():
         vecon.close()
 
 if __name__ == "__main__":
-    asyncio.run(control_loop())
+    app = QApplication(sys.argv)
+    dashboard = db.Dashboard()
+    dashboard.show()
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(control_loop())
+
+    sys.exit(app.exec_())
