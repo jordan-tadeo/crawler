@@ -75,7 +75,7 @@ class Joystick:
     
     def get_axis(self, axis_name: str, limit_perc: float = 100):
         if axis_name in XBOX_AXES:
-            return self.joystick.get_axis(XBOX_AXES[axis_name]) * (limit_perc / 100)
+            return self.joystick.get_axis(XBOX_AXES[axis_name])
         else:
             raise ValueError(f"Invalid axis name: {axis_name}")
     
