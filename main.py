@@ -57,6 +57,7 @@ async def control_loop():
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     dashboard = db.Dashboard()
+    dashboard.show()    
 
     # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
