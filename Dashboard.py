@@ -25,7 +25,6 @@ class Dashboard(QMainWindow):
 
         # USB Camera setup
         self.usb_camera = USBCamera(camera_index=0, fps=30)
-        self.usb_camera.focus_sweep()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_usb_cam)
         self.timer.start(33)  # ~30 FPS
