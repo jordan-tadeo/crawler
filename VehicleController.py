@@ -42,6 +42,24 @@ class VehicleController:
         self.tilt_servo = servo.Servo(self.pca.channels[TILT_CHANNEL], actuation_range=180)
         self.front_steering_servo = servo.Servo(self.pca.channels[FRONT_STEERING_CHANNEL], actuation_range=180)
         self.rear_steering_servo = servo.Servo(self.pca.channels[REAR_STEERING_CHANNEL], actuation_range=180)
+
+    def get_state(self) -> dict:
+        ''' 
+        Get the current state of the ESC and servos.
+        Returns a tuple of (throttle, front_steering, rear_steering, pan, tilt).
+        '''
+
+        throttle = self.pi.get_servo_pulsewidth(ESC_GPIO_PIN)
+        front_steering = self.front_steering_servo.angle
+        rear_steering = self.rear_steering_servo.angle
+        pan = self.pan_servo.angle
+        tilt = self.tilt_servo.angle
+
+        return {"throttle": throttle,
+                "front_s": front_steering,
+                "rear_s": rear_steering,
+                "pan": pan,
+                "tilt": tilt}
     
     def set_throttle(self, value) -> int:
         ''' 
