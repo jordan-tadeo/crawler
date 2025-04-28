@@ -47,8 +47,6 @@ class Joystick:
         rt = self.get_axis("RT")
         lt = self.get_axis("LT")
 
-        print(f"RT: {rt}, LT: {lt}", end="\r", flush=True)
-
         if rt + 1 > deadzone:
             # return rt mapped to [0, 1]
             rt = (rt + 1) / 2
