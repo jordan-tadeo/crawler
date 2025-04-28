@@ -12,11 +12,12 @@ import pygame
 # === Main Control Loop ===
 async def control_loop():
     pygame.init()
+    log = lg.Logger()
 
     joystick = js.Joystick()
-    vecon = vc.VehicleController()
+    vecon = vc.VehicleController(logger=log)
 
-    log = lg.Logger()
+    
 
     await asyncio.sleep(1)  # Allow time for joystick to initialize
 
