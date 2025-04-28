@@ -13,6 +13,7 @@ def control_loop():
     time.sleep(1)  # Allow time for joystick to initialize
     try:
         while True:
+            js.update_connection_status()
             if not joystick.is_connected():
                 joystick.wait_for_connection()
 

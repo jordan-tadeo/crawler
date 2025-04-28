@@ -39,7 +39,7 @@ class Joystick:
             self.connected = True
         except pygame.error as e:
             raise RuntimeError(f"Failed to initialize joystick: {e}")
-
+    
     def read_throttle(self) -> float:
         deadzone = 0.01
 
@@ -86,3 +86,7 @@ class Joystick:
             return self.joystick.get_button(XBOX_BUTTONS[button_name])
         else:
             raise ValueError(f"Invalid button name: {button_name}")
+    
+    def update_connection_status(self):
+        # Check if the joystick is still connected
+        self.connected = pygame.joystick.get_count() > 0
