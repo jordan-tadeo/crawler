@@ -9,6 +9,8 @@ def control_loop():
     joystick = js.Joystick()
     vecon = vc.VehicleController()
 
+    pygame.init()
+
     try:
         while True:
             if not joystick.is_connected():
