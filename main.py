@@ -21,7 +21,8 @@ def control_loop():
             steering_front = joystick.get_axis("LEFT_X")
             steering_rear = joystick.get_axis("RIGHT_X")
 
-            print(f"Throttle: {throttle:.2f}, Front Steering: {steering_front:.2f}, Rear Steering: {steering_rear:.2f}", end="\r", flush=True)
+            if throttle and steering_front and steering_rear:
+                print(f"Throttle: {throttle:.2f}, Front Steering: {steering_front:.2f}, Rear Steering: {steering_rear:.2f}", end="\r", flush=True)
             
             vecon.set_throttle(throttle)
             vecon.set_steering(steering_front, steering_rear)      

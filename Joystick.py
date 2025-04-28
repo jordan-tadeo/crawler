@@ -41,7 +41,7 @@ class Joystick:
             raise RuntimeError(f"Failed to initialize joystick: {e}")
 
     def read_throttle(self) -> float:
-        deadzone = 0.05
+        deadzone = 0.01
 
         # translate RT and LT to one throttle value between -1 and 1
         rt = self.get_axis("RT")
