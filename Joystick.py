@@ -49,9 +49,13 @@ class Joystick:
 
         print(f"RT: {rt}, LT: {lt}", end="\r", flush=True)
 
-        if rt > deadzone:
+        if rt + 1 > deadzone:
+            # return rt mapped to [0, 1]
+            rt = (rt + 1) / 2
             return rt
-        elif lt > deadzone:
+        elif lt + 1 > deadzone:
+            # return lt mapped to [-1, 0]
+            lt = (lt + 1) / 2
             return -lt
 
 
