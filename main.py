@@ -3,12 +3,19 @@ import pygame
 import VehicleController as vc
 import Joystick as js
 import Logger as lg
-
+import USBCamera as uc
+import Dashboard as db
 
 # === Main Control Loop ===
 def control_loop():
     joystick = js.Joystick()
     vecon = vc.VehicleController()
+
+    usbcam = uc.USBCamera(camera_index=0, fps=30)
+
+    dashboard = db.Dashboard()
+    dashboard.run()
+
     log = lg.Logger()
 
     pygame.init()
@@ -22,6 +29,8 @@ def control_loop():
             if not joystick.is_connected():
                 joystick.wait_for_connection()
             print(f"Vehicle State: {vehicle_state}", end="\r", flush=True)
+
+            dashboard.update_usb_cam()
 
             pygame.event.pump()
             throttle = joystick.read_throttle()
