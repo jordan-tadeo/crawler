@@ -10,7 +10,7 @@ def control_loop():
     vecon = vc.VehicleController()
 
     pygame.init()
-
+    time.sleep(1)  # Allow time for joystick to initialize
     try:
         while True:
             if not joystick.is_connected():
