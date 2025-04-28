@@ -61,7 +61,7 @@ if __name__ == "__main__":
 
     # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
-    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(),))
+    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop,))
     asyncio_thread.start()
 
     sys.exit(app.exec_())
