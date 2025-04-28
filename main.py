@@ -8,6 +8,8 @@ import Dashboard as db
 
 # === Main Control Loop ===
 def control_loop():
+    pygame.init()
+
     joystick = js.Joystick()
     vecon = vc.VehicleController()
 
@@ -18,7 +20,6 @@ def control_loop():
 
     log = lg.Logger()
 
-    pygame.init()
     time.sleep(1)  # Allow time for joystick to initialize
 
     vehicle_state = vecon.get_state()
