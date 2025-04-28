@@ -4,6 +4,7 @@ import busio
 from adafruit_pca9685 import PCA9685
 from adafruit_motor import servo
 from typing import Tuple
+import Logger
 
 # Constants for control of the Quicrun 880 ESC
 ESC_GPIO_PIN = 18
@@ -49,11 +50,35 @@ class VehicleController:
         Returns a tuple of (throttle, front_steering, rear_steering, pan, tilt).
         '''
 
-        throttle = self.pi.get_servo_pulsewidth(ESC_GPIO_PIN)
-        front_steering = self.front_steering_servo.angle
-        rear_steering = self.rear_steering_servo.angle
-        pan = self.pan_servo.angle
-        tilt = self.tilt_servo.angle
+        try:
+            throttle = self.pi.get_servo_pulsewidth(ESC_GPIO_PIN)
+        except Exception as e:
+            self.logger.log("error", "Error reading state", f"Error reading throttle: {e}")
+            throttle = None
+
+        try:
+            front_steering = self.front_steering_servo.angle
+        except Exception as e:
+            self.logger.log("error", "Error reading state", f"Error reading front steering: {e}")
+            front_steering = None
+
+        try:
+            rear_steering = self.rear_steering_servo.angle
+        except Exception as e:
+            self.logger.log("error", "Error reading state", f"Error reading rear steering: {e}")
+            rear_steering = None
+
+        try:
+            pan = self.pan_servo.angle
+        except Exception as e:
+            self.logger.log("error", "Error reading state", f"Error reading pan angle: {e}")
+            pan = None
+
+        try:
+            tilt = self.tilt_servo.angle
+        except Exception as e:
+            self.logger.log("error", "Error reading state", f"Error reading tilt angle: {e}")
+            tilt = None
 
         return {"throttle": throttle,
                 "front_s": front_steering,
@@ -136,4 +161,3 @@ class VehicleController:
         self.pca.deinit()
         self.i2c.deinit()
 
-    
