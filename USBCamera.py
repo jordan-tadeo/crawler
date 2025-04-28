@@ -30,17 +30,5 @@ class USBCamera:
             raise RuntimeError("Failed to capture frame from USB camera.")
         return frame
 
-    def focus_sweep (self, focus_value=0):
-        """Set manual focus for the camera.
-        Args:
-            focus_value (int): Focus value (usually between 0 and 255).
-        """
-        while True:
-            if not self.cap.set(cv2.CAP_PROP_FOCUS, focus_value):
-                raise RuntimeError("Failed to set manual focus. Ensure your camera supports this feature.")
-            focus_value += 1
-            if focus_value > 255:
-                focus_value = 0
-
     def release(self):
         self.cap.release()
