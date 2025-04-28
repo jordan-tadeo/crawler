@@ -46,6 +46,9 @@ class Joystick:
         # translate RT and LT to one throttle value between -1 and 1
         rt = self.get_axis("RT")
         lt = self.get_axis("LT")
+
+        print(f"RT: {rt}, LT: {lt}", end="\r", flush=True)
+
         if rt > deadzone:
             return rt
         elif lt > deadzone:
