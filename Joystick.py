@@ -17,8 +17,8 @@ XBOX_AXES = {
     "LEFT_X": 0,
     "LEFT_Y": 1,
     "LT": 5,
-    "RIGHT_X": 3,
-    "RIGHT_Y": 6,
+    "RIGHT_X": 2,
+    "RIGHT_Y": 3,
     "RT": 4
 }
 
