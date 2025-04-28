@@ -53,13 +53,13 @@ async def control_loop():
         vecon.close()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    dashboard = db.Dashboard()
-    dashboard.show()    
+    # app = QApplication(sys.argv)
+    # dashboard = db.Dashboard()
+    # dashboard.show()    
 
     # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
     asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(),))
     asyncio_thread.start()
 
-    sys.exit(app.exec_())
+    # sys.exit(app.exec_())
