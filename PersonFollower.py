@@ -88,8 +88,9 @@ class PersonFollower:
         # Run inference
         detections = self.model(input_tensor)
 
-        # Debug: Print the structure of the detections object
-        print("Detections structure:", detections)
+        # Debug: Print the type and structure of the detections object
+        print("Detections type:", type(detections))
+        print("Detections content:", detections)
 
         # Convert TensorFlow tensors to NumPy arrays if applicable
         if isinstance(detections, dict):
