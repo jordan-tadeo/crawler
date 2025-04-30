@@ -33,15 +33,16 @@ class Dashboard(QMainWindow):
 
     def update_yolo_feed(self):
         try:
-            # Process frame and get YOLO feed
-            _, _, frame = self.person_follower.process_frame(self.person_follower.camera.get_frame())
+            # Get the latest processed frame from PersonFollower
+            frame = self.person_follower.latest_frame
 
-            # Convert frame to QImage and display it
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            height, width, channel = frame.shape
-            bytes_per_line = 3 * width
-            q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_image)
-            self.labels[0][0].setPixmap(pixmap)
+            if frame is not None:
+                # Convert frame to QImage and display it
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                height, width, channel = frame.shape
+                bytes_per_line = 3 * width
+                q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(q_image)
+                self.labels[0][0].setPixmap(pixmap)
         except Exception as e:
             print(f"Error updating YOLO feed: {e}")
