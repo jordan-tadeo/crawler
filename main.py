@@ -59,6 +59,8 @@ if __name__ == "__main__":
     usb_cam = uc.USBCamera(camera_index=0, fps=30)
     person_follower = pf.PersonFollower(vecon, usb_cam)
 
+    person_follower.start()  # Start YOLO processing thread
+
     app = QApplication(sys.argv)
     dashboard = db.Dashboard(person_follower)
     dashboard.show()    
@@ -68,4 +70,7 @@ if __name__ == "__main__":
     asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(joystick, vecon, person_follower),))
     asyncio_thread.start()
 
-    sys.exit(app.exec_())
+    try:
+        sys.exit(app.exec_())
+    finally:
+        person_follower.stop()  # Stop YOLO processing thread
