@@ -52,29 +52,29 @@ class PersonFollower:
 
     def _run_yolo_processing(self):
         while not self.stop_event.is_set():
-            try:
-                # Capture frame from camera
-                frame = self.camera.get_frame()
+            self.process_and_adjust()
 
-                # Resize frame to reduce computational load
-                frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+    def process_and_adjust(self):
+        '''Process the latest frame and adjust servos accordingly.'''
+        try:
+            # Capture frame from camera
+            frame = self.camera.get_frame()
 
-                # Process frame to detect person
-                person_center_x, person_center_y, processed_frame = self.process_frame(frame)
+            # Resize frame to reduce computational load
+            frame = cv2.resize(frame, (self.frame_width, self.frame_height))
 
-                # Store the latest processed frame and detections
-                self.latest_frame = processed_frame
-                self.latest_detections = (person_center_x, person_center_y)
+            # Process frame to detect person
+            person_center_x, person_center_y, processed_frame = self.process_frame(frame)
 
-                # Adjust servos to keep person in frame
-                self.adjust_servos(person_center_x, person_center_y)
+            # Adjust servos to keep person in frame
+            self.adjust_servos(person_center_x, person_center_y)
 
-            except Exception as e:
-                print(f"Error in YOLO processing thread: {e}")
+        except Exception as e:
+            print(f"Error in process_and_adjust: {e}")
 
     def process_frame(self, frame):
         # Run YOLO model on the frame
-        results = self.model.predict(frame, imgsz=(self.frame_width, self.frame_height), conf=0.33)
+        results = self.model.predict(frame, imgsz=(320, 256), conf=0.33)  # Adjusted imgsz to be a multiple of 32
         detections = results[0].boxes.xyxy.cpu().numpy()  # Get detections
 
         # Skip frames to reduce processing frequency
@@ -85,7 +85,7 @@ class PersonFollower:
         self.frame_count += 1
 
         # Filter for person class (class ID 0 in COCO dataset)
-        person_detections = [d for d in detections if int(d[5]) == 0 and d[4] > 0.70]
+        person_detections = [d for d in detections if len(d) > 5 and int(d[5]) == 0 and d[4] > 0.33]  # Confidence > 0.33
 
         if person_detections:
             # Visualize detections by drawing bounding boxes
