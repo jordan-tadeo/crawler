@@ -88,10 +88,23 @@ class PersonFollower:
         # Run inference
         detections = self.model(input_tensor)
 
-        # Convert TensorFlow tensors to NumPy arrays
-        detection_boxes = detections['detection_boxes'].numpy()[0]  # First batch
-        detection_classes = detections['detection_classes'].numpy()[0]
-        detection_scores = detections['detection_scores'].numpy()[0]
+        # Debug: Print the structure of the detections object
+        print("Detections structure:", detections)
+
+        # Convert TensorFlow tensors to NumPy arrays if applicable
+        if isinstance(detections, dict):
+            detection_boxes = detections.get('detection_boxes', None)
+            detection_classes = detections.get('detection_classes', None)
+            detection_scores = detections.get('detection_scores', None)
+
+            if detection_boxes is not None:
+                detection_boxes = detection_boxes.numpy()[0]  # First batch
+            if detection_classes is not None:
+                detection_classes = detection_classes.numpy()[0]
+            if detection_scores is not None:
+                detection_scores = detection_scores.numpy()[0]
+        else:
+            raise ValueError("Unexpected detections format. Expected a dictionary-like object.")
 
         # Visualize all raw detections by drawing bounding boxes
         for i, box in enumerate(detection_boxes):
