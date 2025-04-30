@@ -4,15 +4,21 @@ from VehicleController import VehicleController
 import cv2
 import warnings
 import threading
-import ultralytics
+import tflite_runtime.interpreter as tflite
+import numpy as np
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
-        # Initialize YOLOv8n model
-        self.model = ultralytics.YOLO('yolov8s.pt')  # YOLOv8 small
+        # Initialize TensorFlow Lite interpreter for person detection
+        self.interpreter = tflite.Interpreter(model_path="person_detection.tflite")
+        self.interpreter.allocate_tensors()
+
+        # Get input and output details
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam
@@ -76,39 +82,34 @@ class PersonFollower:
             print(f"Error in process_and_adjust: {e}")
 
     def process_frame(self, frame):
-        # Run YOLO model on the frame
-        results = self.model.predict(frame, imgsz=(320, 256), conf=0.33, verbose=False)  # Suppress verbose output
-        detections = results[0].boxes.xyxy.cpu().numpy()  # Get detections
+        # Resize frame to match model input size
+        input_shape = self.input_details[0]['shape']
+        resized_frame = cv2.resize(frame, (input_shape[2], input_shape[1]))
+        input_data = np.expand_dims(resized_frame, axis=0).astype(np.uint8)
 
-        # Debug: Print raw detection results
-        print(f"Raw detections: {detections}")
+        # Set input tensor
+        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
 
-        # Skip frames to reduce processing frequency
-        self.frame_count = getattr(self, 'frame_count', 0)  # Initialize frame_count if not present
-        if self.frame_count % 3 != 0:  # Process every 3rd frame
-            self.frame_count += 1
-            return None, None, frame
-        self.frame_count += 1
+        # Run inference
+        self.interpreter.invoke()
 
-        # Filter for person class (class ID 0 in COCO dataset)
-        person_detections = [d for d in detections if len(d) > 5 and int(d[5]) == 0 and d[4] > 0.33]  # Confidence > 0.33
+        # Get detection results
+        output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
 
-        # Debug: Print filtered person detections
-        print(f"Person detections: {person_detections}")
+        # Process detections (assuming person class ID is 0)
+        person_detections = [d for d in output_data if d[0] == 0 and d[1] > 0.5]  # Confidence > 0.5
 
         if person_detections:
             # Visualize detections by drawing bounding boxes
-            for x1, y1, x2, y2, conf, cls in person_detections:
+            for detection in person_detections:
+                x1, y1, x2, y2 = detection[2:6]
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                cv2.putText(frame, f"Person {conf:.2f}", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(frame, "Person", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            # Get the first detected person (largest bounding box can be prioritized)
-            x1, y1, x2, y2, conf, cls = person_detections[0]
+            # Get the first detected person
+            x1, y1, x2, y2 = person_detections[0][2:6]
             person_center_x = int((x1 + x2) / 2)
             person_center_y = int((y1 + y2) / 2)
-
-            # Debug: Print coordinates of the first detected person
-            print(f"First person center: ({person_center_x}, {person_center_y})")
 
             return person_center_x, person_center_y, frame
 
