@@ -92,45 +92,28 @@ class PersonFollower:
         print("Detections type:", type(detections))
         print("Detections content:", detections)
 
-        # Convert TensorFlow tensors to NumPy arrays if applicable
-        if isinstance(detections, dict):
-            detection_boxes = detections.get('detection_boxes', None)
-            detection_classes = detections.get('detection_classes', None)
-            detection_scores = detections.get('detection_scores', None)
+        # Convert TensorFlow tensor to NumPy array
+        detection_array = detections.numpy()[0]  # Remove batch dimension
 
-            if detection_boxes is not None:
-                detection_boxes = detection_boxes.numpy()[0]  # First batch
-            if detection_classes is not None:
-                detection_classes = detection_classes.numpy()[0]
-            if detection_scores is not None:
-                detection_scores = detection_scores.numpy()[0]
-        else:
-            raise ValueError("Unexpected detections format. Expected a dictionary-like object.")
+        # Find the class with the highest probability
+        predicted_class = np.argmax(detection_array)
+        confidence = detection_array[predicted_class]
 
-        # Visualize all raw detections by drawing bounding boxes
-        for i, box in enumerate(detection_boxes):
-            y1, x1, y2, x2 = box
-            x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
-            conf = detection_scores[i]
-            label = int(detection_classes[i])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue for raw detections
-            cv2.putText(frame, f"Label {label} ({conf:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        # Debug: Print the predicted class and confidence
+        print(f"Predicted class: {predicted_class}, Confidence: {confidence:.2f}")
 
-        # Process detections (assuming person class ID is 0)
-        person_detections = [i for i, label in enumerate(detection_classes) if label == 0 and detection_scores[i] > 0.5]
+        # Map the predicted class to a label (assuming ImageNet labels)
+        # You can download the ImageNet class index file if needed
+        imagenet_labels = {0: "background", 1: "person", 2: "bicycle", ...}  # Truncated for brevity
+        label = imagenet_labels.get(predicted_class, "Unknown")
 
-        if person_detections:
-            # Visualize detections by drawing bounding boxes
-            for i in person_detections:
-                y1, x1, y2, x2 = detection_boxes[i]
-                x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green for person detections
+        # Visualize the prediction on the frame
+        cv2.putText(frame, f"{label} ({confidence:.2f})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-            # Get the first detected person
-            y1, x1, y2, x2 = detection_boxes[person_detections[0]]
-            person_center_x = int((x1 + x2) / 2 * self.frame_width)
-            person_center_y = int((y1 + y2) / 2 * self.frame_height)
-
+        # If the predicted class is 'person', return the center of the frame
+        if label == "person":
+            person_center_x = self.frame_width // 2
+            person_center_y = self.frame_height // 2
             return person_center_x, person_center_y, frame
 
         return None, None, frame
