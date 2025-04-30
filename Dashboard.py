@@ -2,10 +2,10 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QGridLayout, QLabel, QWid
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import QTimer
 import cv2
-from USBCamera import USBCamera
+from PersonFollower import PersonFollower
 
 class Dashboard(QMainWindow):
-    def __init__(self):
+    def __init__(self, person_follower: PersonFollower):
         super().__init__()
         self.setWindowTitle("Dashboard")
         self.setGeometry(0, 0, 800, 600)  # Default window size
@@ -23,24 +23,25 @@ class Dashboard(QMainWindow):
                 self.labels[i][j].setScaledContents(True)
                 self.grid_layout.addWidget(self.labels[i][j], i, j)
 
-        # USB Camera setup
-        self.usb_camera = USBCamera(camera_index=0, fps=30)
+        # PersonFollower instance
+        self.person_follower = person_follower
+
+        # Timer to update YOLO feed
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_usb_cam)
+        self.timer.timeout.connect(self.update_yolo_feed)
         self.timer.start(33)  # ~30 FPS
 
-    def update_usb_cam(self):
+    def update_yolo_feed(self):
         try:
-            frame = self.usb_camera.get_frame()
+            # Process frame and get YOLO feed
+            _, _, frame = self.person_follower.process_frame(self.person_follower.camera.get_frame())
+
+            # Convert frame to QImage and display it
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channel = frame.shape
             bytes_per_line = 3 * width
             q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(q_image)
             self.labels[0][0].setPixmap(pixmap)
-        except RuntimeError as e:
-            print(f"Error capturing frame: {e}")
-
-    def closeEvent(self, event):
-        self.usb_camera.release()
-        event.accept()
+        except Exception as e:
+            print(f"Error updating YOLO feed: {e}")
