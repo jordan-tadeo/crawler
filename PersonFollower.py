@@ -74,7 +74,7 @@ class PersonFollower:
 
     def process_frame(self, frame):
         # Run YOLO model on the frame
-        results = self.model.predict(frame, imgsz=(320, 256), conf=0.33)  # Adjusted imgsz to be a multiple of 32
+        results = self.model.predict(frame, imgsz=(320, 256), conf=0.33, verbose=False)  # Suppress verbose output
         detections = results[0].boxes.xyxy.cpu().numpy()  # Get detections
 
         # Skip frames to reduce processing frequency
