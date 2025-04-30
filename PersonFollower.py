@@ -96,6 +96,14 @@ class PersonFollower:
         # Get detection results
         output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
 
+        # Visualize all raw detections by drawing bounding boxes
+        for detection in output_data:
+            x1, y1, x2, y2 = detection[2:6]
+            conf = detection[1]
+            label = int(detection[0])
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)  # Blue for raw detections
+            cv2.putText(frame, f"Label {label} ({conf:.2f})", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
         # Process detections (assuming person class ID is 0)
         person_detections = [d for d in output_data if d[0] == 0 and d[1] > 0.5]  # Confidence > 0.5
 
@@ -103,7 +111,7 @@ class PersonFollower:
             # Visualize detections by drawing bounding boxes
             for detection in person_detections:
                 x1, y1, x2, y2 = detection[2:6]
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)  # Green for person detections
                 cv2.putText(frame, "Person", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
             # Get the first detected person
