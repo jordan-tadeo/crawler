@@ -11,14 +11,7 @@ import pygame
 import PersonFollower as pf
 
 # === Main Control Loop ===
-async def control_loop():
-    pygame.init()
-    log = lg.Logger()
-
-    joystick = js.Joystick()
-    vecon = vc.VehicleController(logger=log)
-    usb_cam = uc.USBCamera(camera_index=0, fps=30)
-    person_follower = pf.PersonFollower(vecon, usb_cam)
+async def control_loop(joystick: js.Joystick, vecon: vc.VehicleController, person_follower: pf.PersonFollower):
 
     await asyncio.sleep(1)  # Allow time for joystick to initialize
 
@@ -58,13 +51,21 @@ async def control_loop():
         vecon.close()
 
 if __name__ == "__main__":
-    # app = QApplication(sys.argv)
-    # dashboard = db.Dashboard()
-    # dashboard.show()    
+    pygame.init()
+    log = lg.Logger()
+
+    joystick = js.Joystick()
+    vecon = vc.VehicleController(logger=log)
+    usb_cam = uc.USBCamera(camera_index=0, fps=30)
+    person_follower = pf.PersonFollower(vecon, usb_cam)
+
+    app = QApplication(sys.argv)
+    dashboard = db.Dashboard(person_follower)
+    dashboard.show()    
 
     # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
-    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(),))
+    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(joystick, vecon, person_follower),))
     asyncio_thread.start()
 
     # sys.exit(app.exec_())

@@ -1,6 +1,11 @@
 import torch
 from USBCamera import USBCamera
 from VehicleController import VehicleController
+import cv2
+import warnings
+
+# Suppress FutureWarnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
@@ -33,19 +38,22 @@ class PersonFollower:
         results = self.model(frame)
         detections = results.xyxy[0]  # Get detections
 
-        # Filter for person class (class ID 0 in COCO dataset)
-        person_detections = [d for d in detections if int(d[5]) == 0]
+        # Filter for person class (class ID 0 in COCO dataset) with confidence threshold
+        person_detections = [d for d in detections if int(d[5]) == 0 and d[4] > 0.5]  # Confidence > 0.5
 
         if person_detections:
+            # Visualize detections by drawing bounding boxes
+            for x1, y1, x2, y2, conf, cls in person_detections:
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(frame, f"Person {conf:.2f}", (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
             # Get the first detected person (largest bounding box can be prioritized)
             x1, y1, x2, y2, conf, cls = person_detections[0]
             person_center_x = int((x1 + x2) / 2)
             person_center_y = int((y1 + y2) / 2)
-            self.person_detected = True
-            return person_center_x, person_center_y
-        
-        self.person_detected = False
-        return None, None
+            return person_center_x, person_center_y, frame
+
+        return None, None, frame
 
     def adjust_servos(self, person_center_x, person_center_y):
         # Calculate pan/tilt adjustments
@@ -73,7 +81,7 @@ class PersonFollower:
             frame = self.camera.get_frame()
 
             # Process frame to detect person
-            person_center_x, person_center_y = self.process_frame(frame)
+            person_center_x, person_center_y, frame = self.process_frame(frame)
 
             # Adjust servos to keep person in frame
             self.adjust_servos(person_center_x, person_center_y)
