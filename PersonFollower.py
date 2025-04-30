@@ -41,6 +41,10 @@ class PersonFollower:
         self.latest_frame = None
         self.latest_detections = None
 
+    def start(self):
+        '''Start the YOLO processing thread.'''
+        self.thread.start()
+
     def _run_yolo_processing(self):
         while not self.stop_event.is_set():
             try:
