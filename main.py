@@ -68,4 +68,4 @@ if __name__ == "__main__":
     asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(joystick, vecon, person_follower),))
     asyncio_thread.start()
 
-    # sys.exit(app.exec_())
+    sys.exit(app.exec_())
