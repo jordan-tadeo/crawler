@@ -3,6 +3,7 @@ from USBCamera import USBCamera
 from VehicleController import VehicleController
 import cv2
 import warnings
+import threading
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -32,6 +33,38 @@ class PersonFollower:
         self.controller.set_pan_tilt(0, 0)  # Set to neutral
 
         self.person_detected = False
+
+        # Threading setup
+        self.thread = threading.Thread(target=self._run_yolo_processing, daemon=True)
+        self.stop_event = threading.Event()
+        self.latest_frame = None
+        self.latest_detections = None
+
+    def _run_yolo_processing(self):
+        while not self.stop_event.is_set():
+            try:
+                # Capture frame from camera
+                frame = self.camera.get_frame()
+
+                # Process frame to detect person
+                person_center_x, person_center_y, processed_frame = self.process_frame(frame)
+
+                # Store the latest processed frame and detections
+                self.latest_frame = processed_frame
+                self.latest_detections = (person_center_x, person_center_y)
+
+                # Adjust servos to keep person in frame
+                self.adjust_servos(person_center_x, person_center_y)
+
+            except Exception as e:
+                print(f"Error in YOLO processing thread: {e}")
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join()
 
     def process_frame(self, frame):
         # Run YOLO model on the frame
@@ -84,17 +117,3 @@ class PersonFollower:
 
             # Update pan/tilt servos
             self.controller.set_pan_tilt((self.pan_angle - 90) / 90, (self.tilt_angle - 90) / 90)
-
-    def process_and_adjust(self):
-        try:
-            # Capture frame from camera
-            frame = self.camera.get_frame()
-
-            # Process frame to detect person
-            person_center_x, person_center_y, frame = self.process_frame(frame)
-
-            # Adjust servos to keep person in frame
-            self.adjust_servos(person_center_x, person_center_y)
-
-        except Exception as e:
-            print(f"Error processing frame: {e}")
