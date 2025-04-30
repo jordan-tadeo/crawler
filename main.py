@@ -8,6 +8,7 @@ import Logger as lg
 import USBCamera as uc
 import Dashboard as db
 import pygame
+import PersonFollower as pf
 
 # === Main Control Loop ===
 async def control_loop():
@@ -16,6 +17,8 @@ async def control_loop():
 
     joystick = js.Joystick()
     vecon = vc.VehicleController(logger=log)
+    usb_cam = uc.USBCamera(camera_index=0, fps=30)
+    person_follower = pf.PersonFollower(vecon, usb_cam)
 
     await asyncio.sleep(1)  # Allow time for joystick to initialize
 
@@ -45,6 +48,8 @@ async def control_loop():
                 log.csv("log/vehicle_state_log.csv", "Vehicle State Change", new_vehicle_state)
 
             vehicle_state = new_vehicle_state
+
+            person_follower.process_and_adjust()
 
             await asyncio.sleep(0.01)
     except KeyboardInterrupt:
