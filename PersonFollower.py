@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
         # Initialize YOLOv8n model
-        self.model = ultralytics.YOLO('yolov8n.pt')  # YOLOv8 nano
+        self.model = ultralytics.YOLO('yolov8s.pt')  # YOLOv8 small
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam
