@@ -6,14 +6,24 @@ import warnings
 import threading
 import tflite_runtime.interpreter as tflite
 import numpy as np
+import os
+import kagglehub
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
+        # Check if the model exists locally, if not, download it
+        model_path = "person_detection.tflite"
+        if not os.path.exists(model_path):
+            print("Model not found locally. Downloading...")
+            path = kagglehub.model_download("google/mobilenet-v2/tensorFlow2/035-128-classification")
+            print("Path to model files:", path)
+            model_path = os.path.join(path, "person_detection.tflite")
+
         # Initialize TensorFlow Lite interpreter for person detection
-        self.interpreter = tflite.Interpreter(model_path="person_detection.tflite")
+        self.interpreter = tflite.Interpreter(model_path=model_path)
         self.interpreter.allocate_tensors()
 
         # Get input and output details
