@@ -4,22 +4,23 @@ from VehicleController import VehicleController
 import cv2
 import warnings
 import threading
+import ultralytics
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
-        # Initialize YOLO model
-        self.model = torch.hub.load('ultralytics/yolov5', 'yolov5n')  # YOLOv5 nano
+        # Initialize YOLOv8n model
+        self.model = ultralytics.YOLO('yolov8n.pt')  # YOLOv8 nano
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam
         self.controller = vehicle_controller
 
-        # Frame dimensions (assume 640x480 for now, adjust dynamically if needed)
-        self.frame_width = 640
-        self.frame_height = 480
+        # Frame dimensions (assume 320x240 for now, adjust dynamically if needed)
+        self.frame_width = 320
+        self.frame_height = 240
         self.frame_center_x = self.frame_width // 2
         self.frame_center_y = self.frame_height // 2
 
@@ -46,6 +47,9 @@ class PersonFollower:
                 # Capture frame from camera
                 frame = self.camera.get_frame()
 
+                # Resize frame to reduce computational load
+                frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+
                 # Process frame to detect person
                 person_center_x, person_center_y, processed_frame = self.process_frame(frame)
 
@@ -59,20 +63,10 @@ class PersonFollower:
             except Exception as e:
                 print(f"Error in YOLO processing thread: {e}")
 
-    def start(self):
-        self.thread.start()
-
-    def stop(self):
-        self.stop_event.set()
-        self.thread.join()
-
     def process_frame(self, frame):
         # Run YOLO model on the frame
-        results = self.model(frame)
-        detections = results.xyxy[0]  # Get detections
-
-        # Resize frame to reduce computational load
-        frame = cv2.resize(frame, (320, 240))  # Resize to 320x240
+        results = self.model.predict(frame, imgsz=(self.frame_width, self.frame_height), conf=0.33)
+        detections = results[0].boxes.xyxy.cpu().numpy()  # Get detections
 
         # Skip frames to reduce processing frequency
         self.frame_count = getattr(self, 'frame_count', 0)  # Initialize frame_count if not present
@@ -81,8 +75,8 @@ class PersonFollower:
             return None, None, frame
         self.frame_count += 1
 
-        # Filter for person class (class ID 0 in COCO dataset) with confidence threshold
-        person_detections = [d for d in detections if int(d[5]) == 0 and d[4] > 0.33]  # Confidence > 0.33
+        # Filter for person class (class ID 0 in COCO dataset)
+        person_detections = [d for d in detections if int(d[5]) == 0 and d[4] > 0.70]
 
         if person_detections:
             # Visualize detections by drawing bounding boxes
