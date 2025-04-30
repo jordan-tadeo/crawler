@@ -45,6 +45,11 @@ class PersonFollower:
         '''Start the YOLO processing thread.'''
         self.thread.start()
 
+    def stop(self):
+        '''Stop the YOLO processing thread.'''
+        self.stop_event.set()
+        self.thread.join()
+
     def _run_yolo_processing(self):
         while not self.stop_event.is_set():
             try:
