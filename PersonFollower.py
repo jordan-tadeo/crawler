@@ -88,24 +88,32 @@ class PersonFollower:
         # Run inference
         detections = self.model(input_tensor)
 
+        # Convert TensorFlow tensors to NumPy arrays
+        detection_boxes = detections['detection_boxes'].numpy()[0]  # First batch
+        detection_classes = detections['detection_classes'].numpy()[0]
+        detection_scores = detections['detection_scores'].numpy()[0]
+
         # Visualize all raw detections by drawing bounding boxes
-        for detection in detections['detection_boxes'][0].numpy():
-            y1, x1, y2, x2 = detection
+        for i, box in enumerate(detection_boxes):
+            y1, x1, y2, x2 = box
             x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
+            conf = detection_scores[i]
+            label = int(detection_classes[i])
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue for raw detections
+            cv2.putText(frame, f"Label {label} ({conf:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
         # Process detections (assuming person class ID is 0)
-        person_detections = [d for d in detections['detection_classes'][0].numpy() if d == 0]
+        person_detections = [i for i, label in enumerate(detection_classes) if label == 0 and detection_scores[i] > 0.5]
 
         if person_detections:
             # Visualize detections by drawing bounding boxes
-            for detection in detections['detection_boxes'][0].numpy():
-                y1, x1, y2, x2 = detection
+            for i in person_detections:
+                y1, x1, y2, x2 = detection_boxes[i]
                 x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green for person detections
 
             # Get the first detected person
-            y1, x1, y2, x2 = detections['detection_boxes'][0].numpy()[0]
+            y1, x1, y2, x2 = detection_boxes[person_detections[0]]
             person_center_x = int((x1 + x2) / 2 * self.frame_width)
             person_center_y = int((y1 + y2) / 2 * self.frame_height)
 
