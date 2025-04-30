@@ -80,6 +80,9 @@ class PersonFollower:
         results = self.model.predict(frame, imgsz=(320, 256), conf=0.33, verbose=False)  # Suppress verbose output
         detections = results[0].boxes.xyxy.cpu().numpy()  # Get detections
 
+        # Debug: Print raw detection results
+        print(f"Raw detections: {detections}")
+
         # Skip frames to reduce processing frequency
         self.frame_count = getattr(self, 'frame_count', 0)  # Initialize frame_count if not present
         if self.frame_count % 3 != 0:  # Process every 3rd frame
@@ -89,6 +92,9 @@ class PersonFollower:
 
         # Filter for person class (class ID 0 in COCO dataset)
         person_detections = [d for d in detections if len(d) > 5 and int(d[5]) == 0 and d[4] > 0.33]  # Confidence > 0.33
+
+        # Debug: Print filtered person detections
+        print(f"Person detections: {person_detections}")
 
         if person_detections:
             # Visualize detections by drawing bounding boxes
@@ -100,6 +106,10 @@ class PersonFollower:
             x1, y1, x2, y2, conf, cls = person_detections[0]
             person_center_x = int((x1 + x2) / 2)
             person_center_y = int((y1 + y2) / 2)
+
+            # Debug: Print coordinates of the first detected person
+            print(f"First person center: ({person_center_x}, {person_center_y})")
+
             return person_center_x, person_center_y, frame
 
         return None, None, frame
