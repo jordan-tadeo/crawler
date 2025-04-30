@@ -10,7 +10,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
         # Initialize YOLO model
-        self.model = torch.hub.load('ultralytics/yolov5', 'yolov5s')  # YOLOv5 small model
+        self.model = torch.hub.load('ultralytics/yolov5', 'yolov5n')  # YOLOv5 nano
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam
@@ -38,8 +38,18 @@ class PersonFollower:
         results = self.model(frame)
         detections = results.xyxy[0]  # Get detections
 
+        # Resize frame to reduce computational load
+        frame = cv2.resize(frame, (320, 240))  # Resize to 320x240
+
+        # Skip frames to reduce processing frequency
+        self.frame_count = getattr(self, 'frame_count', 0)  # Initialize frame_count if not present
+        if self.frame_count % 3 != 0:  # Process every 3rd frame
+            self.frame_count += 1
+            return None, None, frame
+        self.frame_count += 1
+
         # Filter for person class (class ID 0 in COCO dataset) with confidence threshold
-        person_detections = [d for d in detections if int(d[5]) == 0 and d[4] > 0.5]  # Confidence > 0.5
+        person_detections = [d for d in detections if int(d[5]) == 0 and d[4] > 0.33]  # Confidence > 0.33
 
         if person_detections:
             # Visualize detections by drawing bounding boxes
