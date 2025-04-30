@@ -66,6 +66,9 @@ class PersonFollower:
             # Process frame to detect person
             person_center_x, person_center_y, processed_frame = self.process_frame(frame)
 
+            # Update the latest processed frame
+            self.latest_frame = processed_frame
+
             # Adjust servos to keep person in frame
             self.adjust_servos(person_center_x, person_center_y)
 
