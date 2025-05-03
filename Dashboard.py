@@ -51,6 +51,9 @@ class Dashboard(QMainWindow):
         # Get the latest frame from the person follower
         frame = self.person_follower.get_latest_frame()
 
+        if frame is None:
+            return
+
         # Convert the frame to a format that can be displayed in the QLabel
         height, width, channel = frame.shape
         bytes_per_line = 3 * width
