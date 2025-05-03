@@ -47,28 +47,21 @@ class Dashboard(QMainWindow):
                 pixmap = QPixmap.fromImage(q_image)
                 self.labels[0][0].setPixmap(pixmap)
 
-                # Process the frame to get the model's input view
+                # Normalize the input tensor to [0,1] for the AI model
                 input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)
                 input_tensor = tf.image.resize(input_tensor, [128, 128])
                 input_tensor = tf.image.rgb_to_grayscale(input_tensor)  # Convert to grayscale
                 input_tensor = input_tensor / 255.0  # Normalize to [0,1]
-                input_tensor = (input_tensor * 255).numpy().astype(np.uint8).squeeze()  # Convert back to uint8 for display
 
-                # Display the model's input view
-                height, width = input_tensor.shape
-                bytes_per_line = width
-                q_image_input = QImage(input_tensor.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
-                pixmap_input = QPixmap.fromImage(q_image_input)
-                self.labels[0][1].setPixmap(pixmap_input)
-
-                # Adjust the aspect ratio for the model's input view
-                input_tensor = tf.image.resize_with_pad(input_tensor, 128, 256)  # Resize with padding to make it wider
-                input_tensor = (input_tensor * 255).numpy().astype(np.uint8).squeeze()  # Convert back to uint8 for display
+                # Prepare the image for display (convert back to uint8 and expand dimensions)
+                display_tensor = (input_tensor * 255).numpy().astype(np.uint8).squeeze()  # Convert back to uint8
+                display_tensor = np.expand_dims(display_tensor, axis=-1)  # Add a channel dimension
+                display_tensor = np.repeat(display_tensor, 3, axis=-1)  # Repeat the channel to simulate RGB
 
                 # Display the adjusted model's input view
-                height, width = input_tensor.shape
-                bytes_per_line = width
-                q_image_input = QImage(input_tensor.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+                height, width, channel = display_tensor.shape
+                bytes_per_line = width * channel
+                q_image_input = QImage(display_tensor, width, height, bytes_per_line, QImage.Format_RGB888)
                 pixmap_input = QPixmap.fromImage(q_image_input)
                 self.labels[0][1].setPixmap(pixmap_input)
 
@@ -80,6 +73,25 @@ class Dashboard(QMainWindow):
                 height, width, channel = input_tensor.shape
                 bytes_per_line = width * channel
                 q_image_input = QImage(input_tensor, width, height, bytes_per_line, QImage.Format_RGB888)
+                pixmap_input = QPixmap.fromImage(q_image_input)
+                self.labels[0][1].setPixmap(pixmap_input)
+
+                # Display the exact input tensor passed to the AI model
+                input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)
+                input_tensor = tf.image.resize(input_tensor, [128, 128])
+                input_tensor = tf.image.rgb_to_grayscale(input_tensor)  # Convert to grayscale
+                input_tensor = input_tensor / 255.0  # Normalize to [0,1]
+
+                # Convert the tensor to a numpy array for visualization
+                display_tensor = input_tensor.numpy().squeeze()  # Remove unnecessary dimensions
+
+                # Scale the values back to [0,255] for visualization purposes
+                display_tensor = (display_tensor * 255).astype(np.uint8)
+
+                # Display the exact input tensor
+                height, width = display_tensor.shape
+                bytes_per_line = width
+                q_image_input = QImage(display_tensor.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
                 pixmap_input = QPixmap.fromImage(q_image_input)
                 self.labels[0][1].setPixmap(pixmap_input)
         except Exception as e:
