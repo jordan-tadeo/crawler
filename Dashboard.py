@@ -51,7 +51,8 @@ class Dashboard(QMainWindow):
                 input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)
                 input_tensor = tf.image.resize(input_tensor, [128, 128])
                 input_tensor = tf.image.rgb_to_grayscale(input_tensor)  # Convert to grayscale
-                input_tensor = input_tensor.numpy().squeeze()  # Remove unnecessary dimensions
+                input_tensor = input_tensor / 255.0  # Normalize to [0,1]
+                input_tensor = (input_tensor * 255).numpy().astype(np.uint8).squeeze()  # Convert back to uint8 for display
 
                 # Display the model's input view
                 height, width = input_tensor.shape
