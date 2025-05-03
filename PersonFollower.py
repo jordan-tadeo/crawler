@@ -16,13 +16,11 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
         # Load the MobileNetV2 model using hub.KerasLayer
-        local_model_path = "/home/jt/Documents/py/crawler/models/mobilenet_v2"
+        local_model_path = "/home/jtadeo/Documents/crawler/models/mobilenet_v2"
         if not os.path.exists(local_model_path):
             raise FileNotFoundError(f"Model not found at {local_model_path}. Please download and extract the MobileNetV2 model to this path.")
         print("Loading MobileNetV2 model from local path:", local_model_path)
-        self.model = tf.keras.Sequential([
-            hub.KerasLayer(local_model_path, trainable=False)
-        ])
+        self.model = hub.KerasLayer(local_model_path, trainable=False)
         self.model.build([None, 128, 128, 3])  # Batch input shape
 
         # Initialize camera and vehicle controller
