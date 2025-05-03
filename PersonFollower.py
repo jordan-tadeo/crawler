@@ -58,9 +58,15 @@ class PersonFollower:
         self.latest_frame = None
         self.latest_detections = None
 
+        self.latest_input_tensor = None
+
     def get_latest_frame(self):
         '''Get the latest processed frame.'''
         return self.latest_frame
+    
+    def get_latest_input_tensor(self):
+        '''Get the latest input tensor used for model inference.'''
+        return self.latest_input_tensor
 
     def start(self):
         '''Start the YOLO processing thread.'''
@@ -104,7 +110,7 @@ class PersonFollower:
         input_tensor = input_tensor / 255.0  # Normalize to [0,1]
 
         # Update the dashboard with the exact input tensor
-        self.dashboard.update_model_input_view(input_tensor)
+        self.latest_input_tensor = input_tensor
 
         # Run inference
         logits = self.model(input_tensor)
