@@ -51,7 +51,7 @@ class Dashboard(QMainWindow):
                 input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)
                 input_tensor = tf.image.resize(input_tensor, [128, 128])
                 input_tensor = tf.image.rgb_to_grayscale(input_tensor)  # Convert to grayscale
-                input_tensor = input_tensor.numpy().astype(np.uint8)  # Convert to numpy array
+                input_tensor = input_tensor.numpy().squeeze()  # Remove unnecessary dimensions
 
                 # Display the model's input view
                 height, width = input_tensor.shape
@@ -60,4 +60,4 @@ class Dashboard(QMainWindow):
                 pixmap_input = QPixmap.fromImage(q_image_input)
                 self.labels[0][1].setPixmap(pixmap_input)
         except Exception as e:
-            print(f"Error updating YOLO feed: {e.with_traceback(None)}")
+            print(f"Error updating YOLO feed: {e}")
