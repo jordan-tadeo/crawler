@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
         # Load the TensorFlow Hub model from a local path
-        local_model_path = "/home/jt/Documents/py/crawler/models/saved_model.pb"
+        local_model_path = "/home/jt/Documents/py/crawler/models/"
         if not os.path.exists(local_model_path):
             raise FileNotFoundError(f"Model not found at {local_model_path}. Please ensure the model is correctly extracted.")
         print("Loading TensorFlow Hub model from local path:", local_model_path)
