@@ -18,17 +18,17 @@ async def control_loop(joystick: js.Joystick, vecon: vc.VehicleController, perso
         # frame_counter = 0  # Counter to throttle console output
         try:
             while True:
-                joystick.update_connection_status()
-                if not joystick.is_connected():
-                    joystick.wait_for_connection()
+                # joystick.update_connection_status()
+                # if not joystick.is_connected():
+                #     joystick.wait_for_connection()
 
-                pygame.event.pump()
-                throttle = joystick.read_throttle()
-                steering_front = joystick.get_axis("LEFT_X", limit_perc=70)
-                steering_rear = joystick.get_axis("RIGHT_X", limit_perc=70)
+                # pygame.event.pump()
+                # throttle = joystick.read_throttle()
+                # steering_front = joystick.get_axis("LEFT_X", limit_perc=70)
+                # steering_rear = joystick.get_axis("RIGHT_X", limit_perc=70)
 
-                vecon.set_throttle(throttle)
-                vecon.set_steering(steering_front, steering_rear)
+                # vecon.set_throttle(throttle)
+                # vecon.set_steering(steering_front, steering_rear)
 
                 new_vehicle_state = vecon.get_state()
 
