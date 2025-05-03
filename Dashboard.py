@@ -4,6 +4,7 @@ from PyQt5.QtCore import QTimer
 import cv2
 import numpy as np
 from PersonFollower import PersonFollower
+import tensorflow as tf
 
 class Dashboard(QMainWindow):
     def __init__(self, person_follower: PersonFollower):
