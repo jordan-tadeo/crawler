@@ -72,14 +72,14 @@ class Dashboard(QMainWindow):
                 pixmap_input = QPixmap.fromImage(q_image_input)
                 self.labels[0][1].setPixmap(pixmap_input)
 
-                # Expand dimensions to make the grayscale image compatible with QImage
+                # Ensure the grayscale image is expanded to 3 dimensions (RGB)
                 input_tensor = np.expand_dims(input_tensor, axis=-1)  # Add a channel dimension
                 input_tensor = np.repeat(input_tensor, 3, axis=-1)  # Repeat the channel to simulate RGB
 
                 # Display the adjusted model's input view
                 height, width, channel = input_tensor.shape
                 bytes_per_line = width * channel
-                q_image_input = QImage(input_tensor.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                q_image_input = QImage(input_tensor, width, height, bytes_per_line, QImage.Format_RGB888)
                 pixmap_input = QPixmap.fromImage(q_image_input)
                 self.labels[0][1].setPixmap(pixmap_input)
         except Exception as e:
