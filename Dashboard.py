@@ -35,7 +35,7 @@ class Dashboard(QMainWindow):
 
     def update_model_input_view(self, input_tensor):
         # Convert the tensor to a numpy array for visualization
-        display_tensor = input_tensor.numpy().squeeze()  # Remove unnecessary dimensions
+        display_tensor = self.person_follower.get_latest_input_tensor() # Remove unnecessary dimensions
 
         # Scale the values back to [0,255] for visualization purposes
         display_tensor = (display_tensor * 255).astype(np.uint8)
