@@ -15,12 +15,15 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
-        # Load the TensorFlow Hub model from a local path
-        local_model_path = "/home/jt/Documents/py/crawler/models/"
+        # Load the MobileNetV2 model using hub.KerasLayer
+        local_model_path = "/home/jt/Documents/py/crawler/models/mobilenet_v2"
         if not os.path.exists(local_model_path):
-            raise FileNotFoundError(f"Model not found at {local_model_path}. Please ensure the model is correctly extracted.")
-        print("Loading TensorFlow Hub model from local path:", local_model_path)
-        self.model = tf.saved_model.load(local_model_path)
+            raise FileNotFoundError(f"Model not found at {local_model_path}. Please download and extract the MobileNetV2 model to this path.")
+        print("Loading MobileNetV2 model from local path:", local_model_path)
+        self.model = tf.keras.Sequential([
+            hub.KerasLayer(local_model_path, trainable=False)
+        ])
+        self.model.build([None, 128, 128, 3])  # Batch input shape
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam
@@ -42,6 +45,13 @@ class PersonFollower:
         self.controller.set_pan_tilt(0, 0)  # Set to neutral
 
         self.person_detected = False
+
+        # Load ImageNet labels from the file
+        labels_path = "/home/jt/Documents/py/crawler/labels/ImageNetLabels.txt"
+        if not os.path.exists(labels_path):
+            raise FileNotFoundError(f"Labels file not found at {labels_path}. Please ensure the file exists.")
+        with open(labels_path, "r") as f:
+            self.imagenet_labels = [line.strip() for line in f.readlines()]
 
         # Threading setup
         self.thread = threading.Thread(target=self._run_yolo_processing, daemon=True)
@@ -85,42 +95,31 @@ class PersonFollower:
 
     def process_frame(self, frame):
         # Preprocess the frame to match the model's input requirements
-        input_tensor = tf.convert_to_tensor(frame, dtype=tf.uint8)
-        input_tensor = tf.image.resize(input_tensor, [640, 640])  # Resize to model's expected input size
+        input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)  # Convert to float32
+        input_tensor = tf.image.resize(input_tensor, [128, 128])  # Resize to 128x128 pixels
+        input_tensor = input_tensor / 255.0  # Normalize to [0,1]
         input_tensor = tf.expand_dims(input_tensor, axis=0)  # Add batch dimension
 
         # Run inference
-        detections = self.model(input_tensor)
+        logits = self.model(input_tensor)
 
-        # Extract detection results
-        detection_boxes = detections["detection_boxes"][0].numpy()  # First batch
-        detection_classes = detections["detection_classes"][0].numpy()
-        detection_scores = detections["detection_scores"][0].numpy()
+        # Get the predicted class and confidence
+        predicted_class = tf.argmax(logits, axis=-1).numpy()[0]
+        confidence = tf.nn.softmax(logits, axis=-1).numpy()[0][predicted_class]
 
-        # Visualize all raw detections by drawing bounding boxes
-        for i, box in enumerate(detection_boxes):
-            y1, x1, y2, x2 = box
-            x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
-            conf = detection_scores[i]
-            label = int(detection_classes[i])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue for raw detections
-            cv2.putText(frame, f"Label {label} ({conf:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        # Debug: Print the predicted class and confidence
+        print(f"Predicted class: {predicted_class}, Confidence: {confidence:.2f}")
 
-        # Process detections (assuming person class ID is 1)
-        person_detections = [i for i, label in enumerate(detection_classes) if label == 1 and detection_scores[i] > 0.5]
+        # Map the predicted class to a label (assuming ImageNet labels)
+        label = self.imagenet_labels[predicted_class] if predicted_class < len(self.imagenet_labels) else "Unknown"
 
-        if person_detections:
-            # Visualize detections by drawing bounding boxes
-            for i in person_detections:
-                y1, x1, y2, x2 = detection_boxes[i]
-                x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green for person detections
+        # Visualize the prediction on the frame
+        cv2.putText(frame, f"{label} ({confidence:.2f})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-            # Get the first detected person
-            y1, x1, y2, x2 = detection_boxes[person_detections[0]]
-            person_center_x = int((x1 + x2) / 2 * self.frame_width)
-            person_center_y = int((y1 + y2) / 2 * self.frame_height)
-
+        # If the predicted class is 'person', return the center of the frame
+        if label == "person":
+            person_center_x = self.frame_width // 2
+            person_center_y = self.frame_height // 2
             return person_center_x, person_center_y, frame
 
         return None, None, frame
