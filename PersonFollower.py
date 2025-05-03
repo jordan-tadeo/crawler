@@ -65,7 +65,7 @@ class PersonFollower:
             frame = self.camera.get_frame()
 
             # Resize frame to reduce computational load
-            frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+            # frame = cv2.resize(frame, (self.frame_width, self.frame_height))
 
             # Process frame to detect person
             person_center_x, person_center_y, processed_frame = self.process_frame(frame)
