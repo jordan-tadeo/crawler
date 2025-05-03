@@ -60,5 +60,16 @@ class Dashboard(QMainWindow):
                 q_image_input = QImage(input_tensor.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
                 pixmap_input = QPixmap.fromImage(q_image_input)
                 self.labels[0][1].setPixmap(pixmap_input)
+
+                # Adjust the aspect ratio for the model's input view
+                input_tensor = tf.image.resize_with_pad(input_tensor, 128, 256)  # Resize with padding to make it wider
+                input_tensor = (input_tensor * 255).numpy().astype(np.uint8).squeeze()  # Convert back to uint8 for display
+
+                # Display the adjusted model's input view
+                height, width = input_tensor.shape
+                bytes_per_line = width
+                q_image_input = QImage(input_tensor.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+                pixmap_input = QPixmap.fromImage(q_image_input)
+                self.labels[0][1].setPixmap(pixmap_input)
         except Exception as e:
             print(f"Error updating YOLO feed: {e}")
