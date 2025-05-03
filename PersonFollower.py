@@ -17,7 +17,7 @@ class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
         # Load the MobileNetV2 model using hub.KerasLayer
         # Ensure the model path points to the directory containing `saved_model.pb`
-        local_model_path = "/home/jtadeo/Documents/crawler/models/mobilenet_v2"
+        local_model_path = "/home/jt/Documents/py/crawler/models/mobilenet_v2"
         if not os.path.exists(os.path.join(local_model_path, "saved_model.pb")):
             raise FileNotFoundError(f"Model not found at {local_model_path}. Please ensure the directory contains `saved_model.pb`." )
         print("Loading MobileNetV2 model from local path:", local_model_path)
