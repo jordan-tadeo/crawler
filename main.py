@@ -30,13 +30,13 @@ async def control_loop(joystick: js.Joystick, vecon: vc.VehicleController, perso
                 # vecon.set_throttle(throttle)
                 # vecon.set_steering(steering_front, steering_rear)
 
-                new_vehicle_state = vecon.get_state()
+                # new_vehicle_state = vecon.get_state()
 
-                if new_vehicle_state != vehicle_state:
-                    log.log("info", "Vehicle State Change", f"New state: {new_vehicle_state}")
-                    log.csv("log/vehicle_state_log.csv", "Vehicle State Change", new_vehicle_state)
+                # if new_vehicle_state != vehicle_state:
+                #     log.log("info", "Vehicle State Change", f"New state: {new_vehicle_state}")
+                #     log.csv("log/vehicle_state_log.csv", "Vehicle State Change", new_vehicle_state)
 
-                vehicle_state = new_vehicle_state
+                # vehicle_state = new_vehicle_state
 
                 # # Throttle console output to every 10th frame
                 # if frame_counter % 10 == 0:
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     usb_cam = uc.USBCamera(camera_index=0, fps=30)
     person_follower = pf.PersonFollower(vecon, usb_cam)
 
-    person_follower.start()  # Start YOLO processing thread
+    person_follower.start()  # Start AI processing thread
 
     app = QApplication(sys.argv)
     dashboard = db.Dashboard(person_follower)
@@ -74,4 +74,4 @@ if __name__ == "__main__":
     try:
         sys.exit(app.exec_())
     finally:
-        person_follower.stop()  # Stop YOLO processing thread
+        person_follower.stop()  # Stop AI processing thread
