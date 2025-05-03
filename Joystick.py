@@ -23,15 +23,19 @@ XBOX_AXES = {
 }
 
 class Joystick:
-    def __init__(self):
+    def __init__(self, disabled: bool = False):
         if not pygame.joystick.get_init():
             pygame.joystick.init()
 
         self.type = type
         self.connected = False
 
-        # if pygame.joystick.get_count() == 0:
-        #     self.wait_for_connection()
+        if disabled:
+            self.connected = True
+            return
+
+        if pygame.joystick.get_count() == 0:
+            self.wait_for_connection()
 
         try:
             self.joystick = pygame.joystick.Joystick(0)

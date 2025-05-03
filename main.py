@@ -55,7 +55,7 @@ if __name__ == "__main__":
     pygame.init()
     log = lg.Logger()
 
-    joystick = js.Joystick()
+    joystick = js.Joystick(disabled=True)
     vecon = vc.VehicleController(logger=log)
     usb_cam = uc.USBCamera(camera_index=0, fps=30)
     person_follower = pf.PersonFollower(vecon, usb_cam)
