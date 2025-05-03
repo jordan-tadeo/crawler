@@ -15,10 +15,12 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
-        # Load the TensorFlow Hub model for person detection
-        module_handle = "https://tfhub.dev/google/faster_rcnn/openimages_v4/inception_resnet_v2/1"
-        print("Loading TensorFlow Hub model from:", module_handle)
-        self.model = hub.load(module_handle)
+        # Load the TensorFlow Hub model from a local path
+        local_model_path = "/home/jt/Documents/py/crawler/models/saved_model.pb"
+        if not os.path.exists(local_model_path):
+            raise FileNotFoundError(f"Model not found at {local_model_path}. Please ensure the model is correctly extracted.")
+        print("Loading TensorFlow Hub model from local path:", local_model_path)
+        self.model = tf.saved_model.load(local_model_path)
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam

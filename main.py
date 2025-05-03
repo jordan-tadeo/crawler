@@ -12,7 +12,7 @@ import PersonFollower as pf
 
 # === Main Control Loop ===
 async def control_loop(joystick: js.Joystick, vecon: vc.VehicleController, person_follower: pf.PersonFollower):
-        await asyncio.sleep(1)  # Allow time for joystick to initialize
+        # await asyncio.sleep(1)  # Allow time for joystick to initialize
 
         vehicle_state = None
         # frame_counter = 0  # Counter to throttle console output
