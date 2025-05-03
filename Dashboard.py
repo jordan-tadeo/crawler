@@ -28,12 +28,12 @@ class Dashboard(QMainWindow):
         # PersonFollower instance
         self.person_follower = person_follower
 
-        # Timer to update YOLO feed
+        # Timer to update pantilt feed
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_yolo_feed)
-        self.timer.start(33)  # ~30 FPS
+        self.timer.timeout.connect(self.update_pantilt_view)
+        self.timer.start(17)  # ~30 FPS
 
-    def update_model_input_feed(self, input_tensor):
+    def update_model_input_view(self, input_tensor):
         # Convert the tensor to a numpy array for visualization
         display_tensor = input_tensor.numpy().squeeze()  # Remove unnecessary dimensions
 
@@ -47,7 +47,7 @@ class Dashboard(QMainWindow):
         pixmap_input = QPixmap.fromImage(q_image_input)
         self.labels[0][1].setPixmap(pixmap_input)
 
-    def update_dashboard_model_feed(self):
+    def update_pantilt_view(self):
         # Get the latest frame from the person follower
         frame = self.person_follower.get_latest_frame()
 

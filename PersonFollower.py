@@ -100,7 +100,7 @@ class PersonFollower:
         input_tensor = input_tensor / 255.0  # Normalize to [0,1]
 
         # Update the dashboard with the exact input tensor
-        self.dashboard.update_model_input_feed(input_tensor)
+        self.dashboard.update_model_input_view(input_tensor)
 
         # Run inference
         logits = self.model(input_tensor)
