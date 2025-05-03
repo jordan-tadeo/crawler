@@ -8,28 +8,17 @@ import numpy as np
 import os
 import kagglehub
 import tflite_runtime.interpreter as tflite
+import tensorflow_hub as hub
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
-        # Check if the TensorFlow Lite model exists locally, if not, download it
-        model_path = "person_detection.tflite"
-        if not os.path.exists(model_path):
-            print("Model not found locally. Downloading...")
-            import urllib.request
-            url = "https://storage.googleapis.com/download.tensorflow.org/models/tflite/coral/person_detection.tflite"
-            urllib.request.urlretrieve(url, model_path)
-            print("Model downloaded to:", model_path)
-
-        # Initialize TensorFlow Lite interpreter for person detection
-        self.interpreter = tflite.Interpreter(model_path=model_path)
-        self.interpreter.allocate_tensors()
-
-        # Get input and output details
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
+        # Load the TensorFlow Hub model for person detection
+        module_handle = "https://tfhub.dev/google/faster_rcnn/openimages_v4/inception_resnet_v2/1"
+        print("Loading TensorFlow Hub model from:", module_handle)
+        self.model = hub.load(module_handle)
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam
@@ -93,26 +82,43 @@ class PersonFollower:
             print(f"Error in process_and_adjust: {e}")
 
     def process_frame(self, frame):
-        # Resize frame to match model input size
-        input_shape = self.input_details[0]['shape']
-        resized_frame = cv2.resize(frame, (input_shape[2], input_shape[1]))
-        input_data = np.expand_dims(resized_frame, axis=0).astype(np.uint8)
-
-        # Set input tensor
-        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
+        # Preprocess the frame to match the model's input requirements
+        input_tensor = tf.convert_to_tensor(frame, dtype=tf.uint8)
+        input_tensor = tf.image.resize(input_tensor, [640, 640])  # Resize to model's expected input size
+        input_tensor = tf.expand_dims(input_tensor, axis=0)  # Add batch dimension
 
         # Run inference
-        self.interpreter.invoke()
+        detections = self.model(input_tensor)
 
-        # Get detection results
-        output_data = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
+        # Extract detection results
+        detection_boxes = detections["detection_boxes"][0].numpy()  # First batch
+        detection_classes = detections["detection_classes"][0].numpy()
+        detection_scores = detections["detection_scores"][0].numpy()
 
-        # Check if a person is detected (output_data[0] > threshold)
-        if output_data[0] > 0.5:  # Confidence threshold
-            print("Person detected with confidence:", output_data[0])
-            # Return the center of the frame as the detected person's position
-            person_center_x = self.frame_width // 2
-            person_center_y = self.frame_height // 2
+        # Visualize all raw detections by drawing bounding boxes
+        for i, box in enumerate(detection_boxes):
+            y1, x1, y2, x2 = box
+            x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
+            conf = detection_scores[i]
+            label = int(detection_classes[i])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue for raw detections
+            cv2.putText(frame, f"Label {label} ({conf:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        # Process detections (assuming person class ID is 1)
+        person_detections = [i for i, label in enumerate(detection_classes) if label == 1 and detection_scores[i] > 0.5]
+
+        if person_detections:
+            # Visualize detections by drawing bounding boxes
+            for i in person_detections:
+                y1, x1, y2, x2 = detection_boxes[i]
+                x1, y1, x2, y2 = int(x1 * self.frame_width), int(y1 * self.frame_height), int(x2 * self.frame_width), int(y2 * self.frame_height)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green for person detections
+
+            # Get the first detected person
+            y1, x1, y2, x2 = detection_boxes[person_detections[0]]
+            person_center_x = int((x1 + x2) / 2 * self.frame_width)
+            person_center_y = int((y1 + y2) / 2 * self.frame_height)
+
             return person_center_x, person_center_y, frame
 
         return None, None, frame
