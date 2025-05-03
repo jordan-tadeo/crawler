@@ -96,8 +96,11 @@ class PersonFollower:
         # Preprocess the frame to match the model's input requirements
         input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)  # Convert to float32
         input_tensor = tf.image.resize(input_tensor, [128, 128])  # Resize to 128x128 pixels
+        input_tensor = tf.image.rgb_to_grayscale(input_tensor)  # Convert to grayscale
         input_tensor = input_tensor / 255.0  # Normalize to [0,1]
-        input_tensor = tf.expand_dims(input_tensor, axis=0)  # Add batch dimension
+
+        # Update the dashboard with the exact input tensor
+        self.dashboard.update_model_input_feed(input_tensor)
 
         # Run inference
         logits = self.model(input_tensor)

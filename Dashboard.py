@@ -33,66 +33,37 @@ class Dashboard(QMainWindow):
         self.timer.timeout.connect(self.update_yolo_feed)
         self.timer.start(33)  # ~30 FPS
 
-    def update_yolo_feed(self):
-        try:
-            # Get the latest processed frame from PersonFollower
-            frame = self.person_follower.latest_frame
+    def update_model_input_feed(self, input_tensor):
+        # Convert the tensor to a numpy array for visualization
+        display_tensor = input_tensor.numpy().squeeze()  # Remove unnecessary dimensions
 
-            if frame is not None:
-                # Convert frame to QImage and display it
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                height, width, channel = frame.shape
-                bytes_per_line = 3 * width
-                q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(q_image)
-                self.labels[0][0].setPixmap(pixmap)
+        # Scale the values back to [0,255] for visualization purposes
+        display_tensor = (display_tensor * 255).astype(np.uint8)
 
-                # Normalize the input tensor to [0,1] for the AI model
-                input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)
-                input_tensor = tf.image.resize(input_tensor, [128, 128])
-                input_tensor = tf.image.rgb_to_grayscale(input_tensor)  # Convert to grayscale
-                input_tensor = input_tensor / 255.0  # Normalize to [0,1]
+        # Display the exact input tensor
+        height, width = display_tensor.shape
+        bytes_per_line = width
+        q_image_input = QImage(display_tensor.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
+        pixmap_input = QPixmap.fromImage(q_image_input)
+        self.labels[0][1].setPixmap(pixmap_input)
 
-                # Prepare the image for display (convert back to uint8 and expand dimensions)
-                display_tensor = (input_tensor * 255).numpy().astype(np.uint8).squeeze()  # Convert back to uint8
-                display_tensor = np.expand_dims(display_tensor, axis=-1)  # Add a channel dimension
-                display_tensor = np.repeat(display_tensor, 3, axis=-1)  # Repeat the channel to simulate RGB
+    def update_dashboard_model_feed(self):
+        # Get the latest frame from the person follower
+        frame = self.person_follower.get_latest_frame()
 
-                # Display the adjusted model's input view
-                height, width, channel = display_tensor.shape
-                bytes_per_line = width * channel
-                q_image_input = QImage(display_tensor, width, height, bytes_per_line, QImage.Format_RGB888)
-                pixmap_input = QPixmap.fromImage(q_image_input)
-                self.labels[0][1].setPixmap(pixmap_input)
+        # Convert the frame to a format that can be displayed in the QLabel
+        height, width, channel = frame.shape
+        bytes_per_line = 3 * width
+        q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_image)
 
-                # Ensure the grayscale image is expanded to 3 dimensions (RGB)
-                input_tensor = np.expand_dims(input_tensor, axis=-1)  # Add a channel dimension
-                input_tensor = np.repeat(input_tensor, 3, axis=-1)  # Repeat the channel to simulate RGB
+        # Update the QLabel with the new pixmap
+        self.labels[1][1].setPixmap(pixmap)
 
-                # Display the adjusted model's input view
-                height, width, channel = input_tensor.shape
-                bytes_per_line = width * channel
-                q_image_input = QImage(input_tensor, width, height, bytes_per_line, QImage.Format_RGB888)
-                pixmap_input = QPixmap.fromImage(q_image_input)
-                self.labels[0][1].setPixmap(pixmap_input)
+        # Update the model input feed for debugging
+        self.update_model_input_feed(self.person_follower.get_latest_input_tensor())
 
-                # Display the exact input tensor passed to the AI model
-                input_tensor = tf.convert_to_tensor(frame, dtype=tf.float32)
-                input_tensor = tf.image.resize(input_tensor, [128, 128])
-                input_tensor = tf.image.rgb_to_grayscale(input_tensor)  # Convert to grayscale
-                input_tensor = input_tensor / 255.0  # Normalize to [0,1]
-
-                # Convert the tensor to a numpy array for visualization
-                display_tensor = input_tensor.numpy().squeeze()  # Remove unnecessary dimensions
-
-                # Scale the values back to [0,255] for visualization purposes
-                display_tensor = (display_tensor * 255).astype(np.uint8)
-
-                # Display the exact input tensor
-                height, width = display_tensor.shape
-                bytes_per_line = width
-                q_image_input = QImage(display_tensor.data, width, height, bytes_per_line, QImage.Format_Grayscale8)
-                pixmap_input = QPixmap.fromImage(q_image_input)
-                self.labels[0][1].setPixmap(pixmap_input)
-        except Exception as e:
-            print(f"Error updating YOLO feed: {e}")
+    def closeEvent(self, event):
+        # Stop the person follower when closing the dashboard
+        self.person_follower.stop()
+        event.accept()
