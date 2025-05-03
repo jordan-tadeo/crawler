@@ -7,16 +7,29 @@ import threading
 import numpy as np
 import os
 import kagglehub
+import tflite_runtime.interpreter as tflite
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
-        # Load the TensorFlow SavedModel
-        model_dir = "/home/jt/.cache/kagglehub/models/google/mobilenet-v2/tensorFlow2/035-128-classification/2"
-        print("Loading TensorFlow SavedModel from:", model_dir)
-        self.model = tf.saved_model.load(model_dir)
+        # Check if the TensorFlow Lite model exists locally, if not, download it
+        model_path = "person_detection.tflite"
+        if not os.path.exists(model_path):
+            print("Model not found locally. Downloading...")
+            import urllib.request
+            url = "https://storage.googleapis.com/download.tensorflow.org/models/tflite/coral/person_detection.tflite"
+            urllib.request.urlretrieve(url, model_path)
+            print("Model downloaded to:", model_path)
+
+        # Initialize TensorFlow Lite interpreter for person detection
+        self.interpreter = tflite.Interpreter(model_path=model_path)
+        self.interpreter.allocate_tensors()
+
+        # Get input and output details
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
 
         # Initialize camera and vehicle controller
         self.camera = usb_cam
@@ -80,35 +93,24 @@ class PersonFollower:
             print(f"Error in process_and_adjust: {e}")
 
     def process_frame(self, frame):
-        # Preprocess the frame to match the model's input requirements
-        input_tensor = tf.convert_to_tensor(frame, dtype=tf.uint8)
-        input_tensor = tf.image.resize(input_tensor, [128, 128])  # Resize to model's expected input size
-        input_tensor = tf.expand_dims(input_tensor, axis=0)  # Add batch dimension
+        # Resize frame to match model input size
+        input_shape = self.input_details[0]['shape']
+        resized_frame = cv2.resize(frame, (input_shape[2], input_shape[1]))
+        input_data = np.expand_dims(resized_frame, axis=0).astype(np.uint8)
+
+        # Set input tensor
+        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
 
         # Run inference
-        detections = self.model(input_tensor)
+        self.interpreter.invoke()
 
-        # Convert TensorFlow tensor to NumPy array
-        detection_array = detections.numpy()[0]  # Remove batch dimension
+        # Get detection results
+        output_data = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
 
-        # Find the class with the highest probability
-        predicted_class = np.argmax(detection_array)
-        confidence = detection_array[predicted_class]
-
-        # Debug: Print the predicted class and confidence
-        print(f"Predicted class: {predicted_class}, Confidence: {confidence:.2f}")
-
-        # Map the predicted class to a label (assuming ImageNet labels)
-        imagenet_labels = {
-            0: "background", 1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airplane", 6: "bus", 7: "train", 8: "truck", 9: "boat", 10: "traffic light", 11: "fire hydrant", 12: "stop sign", 13: "parking meter", 14: "bench", 15: "bird", 16: "cat", 17: "dog", 18: "horse", 19: "sheep", 20: "cow", 21: "elephant", 22: "bear", 23: "zebra", 24: "giraffe", 25: "backpack", 26: "umbrella", 27: "handbag", 28: "tie", 29: "suitcase", 30: "frisbee", 31: "skis", 32: "snowboard", 33: "sports ball", 34: "kite", 35: "baseball bat", 36: "baseball glove", 37: "skateboard", 38: "surfboard", 39: "tennis racket", 40: "bottle", 41: "wine glass", 42: "cup", 43: "fork", 44: "knife", 45: "spoon", 46: "bowl", 47: "banana", 48: "apple", 49: "sandwich", 50: "orange", 51: "broccoli", 52: "carrot", 53: "hot dog", 54: "pizza", 55: "donut", 56: "cake", 57: "chair", 58: "couch", 59: "potted plant", 60: "bed", 61: "dining table", 62: "toilet", 63: "tv", 64: "laptop", 65: "mouse", 66: "remote", 67: "keyboard", 68: "cell phone", 69: "microwave", 70: "oven", 71: "toaster", 72: "sink", 73: "refrigerator", 74: "book", 75: "clock", 76: "vase", 77: "scissors", 78: "teddy bear", 79: "hair drier", 80: "toothbrush"
-        }
-        label = imagenet_labels.get(predicted_class, "Unknown")
-
-        # Visualize the prediction on the frame
-        cv2.putText(frame, f"{label} ({confidence:.2f})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-        # If the predicted class is 'person', return the center of the frame
-        if label == "person":
+        # Check if a person is detected (output_data[0] > threshold)
+        if output_data[0] > 0.5:  # Confidence threshold
+            print("Person detected with confidence:", output_data[0])
+            # Return the center of the frame as the detected person's position
             person_center_x = self.frame_width // 2
             person_center_y = self.frame_height // 2
             return person_center_x, person_center_y, frame
