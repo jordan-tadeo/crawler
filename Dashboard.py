@@ -60,4 +60,4 @@ class Dashboard(QMainWindow):
                 pixmap_input = QPixmap.fromImage(q_image_input)
                 self.labels[0][1].setPixmap(pixmap_input)
         except Exception as e:
-            print(f"Error updating YOLO feed: {e}")
+            print(f"Error updating YOLO feed: {e.with_traceback()}")
