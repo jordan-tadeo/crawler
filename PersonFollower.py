@@ -58,6 +58,10 @@ class PersonFollower:
         self.latest_frame = None
         self.latest_detections = None
 
+    def get_latest_frame(self):
+        '''Get the latest processed frame.'''
+        return self.latest_frame
+
     def start(self):
         '''Start the YOLO processing thread.'''
         self.thread.start()
@@ -123,6 +127,8 @@ class PersonFollower:
             person_center_x = self.frame_width // 2
             person_center_y = self.frame_height // 2
             return person_center_x, person_center_y, frame
+        
+        self.latest_frame = frame
 
         return None, None, frame
 
