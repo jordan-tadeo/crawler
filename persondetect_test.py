@@ -10,7 +10,7 @@ def load_saved_model(model_dir):
     return model.signatures['serving_default']
 
 # Load the model
-saved_model_dir = "/home/jtadeo/Documents/crawler"
+saved_model_dir = "./"
 movenet = load_saved_model(saved_model_dir)
 
 # Function to preprocess the image
