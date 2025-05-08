@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import os
+import time
 
 # Load the SavedModel
 def load_saved_model(model_dir):
@@ -63,11 +64,22 @@ def save_preprocessed_input(image, filename="preprocessed_input.jpg"):
 # Open a video stream (webcam)
 cap = cv2.VideoCapture(0)
 
+# Limit FPS to save CPU
+fps_limit = 10  # Set desired FPS
+frame_time = 1 / fps_limit
+last_frame_time = 0
+
 # Replace the test rectangle with pose estimation drawing
 while cap.isOpened():
+    current_time = time.time()
+    if current_time - last_frame_time < frame_time:
+        continue  # Skip frame to maintain FPS limit
+
     ret, frame = cap.read()
     if not ret:
         break
+
+    last_frame_time = current_time  # Update the last frame time
 
     # Preprocess the frame
     input_shape = (1, 256, 256, 3)  # Update to match SavedModel input
