@@ -67,9 +67,9 @@ class OakD:
         stereo.depth.link(xout_depth.input)
 
         # Disparity output (optional)
-        xout_disp = self.pipeline.create(dai.node.XLinkOut)
-        xout_disp.setStreamName("disparity")
-        stereo.disparity.link(xout_disp.input)
+        # xout_disp = self.pipeline.create(dai.node.XLinkOut)
+        # xout_disp.setStreamName("disparity")
+        # stereo.disparity.link(xout_disp.input)
 
         # Start device
         self.device = dai.Device(self.pipeline)
