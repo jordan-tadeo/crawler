@@ -87,6 +87,16 @@ class OakD:
             return {"accel": (accel.x, accel.y, accel.z),
                     "gyro": (gyro.x, gyro.y, gyro.z)}
         return None
+    
+    def reset_pipeline(self):
+        print("[OakD] Resetting pipeline due to X_LINK_ERROR")
+        try:
+            self.device.close()
+        except Exception:
+            pass
+
+        # Rebuild and restart the device pipeline
+        self.__init__()  # this reinitializes everything
 
     def get_depth_frame(self):
         try:
