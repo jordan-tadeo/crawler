@@ -45,8 +45,14 @@ if __name__ == "__main__":
     driver = Driver(vc, oakd)
 
     # Run the asyncio control loop in a separate thread
-    loop = asyncio.get_event_loop()
-    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(vc, driver),))
-    asyncio_thread.start()
+    try:
+        loop = asyncio.get_event_loop()
+        asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(vc, driver),))
+        asyncio_thread.start()
 
-    sys.exit(app.exec_())
+        sys.exit(app.exec_())
+    except:
+            print("\n[Shutdown] Stopping ESC and Servos...")
+    finally:
+        print("[Shutdown] Stopping vehicle safely.")
+        vc.close()
