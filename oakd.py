@@ -21,12 +21,6 @@ class OakD:
         # Stereo depth node
         stereo = self.pipeline.create(dai.node.StereoDepth)
 
-        imu = self.pipeline.create(dai.node.IMU)
-        imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, 100)
-        imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, 100)
-        imu.setBatchReportThreshold(1)
-        imu.setMaxBatchReports(10)
-
         # Create IMU node
         imu = self.pipeline.create(dai.node.IMU)
         imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 100)
@@ -37,7 +31,6 @@ class OakD:
         imu_out = self.pipeline.create(dai.node.XLinkOut)
         imu_out.setStreamName("imu")
         imu.out.link(imu_out.input)
-
 
         # === GUI-EQUIVALENT SETTINGS ===
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
