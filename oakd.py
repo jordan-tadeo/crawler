@@ -23,7 +23,7 @@ class OakD:
 
         # Create IMU node
         imu = self.pipeline.create(dai.node.IMU)
-        imu.enableIMUSensor(dai.IMUSensor.LINEAR_ACCELERATION, 100)
+        imu.enableIMUSensor([dai.IMUSensor.LINEAR_ACCELERATION, dai.IMUSensor.GYROSCOPE_RAW], 100)
         imu.setBatchReportThreshold(1)
         imu.setMaxBatchReports(10)
 
@@ -84,7 +84,7 @@ class OakD:
 
             packet = data.packets[0]
 
-            accel = packet.linear_acceleroMeter  # <-- key change here
+            accel = packet.linearAcceleration  # Corrected property name
             gyro = packet.gyroscope
 
             return {
@@ -92,8 +92,6 @@ class OakD:
                 "gyro": (gyro.x, gyro.y, gyro.z)
             }
         return None
-
-
 
     def get_depth_frame(self):
         return self.depth_queue.get().getFrame()
