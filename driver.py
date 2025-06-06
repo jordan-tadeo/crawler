@@ -72,7 +72,7 @@ class Driver:
         return steering
 
 
-    def obstacle_in_front(self, depth_frame, threshold_mm=500, region_size=(20, 80)):
+    def obstacle_in_front(self, depth_frame, threshold_mm=100, region_size=(20, 80)):
         """Check if there's an obstacle in the center of the depth frame."""
         h, w = depth_frame.shape
         dh, dw = region_size
@@ -96,7 +96,7 @@ class Driver:
 
         self.controller.set_steering(-turn_dir, turn_dir)
         self.controller.set_throttle(self.forward_speed)
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(1.2)
 
     async def tick(self):
         depth = self.camera.get_depth_frame()
