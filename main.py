@@ -46,3 +46,4 @@ if __name__ == "__main__":
     asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(vc, driver),))
     asyncio_thread.start()
 
+    sys.exit(app.exec_())
