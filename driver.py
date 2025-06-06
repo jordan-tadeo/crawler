@@ -72,7 +72,7 @@ class Driver:
         return steering
 
 
-    def obstacle_in_front(self, depth_frame, threshold_mm=100, region_size=(20, 80)):
+    def obstacle_in_front(self, depth_frame, threshold_mm=250, region_size=(20, 80)):
         """Check if there's an obstacle in the center of the depth frame."""
         h, w = depth_frame.shape
         dh, dw = region_size
