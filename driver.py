@@ -10,6 +10,7 @@ class Driver:
         self.controller = controller
         self.camera = oakd
         self.turning = False
+        self.last_movement_time = None
 
         # Tunable parameters
         self.forward_speed = 0.2    # very slow forward motion
