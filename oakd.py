@@ -105,13 +105,13 @@ class OakD:
 
     def get_depth_frame(self):
         try:
-            print(f"[{time.time():.2f}] get_depth_frame() called")
+            # print(f"[{time.time():.2f}] get_depth_frame() called")
             frame =  self.depth_queue.get().getFrame()
-            print(f"[{time.time():.2f}] Received depth frame")
+            # print(f"[{time.time():.2f}] Received depth frame")
             return frame
         except RuntimeError as e:
             if "X_LINK_ERROR" in str(e):
-                print("[OakD] Stream error—resetting pipeline.")
+                print("[OakD] Stream error—-resetting pipeline.")
                 self.reset_pipeline()
                 return None
             else:
