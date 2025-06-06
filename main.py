@@ -38,7 +38,7 @@ if __name__ == "__main__":
     dashboard = db.Dashboard(None, oakd)
     dashboard.show()  
 
-    driver = Driver(vc)
+    driver = Driver(vc, oakd)
 
     # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
