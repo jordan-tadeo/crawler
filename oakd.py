@@ -31,7 +31,6 @@ class OakD:
         xout_imu.setStreamName("imu")
         imu.out.link(xout_imu.input)
 
-        self.imu_queue = self.device.getOutputQueue("imu", 50, blocking=False)
 
         # === GUI-EQUIVALENT SETTINGS ===
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
@@ -75,6 +74,7 @@ class OakD:
         self.device = dai.Device(self.pipeline)
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
         self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
+        self.imu_queue = self.device.getOutputQueue("imu", 50, blocking=False)
 
     def get_imu_sample(self):
         if self.imu_queue.has():
