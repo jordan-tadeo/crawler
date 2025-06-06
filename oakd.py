@@ -51,7 +51,7 @@ class OakD:
         config.postProcessing.temporalFilter.enable = True
 
         config.postProcessing.speckleFilter.enable = True
-        config.postProcessing.speckleFilter.speckleRange = 50
+        config.postProcessing.speckleFilter.speckleRange = 28
 
         stereo.initialConfig.set(config)
         # === END SETTINGS ===
