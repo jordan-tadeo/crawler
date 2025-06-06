@@ -24,7 +24,7 @@ class OakD:
 
         config = stereo.initialConfig.get()
         config.postProcessing.speckleFilter.enable = True
-        config.postProcessing.speckleFilter.speckleRange = 50
+        config.postProcessing.speckleFilter.speckleRange = 25
         config.postProcessing.temporalFilter.enable = True
         config.postProcessing.spatialFilter.enable = True
         config.postProcessing.spatialFilter.holeFillingRadius = 2
@@ -34,13 +34,28 @@ class OakD:
         cam_left.out.link(stereo.left)
         cam_right.out.link(stereo.right)
 
+        xout_disp = self.pipeline.create(dai.node.XLinkOut)
+        xout_disp.setStreamName("disparity")
+        stereo.disparity.link(xout_disp.input)
+
+
         xout = self.pipeline.create(dai.node.XLinkOut)
         xout.setStreamName("depth")
         stereo.depth.link(xout.input)
 
         self.device = dai.Device(self.pipeline)
+        self.disparity_queue = self.device.getOutputQueue("disparity", maxSize=4, blocking=False)
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
 
+    def get_disparity_colormap(self):
+        disp_frame = self.disparity_queue.get().getFrame()  # uint8
+
+        # Normalize to 0–255 range if needed
+        disp_normalized = cv2.normalize(disp_frame, None, 0, 255, cv2.NORM_MINMAX)
+        disp_normalized = np.uint8(disp_normalized)
+
+        color = cv2.applyColorMap(disp_normalized, cv2.COLORMAP_JET)
+        return color
 
     def get_depth_frame(self):
         return self.depth_queue.get().getFrame()  # raw depth in mm
