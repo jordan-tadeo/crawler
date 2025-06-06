@@ -15,7 +15,7 @@ class Driver:
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.turn_speed = 0.7       # light steering during recovery
-        self.stuck_threshold = 0.1  # or whatever threshold makes sense for imu
+        self.stuck_threshold = 1.4  # or whatever threshold makes sense for imu
         self.stuck_timeout = 3.0
 
 
