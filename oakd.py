@@ -40,8 +40,9 @@ class OakD:
         stereo.setExtendedDisparity(False)
         stereo.setRectifyEdgeFillColor(0)
         stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # Optional
+        stereo.setPostProcessingHardwareResources(numShaves=2, numMemorySlices=3)
 
-        stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
+        # stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
 
         config = stereo.initialConfig.get()
         config.postProcessing.spatialFilter.enable = True
