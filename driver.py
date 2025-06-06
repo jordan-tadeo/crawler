@@ -18,7 +18,7 @@ class Driver:
 
 
         # Tunable parameters
-        self.forward_speed = 0.005    # very slow forward motion
+        self.forward_speed = 0.000001    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.turn_speed = 0.7       # light steering during recovery
         self.stuck_threshold = 0.03  # or whatever threshold makes sense for imu
