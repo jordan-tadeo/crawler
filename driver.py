@@ -91,7 +91,7 @@ class Driver:
 
         if self.obstacle_in_front(depth):
             print("Obstacle detected — backing up.")
-            self.recover()
+            await self.recover()
             return
 
         if self.is_moving(imu):
@@ -103,6 +103,6 @@ class Driver:
             time_since_move = time.time() - self.last_movement_time
             if time_since_move > self.stuck_timeout:
                 print("STUCK — backing up to recover.")
-                self.recover()
+                await self.recover()
 
 
