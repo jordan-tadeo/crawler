@@ -3,6 +3,7 @@ import numpy as np
 from oakd import OakD
 from VehicleController import VehicleController
 import random
+import time
 
 class Driver:
     def __init__(self, controller: VehicleController, oakd: OakD):
@@ -14,6 +15,17 @@ class Driver:
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.turn_speed = 0.7       # light steering during recovery
+
+    def is_moving(self, imu_sample):
+        if imu_sample is None:
+            return True  # assume moving if no data
+
+        ax, ay, az = imu_sample["accel"]
+        accel_mag = (ax**2 + ay**2 + az**2)**0.5
+
+        # Subtract gravity (roughly 9.8 m/s²), so we're looking for change
+        motion = abs(accel_mag - 9.8)
+        return motion > self.stuck_threshold
 
     def get_steering_bias(self, depth, region_width=40, region_height=30, threshold_mm=1000):
         """
@@ -71,15 +83,23 @@ class Driver:
         await asyncio.sleep(0.2)
 
     async def tick(self):
-        """Main loop logic: move or recover based on depth."""
         depth = self.camera.get_depth_frame()
+        imu = self.camera.get_imu_sample()
 
         if self.obstacle_in_front(depth):
-            await self.recover()
-        else:
+            print("Obstacle detected — backing up.")
+            self.recover()
+            return
+
+        if self.is_moving(imu):
+            self.last_movement_time = time.time()
             steering = self.get_steering_bias(depth)
-            print(f"[Driver] Path clear — steering bias: {steering:.2f}")
-            self.controller.set_steering(steering, 0)
+            self.controller.set_steering(steering, steering)
             self.controller.set_throttle(self.forward_speed)
+        else:
+            time_since_move = time.time() - self.last_movement_time
+            if time_since_move > self.stuck_timeout:
+                print("STUCK — backing up to recover.")
+                self.recover()
 
 
