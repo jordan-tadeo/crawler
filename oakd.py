@@ -1,6 +1,7 @@
 import depthai as dai
 import numpy as np
 import cv2
+import time
 
 class OakD:
     def __init__(self):
@@ -73,6 +74,9 @@ class OakD:
 
         # Start device
         self.device = dai.Device(self.pipeline)
+        self.device.setLogLevel(dai.LogLevel.INFO)
+        self.device.setLogOutputLevel(dai.LogLevel.INFO)
+
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
         self.disparity_queue = None # self.device.getOutputQueue("disparity", 4, False)
         self.imu_queue = self.device.getOutputQueue("imu", 10, False)
@@ -101,7 +105,10 @@ class OakD:
 
     def get_depth_frame(self):
         try:
-            return self.depth_queue.get().getFrame()
+            print(f"[{time.time():.2f}] get_depth_frame() called")
+            frame =  self.depth_queue.get().getFrame()
+            print(f"[{time.time():.2f}] Received depth frame")
+            return frame
         except RuntimeError as e:
             if "X_LINK_ERROR" in str(e):
                 print("[OakD] Stream error—resetting pipeline.")

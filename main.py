@@ -12,6 +12,9 @@ import pygame
 import PersonFollower as pf
 from driver import Driver
 from oakd import OakD
+import os
+
+os.environ['DEPTHAI_LEVEL'] = 'debug'
 
 # === Main Control Loop ===
 async def control_loop(vc: VehicleController, driver: Driver):
