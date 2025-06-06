@@ -98,10 +98,6 @@ class Driver:
         self.controller.set_throttle(self.forward_speed)
         await asyncio.sleep(0.6)
 
-        # self.controller.set_steering(0, 0)
-        # self.controller.set_throttle(0)
-        # await asyncio.sleep(0.2)
-
     async def tick(self):
         depth = self.camera.get_depth_frame()
         imu = self.camera.get_imu_sample()
