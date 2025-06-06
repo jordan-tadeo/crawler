@@ -89,6 +89,7 @@ class Driver:
         self.controller.set_steering(turn_dir, -turn_dir)
 
         self.controller.set_throttle(self.reverse_speed)
+        print(f"{self.reverse_speed = }")
         await asyncio.sleep(1.5)
 
         self.controller.set_throttle(0)
@@ -116,7 +117,7 @@ class Driver:
             self.last_movement_time = time.time()
             steering = self.get_steering_bias(depth)
             self.controller.set_steering(steering, 0)
-            self.controller.set_throttle(self.forward_speed/10)
+            self.controller.set_throttle(self.forward_speed)
 
         elif time_since_recovery > self.recovery_cooldown:
             time_since_move = time.time() - self.last_movement_time
