@@ -13,27 +13,34 @@ class Driver:
         self.last_movement_time = time.time()
         self.last_recovery_time = 0  # timestamp of last stuck recovery
         self.recovery_cooldown = 3.0  # seconds to wait before checking for stuck again
+        self.imu_history = []
+        self.imu_window_size = 5  # adjust window size for smoothing    
+
 
         # Tunable parameters
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.turn_speed = 0.7       # light steering during recovery
-        self.stuck_threshold = 1.0  # or whatever threshold makes sense for imu
+        self.stuck_threshold = 1.1  # or whatever threshold makes sense for imu
         self.stuck_timeout = 5.0
 
 
-    def is_moving(self, imu_sample):
-        if imu_sample is None:
-            print("imu sample is None")
-            return True  # assume moving if no data
+    def is_moving(self, imu) -> bool:
+        if imu is None:
+            return False
 
-        ax, ay, az = imu_sample["accel"]
-        accel_mag = (ax**2 + ay**2 + az**2)**0.5
+        accel = imu["accel"]
+        magnitude = np.linalg.norm(accel)
 
-        # Subtract gravity (roughly 9.8 m/s²), so we're looking for change
-        motion = abs(accel_mag - 9.8)
-        print(f"{motion = }")
-        return motion < self.stuck_threshold
+        self.imu_history.append(magnitude)
+        if len(self.imu_history) > self.imu_window_size:
+            self.imu_history.pop(0)
+
+        avg_motion = np.mean(self.imu_history)
+        print(f"Avg motion = {avg_motion:.3f}")
+
+        return avg_motion < self.stuck_threshold
+
 
     def get_steering_bias(self, depth, region_width=40, region_height=30, threshold_mm=1000):
         """
