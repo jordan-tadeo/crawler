@@ -75,13 +75,16 @@ class Driver:
         """Backup and turn to avoid obstacle."""
         print("[Driver] Obstacle detected — reversing and turning")
 
+        #pick rando direction
+        turn_dir = random.choice([-self.turn_speed, self.turn_speed])
+        self.controller.set_steering(turn_dir, -turn_dir)
+
         self.controller.set_throttle(self.reverse_speed)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.5)
 
         self.controller.set_throttle(0)
-
-        turn_dir = random.choice([-self.turn_speed, self.turn_speed])
-        self.controller.set_steering(turn_dir, 0)
+        
+        
         await asyncio.sleep(0.6)
 
         self.controller.set_steering(0, 0)
