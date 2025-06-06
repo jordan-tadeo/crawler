@@ -79,7 +79,7 @@ class OakD:
     def get_imu_sample(self):
         if self.imu_queue.has():
             packet = self.imu_queue.get()
-            accel = packet.acceleroMeter
+            accel = packet.accelerometer
             gyro = packet.gyroscope
             return {
                 "accel": (accel.x, accel.y, accel.z),
