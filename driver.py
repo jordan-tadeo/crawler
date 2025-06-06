@@ -5,9 +5,9 @@ from VehicleController import VehicleController
 import random
 
 class Driver:
-    def __init__(self, controller: VehicleController):
+    def __init__(self, controller: VehicleController, oakd: OakD):
         self.controller = controller
-        self.camera = OakD()
+        self.camera = oakd
         self.turning = False
 
         # Tunable parameters
