@@ -15,6 +15,8 @@ class Driver:
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.turn_speed = 0.7       # light steering during recovery
+        self.stuck_threshold = 0.05  # or whatever threshold makes sense for imu
+
 
     def is_moving(self, imu_sample):
         if imu_sample is None:
