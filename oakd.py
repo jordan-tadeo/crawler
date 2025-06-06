@@ -23,7 +23,7 @@ class OakD:
 
         # Create IMU node
         imu = self.pipeline.create(dai.node.IMU)
-        imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 100)
+        imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER, 100)
         imu.setBatchReportThreshold(1)
         imu.setMaxBatchReports(10)
 
