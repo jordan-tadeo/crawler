@@ -92,13 +92,15 @@ class Driver:
         await asyncio.sleep(1.5)
 
         self.controller.set_throttle(0)
-        
-        
         await asyncio.sleep(0.6)
 
-        self.controller.set_steering(0, 0)
-        self.controller.set_throttle(0)
-        await asyncio.sleep(0.2)
+        self.controller.set_steering(-turn_dir, turn_dir)
+        self.controller.set_throttle(self.forward_speed)
+        await asyncio.sleep(0.6)
+
+        # self.controller.set_steering(0, 0)
+        # self.controller.set_throttle(0)
+        # await asyncio.sleep(0.2)
 
     async def tick(self):
         depth = self.camera.get_depth_frame()
