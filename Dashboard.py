@@ -29,6 +29,8 @@ class Dashboard(QMainWindow):
         # PersonFollower instance
         self.person_follower = person_follower
 
+        self.oakd = oakd
+
         # Timer to update pantilt feed
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_pantilt_view)
