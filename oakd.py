@@ -74,7 +74,7 @@ class OakD:
         # Start device
         self.device = dai.Device(self.pipeline)
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
-        self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
+        # self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
         self.imu_queue = self.device.getOutputQueue("imu", 10, False)
 
     def get_imu_sample(self):
