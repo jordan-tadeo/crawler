@@ -10,7 +10,7 @@ class Driver:
         self.controller = controller
         self.camera = oakd
         self.turning = False
-        self.last_movement_time = None
+        self.last_movement_time = time.time()
 
         # Tunable parameters
         self.forward_speed = 0.2    # very slow forward motion
@@ -102,7 +102,7 @@ class Driver:
             steering = self.get_steering_bias(depth)
             self.controller.set_steering(steering, 0)
             self.controller.set_throttle(self.forward_speed)
-        elif self.last_movement_time is not None:
+        else:
             time_since_move = time.time() - self.last_movement_time
             if time_since_move > self.stuck_timeout:
                 print("STUCK — backing up to recover.")
