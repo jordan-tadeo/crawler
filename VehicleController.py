@@ -89,7 +89,7 @@ class VehicleController:
     
     def set_throttle(self, value) -> int:
         ''' 
-        Set the throttle for the ESC.
+        Set the throttle for the ESC. -1 to +1
         '''
 
         # Restrict value to the range [-1, 1]

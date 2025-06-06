@@ -18,10 +18,10 @@ class Driver:
 
 
         # Tunable parameters
-        self.forward_speed = 0.000001    # very slow forward motion
+        self.forward_speed = 0.1    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
-        self.turn_speed = 0.7       # light steering during recovery
-        self.stuck_threshold = 0.03  # or whatever threshold makes sense for imu
+        self.max_turn = 0.7       # light steering during recovery
+        self.stuck_threshold = 0.3  # or whatever threshold makes sense for imu
         self.stuck_timeout = 2.5
 
 
@@ -42,7 +42,7 @@ class Driver:
         return avg_motion > self.stuck_threshold
 
 
-    def get_steering_bias(self, depth, region_width=40, region_height=30, threshold_mm=1000):
+    def get_steering_bias(self, depth, region_width=60, region_height=40, threshold_mm=1200):
         """
         Compare average depth in left vs right side.
         Return a steering value from -1 (steer left) to 1 (steer right).
@@ -85,7 +85,7 @@ class Driver:
         print("[Driver] Obstacle detected — reversing and turning")
 
         #pick rando direction
-        turn_dir = random.choice([self.turn_speed/2, self.turn_speed])
+        turn_dir = random.choice([self.max_turn/2, self.max_turn])
         self.controller.set_steering(turn_dir, -turn_dir)
 
         self.controller.set_throttle(self.reverse_speed)
