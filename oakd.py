@@ -15,6 +15,22 @@ class OakD:
 
         stereo = self.pipeline.create(dai.node.StereoDepth)
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
+
+        stereo.setLeftRightCheck(True)
+        stereo.setExtendedDisparity(False)
+        stereo.setSubpixel(True)
+        stereo.initialConfig.setConfidenceThreshold(245)
+        stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
+
+        config = stereo.initialConfig.get()
+        config.postProcessing.speckleFilter.enable = True
+        config.postProcessing.speckleFilter.speckleRange = 50
+        config.postProcessing.temporalFilter.enable = True
+        config.postProcessing.spatialFilter.enable = True
+        config.postProcessing.spatialFilter.holeFillingRadius = 2
+        config.postProcessing.spatialFilter.numIterations = 1
+        stereo.initialConfig.set(config)
+
         cam_left.out.link(stereo.left)
         cam_right.out.link(stereo.right)
 
@@ -24,6 +40,7 @@ class OakD:
 
         self.device = dai.Device(self.pipeline)
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
+
 
     def get_depth_frame(self):
         return self.depth_queue.get().getFrame()  # raw depth in mm
