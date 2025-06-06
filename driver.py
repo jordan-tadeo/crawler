@@ -85,7 +85,7 @@ class Driver:
         print("[Driver] Obstacle detected — reversing and turning")
 
         #pick rando direction
-        turn_dir = random.choice([-self.turn_speed, self.turn_speed])
+        turn_dir = random.choice([0, self.turn_speed])
         self.controller.set_steering(turn_dir, -turn_dir)
 
         self.controller.set_throttle(self.reverse_speed)
