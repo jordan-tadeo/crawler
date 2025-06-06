@@ -20,8 +20,9 @@ async def control_loop(vc: VehicleController, driver: Driver):
             while True:
                 
                 # Do something
+                print("running")
 
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.5)
         except KeyboardInterrupt:
             print("\n[Shutdown] Stopping ESC and Servos...")
         finally:
@@ -36,7 +37,7 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     dashboard = db.Dashboard(None, oakd)
-    dashboard.show()    
+    dashboard.show()  
 
     driver = None
 
