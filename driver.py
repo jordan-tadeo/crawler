@@ -94,7 +94,7 @@ class Driver:
         if self.is_moving(imu):
             self.last_movement_time = time.time()
             steering = self.get_steering_bias(depth)
-            self.controller.set_steering(steering, steering)
+            self.controller.set_steering(steering, 0)
             self.controller.set_throttle(self.forward_speed)
         else:
             time_since_move = time.time() - self.last_movement_time

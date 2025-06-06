@@ -27,9 +27,16 @@ class OakD:
         imu.setBatchReportThreshold(1)
         imu.setMaxBatchReports(10)
 
-        xout_imu = self.pipeline.create(dai.node.XLinkOut)
-        xout_imu.setStreamName("imu")
-        imu.out.link(xout_imu.input)
+        # Create IMU node
+        imu = self.pipeline.create(dai.node.IMU)
+        imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 100)
+        imu.setBatchReportThreshold(1)
+        imu.setMaxBatchReports(10)
+
+        # IMU output
+        imu_out = self.pipeline.create(dai.node.XLinkOut)
+        imu_out.setStreamName("imu")
+        imu.out.link(imu_out.input)
 
 
         # === GUI-EQUIVALENT SETTINGS ===
@@ -74,18 +81,25 @@ class OakD:
         self.device = dai.Device(self.pipeline)
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
         self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
-        self.imu_queue = self.device.getOutputQueue("imu", 50, blocking=False)
+        self.imu_queue = self.device.getOutputQueue("imu", 10, False)
 
     def get_imu_sample(self):
         if self.imu_queue.has():
-            packet = self.imu_queue.get()
-            accel = packet.accelerometer
+            data = self.imu_queue.get()
+            if not data.packets:
+                return None
+
+            packet = data.packets[0]
+
+            accel = packet.acceleroMeter  # yes, capital M
             gyro = packet.gyroscope
+
             return {
                 "accel": (accel.x, accel.y, accel.z),
                 "gyro": (gyro.x, gyro.y, gyro.z)
             }
         return None
+
 
     def get_depth_frame(self):
         return self.depth_queue.get().getFrame()
