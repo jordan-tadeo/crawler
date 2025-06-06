@@ -10,36 +10,43 @@ class Driver:
         self.camera = OakD()
         self.turning = False
 
+        # Tunable parameters
+        self.forward_speed = 0.2    # very slow forward motion
+        self.reverse_speed = -0.2   # very slow backup
+        self.turn_speed = 0.3       # light steering during recovery
+
     def obstacle_in_front(self, depth_frame, threshold_mm=500, region_size=(20, 80)):
         """Check if there's an obstacle in the center of the depth frame."""
         h, w = depth_frame.shape
         dh, dw = region_size
         center = depth_frame[h//2 - dh//2:h//2 + dh//2, w//2 - dw//2:w//2 + dw//2]
-        center = center[center > 0]  # filter out invalid values
+        center = center[center > 0]  # ignore zero-depth pixels
         return np.any(center < threshold_mm)
 
     async def recover(self):
-        """Backup and turn in place to recover from obstacle."""
-        print("[Driver] Obstacle detected — backing up and turning")
-        self.controller.set_throttle(-0.5)
-        await asyncio.sleep(0.7)
+        """Backup and turn to avoid obstacle."""
+        print("[Driver] Obstacle detected — reversing and turning")
+
+        self.controller.set_throttle(self.reverse_speed)
+        await asyncio.sleep(0.8)
 
         self.controller.set_throttle(0)
-        turn_dir = random.choice([-0.6, 0.6])  # left or right
+
+        turn_dir = random.choice([-self.turn_speed, self.turn_speed])
         self.controller.set_steering(turn_dir, turn_dir)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.6)
 
         self.controller.set_steering(0, 0)
         self.controller.set_throttle(0)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)
 
     async def tick(self):
-        """Called repeatedly in a loop to make drive decisions."""
+        """Main loop logic: move or recover based on depth."""
         depth = self.camera.get_depth_frame()
 
         if self.obstacle_in_front(depth):
             await self.recover()
         else:
-            print("[Driver] Path is clear — moving forward")
+            print("[Driver] Path is clear — creeping forward")
             self.controller.set_steering(0, 0)
-            self.controller.set_throttle(0.55)
+            self.controller.set_throttle(self.forward_speed)
