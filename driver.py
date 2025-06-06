@@ -13,7 +13,7 @@ class Driver:
         # Tunable parameters
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
-        self.turn_speed = 0.3       # light steering during recovery
+        self.turn_speed = 0.7       # light steering during recovery
 
     def get_steering_bias(self, depth, region_width=40, region_height=30, threshold_mm=1000):
         """
