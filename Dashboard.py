@@ -41,6 +41,27 @@ class Dashboard(QMainWindow):
         self.depth_timer.timeout.connect(self.update_depth_view)
         self.depth_timer.start(17)  # ~30 FPS
 
+        # Timer to update disparity feed
+        self.disparity_timer = QTimer(self)
+        self.disparity_timer.timeout.connect(self.update_disparity_view)
+        self.disparity_timer.start(17)
+
+    def update_disparity_view(self):
+        if self.oakd is None:
+            return
+
+        frame = self.oakd.get_disparity_colormap()
+        if frame is None:
+            return
+
+        height, width, channel = frame.shape
+        bytes_per_line = 3 * width
+        q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_BGR888)
+        pixmap = QPixmap.fromImage(q_image)
+
+        self.labels[1][2].setPixmap(pixmap)  # Show in right-middle of the grid
+
+
     def update_depth_view(self):
         if self.oakd is None:
             return
