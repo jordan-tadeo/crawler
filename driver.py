@@ -102,7 +102,7 @@ class Driver:
             steering = self.get_steering_bias(depth)
             self.controller.set_steering(steering, 0)
             self.controller.set_throttle(self.forward_speed)
-        else:
+        elif self.last_movement_time is not None:
             time_since_move = time.time() - self.last_movement_time
             if time_since_move > self.stuck_timeout:
                 print("STUCK — backing up to recover.")
