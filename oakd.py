@@ -89,7 +89,15 @@ class OakD:
         return None
 
     def get_depth_frame(self):
-        return self.depth_queue.get().getFrame()
+        try:
+            return self.depth_queue.get().getFrame()
+        except RuntimeError as e:
+            if "X_LINK_ERROR" in str(e):
+                print("[OakD] Stream error—resetting pipeline.")
+                self.reset_pipeline()
+                return None
+            else:
+                raise
 
     def get_depth_colormap(self):
         frame = self.get_depth_frame()
