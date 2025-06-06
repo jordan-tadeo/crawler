@@ -8,6 +8,7 @@ class OakD:
 
         self.depth_buffer = []
         self.buffer_size = 4  # average over last 4 frames
+        self.smoothed_depth = None
 
         # Mono cameras
         cam_left = self.pipeline.create(dai.node.MonoCamera)
@@ -68,16 +69,14 @@ class OakD:
 
     def get_depth_colormap(self):
         frame = self.get_depth_frame()
-        frame = np.clip(frame, 300, 3000)
+        frame = np.clip(frame, 300, 3000).astype(np.float32)
 
-        # Accumulate in buffer
-        self.depth_buffer.append(frame)
-        if len(self.depth_buffer) > self.buffer_size:
-            self.depth_buffer.pop(0)
+        if self.smoothed_depth is None:
+            self.smoothed_depth = frame.copy()
+        else:
+            cv2.accumulateWeighted(frame, self.smoothed_depth, 0.3)  # α = 0.3
 
-        avg_frame = np.mean(self.depth_buffer, axis=0).astype(np.uint16)
-
-        norm = ((avg_frame - 300) / (3000 - 300) * 255).astype(np.uint8)
+        norm = ((self.smoothed_depth - 300) / (3000 - 300) * 255).astype(np.uint8)
         return cv2.applyColorMap(norm, cv2.COLORMAP_JET)
 
     def get_disparity_colormap(self):
