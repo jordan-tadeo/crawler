@@ -1,36 +1,36 @@
 import depthai as dai
 import numpy as np
+import cv2
 
 class OakD:
-    """Handles comms with the OAK-D"""
-
     def __init__(self):
         self.pipeline = dai.Pipeline()
 
-        # Create mono cameras
-        self.cam_left = self.pipeline.create(dai.node.MonoCamera)
-        self.cam_right = self.pipeline.create(dai.node.MonoCamera)
-        self.cam_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
-        self.cam_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
-        self.cam_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        self.cam_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        cam_left = self.pipeline.create(dai.node.MonoCamera)
+        cam_right = self.pipeline.create(dai.node.MonoCamera)
+        cam_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+        cam_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+        cam_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        cam_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 
-        # Stereo depth node
-        self.stereo = self.pipeline.create(dai.node.StereoDepth)
-        self.stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
-        self.cam_left.out.link(self.stereo.left)
-        self.cam_right.out.link(self.stereo.right)
+        stereo = self.pipeline.create(dai.node.StereoDepth)
+        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
+        cam_left.out.link(stereo.left)
+        cam_right.out.link(stereo.right)
 
-        # Output
-        self.xout_depth = self.pipeline.create(dai.node.XLinkOut)
-        self.xout_depth.setStreamName("depth")
-        self.stereo.depth.link(self.xout_depth.input)
+        xout = self.pipeline.create(dai.node.XLinkOut)
+        xout.setStreamName("depth")
+        stereo.depth.link(xout.input)
 
-        # Start device
         self.device = dai.Device(self.pipeline)
-        self.depth_queue = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
+        self.depth_queue = self.device.getOutputQueue("depth", 4, False)
 
     def get_depth_frame(self):
-        """Returns the latest depth frame as a numpy array (in millimeters)"""
-        frame = self.depth_queue.get().getFrame()
-        return frame  # shape: (H, W), dtype: uint16, unit: mm
+        return self.depth_queue.get().getFrame()  # raw depth in mm
+
+    def get_depth_colormap(self):
+        frame = self.get_depth_frame()
+        norm = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
+        norm = np.uint8(norm)
+        color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        return color  # BGR, uint8

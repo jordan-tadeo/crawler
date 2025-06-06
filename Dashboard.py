@@ -5,9 +5,10 @@ import cv2
 import numpy as np
 from PersonFollower import PersonFollower
 import tensorflow as tf
+from oakd import OakD
 
 class Dashboard(QMainWindow):
-    def __init__(self, person_follower: PersonFollower):
+    def __init__(self, person_follower: PersonFollower = None, oakd: OakD = None):
         super().__init__()
         self.setWindowTitle("Dashboard")
         self.setGeometry(0, 0, 800, 600)  # Default window size
@@ -33,7 +34,31 @@ class Dashboard(QMainWindow):
         self.timer.timeout.connect(self.update_pantilt_view)
         self.timer.start(17)  # ~30 FPS
 
+        # Timer to update Oak-D depth feed
+        self.depth_timer = QTimer(self)
+        self.depth_timer.timeout.connect(self.update_depth_view)
+        self.depth_timer.start(17)  # ~30 FPS
+
+    def update_depth_view(self):
+        if self.oakd is None:
+            return
+
+        frame = self.oakd.get_depth_colormap()  # BGR image
+        if frame is None:
+            return
+
+        height, width, channel = frame.shape
+        bytes_per_line = 3 * width
+        q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_BGR888)
+        pixmap = QPixmap.fromImage(q_image)
+
+        self.labels[1][0].setPixmap(pixmap)  # Show on left-middle of grid
+
+
     def update_model_input_view(self, input_tensor):
+        if PersonFollower is None:
+            print("PersonFollower is None")
+            return
         # Convert the tensor to a numpy array for visualization
         display_tensor = self.person_follower.get_latest_input_tensor() # Remove unnecessary dimensions
 
@@ -48,6 +73,9 @@ class Dashboard(QMainWindow):
         self.labels[0][1].setPixmap(pixmap_input)
 
     def update_pantilt_view(self):
+        if PersonFollower is None:
+            print("PersonFollower is None")
+            return
         # Get the latest frame from the person follower
         frame = self.person_follower.get_latest_frame()
 
