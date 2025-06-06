@@ -11,6 +11,8 @@ class Driver:
         self.camera = oakd
         self.turning = False
         self.last_movement_time = time.time()
+        self.last_recovery_time = 0  # timestamp of last stuck recovery
+        self.recovery_cooldown = 3.0  # seconds to wait before checking for stuck again
 
         # Tunable parameters
         self.forward_speed = 0.2    # very slow forward motion
@@ -95,20 +97,27 @@ class Driver:
         depth = self.camera.get_depth_frame()
         imu = self.camera.get_imu_sample()
 
+        # Skip stuck check if recently recovered
+        time_since_recovery = time.time() - self.last_recovery_time
+
+        # Obstacle detected in front
         if self.obstacle_in_front(depth):
             print("Obstacle detected — backing up.")
             await self.recover()
             return
 
+        # Check motion
         if self.is_moving(imu):
             self.last_movement_time = time.time()
             steering = self.get_steering_bias(depth)
             self.controller.set_steering(steering, 0)
             self.controller.set_throttle(self.forward_speed)
-        else:
+
+        elif time_since_recovery > self.recovery_cooldown:
             time_since_move = time.time() - self.last_movement_time
             if time_since_move > self.stuck_timeout:
                 print("STUCK — backing up to recover.")
                 await self.recover()
+
 
 
