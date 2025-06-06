@@ -81,16 +81,11 @@ class OakD:
             data = self.imu_queue.get()
             if not data.packets:
                 return None
-
             packet = data.packets[0]
-
-            accel = packet.linearAcceleration  # Corrected property name
+            accel = packet.acceleroMeter  # correct
             gyro = packet.gyroscope
-
-            return {
-                "accel": (accel.x, accel.y, accel.z),
-                "gyro": (gyro.x, gyro.y, gyro.z)
-            }
+            return {"accel": (accel.x, accel.y, accel.z),
+                    "gyro": (gyro.x, gyro.y, gyro.z)}
         return None
 
     def get_depth_frame(self):
