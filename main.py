@@ -1,17 +1,18 @@
+
 from PyQt5.QtWidgets import QApplication
 import sys
 import asyncio
 import threading
-import VehicleController as vc
-import Joystick as js
-import Logger as lg
+from VehicleController import VehicleController
+from Joystick import Joystick
+from Logger import Logger
 import USBCamera as uc
 import Dashboard as db
 import pygame
 import PersonFollower as pf
 
 # === Main Control Loop ===
-async def control_loop(joystick: js.Joystick, vecon: vc.VehicleController, person_follower: pf.PersonFollower):
+async def control_loop(vc: VehicleController, person_follower: pf.PersonFollower):
         # await asyncio.sleep(1)  # Allow time for joystick to initialize
 
         vehicle_state = None
@@ -52,23 +53,26 @@ async def control_loop(joystick: js.Joystick, vecon: vc.VehicleController, perso
             vecon.close()
 
 if __name__ == "__main__":
-    pygame.init()
+    # pygame.init()
     log = lg.Logger()
 
-    joystick = js.Joystick(disabled=True)
-    vecon = vc.VehicleController(logger=log)
-    usb_cam = uc.USBCamera(camera_index=0, fps=30)
-    person_follower = pf.PersonFollower(vecon, usb_cam)
+    # joystick = js.Joystick(disabled=True)
+    vecon = VehicleController(logger=log)
+    # usb_cam = uc.USBCamera(camera_index=0, fps=30)
+    # person_follower = pf.PersonFollower(vecon, usb_cam)
 
-    person_follower.start()  # Start AI processing thread
+    # person_follower.start()  # Start AI processing thread
 
-    app = QApplication(sys.argv)
-    dashboard = db.Dashboard(person_follower)
-    dashboard.show()    
+    # app = QApplication(sys.argv)
+    # dashboard = db.Dashboard(person_follower)
+    # dashboard.show()    
+
+    oakd = OakD()
+    driver = Driver()
 
     # Run the asyncio control loop in a separate thread
     loop = asyncio.get_event_loop()
-    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(joystick, vecon, person_follower),))
+    asyncio_thread = threading.Thread(target=loop.run_until_complete, args=(control_loop(vc, driver),))
     asyncio_thread.start()
 
     try:
