@@ -25,6 +25,7 @@ async def control_loop(vc: VehicleController, driver: Driver):
         except KeyboardInterrupt:
             print("\n[Shutdown] Stopping ESC and Servos...")
         finally:
+            print("[Shutdown] Stopping vehicle safely.")
             vc.close()
 
 if __name__ == "__main__":

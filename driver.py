@@ -63,7 +63,7 @@ class Driver:
         self.controller.set_throttle(0)
 
         turn_dir = random.choice([-self.turn_speed, self.turn_speed])
-        self.controller.set_steering(turn_dir, turn_dir)
+        self.controller.set_steering(turn_dir, 0)
         await asyncio.sleep(0.6)
 
         self.controller.set_steering(0, 0)
@@ -79,6 +79,7 @@ class Driver:
         else:
             steering = self.get_steering_bias(depth)
             print(f"[Driver] Path clear — steering bias: {steering:.2f}")
-            self.controller.set_steering(steering, steering)
+            self.controller.set_steering(steering, 0)
             self.controller.set_throttle(self.forward_speed)
+
 
