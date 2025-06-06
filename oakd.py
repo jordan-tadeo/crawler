@@ -74,8 +74,8 @@ class OakD:
 
         # Start device
         self.device = dai.Device(self.pipeline)
-        self.device.setLogLevel(dai.LogLevel.INFO)
-        self.device.setLogOutputLevel(dai.LogLevel.INFO)
+        # self.device.setLogLevel(dai.LogLevel.INFO)
+        # self.device.setLogOutputLevel(dai.LogLevel.INFO)
 
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
         self.disparity_queue = None # self.device.getOutputQueue("disparity", 4, False)
