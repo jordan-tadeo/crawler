@@ -59,7 +59,6 @@ class Dashboard(QMainWindow):
 
     def update_model_input_view(self, input_tensor):
         if not self.person_follower:
-            print("PersonFollower is None")
             return
         # Convert the tensor to a numpy array for visualization
         display_tensor = self.person_follower.get_latest_input_tensor() # Remove unnecessary dimensions
@@ -76,7 +75,6 @@ class Dashboard(QMainWindow):
 
     def update_pantilt_view(self):
         if not self.person_follower:
-            print("PersonFollower is None")
             return
         # Get the latest frame from the person follower
         frame = self.person_follower.get_latest_frame()
@@ -98,7 +96,6 @@ class Dashboard(QMainWindow):
 
     def closeEvent(self, event):
         if not self.person_follower:
-            print("PersonFollower is None")
             return
         # Stop the person follower when closing the dashboard
         self.person_follower.stop()

@@ -29,8 +29,16 @@ class OakD:
         return self.depth_queue.get().getFrame()  # raw depth in mm
 
     def get_depth_colormap(self):
-        frame = self.get_depth_frame()
-        norm = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
-        norm = np.uint8(norm)
+        frame = self.get_depth_frame()  # millimeters
+
+        # Clip values to a useful display range (e.g. 300mm to 3000mm)
+        frame_clipped = np.clip(frame, 300, 3000)
+
+        # Normalize manually to 0–255
+        norm = ((frame_clipped - 300) / (3000 - 300) * 255).astype(np.uint8)
+
+        # Apply a JET colormap
         color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-        return color  # BGR, uint8
+
+        return color  # BGR image
+
