@@ -21,7 +21,7 @@ class Driver:
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.turn_speed = 0.7       # light steering during recovery
-        self.stuck_threshold = 1.1  # or whatever threshold makes sense for imu
+        self.stuck_threshold = 0.03  # or whatever threshold makes sense for imu
         self.stuck_timeout = 5.0
 
 
@@ -39,7 +39,7 @@ class Driver:
         avg_motion = np.mean(self.imu_history)
         print(f"Avg motion = {avg_motion:.3f}")
 
-        return avg_motion < self.stuck_threshold
+        return avg_motion > self.stuck_threshold
 
 
     def get_steering_bias(self, depth, region_width=40, region_height=30, threshold_mm=1000):
