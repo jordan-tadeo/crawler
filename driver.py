@@ -12,7 +12,7 @@ class Driver:
 
         # Tunable parameters
         self.forward_speed = 0.2    # very slow forward motion
-        self.reverse_speed = -0.2   # very slow backup
+        self.reverse_speed = -0.5   # very slow backup
         self.turn_speed = 0.3       # light steering during recovery
 
     def get_steering_bias(self, depth, region_width=40, region_height=30, threshold_mm=1000):
@@ -58,7 +58,7 @@ class Driver:
         print("[Driver] Obstacle detected — reversing and turning")
 
         self.controller.set_throttle(self.reverse_speed)
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(2.0)
 
         self.controller.set_throttle(0)
 
