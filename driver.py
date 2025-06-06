@@ -78,7 +78,6 @@ class Driver:
         dh, dw = region_size
         center = depth_frame[h//2 - dh//2:h//2 + dh//2, w//2 - dw//2:w//2 + dw//2]
         center = center[center > 0]  # ignore zero-depth pixels
-        print(f"distance to center = {center}")
         return np.any(center < threshold_mm)
 
     async def recover(self):
