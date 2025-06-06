@@ -31,7 +31,7 @@ class Driver:
         # Subtract gravity (roughly 9.8 m/s²), so we're looking for change
         motion = abs(accel_mag - 9.8)
         print(f"{motion = }")
-        return motion > self.stuck_threshold
+        return motion < self.stuck_threshold
 
     def get_steering_bias(self, depth, region_width=40, region_height=30, threshold_mm=1000):
         """
