@@ -21,6 +21,18 @@ class OakD:
         # Stereo depth node
         stereo = self.pipeline.create(dai.node.StereoDepth)
 
+        imu = self.pipeline.create(dai.node.IMU)
+        imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, 100)
+        imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, 100)
+        imu.setBatchReportThreshold(1)
+        imu.setMaxBatchReports(10)
+
+        xout_imu = self.pipeline.create(dai.node.XLinkOut)
+        xout_imu.setStreamName("imu")
+        imu.out.link(xout_imu.input)
+
+        self.imu_queue = self.device.getOutputQueue("imu", 50, blocking=False)
+
         # === GUI-EQUIVALENT SETTINGS ===
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
         stereo.setConfidenceThreshold(245)
@@ -63,6 +75,17 @@ class OakD:
         self.device = dai.Device(self.pipeline)
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
         self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
+
+    def get_imu_sample(self):
+        if self.imu_queue.has():
+            packet = self.imu_queue.get()
+            accel = packet.acceleroMeter
+            gyro = packet.gyroscope
+            return {
+                "accel": (accel.x, accel.y, accel.z),
+                "gyro": (gyro.x, gyro.y, gyro.z)
+            }
+        return None
 
     def get_depth_frame(self):
         return self.depth_queue.get().getFrame()
