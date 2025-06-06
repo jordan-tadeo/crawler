@@ -74,7 +74,7 @@ class OakD:
         # Start device
         self.device = dai.Device(self.pipeline)
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
-        # self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
+        self.disparity_queue = None # self.device.getOutputQueue("disparity", 4, False)
         self.imu_queue = self.device.getOutputQueue("imu", 10, False)
 
     def get_imu_sample(self):
@@ -123,6 +123,8 @@ class OakD:
         return cv2.applyColorMap(norm, cv2.COLORMAP_JET)
 
     def get_disparity_colormap(self):
+        if self.disparity_queue is None:
+            return None
         disp_frame = self.disparity_queue.get().getFrame()
         disp_normalized = cv2.normalize(disp_frame, None, 0, 255, cv2.NORM_MINMAX)
         disp_normalized = np.uint8(disp_normalized)
