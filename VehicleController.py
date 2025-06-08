@@ -8,7 +8,7 @@ import Logger
 
 # Constants for control of the Quicrun 880 ESC
 ESC_GPIO_PIN = 18
-ESC_NEUTRAL_PW = 1700
+ESC_NEUTRAL_PW = 1325
 ESC_FULL_FORWARD_PW = 2000
 ESC_FULL_REVERSE_PW = 1000
 
