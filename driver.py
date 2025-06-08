@@ -21,7 +21,7 @@ class Driver:
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.6   # very slow backup
         self.max_turn = 1      
-        self.stuck_threshold = 0.02  # or whatever threshold makes sense for imu
+        self.stuck_threshold = 0.2  # or whatever threshold makes sense for imu
         self.stuck_timeout = 2.5
 
 
