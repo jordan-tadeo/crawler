@@ -42,7 +42,7 @@ class Driver:
         return avg_motion > self.stuck_threshold
 
 
-    def get_steering_bias(self, depth, region_width=60, region_height=40, threshold_mm=1200):
+    def get_steering_bias(self, depth, region_width=100, region_height=80, threshold_mm=1200):
         """
         Compare average depth in left vs right side.
         Return a steering value from -1 (steer left) to 1 (steer right).
@@ -70,7 +70,6 @@ class Driver:
         max_range = threshold_mm
         steering = np.clip(delta / max_range, -1.0, 1.0)
         return steering
-
 
     def obstacle_in_front(self, depth_frame, threshold_mm=500, region_size=(100, 100)):
         """Check if there's an obstacle in the center of the depth frame."""
