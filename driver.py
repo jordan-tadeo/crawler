@@ -72,13 +72,13 @@ class Driver:
         return steering
 
 
-    def obstacle_in_front(self, depth_frame, threshold_mm=500, region_size=(20, 80)):
+    def obstacle_in_front(self, depth_frame, threshold_mm=500, region_size=(100, 100)):
         """Check if there's an obstacle in the center of the depth frame."""
         h, w = depth_frame.shape
         dh, dw = region_size
         center = depth_frame[h//2 - dh//2:h//2 + dh//2, w//2 - dw//2:w//2 + dw//2]
         center = center[center > 0]  # ignore zero-depth pixels
-        return np.any(center < threshold_mm)
+        return np.mean(center < threshold_mm) > 0.5
 
     async def recover(self):
         """Backup and turn to avoid obstacle."""
