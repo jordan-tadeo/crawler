@@ -71,7 +71,7 @@ class Driver:
         steering = np.clip(delta / max_range, -1.0, 1.0)
         return steering
 
-    def obstacle_in_front(self, depth_frame, threshold_mm=500, region_size=(100, 100)):
+    def obstacle_in_front(self, depth_frame, threshold_mm=400, region_size=(50, 50)):
         """Check if there's an obstacle in the center of the depth frame."""
         h, w = depth_frame.shape
         dh, dw = region_size
