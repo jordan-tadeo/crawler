@@ -22,15 +22,9 @@ async def control_loop(vc: VehicleController, driver: Driver):
         try:
             t = 0
             while True:
-                
                 # Do something
-                # await driver.tick()
-                print(f"{t = }")
-                vc.set_throttle(t)
-                await asyncio.sleep(3)
-                t += 0.1
-                if t > 1.5:
-                     t = 0
+                await driver.tick()
+                await asyncio.sleep(0.1)
         except KeyboardInterrupt:
             print("\n[Shutdown] Stopping ESC and Servos...")
         finally:
@@ -39,9 +33,7 @@ async def control_loop(vc: VehicleController, driver: Driver):
 
 if __name__ == "__main__":
     log = Logger()
-
     vc = VehicleController(logger=log)
-
     oakd = OakD()
 
     app = QApplication(sys.argv)

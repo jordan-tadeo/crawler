@@ -68,9 +68,9 @@ class OakD:
         stereo.depth.link(xout_depth.input)
 
         # Disparity output (optional)
-        # xout_disp = self.pipeline.create(dai.node.XLinkOut)
-        # xout_disp.setStreamName("disparity")
-        # stereo.disparity.link(xout_disp.input)
+        xout_disp = self.pipeline.create(dai.node.XLinkOut)
+        xout_disp.setStreamName("disparity")
+        stereo.disparity.link(xout_disp.input)
 
         # Start device
         self.device = dai.Device(self.pipeline)
@@ -78,7 +78,7 @@ class OakD:
         # self.device.setLogOutputLevel(dai.LogLevel.INFO)
 
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
-        self.disparity_queue = None # self.device.getOutputQueue("disparity", 4, False)
+        self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
         self.imu_queue = self.device.getOutputQueue("imu", 10, False)
 
     def get_imu_sample(self):
