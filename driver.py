@@ -21,7 +21,7 @@ class Driver:
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.6   # very slow backup
         self.max_turn = 0.7       # light steering during recovery
-        self.stuck_threshold = 0.2  # or whatever threshold makes sense for imu
+        self.stuck_threshold = 0.02  # or whatever threshold makes sense for imu
         self.stuck_timeout = 2.5
 
 
@@ -119,10 +119,9 @@ class Driver:
             self.controller.set_throttle(self.forward_speed)
 
         elif time_since_recovery > self.recovery_cooldown:
-            time_since_move = time.time() - self.last_movement_time
-            if time_since_move > self.stuck_timeout:
-                print("STUCK — backing up to recover.")
-                await self.recover()
+            self.last_recovery_time = time.time()
+            print("STUCK — backing up to recover.")
+            await self.recover()
 
 
 
