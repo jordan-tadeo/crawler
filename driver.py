@@ -93,9 +93,7 @@ class Driver:
         self.controller.set_throttle(0)
         await asyncio.sleep(0.5)
 
-        self.controller.set_steering(-turn_dir, 0)
-        self.controller.set_throttle(self.forward_speed)
-        await asyncio.sleep(2)
+        self.controller.set_steering(self.get_steering_bias())
 
     async def tick(self):
         depth = self.camera.get_depth_frame()
@@ -121,6 +119,9 @@ class Driver:
             self.last_recovery_time = time.time()
             print("STUCK — backing up to recover.")
             await self.recover()
+            steering = self.get_steering_bias(depth)
+            self.controller.set_steering(steering, 0)
+            self.controller.set_throttle(self.forward_speed)
 
 
 
