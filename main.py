@@ -27,7 +27,7 @@ async def control_loop(vc: VehicleController, driver: Driver):
                 # await driver.tick()
                 print(f"{t = }")
                 vc.set_throttle(t)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.5)
                 t -= 0.1
                 if t < -1:
                      t = 0
