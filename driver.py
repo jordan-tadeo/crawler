@@ -12,7 +12,7 @@ class Driver:
         self.turning = False
         self.last_movement_time = time.time()
         self.last_recovery_time = 0  # timestamp of last stuck recovery
-        self.recovery_cooldown = 3.0  # seconds to wait before checking for stuck again
+        self.recovery_cooldown = 5.0  # seconds to wait before checking for stuck again
         self.imu_history = []
         self.imu_window_size = 5  # adjust window size for smoothing    
 
@@ -21,7 +21,7 @@ class Driver:
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.max_turn = 0.7       # light steering during recovery
-        self.stuck_threshold = 0.3  # or whatever threshold makes sense for imu
+        self.stuck_threshold = 0.2  # or whatever threshold makes sense for imu
         self.stuck_timeout = 2.5
 
 
