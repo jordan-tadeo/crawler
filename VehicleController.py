@@ -103,8 +103,6 @@ class VehicleController:
             pulse = ESC_NEUTRAL_PW
         self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
 
-        print(f"Pulse width = {pulse}")
-
         return pulse
     
     def set_steering(self, front, rear) -> Tuple[int, int]:

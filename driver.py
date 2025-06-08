@@ -18,7 +18,7 @@ class Driver:
 
 
         # Tunable parameters
-        self.forward_speed = 0.1    # very slow forward motion
+        self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.5   # very slow backup
         self.max_turn = 0.7       # light steering during recovery
         self.stuck_threshold = 0.3  # or whatever threshold makes sense for imu
@@ -84,20 +84,19 @@ class Driver:
         """Backup and turn to avoid obstacle."""
         print("[Driver] Obstacle detected — reversing and turning")
 
-        #pick rando direction
+        # pick rando direction
         turn_dir = random.choice([self.max_turn/2, self.max_turn])
         self.controller.set_steering(turn_dir, -turn_dir)
 
         self.controller.set_throttle(self.reverse_speed)
-        print(f"{self.reverse_speed = }")
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2)
 
         self.controller.set_throttle(0)
         await asyncio.sleep(0.6)
 
         self.controller.set_steering(-turn_dir, turn_dir)
         self.controller.set_throttle(self.forward_speed)
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(2)
 
     async def tick(self):
         depth = self.camera.get_depth_frame()
