@@ -20,7 +20,7 @@ class Driver:
         # Tunable parameters
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.6   # very slow backup
-        self.max_turn = 0.7       # light steering during recovery
+        self.max_turn = 1      
         self.stuck_threshold = 0.02  # or whatever threshold makes sense for imu
         self.stuck_timeout = 2.5
 
@@ -92,9 +92,9 @@ class Driver:
         await asyncio.sleep(2)
 
         self.controller.set_throttle(0)
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.5)
 
-        self.controller.set_steering(-turn_dir, turn_dir)
+        self.controller.set_steering(-turn_dir, 0)
         self.controller.set_throttle(self.forward_speed)
         await asyncio.sleep(2)
 
