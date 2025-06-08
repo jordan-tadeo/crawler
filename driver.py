@@ -81,7 +81,7 @@ class Driver:
 
     async def recover(self):
         """Backup and turn to avoid obstacle."""
-        print("[Driver] Obstacle detected — reversing and turning")
+        print("[Driver] reversing and turning")
 
         # pick rando direction
         turn_dir = random.choice([self.max_turn/2, self.max_turn])
@@ -92,6 +92,8 @@ class Driver:
 
         self.controller.set_throttle(0)
         await asyncio.sleep(0.5)
+
+        self.controller.set_steering(-turn_dir, 0)
 
     async def tick(self):
         depth = self.camera.get_depth_frame()
@@ -118,8 +120,6 @@ class Driver:
             print("STUCK — backing up to recover.")
             await self.recover()
             steering = self.get_steering_bias(depth)
-            self.controller.set_steering(steering, 0)
-            self.controller.set_throttle(self.forward_speed)
 
 
 
