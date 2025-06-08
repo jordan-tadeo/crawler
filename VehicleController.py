@@ -8,7 +8,7 @@ import Logger
 
 # Constants for control of the Quicrun 880 ESC
 ESC_GPIO_PIN = 18
-ESC_NEUTRAL_PW = 1575
+ESC_NEUTRAL_PW = 1700
 ESC_FULL_FORWARD_PW = 2000
 ESC_FULL_REVERSE_PW = 1000
 
@@ -102,6 +102,9 @@ class VehicleController:
         else:
             pulse = ESC_NEUTRAL_PW
         self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
+
+        print(f"Pulse width = {pulse}")
+
         return pulse
     
     def set_steering(self, front, rear) -> Tuple[int, int]:
