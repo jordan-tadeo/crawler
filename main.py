@@ -29,7 +29,7 @@ async def control_loop(vc: VehicleController, driver: Driver):
                 vc.set_throttle(t)
                 await asyncio.sleep(0.1)
                 t -= 0.1
-                if t > -1:
+                if t < -1:
                      t = 0
         except KeyboardInterrupt:
             print("\n[Shutdown] Stopping ESC and Servos...")
