@@ -102,29 +102,24 @@ class Driver:
         # Skip stuck check if recently recovered
         time_since_recovery = time.time() - self.last_recovery_time
 
-        # sanity check
-        self.controller.set_steering(0, 0)
-        self.controller.set_throttle(1)
+        # Obstacle detected in front
+        if self.obstacle_in_front(depth):
+            print("Obstacle detected — backing up.")
+            await self.recover()
+            return
 
-        # # Obstacle detected in front
-        # if self.obstacle_in_front(depth):
-        #     print("Obstacle detected — backing up.")
-        #     await self.recover()
-        #     return
-
-        # # If still moving
-        # if self.is_moving(imu):
-        #     self.last_movement_time = time.time()
-        #     steering = self.get_steering_bias(depth)
-        #     self.controller.set_steering(steering, 0)
-        #     self.controller.set_throttle(self.forward_speed)
-
-        # # Haven't moved for a while
-        # elif time_since_recovery > self.recovery_cooldown:
-        #     self.last_recovery_time = time.time()
-        #     print("STUCK — backing up to recover.")
-        #     await self.recover()
-        #     steering = self.get_steering_bias(depth)
+        # If still moving
+        if self.is_moving(imu):
+            self.last_movement_time = time.time()
+            steering = self.get_steering_bias(depth)
+            self.controller.set_steering(steering, 0)
+            self.controller.set_throttle(self.forward_speed)
+        # Haven't moved for a while
+        elif time_since_recovery > self.recovery_cooldown:
+            self.last_recovery_time = time.time()
+            print("STUCK — backing up to recover.")
+            await self.recover()
+            steering = self.get_steering_bias(depth)
 
 
 
