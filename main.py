@@ -24,7 +24,6 @@ ESC_FULL_REVERSE_PW = 1100
 async def control_loop(vc: VehicleController, driver: Driver):
 
         try:
-            t = 0
             while True:
                 # Do something
                 await driver.tick()
