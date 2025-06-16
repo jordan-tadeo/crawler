@@ -17,7 +17,8 @@ import os
 # os.environ['DEPTHAI_LEVEL'] = 'debug'
 
 ESC_NEUTRAL_PW = 1325
-ESC_FULL_FORWARD_PW = 1865
+ESC_FULL_FORWARD_PW = 1850
+ESC_MIN_FORWARD_PW = 1500
 ESC_FULL_REVERSE_PW = 1100
 
 # === Main Control Loop ===
@@ -27,7 +28,7 @@ async def control_loop(vc: VehicleController, driver: Driver):
             while True:
                 # Do something
                 await driver.tick()
-                await vc.throttle_sweep(1100, 1951, 50, 2)
+                # await vc.throttle_sweep(1100, 1951, 50, 2)
                 await asyncio.sleep(0.1)
         except KeyboardInterrupt:
             print("\n[Shutdown] Stopping ESC and Servos...")
