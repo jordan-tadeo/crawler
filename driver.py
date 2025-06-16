@@ -18,7 +18,7 @@ class Driver:
 
 
         # Tunable parameters
-        self.forward_speed = 0.2    # very slow forward motion
+        self.forward_speed = 0.3    # very slow forward motion
         self.reverse_speed = -0.6   # very slow backup
         self.max_turn = 0.6         # limit to avoid servo damage when steering against an object
         self.stuck_threshold = 0.2  # or whatever threshold makes sense for imu
@@ -108,13 +108,14 @@ class Driver:
             await self.recover()
             return
 
-        # Check motion
+        # If still moving
         if self.is_moving(imu):
             self.last_movement_time = time.time()
             steering = self.get_steering_bias(depth)
             self.controller.set_steering(steering, 0)
             self.controller.set_throttle(self.forward_speed)
 
+        # Haven't moved for a while
         elif time_since_recovery > self.recovery_cooldown:
             self.last_recovery_time = time.time()
             print("STUCK — backing up to recover.")
