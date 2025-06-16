@@ -166,7 +166,7 @@ class VehicleController:
 
     async def throttle_sweep(self, start: int, end: int, step: int) -> None:
         ''' 
-        Sweep the throttle from start to end with a given step.
+        Sweep the throttle from start to end with a given step. uses PWM numbers
         '''
         for pulse in range(start, end, step):
             self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
