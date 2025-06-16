@@ -10,8 +10,10 @@ import time
 # Constants for control of the Quicrun 880 ESC
 ESC_GPIO_PIN = 18
 ESC_NEUTRAL_PW = 1350
-ESC_FULL_FORWARD_PW = 1945
+ESC_MIN_FORWARD_PW = 1500
+ESC_FULL_FORWARD_PW = 1850
 ESC_FULL_REVERSE_PW = 1100
+
 
 # Constants for PCA9685 PWM Channels (Servos)
 PAN_CHANNEL = 12
@@ -97,7 +99,7 @@ class VehicleController:
         value = max(-1.0, min(1.0, value)) if value else 0
 
         if value > 0:
-            pulse = int(ESC_NEUTRAL_PW + value * (ESC_FULL_FORWARD_PW - ESC_NEUTRAL_PW))
+            pulse = int(ESC_NEUTRAL_PW + value * (ESC_FULL_FORWARD_PW - ESC_MIN_FORWARD_PW))
         elif value < 0:
             pulse = int(ESC_NEUTRAL_PW - abs(value) * (ESC_NEUTRAL_PW - ESC_FULL_REVERSE_PW))
         else:
