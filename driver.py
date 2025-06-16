@@ -87,13 +87,14 @@ class Driver:
         turn_dir = random.choice([self.max_turn/4, self.max_turn])
         self.controller.set_steering(turn_dir, -turn_dir)
 
-        self.controller.set_throttle(-self.reverse_speed)
+        self.controller.set_throttle(self.reverse_speed)
         await asyncio.sleep(2)
 
         self.controller.set_throttle(0)
         await asyncio.sleep(0.5)
 
         self.controller.set_steering(-turn_dir, 0)
+        self.controller.set_throttle(self.forward_speed/2)
 
     async def tick(self):
         depth = self.camera.get_depth_frame()
