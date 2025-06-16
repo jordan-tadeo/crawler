@@ -106,7 +106,7 @@ class Driver:
         steering = self.get_steering_bias(depth)
         self.controller.set_steering(steering, 0)
         self.controller.set_throttle(self.forward_speed)
-        print(f"[Driver] set throttle to {self.forward_speed:.2f}, PWM = {self.controller.get_throttle_pwm()}")
+        print(f"[Driver] state = {self.controller.get_state()}")
 
         # Obstacle detected in front
         if self.obstacle_in_front(depth):
