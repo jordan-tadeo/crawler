@@ -105,7 +105,6 @@ class Driver:
         # sanity check
         self.controller.set_steering(0, 0)
         self.controller.set_throttle(1)
-        print(f"Throttle: {self.reverse_speed:.2f}, Steering: 0.00")
 
         # # Obstacle detected in front
         # if self.obstacle_in_front(depth):
