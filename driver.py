@@ -96,6 +96,7 @@ class Driver:
         self.controller.set_steering(-turn_dir, 0)
         print("[Driver] setting forward throttle")
         self.controller.set_throttle(self.forward_speed/2)
+        await asyncio.sleep(1)
 
     async def tick(self):
         depth = self.camera.get_depth_frame()
