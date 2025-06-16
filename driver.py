@@ -94,6 +94,7 @@ class Driver:
         await asyncio.sleep(0.5)
 
         self.controller.set_steering(-turn_dir, 0)
+        print("[Driver] setting forward throttle")
         self.controller.set_throttle(self.forward_speed/2)
 
     async def tick(self):
