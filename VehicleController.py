@@ -164,14 +164,14 @@ class VehicleController:
         self.pca.deinit()
         self.i2c.deinit()
 
-    async def throttle_sweep(self, start: int, end: int, step: int) -> None:
+    async def throttle_sweep(self, start: int, end: int, step: int, delay: int = 3) -> None:
         ''' 
         Sweep the throttle from start to end with a given step. uses PWM numbers
         '''
         for pulse in range(start, end, step):
             self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
             print(f"Throttle Pulse Width: {pulse}")
-            time.sleep(3)
+            time.sleep(delay)
         self.return_neutral()
         self.logger.log("info", "Throttle Sweep", "Throttle sweep completed.")
 
