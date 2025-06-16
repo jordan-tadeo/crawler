@@ -99,7 +99,7 @@ class VehicleController:
         value = max(-1.0, min(1.0, value)) if value else 0
 
         if value > 0:
-            pulse = int(ESC_NEUTRAL_PW + value * (ESC_FULL_FORWARD_PW - ESC_MIN_FORWARD_PW))
+            pulse = int(ESC_MIN_FORWARD_PW + value * (ESC_FULL_FORWARD_PW - ESC_MIN_FORWARD_PW))
         elif value < 0:
             pulse = int(ESC_NEUTRAL_PW - abs(value) * (ESC_NEUTRAL_PW - ESC_FULL_REVERSE_PW))
         else:
