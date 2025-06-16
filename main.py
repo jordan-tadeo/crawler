@@ -27,7 +27,7 @@ async def control_loop(vc: VehicleController, driver: Driver):
             while True:
                 # Do something
                 await driver.tick()
-                # await vc.throttle_sweep(1100, 1901, 100, 2)
+                await vc.throttle_sweep(1100, 1951, 50, 2)
                 await asyncio.sleep(0.1)
         except KeyboardInterrupt:
             print("\n[Shutdown] Stopping ESC and Servos...")
