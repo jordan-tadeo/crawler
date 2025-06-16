@@ -5,6 +5,7 @@ from adafruit_pca9685 import PCA9685
 from adafruit_motor import servo
 from typing import Tuple
 import Logger
+import time
 
 # Constants for control of the Quicrun 880 ESC
 ESC_GPIO_PIN = 18
@@ -162,4 +163,14 @@ class VehicleController:
         self.pi.stop()
         self.pca.deinit()
         self.i2c.deinit()
+
+    async def throttle_sweep(self, start: int, end: int, step: int) -> None:
+        ''' 
+        Sweep the throttle from start to end with a given step.
+        '''
+        for pulse in range(start, end, step):
+            self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
+            time.sleep(3)
+        self.return_neutral()
+        self.logger.log("info", "Throttle Sweep", "Throttle sweep completed.")
 
