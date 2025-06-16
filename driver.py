@@ -18,7 +18,7 @@ class Driver:
 
 
         # Tunable parameters
-        self.forward_speed = 0.4    # very slow forward motion
+        self.forward_speed = 0.6    # very slow forward motion
         self.reverse_speed = -0.6   # very slow backup
         self.max_turn = 0.6         # limit to avoid servo damage when steering against an object
         self.stuck_threshold = 0.2  # or whatever threshold makes sense for imu
