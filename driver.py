@@ -84,7 +84,7 @@ class Driver:
         print("[Driver] reversing and turning")
 
         # pick rando direction
-        turn_dir = random.choice([self.max_turn/2, self.max_turn])
+        turn_dir = random.choice([self.max_turn/4, self.max_turn])
         self.controller.set_steering(turn_dir, -turn_dir)
 
         self.controller.set_throttle(self.reverse_speed)
