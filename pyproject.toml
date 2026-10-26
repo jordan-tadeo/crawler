@@ -23,6 +23,24 @@ dependencies = [
     "Adafruit-Blinka==8.56.0",
     "adafruit-circuitpython-pca9685==3.4.17",
     "adafruit-circuitpython-motor==3.4.15",
+    # Live telemetry to Foxglove Studio. This is the official SDK, and the
+    # name is worth being careful about: the package called `foxglove` on PyPI
+    # is a Firefox proxy profile manager by somebody else entirely. The one I
+    # want is `foxglove-sdk`, which installs as `import foxglove`.
+    #
+    # The other candidate was `foxglove-websocket`, the older pure-Python
+    # server. Its own PyPI summary now reads "deprecated in favor of
+    # foxglove-sdk", so it is out on those grounds alone -- but the thing I
+    # checked first was wheels, because this one is Rust underneath and a Rust
+    # package with no aarch64 wheel means cargo building on a Pi 4. It ships
+    # abi3 wheels, so one build covers 3.10 and up, and the aarch64 ones are
+    # there:
+    #
+    #   foxglove_sdk-0.30.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+    #   foxglove_sdk-0.30.2-cp310-abi3-manylinux_2_28_aarch64.whl
+    #
+    # The Pi is glibc 2.36, so either tag is satisfied and nothing compiles.
+    "foxglove-sdk==0.30.2",
 ]
 
 [project.optional-dependencies]

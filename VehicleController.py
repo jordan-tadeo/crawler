@@ -67,6 +67,26 @@ class VehicleController:
         self.front_steering_servo = servo.Servo(self.pca.channels[FRONT_STEERING_CHANNEL], actuation_range=180)
         self.rear_steering_servo = servo.Servo(self.pca.channels[REAR_STEERING_CHANNEL], actuation_range=180)
 
+        # The last thing commanded, recorded as a side effect of commanding it.
+        #
+        # Read-only bookkeeping. Every one of these is a number the setters
+        # below have already worked out and are about to write anyway, so
+        # keeping it costs nothing -- and it means telemetry can report what
+        # was asked for without asking the hardware what it got. Asking is the
+        # expensive direction: get_state() is a pigpio round trip and two I2C
+        # reads, which is exactly why the control loop only polls it once a
+        # second.
+        #
+        # Nothing reads these to make a driving decision and nothing writes
+        # hardware off the back of them. There is still exactly one writer to
+        # the ESC and the servos, and it is still this class.
+        self.last_throttle = 0.0
+        self.last_esc_pulse = ESC_NEUTRAL_PW
+        self.last_steering_front = 0.0
+        self.last_steering_rear = 0.0
+        self.last_front_angle = 90
+        self.last_rear_angle = 90
+
         # Disarm before anything else gets a chance to command. pigpio latches
         # a pulse width and keeps emitting it, so if the last process was
         # SIGKILLed mid-throttle the ESC is still being fed that value right
@@ -121,6 +141,10 @@ class VehicleController:
         else:
             pulse = ESC_NEUTRAL_PW
         self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, pulse)
+        # After the write, not before. If pigpio raises, nothing was commanded
+        # and the record should not claim otherwise.
+        self.last_throttle = value
+        self.last_esc_pulse = pulse
         return pulse
     
     def set_steering(self, front, rear) -> Tuple[int, int]:
@@ -128,17 +152,28 @@ class VehicleController:
         Set the steering angle for the servos.
         '''
 
+        # What was asked for, before the sign flip below turns it into a servo
+        # direction. This is the number the caller handed over, and it is the
+        # one worth reporting: a telemetry channel that showed the inverted
+        # value would read as a steering bug every time I looked at it.
+        asked_front, asked_rear = front, rear
+
         # Restrict values to the range [-1, 1]
         front = max(-1.0, min(1.0, -front)) if front else 0
         rear = max(-1.0, min(1.0, -rear)) if rear else 0
-        
+
         # Map the range [-1, 1] to [0, 180] for servo angle
         front_angle = int((front + 1.0) * 90)
         rear_angle = int((rear + 1.0) * 90)
-        
+
         self.front_steering_servo.angle = front_angle
         self.rear_steering_servo.angle = rear_angle
-        
+
+        self.last_steering_front = asked_front or 0.0
+        self.last_steering_rear = asked_rear or 0.0
+        self.last_front_angle = front_angle
+        self.last_rear_angle = rear_angle
+
         return front_angle, rear_angle
     
     def set_pan_tilt(self, pan, tilt) -> Tuple[int, int]:
@@ -179,6 +214,18 @@ class VehicleController:
         self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, ESC_NEUTRAL_PW)
         self.front_steering_servo.angle = 90
         self.rear_steering_servo.angle = 90
+
+        # This path writes the hardware directly instead of going through the
+        # two setters, so it has to keep the record straight itself. It is set
+        # last for the same reason the setters set it last: if one of the three
+        # writes above raised, the car is not at neutral and this must not say
+        # it is.
+        self.last_throttle = 0.0
+        self.last_esc_pulse = ESC_NEUTRAL_PW
+        self.last_steering_front = 0.0
+        self.last_steering_rear = 0.0
+        self.last_front_angle = 90
+        self.last_rear_angle = 90
     
     def close(self) -> None:
         '''

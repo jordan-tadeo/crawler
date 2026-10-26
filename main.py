@@ -97,6 +97,9 @@ class AutoPilot:
         self.driver = None
         self.unavailable = False
         self._next_tick = 0.0
+        # Set once a CameraHub exists. None means no camera at all, which is
+        # the normal state on a manual boot.
+        self.hub = None
 
     def resume(self):
         """Start or restart auto mode. True if it is running."""
@@ -156,6 +159,32 @@ class AutoPilot:
         self.driver = None
         self._release()
 
+    # ---- what telemetry asks about the camera ----------------------------
+    #
+    # These three are the whole of AutoPilot's telemetry surface. They never
+    # touch the device and never block: the camera is owned by a CameraHub on
+    # its own thread, and all three of these read a field it has already set.
+
+    def camera_state(self) -> str:
+        if self.hub is None:
+            return "off"
+        return self.hub.state
+
+    def camera_error(self) -> str:
+        if self.hub is None:
+            return ""
+        return self.hub.error or ""
+
+    def pump_telemetry(self, tele, now):
+        """Offer whatever the camera has, if anybody is watching it.
+
+        Called from the control loop every tick. With no camera, or with
+        Foxglove shut, this is one None check and three dict lookups.
+        """
+        if self.hub is None:
+            return
+        self.hub.pump_telemetry(tele, now)
+
     def _release(self):
         if self.oakd is not None:
             try:
@@ -165,15 +194,33 @@ class AutoPilot:
             self.oakd = None
 
 
+def read_pad_intent(joystick):
+    """What the pad is asking for: (throttle, steering front, steering rear).
+
+    Reads only. Pulled out of drive_manual so telemetry can report what the
+    sticks are saying while auto has the wheels, without there being a second
+    copy of the three readings that could drift away from the ones that
+    actually drive the car.
+    """
+    return (
+        joystick.read_throttle(),
+        joystick.get_axis("LEFT_X", limit_perc=STEERING_LIMIT_PERC),
+        joystick.get_axis("RIGHT_X", limit_perc=STEERING_LIMIT_PERC),
+    )
+
+
 def drive_manual(joystick, vecon, log):
-    """One tick of hand driving. Anything that goes wrong in here means neutral."""
+    """One tick of hand driving. Anything that goes wrong in here means neutral.
+
+    Returns what it commanded, so the caller does not have to read the pad a
+    second time to report it.
+    """
     try:
-        throttle = joystick.read_throttle()
-        steering_front = joystick.get_axis("LEFT_X", limit_perc=STEERING_LIMIT_PERC)
-        steering_rear = joystick.get_axis("RIGHT_X", limit_perc=STEERING_LIMIT_PERC)
+        throttle, steering_front, steering_rear = read_pad_intent(joystick)
 
         vecon.set_throttle(throttle)
         vecon.set_steering(steering_front, steering_rear)
+        return throttle, steering_front, steering_rear
     except Exception as e:
         # A pad that re-pairs at a different SDL index leaves a handle whose
         # get_axis raises, or worse, keeps answering with stale values. An
@@ -184,20 +231,40 @@ def drive_manual(joystick, vecon, log):
         except Exception:
             pass
         log.log("warning", "Manual", f"Dropped a tick, holding neutral: {e}")
+        return 0.0, 0.0, 0.0
 
 
-def control_loop(joystick, vecon, autopilot, modes, log, stop_event):
+def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
     """Poll the controller and drive whichever mode is current.
 
     Only one mode ever has the wheels: auto runs as a step() on this thread
     and manual writes nothing while auto is up, so a switch can never leave
     the car rolling under two owners.
+
+    `tele` is a telemetry.Telemetry, or None. A Telemetry that failed to start
+    is already a complete no-op -- wants() is False for every channel -- so
+    there is no third case to handle and no branch in here that depends on
+    whether Foxglove is installed, running or being watched.
     """
     import pygame
+    import telemetry as tm
+
+    if tele is None:
+        tele = tm.Telemetry()  # never started, so every call below is a no-op
 
     vehicle_state = None
+    state_read_at = 0.0
     next_state_poll = 0.0
     was_connected = joystick.is_connected()
+
+    # Diagnostics bookkeeping. tick_max_ms is the number that matters: it is
+    # the longest this loop has spent on one pass since the last diagnostics
+    # message, and if telemetry ever did block the loop, this is where it
+    # would show up. Watching it in Foxglove while driving is the point.
+    last_error = ""
+    tick_max_ms = 0.0
+    tick_count = 0
+    window_started = time.monotonic()
 
     try:
         while not stop_event.is_set():
@@ -216,6 +283,20 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event):
                         log.log("warning", "Mode", "Parked auto, back to manual")
                     vecon.return_neutral()
                     was_connected = False
+                    last_error = "controller disconnected"
+                # Say so once before parking in the wait below, or the last
+                # thing Foxglove ever saw would be a connected pad.
+                if tele.wants("diagnostics", now):
+                    tele.offer("diagnostics", {
+                        "mode": modes.mode,
+                        "controller_connected": False,
+                        "auto_available": not autopilot.unavailable,
+                        "camera_state": autopilot.camera_state(),
+                        "camera_error": autopilot.camera_error(),
+                        "last_error": last_error,
+                        "loop_hz": 0.0,
+                        "loop_tick_max_ms": tick_max_ms,
+                    }, now)
                 # Interruptible, so a systemctl stop does not sit here until
                 # TimeoutStopSec runs out and systemd SIGKILLs us past
                 # vecon.close().
@@ -241,7 +322,68 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event):
             elif not autopilot.step(now):
                 modes.mode = MANUAL
                 vecon.return_neutral()
+                last_error = "auto gave up"
                 log.log("warning", "Mode", "Auto gave up, dropping to manual")
+
+            # Telemetry. Every one of these is the same shape: ask whether
+            # anybody is watching the channel and whether its rate gate has
+            # come round, and only then build the message. With Foxglove shut
+            # the wants() call is two dict lookups and a float compare, so
+            # this whole block costs nothing and allocates nothing.
+            #
+            # offer() drops the message into a one-deep mailbox and returns.
+            # It does not encode, it does not touch a socket, and it cannot
+            # wait on the laptop. See telemetry.py.
+            if tele.wants("controller", now):
+                # Read the pad again rather than reuse what drive_manual
+                # commanded, because in auto mode drive_manual did not run
+                # and the sticks are still worth seeing. Three cached SDL
+                # reads off the event pump that already happened; no syscall.
+                try:
+                    intent = read_pad_intent(joystick)
+                except Exception:
+                    intent = (0.0, 0.0, 0.0)
+                tele.offer("controller",
+                           tm.controller_sample(joystick, *intent), now)
+
+            if tele.wants("vehicle", now):
+                readback_age = now - state_read_at if state_read_at else -1.0
+                tele.offer("vehicle", {
+                    "mode": modes.mode,
+                    # What the last command asked for, recorded by
+                    # VehicleController as it wrote it. Free; no bus traffic.
+                    "throttle": float(vecon.last_throttle or 0.0),
+                    "steering_front": float(vecon.last_steering_front or 0.0),
+                    "steering_rear": float(vecon.last_steering_rear or 0.0),
+                    "esc_pulse_us": int(vecon.last_esc_pulse or 0),
+                    # What pigpio says is on GPIO18. A real round trip, so it
+                    # is whatever the once-a-second poll below last read and
+                    # not a fresh one -- reading it at 20 Hz would put bus I/O
+                    # back on the throttle's thread. readback_age_s says how
+                    # old it is so the number cannot be mistaken for live.
+                    "esc_pulse_us_readback": int((vehicle_state or {}).get("throttle") or 0),
+                    "steering_front_angle": float((vehicle_state or {}).get("front_s") or 0.0),
+                    "steering_rear_angle": float((vehicle_state or {}).get("rear_s") or 0.0),
+                    "readback_age_s": readback_age,
+                }, now)
+
+            if tele.wants("diagnostics", now):
+                elapsed = now - window_started
+                tele.offer("diagnostics", {
+                    "mode": modes.mode,
+                    "controller_connected": True,
+                    "auto_available": not autopilot.unavailable,
+                    "camera_state": autopilot.camera_state(),
+                    "camera_error": autopilot.camera_error(),
+                    "last_error": last_error,
+                    "loop_hz": (tick_count / elapsed) if elapsed > 0 else 0.0,
+                    "loop_tick_max_ms": tick_max_ms,
+                }, now)
+                tick_max_ms = 0.0
+                tick_count = 0
+                window_started = now
+
+            autopilot.pump_telemetry(tele, now)
 
             # Reading the state is three pigpio and I2C round trips, and this
             # loop runs at 100 Hz. Doing it every tick was about 54 MB of log
@@ -256,6 +398,17 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event):
                     log.log("info", "Vehicle State Change", f"New state: {new_vehicle_state}")
                     log.csv("log/vehicle_state_log.csv", "Vehicle State Change", new_vehicle_state)
                 vehicle_state = new_vehicle_state
+                state_read_at = now
+
+            # How long that pass took, before the wait. This is measured after
+            # everything including the telemetry block on purpose: it is the
+            # evidence that the telemetry block costs nothing, and if it ever
+            # stops costing nothing it shows up here and gets published on
+            # /diagnostics as loop_tick_max_ms.
+            tick_ms = (time.monotonic() - now) * 1000.0
+            if tick_ms > tick_max_ms:
+                tick_max_ms = tick_ms
+            tick_count += 1
 
             stop_event.wait(LOOP_INTERVAL)
     except KeyboardInterrupt:
@@ -279,6 +432,28 @@ def parse_args(argv=None):
         action="store_true",
         help="show the PyQt depth dashboard (needs a display)",
     )
+    # On by default, and the reason is that it has to be on when I want it,
+    # not when I remembered to ask for it. The whole value of this is opening
+    # Foxglove while something is going wrong, and if it needed a flag I would
+    # have to stop the service, edit the unit and restart it first -- by which
+    # point whatever I wanted to look at is over. It is also as close to free
+    # as I can make it: with nothing connected, every channel's has_sinks() is
+    # false and the control loop builds no messages at all.
+    #
+    # --no-telemetry is the off switch, and it takes the whole thing out: no
+    # thread, no socket, no port bound.
+    parser.add_argument(
+        "--telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="serve live telemetry to Foxglove (default: on)",
+    )
+    parser.add_argument(
+        "--telemetry-port",
+        type=int,
+        default=8765,
+        help="port for the Foxglove WebSocket server (default: 8765)",
+    )
     return parser.parse_args(argv)
 
 
@@ -297,6 +472,7 @@ def main(argv=None):
     import pygame
     import VehicleController as vc
     import Joystick as js
+    import telemetry as tm
 
     pygame.init()
     log = lg.Logger()
@@ -321,6 +497,15 @@ def main(argv=None):
     autopilot = AutoPilot(vecon, log)
     modes = ModeSwitch(args.mode, log)
 
+    # Before the joystick, because Joystick() blocks waiting for a pad and I
+    # want the server already listening while it waits -- that wait is one of
+    # the things worth watching from the laptop. start() never raises: a
+    # missing foxglove-sdk or a port somebody else is already on costs
+    # telemetry and nothing else.
+    tele = tm.Telemetry(logger=log, port=args.telemetry_port)
+    if args.telemetry:
+        tele.start()
+
     joystick = js.Joystick(stop_event=stop_event)
 
     if modes.mode == AUTO and not autopilot.resume():
@@ -330,7 +515,13 @@ def main(argv=None):
     log.log("info", "Startup", f"Running in {modes.mode} mode")
 
     if not args.dashboard:
-        control_loop(joystick, vecon, autopilot, modes, log, stop_event)
+        try:
+            control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele)
+        finally:
+            # After control_loop's own finally, which is what disarms the ESC.
+            # Telemetry goes last because it is the one thing in this process
+            # that does not matter.
+            tele.stop()
         return 0
 
     # With the dashboard, Qt owns the main thread and the control loop runs
@@ -347,7 +538,7 @@ def main(argv=None):
 
     worker = threading.Thread(
         target=control_loop,
-        args=(joystick, vecon, autopilot, modes, log, stop_event),
+        args=(joystick, vecon, autopilot, modes, log, stop_event, tele),
         daemon=True,
     )
     worker.start()
@@ -360,6 +551,7 @@ def main(argv=None):
     finally:
         stop_event.set()
         worker.join(timeout=5)
+        tele.stop()
 
 
 if __name__ == "__main__":

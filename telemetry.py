@@ -1,0 +1,633 @@
+"""Live telemetry out to Foxglove, on a thread that cannot stall the car.
+
+What this is for: watching the controller, the vehicle state, the OAK-D IMU
+and the depth picture from the laptop while the car is being driven, instead
+of reading app.log afterwards. Foxglove Studio connects straight to the Pi --
+no broker, no rosbridge, no cloud:
+
+    ws://192.168.68.56:8765
+
+The one rule this file exists to obey
+-------------------------------------
+pigpio latches a servo pulse width and emits it forever. The control loop is
+the only thing that can take that pulse width back to neutral, so anything
+that can delay the loop can run the car into a wall with a dead process at
+the wheel. A WebSocket client is the worst possible thing to put near that
+loop: it is a socket to a laptop on wifi, it can be slow, it can be a
+half-open TCP connection that takes two minutes to notice, and the laptop can
+be closed mid-frame.
+
+So the control thread never touches a socket. It calls wants() -- which is a
+dict lookup and two float compares -- and offer(), which drops a value into a
+one-deep mailbox and returns. Everything after that (JSON encoding, JPEG
+encoding, colormapping, the actual write) happens on the publisher thread in
+here. If that thread falls behind, the mailboxes overwrite and old samples
+are dropped on the floor, which is the correct answer for live telemetry: a
+stale frame is worth nothing and a late throttle command is worth less.
+
+Costs nothing when nobody is watching
+-------------------------------------
+Every channel is gated on Channel.has_sinks() -- note that it is a method on
+this SDK and not the property the type stubs make it look like. With no
+Foxglove client connected, wants() is False for everything, so the control
+loop builds no dicts and the publisher thread encodes no JPEGs. This is a
+4-core Pi that is also running a 100 Hz control loop; telemetry is not
+allowed to cost anything when it is not being read.
+
+Failure is always non-fatal
+---------------------------
+A missing foxglove-sdk, a port already bound by a previous process, a client
+that vanished mid-write: all of it is caught in here and logged. start()
+returns False and the car drives exactly as it did before. There is no path
+through this file that reaches the hardware -- telemetry only ever reads
+values the control loop has already computed, and it has no reference to the
+VehicleController at all.
+"""
+
+import json
+import queue
+import threading
+import time
+
+# The Foxglove default, which is what Studio offers in the connection dialog,
+# so there is nothing to type but the host.
+DEFAULT_PORT = 8765
+
+# 0.0.0.0, not the SDK's default of 127.0.0.1. The whole point is a laptop on
+# the other side of the wifi, and the loopback default fails silently -- the
+# server comes up, the port is open on the Pi, and the Mac cannot reach it.
+DEFAULT_HOST = "0.0.0.0"
+
+# How often the publisher thread drains the mailboxes. 100 Hz, the same rate
+# the control loop offers at, so a sample waits at most one tick.
+DRAIN_INTERVAL = 0.01
+
+# How often the publisher thread re-reads has_sinks() for every channel into
+# the snapshot the control thread looks at. 10 Hz is plenty -- it only decides
+# whether a channel is being watched, and being one tenth of a second late to
+# notice is invisible.
+SINK_POLL_INTERVAL = 0.1
+
+# Per-channel rate limits, in seconds between messages. These are transport
+# rates and nothing else: the control loop runs at 100 Hz and the OAK-D IMU
+# at 100 Hz, and neither a plot panel nor a wifi link wants all of it.
+#
+# The three image rates are the ones that cost real CPU. Each frame is a
+# colormap plus a JPEG encode of a downscaled frame on the publisher thread,
+# so these are the knob to turn if the Pi gets warm.
+INTERVALS = {
+    "controller": 0.05,   # 20 Hz -- fast enough to watch a trigger move
+    "vehicle": 0.05,      # 20 Hz -- commanded values only, see below
+    "diagnostics": 0.25,  # 4 Hz, and it only changes on an event anyway
+    "imu": 0.05,          # 20 Hz, downsampled from the sensor's 100 Hz
+    "depth": 0.125,       # 8 Hz
+    "disparity": 0.125,   # 8 Hz
+    "rectified_left": 0.5,  # 2 Hz -- this is for checking aim, not for driving
+}
+
+# Longest side of an image channel after downscaling, in pixels. The mono
+# cameras are 640x400, so this is a 2x reduction in each axis and a 4x
+# reduction in pixels to encode.
+IMAGE_MAX_DIM = 320
+
+# JPEG quality for the image channels. 60 is visibly lossy on a colormap and
+# nobody cares; it is a depth picture, not a photograph.
+JPEG_QUALITY = 60
+
+
+# Timestamps. One monotonic source for every channel, so a plot of the
+# throttle and a plot of the IMU line up even if NTP steps the clock mid-run.
+#
+# time.monotonic() has an arbitrary zero, and Foxglove wants nanoseconds since
+# the unix epoch or it will draw everything in 1970. So the offset between the
+# two clocks is captured once, here, at import -- and then never again. Every
+# timestamp this file emits is monotonic plus that one fixed constant, which
+# means the series cannot go backwards and cannot jump, and still lands at
+# roughly the right wall-clock time.
+_EPOCH_OFFSET = time.time() - time.monotonic()
+
+
+def epoch_ns(mono: float) -> int:
+    """A time.monotonic() reading as nanoseconds since the unix epoch."""
+    return int((mono + _EPOCH_OFFSET) * 1e9)
+
+
+def _schema(name: str, properties: dict) -> dict:
+    """A JSON Schema object with a stable name.
+
+    Passing a bare dict to Channel() works, but the SDK then invents a schema
+    name like `schema-l6Hj5PBy`, which is what Studio shows in the topic list.
+    Naming them means the panel says `crawler.Controller`.
+    """
+    return {
+        "name": name,
+        "schema": {
+            "type": "object",
+            "title": name,
+            "properties": properties,
+        },
+    }
+
+
+_NUM = {"type": "number"}
+_INT = {"type": "integer"}
+_STR = {"type": "string"}
+_BOOL = {"type": "boolean"}
+
+# The project-specific channels. There is no well-known Foxglove schema for
+# any of this -- and, worth writing down because it is not what I assumed,
+# there is no well-known Foxglove IMU schema either. The SDK's schema set has
+# CompressedImage, RawImage, LocationFix, PointCloud, Odometry, JointState and
+# forty others, and nothing for an accelerometer. So /imu is JSON as well, and
+# the panel that reads it is Plot, which is the panel I wanted anyway.
+JSON_SCHEMAS = {
+    "controller": _schema("crawler.Controller", {
+        "connected": _BOOL,
+        "name": _STR,
+        "num_axes": _INT,
+        "num_buttons": _INT,
+        # Every axis and every button by raw SDL index. This is the diagnostic
+        # half of the channel: the pad renumbers its axes between hid-generic
+        # over Bluetooth and xpad/xpadneo over USB, and that renumbering is
+        # what once turned a resting thumbstick into half throttle. Reading
+        # the indices live is how you see which map you are on.
+        "axes": {"type": "array", "items": _NUM},
+        "buttons": {"type": "array", "items": _INT},
+        # The named view, resolved through Joystick's own maps at runtime.
+        # This file does not contain a copy of those maps on purpose.
+        "named_axes": {"type": "object", "additionalProperties": _NUM},
+        "named_buttons": {"type": "object", "additionalProperties": _BOOL},
+        # Calibrated trigger rest, which is the other half of the same story.
+        "trigger_rest_rt": _NUM,
+        "trigger_rest_lt": _NUM,
+        # What the code actually computed from all of the above and handed to
+        # the hardware. If this disagrees with the sticks, the mapping is the
+        # thing that is wrong.
+        "throttle": _NUM,
+        "steering_front": _NUM,
+        "steering_rear": _NUM,
+    }),
+    "vehicle": _schema("crawler.Vehicle", {
+        "mode": _STR,
+        "throttle": _NUM,
+        "steering_front": _NUM,
+        "steering_rear": _NUM,
+        # The pulse width set_throttle() computed and wrote, returned by the
+        # call itself, so this costs no bus traffic and is good every tick.
+        "esc_pulse_us": _INT,
+        # What pigpio says is actually on GPIO18, read back off the daemon.
+        # This is a real round trip and it is NOT free, so it is whatever the
+        # control loop's once-a-second state poll last read, not a fresh read
+        # -- reading it at 20 Hz would put I/O on the throttle's thread, which
+        # is the exact mistake the state poll exists to avoid. age_s says how
+        # stale it is.
+        "esc_pulse_us_readback": _INT,
+        "steering_front_angle": _NUM,
+        "steering_rear_angle": _NUM,
+        "readback_age_s": _NUM,
+    }),
+    "diagnostics": _schema("crawler.Diagnostics", {
+        "mode": _STR,
+        "controller_connected": _BOOL,
+        "auto_available": _BOOL,
+        "camera_state": _STR,
+        "camera_error": _STR,
+        "last_error": _STR,
+        "loop_hz": _NUM,
+        "loop_tick_max_ms": _NUM,
+    }),
+    "imu": _schema("crawler.Imu", {
+        # Straight off the OAK-D's BNO086: linear acceleration in m/s^2 and
+        # raw gyro in rad/s. Enabled as LINEAR_ACCELERATION, so this reads
+        # near zero at a constant velocity -- which is the trap driver.py's
+        # is_moving() warns about and not a bug in here.
+        "accel_x": _NUM, "accel_y": _NUM, "accel_z": _NUM,
+        "gyro_x": _NUM, "gyro_y": _NUM, "gyro_z": _NUM,
+        "accel_magnitude": _NUM,
+    }),
+}
+
+# The image channels, which do get a well-known schema: foxglove.CompressedImage,
+# so the Image panel finds them on its own with no layout to build.
+IMAGE_CHANNELS = {
+    "depth": "/camera/depth",
+    "disparity": "/camera/disparity",
+    "rectified_left": "/camera/rectified_left",
+}
+
+JSON_TOPICS = {
+    "controller": "/controller",
+    "vehicle": "/vehicle",
+    "diagnostics": "/diagnostics",
+    "imu": "/imu",
+}
+
+ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
+
+
+class Telemetry:
+    """A Foxglove WebSocket server and the thread that feeds it.
+
+    Everything public splits into two halves:
+
+      the control thread calls wants() and offer(), and neither one can block
+      on a socket, a file or a lock that is held during I/O;
+
+      the publisher thread owns the server, the channels and all encoding.
+
+    An instance that failed to start is not a special case anywhere: wants()
+    is False for every key, offer() is a no-op, and the car never notices.
+    """
+
+    def __init__(self, logger=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
+        self.logger = logger
+        self.host = host
+        self.port = port
+
+        self.running = False
+        self.error = None
+
+        self._server = None
+        self._channels = {}
+        self._thread = None
+        self._stop = threading.Event()
+
+        # One mailbox per channel, one deep. put_nowait into a full queue
+        # raises instead of waiting, and the handler below throws the stale
+        # item away and keeps the new one -- drop-oldest, which for live
+        # telemetry means the laptop always sees the most recent sample it
+        # could have seen rather than a backlog of old ones.
+        #
+        # These do take a lock. It is held for the handful of microseconds it
+        # takes to append to a deque and never across any I/O: the publisher
+        # thread get_nowait()s into a local and only then encodes and writes.
+        # So the worst case for the control thread is waiting on a mutex that
+        # is already released, not on a socket.
+        self._mail = {key: queue.Queue(maxsize=1) for key in ALL_KEYS}
+
+        # has_sinks(), snapshotted by the publisher thread. Reading a bool out
+        # of a dict is the cheapest check I can give the control loop, and it
+        # cannot block even in principle.
+        self._watched = {key: False for key in ALL_KEYS}
+
+        # Rate gates, advanced in offer() by whichever thread offered.
+        self._next_at = {key: 0.0 for key in ALL_KEYS}
+
+        self._cv2 = None
+        self._np = None
+
+    # ---- lifecycle, called once from main --------------------------------
+
+    def start(self) -> bool:
+        """Bring the server up. False means telemetry is off and that is fine.
+
+        Nothing in here is allowed to raise. An ImportError because the SDK is
+        not installed on this machine, and an OSError because something is
+        already sitting on 8765, are both ordinary outcomes that cost
+        telemetry and nothing else.
+        """
+        if self.running:
+            return True
+
+        try:
+            import foxglove
+            from foxglove import Channel, Schema
+            from foxglove.channels import CompressedImageChannel
+
+            # Quiet by default. The SDK logs every client connect and
+            # disconnect at info, and this process shares a journal with the
+            # thing that drives the car.
+            try:
+                foxglove.set_log_level("WARN")
+            except Exception:
+                pass
+
+            self._server = foxglove.start_server(
+                name="crawler",
+                host=self.host,
+                port=self.port,
+            )
+
+            for key, topic in JSON_TOPICS.items():
+                spec = JSON_SCHEMAS[key]
+                self._channels[key] = Channel(
+                    topic=topic,
+                    message_encoding="json",
+                    schema=Schema(
+                        name=spec["name"],
+                        encoding="jsonschema",
+                        data=json.dumps(spec["schema"]).encode("utf-8"),
+                    ),
+                )
+
+            for key, topic in IMAGE_CHANNELS.items():
+                self._channels[key] = CompressedImageChannel(topic=topic)
+
+        except Exception as e:
+            self.error = str(e)
+            self._server = None
+            self._channels = {}
+            self._log("warning", "Telemetry",
+                      f"Not starting telemetry, driving as normal: {e}")
+            return False
+
+        self.running = True
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._publish_loop, name="telemetry", daemon=True)
+        self._thread.start()
+        self._log("info", "Telemetry",
+                  f"Foxglove server on ws://{self.host}:{self.port}")
+        return True
+
+    def stop(self):
+        """Shut the server down. Safe to call twice, and never raises."""
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+        self.running = False
+
+        for channel in self._channels.values():
+            try:
+                channel.close()
+            except Exception:
+                pass
+        self._channels = {}
+
+        server, self._server = self._server, None
+        if server is not None:
+            try:
+                server.stop()
+            except Exception as e:
+                print(f"[telemetry] server stop failed: {e}")
+
+    # ---- the control thread's half ---------------------------------------
+
+    def wants(self, key: str, now: float) -> bool:
+        """Is this channel worth building a message for right now?
+
+        False unless a Foxglove client is subscribed to it AND its rate gate
+        has come round. Two dict lookups and a float compare; no lock, no
+        allocation, no I/O. With Studio closed this is False forever and the
+        caller does no work at all.
+        """
+        if not self.running:
+            return False
+        if not self._watched.get(key, False):
+            return False
+        return now >= self._next_at.get(key, 0.0)
+
+    def offer(self, key: str, payload, now: float) -> None:
+        """Hand a message over and return. Never blocks, never raises.
+
+        A full mailbox means the publisher thread has not drained the previous
+        value yet, so the previous value is thrown away and this one takes its
+        place. Dropping is the designed behaviour, not a failure.
+        """
+        if not self.running:
+            return
+
+        mailbox = self._mail.get(key)
+        if mailbox is None:
+            return
+
+        self._next_at[key] = now + INTERVALS.get(key, 0.1)
+        item = (epoch_ns(now), payload)
+
+        try:
+            mailbox.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            mailbox.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            mailbox.put_nowait(item)
+        except queue.Full:
+            # The publisher thread refilled it between the two calls. Its
+            # value is no older than one tick, so this one is the one to drop.
+            pass
+
+    # ---- the publisher thread's half -------------------------------------
+
+    def _publish_loop(self):
+        next_sink_poll = 0.0
+
+        while not self._stop.is_set():
+            now = time.monotonic()
+
+            if now >= next_sink_poll:
+                next_sink_poll = now + SINK_POLL_INTERVAL
+                self._refresh_watched()
+
+            for key in ALL_KEYS:
+                try:
+                    log_time, payload = self._mail[key].get_nowait()
+                except queue.Empty:
+                    continue
+                except Exception:
+                    continue
+
+                # Outside the mailbox lock, always. Encoding a JPEG while
+                # holding it would hand the control thread a lock that is
+                # held for milliseconds, which is the one thing this whole
+                # file is built to prevent.
+                try:
+                    self._emit(key, payload, log_time)
+                except Exception as e:
+                    # A client that went away mid-write lands here. It is not
+                    # worth a log line per frame, and it is certainly not
+                    # worth stopping for.
+                    self.error = str(e)
+
+            self._stop.wait(DRAIN_INTERVAL)
+
+    def _refresh_watched(self):
+        for key, channel in self._channels.items():
+            try:
+                # A method on this SDK, not a property, whatever the .pyi
+                # stubs suggest. `if channel.has_sinks:` is a bound method and
+                # therefore always truthy, which silently defeats the whole
+                # don't-encode-when-nobody-is-watching idea.
+                self._watched[key] = bool(channel.has_sinks())
+            except Exception:
+                self._watched[key] = False
+
+    def _emit(self, key, payload, log_time):
+        channel = self._channels.get(key)
+        if channel is None:
+            return
+
+        if key in JSON_TOPICS:
+            channel.log(payload, log_time=log_time)
+            return
+
+        data = self._encode_jpeg(payload)
+        if data is None:
+            return
+
+        from foxglove.messages import CompressedImage, Timestamp
+
+        channel.log(
+            CompressedImage(
+                timestamp=Timestamp(sec=log_time // 1_000_000_000,
+                                    nsec=log_time % 1_000_000_000),
+                frame_id="oakd",
+                data=data,
+                format="jpeg",
+            ),
+            log_time=log_time,
+        )
+
+    def _encode_jpeg(self, frame):
+        """Downscale and JPEG one frame. None if it cannot be done.
+
+        cv2 and numpy are imported here rather than at module scope. Phase one
+        of this -- controller, vehicle, diagnostics -- has no business needing
+        opencv installed, and this file has to import on a machine that has
+        none of the car's libraries on it.
+        """
+        if self._cv2 is None:
+            try:
+                import cv2
+                import numpy as np
+                self._cv2 = cv2
+                self._np = np
+            except Exception as e:
+                self.error = f"no opencv for image telemetry: {e}"
+                return None
+
+        cv2 = self._cv2
+
+        if frame is None:
+            return None
+
+        height, width = frame.shape[:2]
+        longest = max(height, width)
+        if longest > IMAGE_MAX_DIM:
+            scale = IMAGE_MAX_DIM / float(longest)
+            frame = cv2.resize(frame, (max(1, int(width * scale)),
+                                       max(1, int(height * scale))),
+                               interpolation=cv2.INTER_NEAREST)
+
+        ok, buf = cv2.imencode(".jpg", frame,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        if not ok:
+            return None
+        return buf.tobytes()
+
+    # ---- odds and ends ---------------------------------------------------
+
+    def _log(self, level, subject, message):
+        if self.logger is not None:
+            try:
+                self.logger.log(level, subject, message)
+                return
+            except Exception:
+                pass
+        print(f"[telemetry] {subject}: {message}")
+
+
+def controller_sample(joystick, throttle, steering_front, steering_rear):
+    """Everything the pad is reporting, as a /controller message.
+
+    Reads Joystick's own XBOX_AXES and XBOX_BUTTONS at call time instead of
+    carrying a copy. That map is being measured right now against an xpadneo
+    driver change that renumbers both, and a second copy of it in here would
+    be a second thing to get wrong -- and would make this channel lie about
+    exactly the thing it is meant to diagnose.
+
+    Everything is read defensively. A pad that dropped and re-paired at a
+    different SDL index leaves a handle whose getters raise, and this is a
+    debug channel: a missing field beats an exception on the caller's thread.
+    """
+    import Joystick as js
+
+    sample = {
+        "connected": False,
+        "name": "",
+        "num_axes": 0,
+        "num_buttons": 0,
+        "axes": [],
+        "buttons": [],
+        "named_axes": {},
+        "named_buttons": {},
+        "trigger_rest_rt": 0.0,
+        "trigger_rest_lt": 0.0,
+        "throttle": float(throttle or 0.0),
+        "steering_front": float(steering_front or 0.0),
+        "steering_rear": float(steering_rear or 0.0),
+    }
+
+    try:
+        sample["connected"] = bool(joystick.is_connected())
+    except Exception:
+        return sample
+
+    handle = getattr(joystick, "joystick", None)
+    if handle is None:
+        return sample
+
+    try:
+        sample["name"] = str(handle.get_name())
+    except Exception:
+        pass
+
+    # Raw first. This is the part that is worth having when the named map is
+    # the suspect: if LEFT_X stops steering, the axis that moves in here is
+    # the one the map should be pointing at.
+    try:
+        count = int(handle.get_numaxes())
+        sample["num_axes"] = count
+        sample["axes"] = [float(handle.get_axis(i)) for i in range(count)]
+    except Exception:
+        pass
+
+    try:
+        count = int(handle.get_numbuttons())
+        sample["num_buttons"] = count
+        sample["buttons"] = [int(handle.get_button(i)) for i in range(count)]
+    except Exception:
+        pass
+
+    for name in getattr(js, "XBOX_AXES", {}):
+        try:
+            sample["named_axes"][name] = float(joystick.get_axis(name))
+        except Exception:
+            pass
+
+    for name in getattr(js, "XBOX_BUTTONS", {}):
+        try:
+            sample["named_buttons"][name] = bool(joystick.get_button(name))
+        except Exception:
+            pass
+
+    rest = getattr(joystick, "_trigger_rest", None) or {}
+    try:
+        sample["trigger_rest_rt"] = float(rest.get("RT", 0.0))
+        sample["trigger_rest_lt"] = float(rest.get("LT", 0.0))
+    except Exception:
+        pass
+
+    return sample
+
+
+def imu_sample(reading):
+    """An OakD.get_imu_sample() dict as an /imu message, or None."""
+    if not reading:
+        return None
+    try:
+        ax, ay, az = (float(v) for v in reading["accel"])
+        gx, gy, gz = (float(v) for v in reading["gyro"])
+    except Exception:
+        return None
+    return {
+        "accel_x": ax, "accel_y": ay, "accel_z": az,
+        "gyro_x": gx, "gyro_y": gy, "gyro_z": gz,
+        "accel_magnitude": (ax * ax + ay * ay + az * az) ** 0.5,
+    }
