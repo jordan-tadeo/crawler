@@ -18,14 +18,31 @@
 # --print-unit is how I check the result before anything gets written.
 #
 # One thing this script deliberately does NOT do: install the udev rule the
-# OAK-D needs. Auto mode wants
+# OAK-D needs. It does not have to. The rule is already on the car and has been
+# since 2025-06-06. This is what is actually there, read off the Pi 2026-10-26:
 #
-#   /etc/udev/rules.d/80-movidius.rules
-#   SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"
+#   /etc/udev/rules.d/99-luxonis-usb.rules
+#   SUBSYSTEM=="usb", ATTR{idVendor}=="03e7", ATTR{idProduct}=="2485", MODE="0666"
+#   ...and one more line each for f63b, f63d, f63f, f640 through f644
 #
-# followed by `sudo udevadm control --reload-rules && sudo udevadm trigger`,
-# or dai.Device() just fails for a non-root service user. That is a one-time
-# system change and I want to be the one typing it.
+# Covering every one of those product IDs is the part that matters: the OAK-D
+# changes its USB product ID when it boots, 2485 before and f63b after, so a
+# rule that matches a single ID only covers half the device's life.
+#
+# And it works. The device node comes up crw-rw-rw-, and while I was checking,
+# the running crawler.service -- user jt, no sudo, straight out of the unit this
+# script writes -- had that node open with a live handle on it. dai.Device() is
+# fine for a non-root service user on this machine.
+#
+# This comment block used to assert the exact opposite: that the rule was not
+# installed, that auto mode wanted an 80-movidius.rules, and that dai.Device()
+# just fails without it. None of that is true here and 80-movidius.rules has
+# never existed on this Pi. Do not go installing one.
+#
+# If a rebuilt Pi ever does come up without a rule, the symptom is specific:
+# dai.Device() fails as jt and succeeds under sudo. The fix then is Luxonis'
+# own rules file, not a hand-rolled one, and it is still a one-time system
+# change made by hand -- which is why it is not in this script.
 
 set -euo pipefail
 
@@ -39,7 +56,12 @@ while [[ $# -gt 0 ]]; do
     --print-unit) PRINT_ONLY=1; shift ;;
     --python)     PYTHON_OVERRIDE="${2:?--python needs a path}"; shift 2 ;;
     --python=*)   PYTHON_OVERRIDE="${1#--python=}"; shift ;;
-    -h|--help)    sed -n '2,28p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
+    # Print the header block as the help text. This used to be a hardcoded
+    # sed -n '2,28p', which silently stopped matching the header the moment I
+    # edited a comment above -- it was already short by the time I noticed.
+    # Walk from the shebang to the first line that is not a comment instead, so
+    # the range cannot go stale again.
+    -h|--help)    awk 'NR>1 { if (!/^#/) exit; sub(/^#+ ?/, ""); print }' "$0"; exit 0 ;;
     *)            echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done

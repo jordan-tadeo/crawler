@@ -200,7 +200,9 @@ JSON_SCHEMAS = {
         # Straight off the OAK-D's BNO086: linear acceleration in m/s^2 and
         # raw gyro in rad/s. Enabled as LINEAR_ACCELERATION, so this reads
         # near zero at a constant velocity -- which is the trap driver.py's
-        # is_moving() warns about and not a bug in here.
+        # motion_evidence() warns about and not a bug in here. That is why the
+        # gyro channels are worth watching in Foxglove next to the accel ones:
+        # the gyro is the witness that survives a steady creep.
         "accel_x": _NUM, "accel_y": _NUM, "accel_z": _NUM,
         "gyro_x": _NUM, "gyro_y": _NUM, "gyro_z": _NUM,
         "accel_magnitude": _NUM,
