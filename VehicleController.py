@@ -1,4 +1,5 @@
 from typing import Tuple
+import math
 import Logger
 
 # pigpio, board, busio, adafruit_pca9685 and adafruit_motor are imported
@@ -87,6 +88,10 @@ class VehicleController:
         self.last_front_angle = 90
         self.last_rear_angle = 90
 
+        # One latch per channel, so a stream of bad commands says so once
+        # instead of once per tick. See _usable().
+        self._rejected = {}
+
         # Disarm before anything else gets a chance to command. pigpio latches
         # a pulse width and keeps emitting it, so if the last process was
         # SIGKILLed mid-throttle the ESC is still being fed that value right
@@ -126,13 +131,58 @@ class VehicleController:
                 "front_s": front_steering,
                 "rear_s": rear_steering}
     
+    def _usable(self, value, channel) -> bool:
+        '''
+        Can this number be clamped into a command, or does the channel have to
+        go neutral?
+
+        False for anything falsy -- 0, 0.0, False, None -- which is what the
+        `if value else 0` these guards replaced already did, and which is
+        correct: all of those mean neutral.
+
+        False for a nan or an infinity, which is the whole reason this exists.
+        min() and max() do not clamp a nan. Every comparison against a nan is
+        False, so `min(1.0, nan)` never swaps and hands back 1.0, and
+        `max(-1.0, 1.0)` agrees -- a nan throttle came out of that clamp as a
+        clean 1.0 and went to the ESC as 2000 us, full forward. The steering
+        did the same thing and reached 180 degrees, full lock. An infinity got
+        through the same hole on the throttle. Nothing upstream sends me a nan
+        today; the joystick and the autonomous path both filter first. But
+        1787 us once left here as arithmetic I had not run anywhere but on the
+        car, and this is the same shape of mistake with a worse number at the
+        end of it, so it is checked here, at the one place that writes the
+        hardware, rather than trusted to every caller.
+
+        Logged on the way down, because silently driving at neutral when I am
+        asking for throttle is its own confusing afternoon. Logged once per
+        run of bad values, not once per value: this sits in a 100 Hz loop and
+        self.logger writes and flushes a file on the calling thread, so a
+        sustained nan would mean hundreds of synchronous writes a second on
+        the thread that commands the ESC. The latch clears as soon as the
+        channel reports a number again, so a second episode is a second line.
+        '''
+
+        if not value:
+            return False
+
+        if math.isnan(value) or math.isinf(value):
+            if not self._rejected.get(channel):
+                self.logger.log("warning", "Rejected command",
+                                f"{channel} was {value}, which is not a finite "
+                                f"number -- commanding neutral instead")
+            self._rejected[channel] = True
+            return False
+
+        self._rejected[channel] = False
+        return True
+
     def set_throttle(self, value) -> int:
-        ''' 
+        '''
         Set the throttle for the ESC.
         '''
 
         # Restrict value to the range [-1, 1]
-        value = max(-1.0, min(1.0, value)) if value else 0
+        value = max(-1.0, min(1.0, value)) if self._usable(value, "throttle") else 0
 
         if value > 0:
             pulse = int(ESC_NEUTRAL_PW + value * (ESC_FULL_FORWARD_PW - ESC_NEUTRAL_PW))
@@ -158,9 +208,15 @@ class VehicleController:
         # value would read as a steering bug every time I looked at it.
         asked_front, asked_rear = front, rear
 
+        # Asked once, read twice: once for the clamp and once for the record
+        # below. Calling _usable again down there would log the same rejection
+        # a second time.
+        front_ok = self._usable(front, "front steering")
+        rear_ok = self._usable(rear, "rear steering")
+
         # Restrict values to the range [-1, 1]
-        front = max(-1.0, min(1.0, -front)) if front else 0
-        rear = max(-1.0, min(1.0, -rear)) if rear else 0
+        front = max(-1.0, min(1.0, -front)) if front_ok else 0
+        rear = max(-1.0, min(1.0, -rear)) if rear_ok else 0
 
         # Map the range [-1, 1] to [0, 180] for servo angle
         front_angle = int((front + 1.0) * 90)
@@ -169,8 +225,12 @@ class VehicleController:
         self.front_steering_servo.angle = front_angle
         self.rear_steering_servo.angle = rear_angle
 
-        self.last_steering_front = asked_front or 0.0
-        self.last_steering_rear = asked_rear or 0.0
+        # A rejected ask is recorded as the neutral that was actually
+        # commanded. Reporting the nan back out would put it on the telemetry
+        # channels and into the CSV, where it reads as a steering fault
+        # instead of a rejected input.
+        self.last_steering_front = asked_front if front_ok else 0.0
+        self.last_steering_rear = asked_rear if rear_ok else 0.0
         self.last_front_angle = front_angle
         self.last_rear_angle = rear_angle
 
@@ -188,9 +248,13 @@ class VehicleController:
         Until then the live path does not touch channels 12 and 13 at all.
         '''
 
-        # Restrict values to the range [-1, 1]
-        pan = max(-1.0, min(1.0, pan))
-        tilt = max(-1.0, min(1.0, tilt))
+        # Restrict values to the range [-1, 1]. Same nan hole as the throttle
+        # and the steering -- this one is unreachable twice over, since nothing
+        # calls it and the gimbal is off the car, but it is the third clamp of
+        # that shape in this file and leaving one unguarded is how it comes
+        # back when the gimbal does.
+        pan = max(-1.0, min(1.0, pan)) if self._usable(pan, "pan") else 0
+        tilt = max(-1.0, min(1.0, tilt)) if self._usable(tilt, "tilt") else 0
         
         # Map the range [-1, 1] to [0, 180] for servo angle
         pan_angle = int((pan + 1.0) * 90)
