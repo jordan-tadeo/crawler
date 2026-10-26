@@ -6,7 +6,17 @@ from adafruit_motor import servo
 from typing import Tuple
 import Logger
 
-# Constants for control of the Quicrun 880 ESC
+# Constants for control of the Quicrun 880 ESC.
+#
+# These are my bench calibration and nothing in this repo gets to change
+# them. There is a second set of candidates sitting on the experimental
+# branch -- neutral 1350 (and 1325 in its main.py), full forward 1850, full
+# reverse 1100, plus an ESC_MIN_FORWARD_PW of 1500 -- which is why I pulled
+# only oakd.py and driver.py off that branch instead of merging it: a merge
+# would have taken 1350 with no conflict and parked the car 225 us into
+# reverse on every "neutral", including the shutdown path. Which set is
+# right is a question for the ESC with a wheel off the ground, so until I
+# have armed it and watched it, 1575 stands.
 ESC_GPIO_PIN = 18
 ESC_NEUTRAL_PW = 1575
 ESC_FULL_FORWARD_PW = 2000
@@ -44,6 +54,13 @@ class VehicleController:
         self.tilt_servo = servo.Servo(self.pca.channels[TILT_CHANNEL], actuation_range=180)
         self.front_steering_servo = servo.Servo(self.pca.channels[FRONT_STEERING_CHANNEL], actuation_range=180)
         self.rear_steering_servo = servo.Servo(self.pca.channels[REAR_STEERING_CHANNEL], actuation_range=180)
+
+        # Disarm before anything else gets a chance to command. pigpio latches
+        # a pulse width and keeps emitting it, so if the last process was
+        # SIGKILLed mid-throttle the ESC is still being fed that value right
+        # now -- and it will be until something overwrites it. Constructing
+        # this object is the first moment I can.
+        self.return_neutral()
 
     def get_state(self) -> dict:
         ''' 
@@ -152,13 +169,41 @@ class VehicleController:
         self.rear_steering_servo.angle = 90
     
     def close(self) -> None:
-        ''' 
-        Set neutral position and cleanup resources.
         '''
-    
-        self.return_neutral()
-        self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, 0)
-        self.pi.stop()
-        self.pca.deinit()
-        self.i2c.deinit()
+        Stop the ESC, then centre the servos, then let the hardware go.
+
+        The ESC goes first and on its own. return_neutral() touches the I2C
+        bus for four servos before it is done, and one I2C error in there used
+        to throw straight past set_servo_pulsewidth(pin, 0) -- so the one step
+        that actually stops the car got skipped because a servo I do not even
+        have attached did not answer. Every step is on its own now and a
+        failure in one cannot cost me the next.
+        '''
+
+        try:
+            self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, ESC_NEUTRAL_PW)
+        except Exception as e:
+            print(f"[Shutdown] could not neutral the ESC: {e}")
+
+        try:
+            self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, 0)
+        except Exception as e:
+            print(f"[Shutdown] could not stop the ESC pulse: {e}")
+
+        for name, s in (("front steering", self.front_steering_servo),
+                        ("rear steering", self.rear_steering_servo),
+                        ("pan", self.pan_servo),
+                        ("tilt", self.tilt_servo)):
+            try:
+                s.angle = 90
+            except Exception as e:
+                print(f"[Shutdown] could not centre {name}: {e}")
+
+        for name, release in (("pigpio", self.pi.stop),
+                              ("pca9685", self.pca.deinit),
+                              ("i2c", self.i2c.deinit)):
+            try:
+                release()
+            except Exception as e:
+                print(f"[Shutdown] could not release {name}: {e}")
 
