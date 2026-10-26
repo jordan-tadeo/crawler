@@ -1,3 +1,5 @@
+# Hand-run bench scratchpad, not a test: importing this file loads the model,
+# opens the camera and never returns.
 import cv2
 import numpy as np
 import tensorflow as tf

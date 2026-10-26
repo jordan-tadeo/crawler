@@ -1,3 +1,7 @@
+# Hand-run bench scratchpad, not a test: importing this file commands a servo.
+# It also drives pca.channels[0], which is none of the four channels this
+# vehicle actually uses (12 pan, 13 tilt, 14 rear steering, 15 front
+# steering), so it proves nothing about the car.
 from adafruit_pca9685 import PCA9685
 import board
 import busio
