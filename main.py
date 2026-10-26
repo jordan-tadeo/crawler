@@ -323,6 +323,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
                         "last_error": last_error,
                         "loop_hz": 0.0,
                         "loop_tick_max_ms": tick_max_ms,
+                        **tele.recording_status(),
                     }, now)
                 # Interruptible, so a systemctl stop does not sit here until
                 # TimeoutStopSec runs out and systemd SIGKILLs us past
@@ -405,6 +406,10 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
                     "last_error": last_error,
                     "loop_hz": (tick_count / elapsed) if elapsed > 0 else 0.0,
                     "loop_tick_max_ms": tick_max_ms,
+                    # Four attribute reads off the Recorder. This is how I
+                    # check from Studio that the run I am watching is also
+                    # being written down, instead of sshing in to look.
+                    **tele.recording_status(),
                 }, now)
                 tick_max_ms = 0.0
                 tick_count = 0
@@ -498,6 +503,32 @@ def parse_args(argv=None):
         help="open the OAK-D at startup so camera and IMU telemetry work in "
              "manual mode too (default: off, and auto mode opens it anyway)",
     )
+    # On by default, for the same reason --telemetry is, only more so.
+    #
+    # Foxglove live is a window. The run I want to look at is always the one
+    # that just ended badly, and by then the window is shut. A button to
+    # start recording is a button I will not have pressed; recording only in
+    # auto loses the manual runs, and the pad axis renumbering that cost me
+    # an afternoon was a manual run. So every run gets written down, and the
+    # disk budget in recording.py is what keeps that from being a problem:
+    # the newest 8 GiB of driving is on the card and nothing older is.
+    #
+    # It is not free the way telemetry-with-nobody-watching is free. An MCAP
+    # writer is a sink, so the channels are live whether or not Foxglove is
+    # open, which means the publisher thread encodes camera JPEGs whenever
+    # the camera is up. That cost is on the publisher thread, measured, and
+    # in the README.
+    parser.add_argument(
+        "--record",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write every run to log/mcap/*.mcap for replay (default: on)",
+    )
+    parser.add_argument(
+        "--record-dir",
+        default=None,
+        help="where recordings go (default: log/mcap under the checkout)",
+    )
     return parser.parse_args(argv)
 
 
@@ -541,20 +572,42 @@ def main(argv=None):
     modes = ModeSwitch(args.mode, log)
 
     # Before the joystick, because Joystick() blocks waiting for a pad and I
-    # want the server already listening while it waits -- that wait is one of
-    # the things worth watching from the laptop. start() never raises: a
-    # missing foxglove-sdk or a port somebody else is already on costs
-    # telemetry and nothing else.
-    tele = tm.Telemetry(logger=log, port=args.telemetry_port)
-    if args.telemetry:
-        tele.start()
+    # want the server already listening and the recording already running
+    # while it waits -- that wait is one of the things worth watching from
+    # the laptop, and "I booted the car and it never found the pad" is
+    # exactly the kind of run I want written down. start() never raises: a
+    # missing foxglove-sdk, a port somebody else is already on, or a card
+    # with no room on it all cost telemetry and nothing else.
+    #
+    # The recorder is constructed here and opened on the publisher thread.
+    # Constructing it touches no disk.
+    recorder = None
+    if args.record:
+        import recording
+        recorder = recording.Recorder(
+            logger=log,
+            directory=args.record_dir or recording.DEFAULT_DIR,
+        )
+
+    tele = tm.Telemetry(logger=log, port=args.telemetry_port,
+                        recorder=recorder)
+
+    # One thread for both jobs, so there is nothing to start if neither is
+    # wanted: --no-telemetry --no-record is the old no-thread, no-socket,
+    # nothing-bound behaviour exactly. --no-telemetry on its own now means
+    # "record, but do not listen on the network", which is the right thing
+    # for a car driving somewhere there is no laptop.
+    channels_live = args.telemetry or args.record
+    if channels_live:
+        tele.start(serve=args.telemetry)
 
     # One camera for the whole process, and constructing it opens nothing --
     # no USB, no depthai import, no risk. The rectified mono stream is only
-    # linked when telemetry is going to carry it, so with telemetry off the
-    # pipeline is byte for byte the one auto mode has always run.
-    hub = camera.CameraHub(logger=log, tele=tele if args.telemetry else None,
-                           rectified=args.telemetry)
+    # linked when something is going to carry it, so with both telemetry and
+    # recording off the pipeline is byte for byte the one auto mode has
+    # always run.
+    hub = camera.CameraHub(logger=log, tele=tele if channels_live else None,
+                           rectified=channels_live)
     autopilot = AutoPilot(vecon, log, hub=hub)
 
     # Who gets the device opened at startup, and who waits for it:

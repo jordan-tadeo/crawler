@@ -34,6 +34,20 @@ loop builds no dicts and the publisher thread encodes no JPEGs. This is a
 4-core Pi that is also running a 100 Hz control loop; telemetry is not
 allowed to cost anything when it is not being read.
 
+And a recording counts as watching
+----------------------------------
+recording.py opens an MCAP writer, and an MCAP writer in this SDK is a sink
+exactly like a connected client. So "nobody is watching" now means no laptop
+AND no recording, and with recording on by default the messages get built
+whether or not Foxglove is open -- which is the entire point, because the run
+I want is the one I was not watching.
+
+That means the server is no longer what decides whether any of this runs.
+start() creates the channels first and starts the socket second, and a socket
+that cannot come up -- a port somebody else is already on -- costs the live
+view and leaves the recording alone. Everything the control thread touches is
+keyed off the channels, not the server.
+
 Failure is always non-fatal
 ---------------------------
 A missing foxglove-sdk, a port already bound by a previous process, a client
@@ -45,6 +59,7 @@ VehicleController at all.
 """
 
 import json
+import os
 import queue
 import threading
 import time
@@ -195,6 +210,14 @@ JSON_SCHEMAS = {
         "last_error": _STR,
         "loop_hz": _NUM,
         "loop_tick_max_ms": _NUM,
+        # Whether this run is being written to an MCAP file, and which one.
+        # In the file itself this is how a replay says who wrote it; live in
+        # Studio it is how I check recording is actually on without sshing
+        # into the car. recording_error carries why it is not, if it is not.
+        "recording": _BOOL,
+        "recording_file": _STR,
+        "recording_mib": _NUM,
+        "recording_error": _STR,
     }),
     "imu": _schema("crawler.Imu", {
         # Straight off the OAK-D's BNO086: linear acceleration in m/s^2 and
@@ -252,26 +275,36 @@ ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
 
 
 class Telemetry:
-    """A Foxglove WebSocket server and the thread that feeds it.
+    """The channels, the WebSocket server, the recorder, and the one thread.
 
     Everything public splits into two halves:
 
       the control thread calls wants() and offer(), and neither one can block
       on a socket, a file or a lock that is held during I/O;
 
-      the publisher thread owns the server, the channels and all encoding.
+      the publisher thread owns the server, the channels, the MCAP writer and
+      all encoding.
 
     An instance that failed to start is not a special case anywhere: wants()
     is False for every key, offer() is a no-op, and the car never notices.
     """
 
-    def __init__(self, logger=None, host=DEFAULT_HOST, port=DEFAULT_PORT):
+    def __init__(self, logger=None, host=DEFAULT_HOST, port=DEFAULT_PORT,
+                 recorder=None):
         self.logger = logger
         self.host = host
         self.port = port
 
         self.running = False
+        self.serving = False
         self.error = None
+
+        # A recording.Recorder, or None for a run that is not being recorded.
+        # It is opened and closed on the publisher thread, inside
+        # _publish_loop, so that the sink's lifetime is exactly the drain
+        # loop's lifetime -- no window where a channel has a file sink but
+        # nothing is draining the mailboxes into it.
+        self.recorder = recorder
 
         self._server = None
         self._channels = {}
@@ -304,13 +337,21 @@ class Telemetry:
 
     # ---- lifecycle, called once from main --------------------------------
 
-    def start(self) -> bool:
-        """Bring the server up. False means telemetry is off and that is fine.
+    def start(self, serve: bool = True) -> bool:
+        """Build the channels and the thread. False means telemetry is off.
 
-        Nothing in here is allowed to raise. An ImportError because the SDK is
-        not installed on this machine, and an OSError because something is
-        already sitting on 8765, are both ordinary outcomes that cost
-        telemetry and nothing else.
+        `serve` is whether to also bind the WebSocket port. False gives a
+        recording-only run: the channels exist, the thread drains them into
+        the MCAP file, and nothing listens on the network.
+
+        The channels come first and the socket second, and the socket failing
+        is not the channels failing. Something already sitting on 8765 used to
+        take the whole of telemetry out with it; now it costs the live view
+        and the recording carries on, which is the right trade when the
+        recording is the thing I cannot get back.
+
+        Nothing in here is allowed to raise. A missing foxglove-sdk is an
+        ordinary outcome that costs telemetry and nothing else.
         """
         if self.running:
             return True
@@ -327,12 +368,6 @@ class Telemetry:
                 foxglove.set_log_level("WARN")
             except Exception:
                 pass
-
-            self._server = foxglove.start_server(
-                name="crawler",
-                host=self.host,
-                port=self.port,
-            )
 
             for key, topic in JSON_TOPICS.items():
                 spec = JSON_SCHEMAS[key]
@@ -351,29 +386,54 @@ class Telemetry:
 
         except Exception as e:
             self.error = str(e)
-            self._server = None
             self._channels = {}
             self._log("warning", "Telemetry",
                       f"Not starting telemetry, driving as normal: {e}")
             return False
+
+        if serve:
+            try:
+                import foxglove
+                self._server = foxglove.start_server(
+                    name="crawler",
+                    host=self.host,
+                    port=self.port,
+                )
+                self.serving = True
+            except Exception as e:
+                self.error = str(e)
+                self._server = None
+                self._log("warning", "Telemetry",
+                          f"No Foxglove server, driving as normal: {e}")
 
         self.running = True
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._publish_loop, name="telemetry", daemon=True)
         self._thread.start()
-        self._log("info", "Telemetry",
-                  f"Foxglove server on ws://{self.host}:{self.port}")
+        if self.serving:
+            self._log("info", "Telemetry",
+                      f"Foxglove server on ws://{self.host}:{self.port}")
         return True
 
     def stop(self):
-        """Shut the server down. Safe to call twice, and never raises."""
+        """Shut it all down. Safe to call twice, and never raises."""
         self._stop.set()
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=2.0)
 
         self.running = False
+        self.serving = False
+
+        # Belt and braces. _publish_loop's finally has already closed the
+        # recorder by the time that join returns; this catches the case where
+        # the thread never started, and Recorder.stop() is idempotent.
+        if self.recorder is not None:
+            try:
+                self.recorder.stop()
+            except Exception:
+                pass
 
         for channel in self._channels.values():
             try:
@@ -444,12 +504,44 @@ class Telemetry:
     def _publish_loop(self):
         next_sink_poll = 0.0
 
+        # The recorder opens here rather than in start() so that the MCAP
+        # sink exists only while something is draining the mailboxes into it,
+        # and so that a disk problem is handled on this thread -- the one
+        # that is allowed to do I/O -- and never on the caller's.
+        recorder = self.recorder
+        if recorder is not None:
+            try:
+                recorder.start()
+            except Exception as e:
+                # Recorder.start() already swallows everything; this is the
+                # case where it has a bug. A recording is never worth this
+                # thread.
+                self.error = str(e)
+
+        try:
+            self._drain_forever(recorder)
+        finally:
+            if recorder is not None:
+                try:
+                    recorder.stop()
+                except Exception:
+                    pass
+
+    def _drain_forever(self, recorder):
+        next_sink_poll = 0.0
+
         while not self._stop.is_set():
             now = time.monotonic()
 
             if now >= next_sink_poll:
                 next_sink_poll = now + SINK_POLL_INTERVAL
                 self._refresh_watched()
+
+            if recorder is not None:
+                # Rotation and pruning, on this thread, behind a float
+                # compare. See recording.py: almost every call returns
+                # without a syscall.
+                recorder.tick(now)
 
             for key in ALL_KEYS:
                 try:
@@ -470,6 +562,13 @@ class Telemetry:
                     # worth a log line per frame, and it is certainly not
                     # worth stopping for.
                     self.error = str(e)
+                    if recorder is not None:
+                        # channel.log() writes to every sink and does not say
+                        # which one failed, so the recorder counts this and
+                        # forgets the count again as soon as it can see its
+                        # own file growing. A card that has genuinely started
+                        # refusing writes is the case it is looking for.
+                        recorder.note_write_error(e)
 
             self._stop.wait(DRAIN_INTERVAL)
 
@@ -570,6 +669,40 @@ class Telemetry:
         return buf.tobytes()
 
     # ---- odds and ends ---------------------------------------------------
+
+    def recording_status(self) -> dict:
+        """The four /diagnostics fields that describe the recording.
+
+        Called from the control loop at 4 Hz, so it is attribute reads off an
+        object the publisher thread is also touching -- and nothing more. No
+        lock: the worst case is a basename and a size from one side of the
+        same rotation, which is a cosmetic lie in a diagnostics message. The
+        alternative is a lock the control thread has to take, and this file
+        does not hand the control thread locks.
+        """
+        recorder = self.recorder
+        if recorder is None:
+            return {
+                "recording": False,
+                "recording_file": "",
+                "recording_mib": 0.0,
+                "recording_error": "",
+            }
+        try:
+            path = recorder.path or ""
+            return {
+                "recording": bool(recorder.active),
+                "recording_file": os.path.basename(path) if path else "",
+                "recording_mib": round(recorder.bytes_written / 1048576.0, 1),
+                "recording_error": str(recorder.error or ""),
+            }
+        except Exception as e:
+            return {
+                "recording": False,
+                "recording_file": "",
+                "recording_mib": 0.0,
+                "recording_error": str(e),
+            }
 
     def _log(self, level, subject, message):
         if self.logger is not None:

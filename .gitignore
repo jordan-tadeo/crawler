@@ -13,7 +13,10 @@ __pycache__/
 # which is the only telemetry I have of the ESC at neutral 1575.
 app.log
 app.log.*
-log/*.csv
+# log/ whole, not log/*.csv. It was the CSVs for a long time, and then the
+# car started writing .mcap recordings in there and walked straight past a
+# rule that names one extension.
+log/
 
 # Downloaded model weights and the archives they arrive in.
 #
@@ -61,3 +64,8 @@ requirements.txt
 
 # pytest's cache.
 .pytest_cache/
+
+# Where pull-recordings.sh drops what it fetched off the car. These are the
+# car's own recordings coming back the other way, and some of them are
+# hundreds of megabytes.
+recordings/
