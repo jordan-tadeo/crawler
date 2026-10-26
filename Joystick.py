@@ -23,12 +23,53 @@ XBOX_AXES = {
 }
 
 # How far a trigger has to come off its rest position before it counts as
-# pressed at all.
+# pressed at all. A fraction of the pull now, not a raw axis reading.
 TRIGGER_DEADZONE = 0.05
 
+# The only two readings this pad produces with nothing touched: an axis
+# bound as a trigger sits at -1.0, and a thumbstick sits at 0.0.
+TRIGGER_REST_CANDIDATES = (-1.0, 0.0)
 
-def trigger_pull(value) -> float:
+# How close a calibration sample has to land to one of those before I
+# believe it. Anything in between means the trigger was held while I
+# sampled, or that axis is not what I think it is.
+TRIGGER_REST_TOLERANCE = 0.1
+
+# What I assume before I have calibrated, and whenever the sample made no
+# sense. Rest at 0.0 means only the positive half of the travel commands
+# anything, which is what stopped the car launching on its own, so this is
+# the one fallback and it is never relaxed.
+SAFE_TRIGGER_REST = 0.0
+
+
+def plausible_rest(sample) -> float:
+    """A rest reading I am willing to calibrate to, or the safe default.
+
+    A sample that lands above its candidate I keep as it reads, so a trigger
+    sitting at -0.97 calibrates to -0.97 and commands exactly nothing while
+    it sits there -- calling it -1.0 would leave a 1.5% pull standing at
+    rest. A sample that lands below its candidate I take as the candidate
+    instead, because a rest lower than the real one is the one direction
+    that creeps: a stick drifting to -0.06 would otherwise command 6%
+    throttle sitting dead centre, which is worse than the plain clamp was.
+    So rest is never below the candidate and never in between two of them.
+    """
+    try:
+        s = float(sample)
+    except (TypeError, ValueError):
+        return SAFE_TRIGGER_REST
+    if s != s:  # NaN
+        return SAFE_TRIGGER_REST
+    for candidate in TRIGGER_REST_CANDIDATES:
+        if abs(s - candidate) <= TRIGGER_REST_TOLERANCE:
+            return max(s, candidate)
+    return SAFE_TRIGGER_REST
+
+
+def trigger_pull(value, rest: float = SAFE_TRIGGER_REST) -> float:
     """A trigger axis reading turned into 0.0 at rest, 1.0 at full pull.
+
+    (value - rest) / (1 - rest), clamped to [0, 1].
 
     This used to be (value + 1) / 2, which is the honest conversion for an
     Xbox trigger that reports -1.0 at rest and +1.0 pulled -- and which turns
@@ -38,14 +79,28 @@ def trigger_pull(value) -> float:
     and the axis order is not the one in XBOX_AXES above. The first tick then
     commanded 0.5 and the car launched at 1787 us with nobody touching it.
 
-    So only the positive half of the travel commands anything: zero is
-    neutral, and so is everything below it. That costs me the bottom half of
-    the trigger pull as a dead band and I am happy to pay it, because the
-    failure I am designing against is the car driving off on its own.
+    After that it was a bare clamp. Safe under either binding, but it eats
+    the bottom half of the pull: the trigger does nothing until it is halfway
+    in, then goes 0 to full over the back half. So I measure rest at the
+    moment I pick the pad up instead of assuming it -- see
+    Joystick._calibrate_triggers -- and scale from there. A rest of -1.0 is
+    (value + 1) / 2 again and I get the whole travel back. A rest of 0.0,
+    which is what I fall back to whenever I have no sample I trust, is the
+    bare clamp again, so a resting stick on a wrongly mapped axis still
+    commands nothing. Nothing in between ever gets calibrated to.
     """
-    if value is None:
+    try:
+        v = float(value)
+        r = float(rest)
+    except (TypeError, ValueError):
         return 0.0
-    return max(0.0, min(1.0, float(value)))
+    if v != v or r != r:  # NaN in either one
+        return 0.0
+    span = 1.0 - r
+    if span <= 0.0:
+        # Nonsense rest. Neutral beats a divide.
+        return 0.0
+    return max(0.0, min(1.0, (v - r) / span))
 
 
 class Joystick:
@@ -55,6 +110,8 @@ class Joystick:
 
         self.connected = False
         self.joystick = None
+        # Safe until a sample proves otherwise, every time I take a handle.
+        self._invalidate_calibration()
 
         if disabled:
             self.connected = True
@@ -72,11 +129,53 @@ class Joystick:
         except pygame.error as e:
             raise RuntimeError(f"Failed to initialize joystick: {e}")
 
+        self._calibrate_triggers()
+
+    def _invalidate_calibration(self):
+        """Forget what rest read. Uncalibrated has to mean safe, not unclamped."""
+        self._trigger_rest = {"RT": SAFE_TRIGGER_REST, "LT": SAFE_TRIGGER_REST}
+
+    def _calibrate_triggers(self):
+        """Learn what the two trigger axes read with nobody touching them.
+
+        Only called the moment I take a handle, which is the one moment I
+        know the pad is not being driven: the service boots and sits in
+        wait_for_connection until a pad shows up, and a re-pair comes back
+        through the same door. The axis order can change between hid-generic
+        over Bluetooth and xpad over USB across that re-pair, which is the
+        whole reason the half throttle bug existed, so the old numbers go in
+        the bin every time rather than carrying over.
+
+        Never raises, never waits. One sample, and if it is not a sample I
+        believe I keep the safe rest and take it again on the next handle.
+        """
+        self._invalidate_calibration()
+        if self.joystick is None:
+            return
+
+        try:
+            pygame.event.pump()
+            sampled = {
+                "RT": plausible_rest(self.get_axis("RT")),
+                "LT": plausible_rest(self.get_axis("LT")),
+            }
+        except Exception as e:
+            # A handle that went stale between the device count and the read.
+            # The control loop runs at 100 Hz and does not want to hear it.
+            print(f"\nTrigger calibration failed, holding the safe rest: {e}")
+            return
+
+        self._trigger_rest = sampled
+        # Off the end of the "Waiting..." carriage return, and the only way
+        # to tell from the service log which axis map I ended up on.
+        print("\nTrigger rest: RT={:.3f} LT={:.3f}".format(sampled["RT"], sampled["LT"]))
+
     def read_throttle(self) -> float:
         """One throttle value in [-1, 1]. Never None, never a surprise."""
         try:
-            rt = trigger_pull(self.get_axis("RT"))
-            lt = trigger_pull(self.get_axis("LT"))
+            rest = self._trigger_rest
+            rt = trigger_pull(self.get_axis("RT"), rest.get("RT", SAFE_TRIGGER_REST))
+            lt = trigger_pull(self.get_axis("LT"), rest.get("LT", SAFE_TRIGGER_REST))
         except Exception:
             # A stale handle after a re-pair raises in here. Neutral.
             return 0.0
@@ -110,6 +209,8 @@ class Joystick:
                     self.joystick = pygame.joystick.Joystick(0)
                     self.joystick.init()
                     self.connected = True
+                    # New handle, possibly a new axis map. Measure rest again.
+                    self._calibrate_triggers()
                     break
                 except pygame.error as e:
                     raise RuntimeError(f"Failed to initialize joystick: {e}")
@@ -143,16 +244,21 @@ class Joystick:
         re-pairs can come back at a different SDL index while the count never
         reaches zero, and the handle I kept then returns stale axis values or
         raises. Clearing self.connected here sends the control loop back
-        through wait_for_connection(), which re-attaches at index 0.
+        through wait_for_connection(), which re-attaches at index 0 and
+        measures the trigger rest again. The calibration dies with the
+        handle: whatever rest read on the old binding is not evidence about
+        the next one, and an uncalibrated trigger is the clamped, safe one.
         """
         if pygame.joystick.get_count() == 0 or self.joystick is None:
             self.connected = False
+            self._invalidate_calibration()
             return
 
         try:
             self.joystick.get_axis(0)
         except Exception:
             self.connected = False
+            self._invalidate_calibration()
             return
 
         self.connected = True
