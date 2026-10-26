@@ -1,2 +1,10 @@
 env
 __pycache__/
+
+# Runtime output. Both of these are written by every run, so tracking them
+# meant the tree was dirty the moment I drove the car. The versions already
+# committed stay in history -- in particular the app.log from 2025-04-27,
+# which is the only telemetry I have of the ESC at neutral 1575.
+app.log
+app.log.*
+log/*.csv
