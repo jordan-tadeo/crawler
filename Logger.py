@@ -1,9 +1,46 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
+# This checkout, worked out from where this file sits rather than from where
+# the process happens to be standing.
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _prepare(path):
+    '''Resolve a log path against the checkout and make sure its folder exists.
+
+    Two separate things, both learned the hard way.
+
+    The folder: `log/` holds nothing but generated CSVs, so it is gitignored,
+    so it is not in a fresh clone -- and open(..., 'a') does not create a
+    missing parent. The csv() call below sits in the 100 Hz control loop but
+    only runs once a controller is connected and the state has changed, which
+    is why a clone that cannot write it does not fall over at startup. It
+    falls over a few seconds in, on the first state change, and with
+    Restart=on-failure that is a restart loop. I patched it on the car with
+    `mkdir -p log` once; this is so I never have to again.
+
+    The checkout: the unit does set WorkingDirectory to this directory, so
+    relative paths resolve correctly there today. But that is the unit's
+    promise, not a property of the code -- run main.py from anywhere else, or
+    change that line, and the logs quietly land somewhere else. Anchoring here
+    means `log/vehicle_state_log.csv` is the same file whoever starts the car.
+    An absolute path handed in is left exactly as it was given.
+    '''
+
+    path = os.path.join(REPO_DIR, path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
+
 class Logger:
     def __init__(self, log_file="app.log", max_size=10 * 1024 * 1024, backup_count=1):
+        log_file = _prepare(log_file)
+
         self.logger = logging.getLogger("VehicleLogger")
         self.logger.setLevel(logging.INFO)
 
@@ -41,8 +78,12 @@ class Logger:
 
     def csv(self, csv_file, subject, message, max_size=10 * 1024 * 1024):
         import csv
-        import os
         from datetime import datetime
+
+        # Before anything looks at the path: anchor it to the checkout and
+        # make its folder. Everything below -- the size check, both rotations,
+        # the header read and the append -- works off this one resolved path.
+        csv_file = _prepare(csv_file)
 
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
