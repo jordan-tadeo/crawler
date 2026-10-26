@@ -51,14 +51,27 @@ UNKNOWN = "unknown"
 # It cannot tell those two apart at all. The gyro can -- a crawler rolling over
 # real ground shakes, and the shake is the witness.
 #
+# Both channels come off the BNO086 as fixed point, which is why a component
+# sometimes reads an exact 0.0 while the other two show noise -- nothing is
+# being dropped, it is the zero bucket. Every accel component in 1673 samples
+# is an exact multiple of 1/256 = 0.00390625 m/s^2 and every gyro component an
+# exact multiple of 0.00106526 rad/s. Parked, the whole accel floor fits inside
+# 11 of its steps and the whole gyro floor inside 6 of its own.
+#
 # GYRO_MOVING_MIN sits at five times the measured parked maximum and about eight
-# times p99. The parked end of that range is measured. The rolling end is not --
-# see the note in motion_evidence().
+# times p99, which is 33 gyro steps against a parked floor of 6 -- clear of the
+# quantisation either way. The parked end of that range is measured. The rolling
+# end is not -- see the note in motion_evidence().
 GYRO_MOVING_MIN = 0.035  # rad/s
 
 # How much evidence before the car is allowed to call itself stuck. At the 10 Hz
 # tick this is a full second of consecutive confident no-motion readings, every
 # one of them taken while forward throttle was already up.
+#
+# A count of ticks on purpose, not a wall-clock duration. The control loop does
+# not always make its 100 Hz -- I have watched it sit at 75 Hz with a 190 ms
+# stall in it -- and a count can only ever make confirming a stick take longer
+# in real time, never make it fire early. A deadline would do the opposite.
 STUCK_CONFIRM_SAMPLES = 10
 
 # And how long forward throttle must have been commanded before the stuck check
