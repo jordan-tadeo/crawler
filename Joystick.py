@@ -1,5 +1,16 @@
 import pygame
 
+# xpadneo reports 11 buttons, which is the count I measured, and it puts the
+# Xbox guide button in among them at 8 -- so the two stick clicks sit at 9 and
+# 10, not 8 and 9 as this used to say. Nothing reads LS or RS today, so that
+# was a wrong number waiting rather than a bug, but GUIDE belongs in here by
+# name: an unnamed 8 is how it gets rediscovered as a stick click.
+#
+# The count and the guide at 8 are measured. The identity of A/B/X/Y/LB/RB/
+# BACK/START below is xpadneo's order, which the count agrees with; I have not
+# pressed each one and watched its index move. BACK 6 and START 7 are what
+# they already were, so main.py's MODE_TOGGLE_BUTTON = "START" is untouched
+# and still the Menu button to the right of the guide.
 XBOX_BUTTONS = {
     "A": 0,
     "B": 1,
@@ -9,17 +20,40 @@ XBOX_BUTTONS = {
     "RB": 5,
     "BACK": 6,
     "START": 7,
-    "LS": 8,
-    "RS": 9
+    "GUIDE": 8,
+    "LS": 9,
+    "RS": 10
 }
 
+# Measured on the car under xpadneo, not copied off a diagram. The pad comes
+# up to SDL as "Xbox 360 Controller", guid 050003f05e0400008e02000030110000,
+# with 7 axes, 11 buttons and 1 hat, and at rest it reads:
+#
+#   axis 0  +0.000   left stick X
+#   axis 1  +0.000   left stick Y
+#   axis 2  -1.000   LEFT trigger
+#   axis 3  +0.000   right stick X
+#   axis 4  +0.000   right stick Y
+#   axis 5  -1.000   RIGHT trigger
+#   axis 6  -1.000   ABS_PROFILE, the pad's own profile switch. Unread.
+#
+# Triggers at 2 and 5 with the right stick between them, which is the plain
+# xpad layout. This map used to say LT 5 and RT 4 with the right stick at 2
+# and 3, and everything that was wrong with driving came out of that. Axis 2
+# is the left trigger, and it was being handed to set_steering as the rear
+# steering angle -- so a trigger resting at -1.0 held the rear servo at full
+# lock the whole time the car sat still, and pulling LT swung it to the other
+# stop instead of touching throttle. The code's "RT" landed on axis 4, a
+# thumbstick, and that is the only reason throttle stayed at neutral:
+# trigger_pull clamps a rest of 0.0, exactly as it was built to. Running the
+# right stick down its own travel would have commanded throttle.
 XBOX_AXES = {
     "LEFT_X": 0,
     "LEFT_Y": 1,
-    "LT": 5,
-    "RIGHT_X": 2,
-    "RIGHT_Y": 3,
-    "RT": 4
+    "LT": 2,
+    "RIGHT_X": 3,
+    "RIGHT_Y": 4,
+    "RT": 5
 }
 
 # How far a trigger has to come off its rest position before it counts as
