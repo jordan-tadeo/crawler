@@ -36,6 +36,15 @@ vision = [
     "tensorflow==2.19.0",
     "tensorflow-hub==0.16.1",
     "tflite-runtime==2.14.0",
+    # Not a dependency of mine, a dependency of theirs that they forgot to
+    # declare. tensorflow_hub 0.16.1 does `from pkg_resources import
+    # parse_version` at import time and never asks for setuptools; tensorflow
+    # and tensorboard do ask for it, but unpinned. setuptools 81 dropped
+    # pkg_resources, so a fresh resolve lands on 84.x and `import
+    # tensorflow_hub` dies with ModuleNotFoundError before it runs a line of
+    # mine. The old venv on the car never hit it because it happens to be
+    # sitting on setuptools 80.0.1.
+    "setuptools<81",
 ]
 
 # Deliberately empty, and the emptiness is the point.
