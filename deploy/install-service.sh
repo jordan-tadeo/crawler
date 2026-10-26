@@ -4,11 +4,18 @@
 #
 # Run it on the Pi, from the checkout:
 #
-#   sudo ./deploy/install-service.sh          # install + enable, don't start
-#   sudo ./deploy/install-service.sh --start  # install + enable + start now
+#   sudo ./deploy/install-service.sh                  # install + enable, don't start
+#   sudo ./deploy/install-service.sh --start          # install + enable + start now
+#   ./deploy/install-service.sh --print-unit          # show the unit, touch nothing
+#   sudo ./deploy/install-service.sh --python PATH    # name the interpreter myself
+#
+# The unit itself lives in deploy/crawler.service.template now, as a file I can
+# read, instead of forty `echo` lines in here. This script's whole job is to
+# work out what goes in the placeholders and fill them in.
 #
 # Everything it needs is detected rather than hardcoded, because a wrong path
 # or a group that does not exist makes systemd refuse to start the unit at all.
+# --print-unit is how I check the result before anything gets written.
 #
 # One thing this script deliberately does NOT do: install the udev rule the
 # OAK-D needs. Auto mode wants
@@ -23,30 +30,28 @@
 set -euo pipefail
 
 START_NOW=0
-[[ "${1:-}" == "--start" ]] && START_NOW=1
+PRINT_ONLY=0
+PYTHON_OVERRIDE=""
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Needs root: sudo $0 ${1:-}" >&2
-  exit 1
-fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --start)      START_NOW=1; shift ;;
+    --print-unit) PRINT_ONLY=1; shift ;;
+    --python)     PYTHON_OVERRIDE="${2:?--python needs a path}"; shift 2 ;;
+    --python=*)   PYTHON_OVERRIDE="${1#--python=}"; shift ;;
+    -h|--help)    sed -n '2,28p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
+    *)            echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEMPLATE="$REPO_DIR/deploy/crawler.service.template"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 
-if [[ "$RUN_USER" == "root" ]]; then
-  echo "Refusing to install a root-owned service. Run it with sudo as your own user." >&2
+if [[ ! -f "$TEMPLATE" ]]; then
+  echo "No unit template at $TEMPLATE" >&2
   exit 1
-fi
-
-# Prefer the project venv; fall back to the system interpreter.
-if [[ -x "$REPO_DIR/env/bin/python" ]]; then
-  PYTHON="$REPO_DIR/env/bin/python"
-elif [[ -x "$REPO_DIR/env/bin/python3" ]]; then
-  PYTHON="$REPO_DIR/env/bin/python3"
-else
-  PYTHON="$(command -v python3)"
-  echo "WARNING: no venv at $REPO_DIR/env, falling back to $PYTHON" >&2
 fi
 
 if [[ ! -f "$REPO_DIR/main.py" ]]; then
@@ -54,12 +59,49 @@ if [[ ! -f "$REPO_DIR/main.py" ]]; then
   exit 1
 fi
 
+if [[ "$RUN_USER" == "root" ]]; then
+  echo "Refusing to install a root-owned service. Run it with sudo as your own user." >&2
+  exit 1
+fi
+
+# Interpreter, in this order and for this reason:
+#
+#   1. --python, for when I am switching on purpose.
+#   2. env/bin/python, env/bin/python3 -- the old hand-rolled venv. This is
+#      what the installed unit points at today and what the car is running out
+#      of, so it keeps winning. Re-running this script on the Pi must never
+#      quietly move a working service onto a different interpreter behind my
+#      back.
+#   3. .venv/bin/python, .venv/bin/python3 -- what `uv sync` makes. A fresh
+#      checkout has no env/, so there it gets picked up on its own, which is
+#      the point. On the car it only takes over once I delete env/ or pass
+#      --python.
+#   4. system python3, with a warning.
+#
+# So the uv path is available everywhere and automatic on anything new, and
+# moving the car itself across stays a decision I make with --python.
+if [[ -n "$PYTHON_OVERRIDE" ]]; then
+  if [[ ! -x "$PYTHON_OVERRIDE" ]]; then
+    echo "Not executable: $PYTHON_OVERRIDE" >&2
+    exit 1
+  fi
+  PYTHON="$PYTHON_OVERRIDE"
+elif [[ -x "$REPO_DIR/env/bin/python" ]]; then
+  PYTHON="$REPO_DIR/env/bin/python"
+elif [[ -x "$REPO_DIR/env/bin/python3" ]]; then
+  PYTHON="$REPO_DIR/env/bin/python3"
+elif [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
+  PYTHON="$REPO_DIR/.venv/bin/python"
+elif [[ -x "$REPO_DIR/.venv/bin/python3" ]]; then
+  PYTHON="$REPO_DIR/.venv/bin/python3"
+else
+  PYTHON="$(command -v python3)"
+  echo "WARNING: no venv at $REPO_DIR/env or $REPO_DIR/.venv, falling back to $PYTHON" >&2
+  echo "         Make one with: uv venv --python /usr/bin/python3 --system-site-packages && uv sync" >&2
+fi
+
 # Only ask for groups that actually exist on this system. SupplementaryGroups
 # naming a missing group is a hard start failure.
-#
-# `input` is the load-bearing one: it is what lets the service user read
-# /dev/input/event*, which is what makes joystick input work with no login
-# session. SDL_VIDEODRIVER below is not what does that.
 WANT_GROUPS=(input i2c gpio video bluetooth dialout plugdev render)
 HAVE_GROUPS=()
 for g in "${WANT_GROUPS[@]}"; do
@@ -87,61 +129,86 @@ if [[ -z "$PIGS" ]]; then
   echo "WARNING: no pigs binary found. Installing without the ESC disarm hook." >&2
 fi
 
+# Fill the template.
+#
+# Three lines are conditional, exactly as they were when this script echoed
+# them one by one: the SupplementaryGroups line goes in only if some of those
+# groups exist, ExecStartPre only if there is both a pigs binary and a pigpiod
+# unit to wait for, and ExecStopPost only if there is a pigs binary to call.
+#
+# Substitution is literal, done by hand, rather than sed or awk's gsub -- both
+# of those treat characters in the replacement text as special (& most of all),
+# and these values are filesystem paths I did not write.
+render_unit() {
+  local drop_groups=0 drop_pre=0 drop_post=0
+  [[ -n "$GROUP_LINE" ]] || drop_groups=1
+  [[ -n "$PIGS" && -n "$PIGPIO_UNIT" ]] || drop_pre=1
+  [[ -n "$PIGS" ]] || drop_post=1
+
+  awk \
+    -v py="$PYTHON" \
+    -v repo="$REPO_DIR" \
+    -v run_user="$RUN_USER" \
+    -v run_group="$RUN_GROUP" \
+    -v group_line="$GROUP_LINE" \
+    -v pigs="$PIGS" \
+    -v pigpio_unit="$PIGPIO_UNIT" \
+    -v drop_groups="$drop_groups" \
+    -v drop_pre="$drop_pre" \
+    -v drop_post="$drop_post" '
+    function rep(s, from, to,   out, i) {
+      out = ""
+      while ((i = index(s, from)) > 0) {
+        out = out substr(s, 1, i - 1) to
+        s = substr(s, i + length(from))
+      }
+      return out s
+    }
+    # Comments in the template document the unit; they are not part of it.
+    /^[ \t]*#/       { next }
+    /@GROUP_LINE@/   { if (drop_groups) next }
+    /^ExecStartPre=/ { if (drop_pre)    next }
+    /^ExecStopPost=/ { if (drop_post)   next }
+    {
+      line = $0
+      line = rep(line, "@PYTHON@",      py)
+      line = rep(line, "@REPO_DIR@",    repo)
+      line = rep(line, "@RUN_USER@",    run_user)
+      line = rep(line, "@RUN_GROUP@",   run_group)
+      line = rep(line, "@GROUP_LINE@",  group_line)
+      line = rep(line, "@PIGS@",        pigs)
+      line = rep(line, "@PIGPIO_UNIT@", pigpio_unit)
+      # An empty @PIGPIO_UNIT@ would otherwise leave a trailing space on the
+      # After= and Wants= lines. Nothing in this unit ends in whitespace.
+      sub(/[ \t]+$/, "", line)
+      print line
+    }
+  ' "$TEMPLATE"
+}
+
+# Render once, check it, then use it. Anything still looking like a placeholder
+# is one I added to the template and forgot to wire up here, and I would much
+# rather hear about that than install it.
+UNIT_TEXT="$(render_unit)"
+if printf '%s\n' "$UNIT_TEXT" | grep -q '@[A-Z_][A-Z_]*@'; then
+  echo "Unfilled placeholder in the rendered unit:" >&2
+  printf '%s\n' "$UNIT_TEXT" | grep -n '@[A-Z_][A-Z_]*@' >&2
+  exit 1
+fi
+
+if [[ $PRINT_ONLY -eq 1 ]]; then
+  printf '%s\n' "$UNIT_TEXT"
+  exit 0
+fi
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Needs root: sudo $0" >&2
+  exit 1
+fi
+
 UNIT=/etc/systemd/system/crawler.service
 echo "Writing $UNIT"
-
-{
-  echo "[Unit]"
-  echo "Description=RC rock crawler control"
-  echo "After=network-online.target bluetooth.target ${PIGPIO_UNIT}"
-  echo "Wants=network-online.target ${PIGPIO_UNIT}"
-  echo ""
-  echo "[Service]"
-  echo "Type=simple"
-  echo "User=${RUN_USER}"
-  echo "Group=${RUN_GROUP}"
-  [[ -n "$GROUP_LINE" ]] && echo "$GROUP_LINE"
-  echo "WorkingDirectory=${REPO_DIR}"
-  # SDL wants to be told the name of a video driver before it will initialise
-  # at all, and there is no display here. It is NOT what makes the joystick
-  # readable headless -- group `input` above is. Keeping it because SDL still
-  # asks; it is not the magic.
-  echo "Environment=SDL_VIDEODRIVER=dummy"
-  echo "Environment=PYTHONUNBUFFERED=1"
-  if [[ -n "$PIGS" && -n "$PIGPIO_UNIT" ]]; then
-    # After=pigpiod only means the unit was started, not that the socket is
-    # listening yet. VehicleController raises outright if it cannot connect,
-    # and with Restart=on-failure that turns into a restart loop at boot.
-    # No shell variables and no command substitution in here on purpose:
-    # systemd expands $NAME and ${NAME} inside Exec lines itself, so a loop
-    # counter would get eaten before /bin/sh ever saw it. The bound on this
-    # wait is TimeoutStartSec, which is what it is for.
-    echo "ExecStartPre=/bin/sh -c 'until \"${PIGS}\" t >/dev/null 2>&1; do sleep 0.25; done'"
-  fi
-  # Quoted, because an unquoted path with a space in it splits into extra
-  # arguments and argparse rejects them.
-  echo "ExecStart=\"${PYTHON}\" \"${REPO_DIR}/main.py\" --mode manual"
-  if [[ -n "$PIGS" ]]; then
-    # The last line of defence. If the process was SIGKILLed, or crashed hard,
-    # or TimeoutStopSec ran out, nothing in Python got to disarm anything --
-    # and pigpio keeps emitting the last pulse width it was handed, so the car
-    # is still driving. This zeroes GPIO18 whatever happened. The leading `-`
-    # keeps a failure here from marking the unit failed. Unquoted, because
-    # the prefix character has to be the first thing on the line and I am not
-    # going to find out the hard way whether systemd takes a quote straight
-    # after it. /usr/bin/pigs has no spaces in it.
-    echo "ExecStopPost=-${PIGS} servo 18 0"
-  fi
-  echo "Restart=on-failure"
-  echo "RestartSec=5"
-  # Give main.py time to unwind through vecon.close() so the ESC is left at
-  # neutral instead of holding its last pulse width.
-  echo "KillSignal=SIGTERM"
-  echo "TimeoutStopSec=15"
-  echo ""
-  echo "[Install]"
-  echo "WantedBy=multi-user.target"
-} > "$UNIT"
+printf '%s\n' "$UNIT_TEXT" > "$UNIT"
 
 systemctl daemon-reload
 

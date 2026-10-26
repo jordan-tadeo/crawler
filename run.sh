@@ -13,13 +13,25 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-if [[ -x env/bin/python ]]; then
+# Same precedence as deploy/install-service.sh, and the same reason: `env` is
+# the old hand-rolled venv the installed service still points at, so on the car
+# it keeps winning until I delete it. `.venv` is what `uv sync` makes, and on a
+# fresh checkout -- which has no env/ -- it is what gets used. CRAWLER_PYTHON
+# overrides the lot, for trying one against the other.
+if [[ -n "${CRAWLER_PYTHON:-}" ]]; then
+  PYTHON="$CRAWLER_PYTHON"
+elif [[ -x env/bin/python ]]; then
   PYTHON=env/bin/python
 elif [[ -x env/bin/python3 ]]; then
   PYTHON=env/bin/python3
+elif [[ -x .venv/bin/python ]]; then
+  PYTHON=.venv/bin/python
+elif [[ -x .venv/bin/python3 ]]; then
+  PYTHON=.venv/bin/python3
 else
   PYTHON="$(command -v python3)"
-  echo "No venv at $REPO_DIR/env, using $PYTHON" >&2
+  echo "No venv at $REPO_DIR/env or $REPO_DIR/.venv, using $PYTHON" >&2
+  echo "Make one with: uv venv --python /usr/bin/python3 --system-site-packages && uv sync" >&2
 fi
 
 exec "$PYTHON" main.py --mode manual "$@"

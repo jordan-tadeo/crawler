@@ -1,0 +1,66 @@
+# The systemd unit for the car, as a file I can read, instead of forty echo
+# lines in a shell script. deploy/install-service.sh fills the @PLACEHOLDERS@
+# and writes the result to /etc/systemd/system/crawler.service.
+#
+# Lines starting with # are stripped on the way out, so the installed unit is
+# byte-for-byte the unit and nothing else. Keep comments tight against the line
+# they describe: the only blank lines in here are the two section breaks, and
+# they survive into the output.
+#
+# Placeholders:
+#   @PYTHON@        interpreter, detected (see the script's precedence order)
+#   @REPO_DIR@      this checkout
+#   @RUN_USER@      the invoking user, never root
+#   @RUN_GROUP@     that user's primary group
+#   @GROUP_LINE@    the whole SupplementaryGroups= line, or the line is dropped
+#   @PIGS@          path to the pigs binary; its two lines drop without it
+#   @PIGPIO_UNIT@   pigpiod.service, or empty if the unit is not installed
+[Unit]
+Description=RC rock crawler control
+After=network-online.target bluetooth.target @PIGPIO_UNIT@
+Wants=network-online.target @PIGPIO_UNIT@
+
+[Service]
+Type=simple
+User=@RUN_USER@
+Group=@RUN_GROUP@
+# `input` is the load-bearing one: it is what lets the service user read
+# /dev/input/event*, which is what makes joystick input work with no login
+# session. SDL_VIDEODRIVER below is not what does that. Naming a group that
+# does not exist is a hard start failure, so the script builds this line out of
+# the groups it actually found.
+@GROUP_LINE@
+WorkingDirectory=@REPO_DIR@
+# SDL wants to be told the name of a video driver before it will initialise at
+# all, and there is no display here. It is NOT what makes the joystick readable
+# headless -- group `input` above is. Keeping it because SDL still asks; it is
+# not the magic.
+Environment=SDL_VIDEODRIVER=dummy
+Environment=PYTHONUNBUFFERED=1
+# After=pigpiod only means the unit was started, not that the socket is
+# listening yet. VehicleController raises outright if it cannot connect, and
+# with Restart=on-failure that turns into a restart loop at boot. No shell
+# variables and no command substitution in here on purpose: systemd expands
+# $NAME and ${NAME} inside Exec lines itself, so a loop counter would get eaten
+# before /bin/sh ever saw it. The bound on this wait is TimeoutStartSec.
+ExecStartPre=/bin/sh -c 'until "@PIGS@" t >/dev/null 2>&1; do sleep 0.25; done'
+# Quoted, because an unquoted path with a space in it splits into extra
+# arguments and argparse rejects them.
+ExecStart="@PYTHON@" "@REPO_DIR@/main.py" --mode manual
+# The last line of defence. If the process was SIGKILLed, or crashed hard, or
+# TimeoutStopSec ran out, nothing in Python got to disarm anything -- and
+# pigpio keeps emitting the last pulse width it was handed, so the car is still
+# driving. This zeroes GPIO18 whatever happened. The leading `-` keeps a failure
+# here from marking the unit failed. Unquoted, because the prefix character has
+# to be the first thing on the line and I am not going to find out the hard way
+# whether systemd takes a quote straight after it. /usr/bin/pigs has no spaces.
+ExecStopPost=-@PIGS@ servo 18 0
+Restart=on-failure
+RestartSec=5
+# Give main.py time to unwind through vecon.close() so the ESC is left at
+# neutral instead of holding its last pulse width.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
