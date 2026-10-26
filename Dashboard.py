@@ -64,7 +64,7 @@ class Dashboard(QMainWindow):
         self.labels[1][1].setPixmap(pixmap)
 
         # Update the model input feed for debugging
-        self.update_model_input_feed(self.person_follower.get_latest_input_tensor())
+        self.update_model_input_view(self.person_follower.get_latest_input_tensor())
 
     def closeEvent(self, event):
         # Stop the person follower when closing the dashboard

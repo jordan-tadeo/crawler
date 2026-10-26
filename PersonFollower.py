@@ -6,18 +6,22 @@ import warnings
 import threading
 import numpy as np
 import os
-import kagglehub
-import tflite_runtime.interpreter as tflite
 import tensorflow_hub as hub
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# Where the vision assets live. Defaults sit next to this file so the checkout
+# works under any user, and either can be pointed elsewhere with an env var.
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.environ.get("CRAWLER_MODEL_DIR", os.path.join(REPO_DIR, "models", "mobilenet_v2"))
+LABELS_PATH = os.environ.get("CRAWLER_LABELS", os.path.join(REPO_DIR, "labels", "ImageNetLabels.txt"))
+
 class PersonFollower:
     def __init__(self, vehicle_controller: VehicleController, usb_cam: USBCamera):
         # Load the MobileNetV2 model using hub.KerasLayer
         # Ensure the model path points to the directory containing `saved_model.pb`
-        local_model_path = "/home/jt/Documents/py/crawler/models/mobilenet_v2"
+        local_model_path = MODEL_DIR
         if not os.path.exists(os.path.join(local_model_path, "saved_model.pb")):
             raise FileNotFoundError(f"Model not found at {local_model_path}. Please ensure the directory contains `saved_model.pb`." )
         print("Loading MobileNetV2 model from local path:", local_model_path)
@@ -46,7 +50,7 @@ class PersonFollower:
         self.person_detected = False
 
         # Load ImageNet labels from the file
-        labels_path = "/home/jt/Documents/py/crawler/labels/ImageNetLabels.txt"
+        labels_path = LABELS_PATH
         if not os.path.exists(labels_path):
             raise FileNotFoundError(f"Labels file not found at {labels_path}. Please ensure the file exists.")
         with open(labels_path, "r") as f:
@@ -55,6 +59,9 @@ class PersonFollower:
         # Threading setup
         self.thread = threading.Thread(target=self._run_yolo_processing, daemon=True)
         self.stop_event = threading.Event()
+        # Set while auto mode owns the gimbal. A thread cannot be restarted, so
+        # leaving manual mode has to park this thread rather than stop it.
+        self.active_event = threading.Event()
         self.latest_frame = None
         self.latest_detections = None
 
@@ -69,16 +76,29 @@ class PersonFollower:
         return self.latest_input_tensor
 
     def start(self):
-        '''Start the YOLO processing thread.'''
+        '''Start the YOLO processing thread, active.'''
+        self.active_event.set()
         self.thread.start()
+
+    def resume(self):
+        '''Let the thread drive the gimbal again.'''
+        self.active_event.set()
+
+    def pause(self):
+        '''Park the thread without tearing it down.'''
+        self.active_event.clear()
 
     def stop(self):
         '''Stop the YOLO processing thread.'''
         self.stop_event.set()
-        self.thread.join()
+        self.active_event.set()  # release the wait so the thread can exit
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
 
     def _run_yolo_processing(self):
         while not self.stop_event.is_set():
+            if not self.active_event.wait(timeout=0.1):
+                continue
             self.process_and_adjust()
 
     def process_and_adjust(self):
