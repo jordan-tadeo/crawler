@@ -44,26 +44,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# PersonFollower.py and the two scratch_* / convert_* bench scripts, and
-# nothing else. PersonFollower is retired and imported by nothing. TensorFlow
-# is by a wide margin the biggest and most aarch64-fragile thing in this
-# project, so it does not belong in the install that has to come up on boot.
+# There was a `vision` extra in here -- tensorflow, tensorflow-hub,
+# tflite-runtime and a setuptools<81 pin to work around tensorflow_hub
+# importing pkg_resources without declaring it. It is gone, along with the
+# four files that were its only consumers: PersonFollower.py, USBCamera.py,
+# scratch_persondetect.py and convert_pb_to_tflite.py.
 #
-#   uv sync --extra vision
-vision = [
-    "tensorflow==2.19.0",
-    "tensorflow-hub==0.16.1",
-    "tflite-runtime==2.14.0",
-    # Not a dependency of mine, a dependency of theirs that they forgot to
-    # declare. tensorflow_hub 0.16.1 does `from pkg_resources import
-    # parse_version` at import time and never asks for setuptools; tensorflow
-    # and tensorboard do ask for it, but unpinned. setuptools 81 dropped
-    # pkg_resources, so a fresh resolve lands on 84.x and `import
-    # tensorflow_hub` dies with ModuleNotFoundError before it runs a line of
-    # mine. The old venv on the car never hit it because it happens to be
-    # sitting on setuptools 80.0.1.
-    "setuptools<81",
-]
+# Worth being clear about why, because TensorFlow looks like something a robot
+# project ought to want. It was a whole-image classifier bolted to a USB
+# webcam, and the car does not see that way any more -- vision is the OAK-D
+# now, and depthai does stereo depth on the camera's own chip. Nothing left in
+# this project has any use for a TensorFlow graph, and it was by a wide margin
+# the biggest and most aarch64-fragile thing in here.
+#
+# `uv sync --extra vision` is not a command any more. git log has all of it if
+# I ever want the pin set back.
 
 # Deliberately empty, and the emptiness is the point.
 #

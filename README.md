@@ -45,14 +45,15 @@ it inside the venv.
 
 ### Extras
 
-```sh
-uv sync --extra vision      # tensorflow, tensorflow-hub, tflite-runtime
-```
+There was a `vision` extra here for TensorFlow. It is gone, and so are the four
+files that were its only consumers: `PersonFollower.py`, `USBCamera.py`,
+`scratch_persondetect.py` and `convert_pb_to_tflite.py`, plus the 45 MiB of
+SavedModel and `.tflite` weights they loaded.
 
-Only `PersonFollower.py` -- retired, imported by nothing -- and the `scratch_*`
-/ `convert_pb_to_tflite.py` bench scripts want those. They are the largest and
-most aarch64-fragile things in the project, so the install that has to come up
-on boot does not carry them.
+That whole branch of the project was a whole-image classifier on a USB webcam,
+aimed at a pan/tilt gimbal that is not bolted to the car any more. Vision is the
+OAK-D now: `oakd.py` and `camera.py` take stereo depth off the camera's own chip
+and `driver.py` crawls on it. Nothing left in the tree imports TensorFlow.
 
 The `dashboard` extra is deliberately empty. `main.py --dashboard` needs PyQt5,
 and PyQt5 5.15.x publishes **no `linux_aarch64` wheel at all** -- 5.15.9 ships
