@@ -66,6 +66,39 @@ instead, which is the whole reason the venv needs `--system-site-packages`.
 `cv2` call in the tree is in the base module. Having both installed is a known
 way to end up with two native extensions fighting over one `cv2` name.
 
+## Tests
+
+```sh
+uv run pytest
+```
+
+Runs on a laptop in under a second. Nothing in the suite wants pigpio talking
+to a daemon, a pad paired, or the OAK-D plugged in -- which is the point. These
+cover the arithmetic and the gating that had never run anywhere but on the car,
+and every one of them is aimed at something that has already gone wrong:
+
+- **`tests/test_driver.py`** -- the stuck check. The journal used to show
+  "Switched to auto" and "STUCK - backing up to recover." on the same second,
+  then STUCK again every five seconds on a car that was driving fine. Three
+  faults made that: a missing IMU packet filed as "not moving", no check that
+  the car had even been asked to move, and `last_recovery_time` stamped on
+  every false positive. One test per fault, plus the fail-closed depth checks.
+- **`tests/test_vehicle_controller.py`** -- pulse widths and servo angles,
+  including that half throttle is still 1787 us, and the nan/inf guard.
+  `min()` and `max()` do not clamp a nan, so a nan throttle used to come out of
+  the clamp as a clean 1.0 and reach the ESC as 2000 us, full forward.
+- **`tests/test_joystick.py`** -- the axis and button map, which was wrong in a
+  way that held the rear steering servo at full lock, and the trigger scaling,
+  which turned an unreported axis reading of 0.0 into half throttle.
+- **`tests/test_logger.py`** -- that `log/` makes itself. It is gitignored, so
+  it is not in a fresh clone, and `open(..., 'a')` does not create a missing
+  parent -- which with `Restart=on-failure` was a restart loop a few seconds
+  into every run.
+
+`conftest.py` at the root is what lets the tests `import driver` the same way
+`main.py` does. There is no `src/` layout and no installed package: the flat
+module names are load-bearing in `main.py` and in the systemd unit.
+
 ## Driving it
 
 ```sh

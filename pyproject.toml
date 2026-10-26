@@ -83,6 +83,29 @@ dependencies = [
 # uv-managed CPython would not find dist-packages at all.
 dashboard = []
 
+[dependency-groups]
+# Tests. A dependency group and not an extra, because an extra is something a
+# consumer installs and a group is something only this checkout needs -- and
+# `uv sync` installs the dev group by default, so the tests are there without
+# anybody remembering a flag. `uv sync --no-dev` on the car if I ever want it
+# left out.
+#
+# pytest only. Everything the tests import beyond it -- numpy for the depth
+# frames, and nothing else -- is already a real dependency of the project.
+# Nothing in here needs pigpio talking to a daemon, a pad plugged in, or the
+# OAK-D attached, which is the whole point: they run on the laptop.
+dev = [
+    "pytest==9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The project is a flat pile of modules imported by name (`import Joystick as
+# js`), so the tests have to import them the same way. conftest.py at the root
+# puts the checkout on sys.path; this just stops pytest from hunting for tests
+# anywhere else.
+addopts = "-q"
+
 [tool.uv]
 # This is a flat pile of modules driven by `python main.py`, not a package to
 # build and install. Without this, uv tries to build `crawler` itself and wants
