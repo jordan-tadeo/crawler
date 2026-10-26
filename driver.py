@@ -1,31 +1,68 @@
-import asyncio
-import numpy as np
-from oakd import OakD
-from VehicleController import VehicleController
+"""Depth-driven roomba mode: crawl forward, back out of whatever it hits.
+
+Everything here is synchronous and non-blocking. The control loop owns the
+ESC and the servos on one thread and calls tick() about ten times a second,
+so nothing in this file is allowed to sleep: the old recover() awaited 2.5
+seconds with the throttle pinned in reverse, and for those 2.5 seconds
+nothing was polling the controller, the stop signal or the camera. SIGTERM
+arrived and the car kept reversing.
+
+recover() is a phase machine instead. begin_recover() commands the first
+phase and returns, recovering() advances it on the next tick, and abort()
+drops it on the floor and zeroes the throttle. A START press, a controller
+dropout and a systemctl stop are all honoured inside one 10 ms tick, even
+halfway through a reverse.
+"""
+
 import random
 import time
 
+import numpy as np
+
+# Recover phases, in order.
+_PHASE_REVERSE = "reverse"
+_PHASE_SETTLE = "settle"
+
+# How long each phase holds. These two came out of the original recover()'s
+# asyncio.sleep() calls, so it is the same feel, just not blocking.
+REVERSE_SECONDS = 2.0
+SETTLE_SECONDS = 0.5
+
+
 class Driver:
-    def __init__(self, controller: VehicleController, oakd: OakD):
+    def __init__(self, controller, oakd):
         self.controller = controller
         self.camera = oakd
-        self.turning = False
-        self.last_movement_time = time.time()
-        self.last_recovery_time = 0  # timestamp of last stuck recovery
-        self.recovery_cooldown = 5.0  # seconds to wait before checking for stuck again
+
+        self.last_recovery_time = 0.0
+        self.recovery_cooldown = 5.0  # seconds before the stuck check re-arms
         self.imu_history = []
-        self.imu_window_size = 5  # adjust window size for smoothing    
+        self.imu_window_size = 5  # window for smoothing the accel magnitude
 
-
-        # Tunable parameters
+        # Tunable parameters. I set all four of these by feel on the bench and
+        # they are not to be nudged from a desk.
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.6   # very slow backup
         self.max_turn = 0.6         # limit to avoid servo damage when steering against an object
         self.stuck_threshold = 0.2  # or whatever threshold makes sense for imu
-        self.stuck_timeout = 2.5
 
+        # Recover phase machine. _phase is None whenever recover does not own
+        # the wheels, which is the normal case.
+        self._phase = None
+        self._phase_until = 0.0
+        self._turn_dir = 0.0
 
     def is_moving(self, imu) -> bool:
+        """True if the car looks like it is actually moving.
+
+        Careful: the IMU node is enabled for LINEAR_ACCELERATION, and linear
+        acceleration is near zero at a constant velocity. A smooth roll across
+        a flat floor can therefore read as "stuck" and trigger a recover for
+        no reason. stuck_threshold = 0.2 is my bench number on the accel
+        magnitude, so it mostly rides the noise floor -- but whether this
+        wants a gyro term or a wheel-speed source instead needs a run on the
+        bench, not a guess. Leaving the threshold alone until then.
+        """
         if imu is None:
             return False
 
@@ -37,10 +74,8 @@ class Driver:
             self.imu_history.pop(0)
 
         avg_motion = np.mean(self.imu_history)
-        print(f"Avg motion = {avg_motion:.3f}")
 
         return avg_motion > self.stuck_threshold
-
 
     def get_steering_bias(self, depth, region_width=100, region_height=80, threshold_mm=1200):
         """
@@ -72,53 +107,105 @@ class Driver:
         return steering
 
     def obstacle_in_front(self, depth_frame, threshold_mm=400, region_size=(50, 50)):
-        """Check if there's an obstacle in the center of the depth frame."""
+        """Check if there's an obstacle in the center of the depth frame.
+
+        Fails closed. Dropping the zero pixels and then taking a mean used to
+        hand np.mean() an empty array, which is nan, and nan > 0.5 is False --
+        so a centre patch with nothing measurable in it read as "clear" and
+        the car drove straight at it. On a stereo pair a no-return usually
+        means too close, too dark or too featureless, every one of which is a
+        reason to stop. So if under a tenth of the patch came back valid,
+        call it an obstacle.
+        """
         h, w = depth_frame.shape
         dh, dw = region_size
         center = depth_frame[h//2 - dh//2:h//2 + dh//2, w//2 - dw//2:w//2 + dw//2]
+        total = center.size
         center = center[center > 0]  # ignore zero-depth pixels
+
+        if total == 0 or center.size < total * 0.1:
+            return True
+
         return np.mean(center < threshold_mm) > 0.5
 
-    async def recover(self):
-        """Backup and turn to avoid obstacle."""
+    def begin_recover(self, now):
+        """Start a backup-and-turn. Commands the first phase and returns."""
         print("[Driver] reversing and turning")
 
-        # pick rando direction
-        turn_dir = random.choice([self.max_turn/4, self.max_turn])
-        self.controller.set_steering(turn_dir, -turn_dir)
-
+        # Pick a random direction, and a random amount of it. The old version
+        # chose between max_turn/4 and max_turn -- two magnitudes, both
+        # positive -- so the car always pivoted the same way and a corner that
+        # beat it beat it forever. Both signs now.
+        self._turn_dir = random.choice([
+            -self.max_turn,
+            -self.max_turn / 4,
+            self.max_turn / 4,
+            self.max_turn,
+        ])
+        self.controller.set_steering(self._turn_dir, -self._turn_dir)
         self.controller.set_throttle(self.reverse_speed)
-        await asyncio.sleep(2)
 
+        self._phase = _PHASE_REVERSE
+        self._phase_until = now + REVERSE_SECONDS
+
+    def recovering(self, now):
+        """Advance the recover phases. True while recover owns the wheels."""
+        if self._phase is None:
+            return False
+
+        if now < self._phase_until:
+            return True
+
+        if self._phase == _PHASE_REVERSE:
+            self.controller.set_throttle(0)
+            self._phase = _PHASE_SETTLE
+            self._phase_until = now + SETTLE_SECONDS
+            return True
+
+        # Settle is up: unwind the steering and hand the wheels back.
+        self.controller.set_steering(-self._turn_dir, 0)
+        self._phase = None
+        self._phase_until = 0.0
+        return False
+
+    def abort(self):
+        """Give up on a recover in progress and stop. Safe to call twice."""
+        self._phase = None
+        self._phase_until = 0.0
         self.controller.set_throttle(0)
-        await asyncio.sleep(0.5)
 
-        self.controller.set_steering(-turn_dir, 0)
+    def tick(self, now=None):
+        """One pass of autonomy. Never blocks, never sleeps."""
+        if now is None:
+            now = time.monotonic()
 
-    async def tick(self):
+        if self.recovering(now):
+            return
+
         depth = self.camera.get_depth_frame()
+        if depth is None:
+            # None is a real return value: no packet waiting, or the X_LINK
+            # error path. Without depth there is nothing to decide on, and the
+            # only safe command is to stop -- pigpio holds the last pulse
+            # width forever, so "do nothing" means "keep driving".
+            self.controller.set_throttle(0)
+            return
+
         imu = self.camera.get_imu_sample()
 
-        # Skip stuck check if recently recovered
-        time_since_recovery = time.time() - self.last_recovery_time
-
-        self.last_movement_time = time.time()
-        steering = self.get_steering_bias(depth)
-        self.controller.set_steering(steering, 0)
-        self.controller.set_throttle(self.forward_speed)
-        print(f"[Driver] state = {self.controller.get_state()}")
-
-        # Obstacle detected in front
+        # Decide first, command second. The old order commanded forward speed
+        # and only then checked for an obstacle, so every tick facing a wall
+        # lurched into it for a tick before reversing.
         if self.obstacle_in_front(depth):
-            print("Obstacle detected — backing up.")
-            await self.recover()
+            print("Obstacle detected - backing up.")
+            self.begin_recover(now)
             return
-        # Haven't moved for a while
-        if not self.is_moving(imu) and time_since_recovery > self.recovery_cooldown:
-            self.last_recovery_time = time.time()
-            print("STUCK — backing up to recover.")
-            await self.recover()
-            steering = self.get_steering_bias(depth)
 
+        if not self.is_moving(imu) and now - self.last_recovery_time > self.recovery_cooldown:
+            self.last_recovery_time = now
+            print("STUCK - backing up to recover.")
+            self.begin_recover(now)
+            return
 
-
+        self.controller.set_steering(self.get_steering_bias(depth), 0)
+        self.controller.set_throttle(self.forward_speed)
