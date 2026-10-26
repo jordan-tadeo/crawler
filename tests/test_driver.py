@@ -21,6 +21,8 @@ Three separate faults produced that, and there is a test for each:
 Everything here is arithmetic on numbers and numpy arrays. No OAK-D, no pigpio.
 """
 
+import time
+
 import numpy as np
 import pytest
 
@@ -370,3 +372,374 @@ def test_steering_bias_stays_in_the_unit_range(d):
 
 def test_no_valid_depth_either_side_steers_straight_rather_than_dividing(d):
     assert d.get_steering_bias(np.zeros((400, 640), dtype=np.uint16)) == 0
+
+
+# --- the footprint check ----------------------------------------------------
+#
+# The bug this half of the file is about: obstacle_in_front() sampled a 50x50
+# patch at the dead centre of a 640x400 frame. 2,500 of 256,000 pixels, 0.98%
+# of the frame, a 45 mm square window at the 400 mm trigger distance -- on a
+# car 267 mm wide. A wall or a doorway corner that catches a wheel was never
+# in it. Worse vertically: the lowest row it read was 25 px below the optical
+# centre, which with the lens 165 mm up is 142 mm of air at 400 mm, so it
+# looked straight over every rock on the floor.
+#
+# All of this is arithmetic on numpy arrays. No OAK-D, no pigpio, no car.
+
+def ground_depth(invalid=0.0, wall_mm=2500, seed=5):
+    """A believable clear scene: floor sloping away, a far wall above the horizon.
+
+    Level ground at distance Z appears fy * CAMERA_HEIGHT_MM / Z px below the
+    optical centre, so this inverts that per row. It matters that the clear
+    case is this and not a uniform slab, because the floor is what guarantees
+    every probe far evidence, and that guarantee is the whole reason
+    fail-closed does not become routine once the band reaches down.
+
+    `invalid` drops that fraction of pixels to 0, the way an unmeasurable
+    pixel comes off the device.
+    """
+    rows = np.arange(400) - 200
+    floor = np.where(rows > 0,
+                     dv.FY_AT_400 * dv.CAMERA_HEIGHT_MM / np.maximum(rows, 1),
+                     1e9)
+    frame = np.broadcast_to(np.minimum(floor, wall_mm).astype(np.uint16)[:, None],
+                            (400, 640)).copy()
+    if invalid:
+        rng = np.random.default_rng(seed)
+        frame[rng.random(frame.shape) < invalid] = 0
+    return frame
+
+
+def row_for(height_mm, range_mm=dv.CLEARANCE_MM):
+    """Image row where something `height_mm` off the ground sits at `range_mm`."""
+    return 200 + int(round(dv.FY_AT_400 * (dv.CAMERA_HEIGHT_MM - height_mm) / range_mm))
+
+
+def marks(scan):
+    """The scan as one readable string: N near, ? no-return, . clear."""
+    return "".join("N" if r == dv.NEAR else "?" if r == dv.NO_RETURN else "."
+                   for r in scan.reason)
+
+
+def sampled_cells(geo, probe):
+    """The pixels one probe actually reads, after decimation.
+
+    Needed because a test that scatters pixels at random mostly misses the
+    stride grid and then proves nothing: five random pixels inside the band
+    land zero sampled cells. Anything testing a count has to put the pixels
+    where the probe will look.
+    """
+    return [(r, c)
+            for r in range(geo.row_top, geo.row_bottom, dv.ROW_STRIDE)
+            for c in range(geo.col_edges[probe], geo.col_edges[probe + 1], dv.COL_STRIDE)]
+
+
+def probe_k(geo, probe):
+    """How many samples inside the budget it takes to block one probe."""
+    n = len(sampled_cells(geo, probe))
+    return max(dv.NEAR_SAMPLES_FLOOR, int(round(dv.NEAR_SAMPLE_FRACTION * n)))
+
+
+def speckled_depth(near_samples, probe=4):
+    """Clear ground with `near_samples` isolated near pixels in one probe.
+
+    Isolated on purpose: each one is a single pixel on the stride grid with
+    untouched neighbours, which is what sensor speckle looks like rather than
+    an object.
+    """
+    frame = ground_depth()
+    geo = dv.footprint_geometry(frame.shape)
+    for r, c in sampled_cells(geo, probe)[::3][:near_samples]:
+        frame[r, c] = 120
+    return frame
+
+
+# --- the geometry, against the two numbers measured off the car -------------
+
+def test_the_probes_span_the_measured_track_width():
+    """Track width outside-to-outside is 266.7 mm, measured on the car, so the
+    probes have to reach 133.35 mm each side plus the clearance margin. The old
+    patch reached 22.7 mm, which is 5.9x too narrow."""
+    geo = dv.footprint_geometry((400, 640))
+    half_px = (geo.col_edges[-1] - geo.col_edges[0]) / 2.0
+    half_mm = dv.CLEARANCE_MM * half_px / geo.fx
+    assert half_mm == pytest.approx(dv.HALF_TRACK_MM + dv.FOOTPRINT_MARGIN_MM, abs=1.0)
+    assert half_px / 25.0 > 5.0, "no wider than the old patch is no fix"
+
+
+def test_the_probes_tile_the_footprint_with_no_gaps():
+    """Contiguous, not sampled. A gap between probes is somewhere a wheel can
+    hide, and the probe width has to stay under a tyre face."""
+    geo = dv.footprint_geometry((400, 640))
+    edges = geo.col_edges
+    assert len(edges) == dv.PROBE_COLUMNS + 1
+    widths = [edges[i + 1] - edges[i] for i in range(dv.PROBE_COLUMNS)]
+    assert all(w > 0 for w in widths)
+    assert sum(widths) == edges[-1] - edges[0]
+    widest_mm = dv.CLEARANCE_MM * max(widths) / geo.fx
+    assert widest_mm < 50.0, "a probe wider than a tyre blurs which wheel is blocked"
+
+
+def test_the_probes_reach_down_toward_the_near_ground():
+    """The part his 165.1 mm lens-height measurement unblocked. The old band
+    was a 3.24 degree stripe around the optical axis and saw nothing below
+    142 mm above the ground at the trigger range."""
+    geo = dv.footprint_geometry((400, 640))
+    lowest = geo.row_bottom - 1
+    assert lowest > 225, "no lower than the old patch is no fix"
+    above_ground = dv.CAMERA_HEIGHT_MM - dv.CLEARANCE_MM * (lowest - 200) / geo.fy
+    assert above_ground < 100.0
+
+
+def test_the_bottom_probe_row_cannot_read_level_ground_as_an_obstacle():
+    """The reason the band stops where it does. A probe takes the near
+    distance in its column, so a row low enough to see flat floor inside the
+    budget reads the floor as a wall and the car reverses forever."""
+    geo = dv.footprint_geometry((400, 640))
+    floor_mm = geo.fy * dv.CAMERA_HEIGHT_MM / (geo.row_bottom - 1 - 200)
+    assert floor_mm == pytest.approx(dv.FLOOR_CLEAR_MM, rel=0.02)
+    assert floor_mm > 2.0 * dv.CLEARANCE_MM, "needs room for the car to pitch"
+
+
+def test_the_geometry_scales_with_the_frame_it_is_given():
+    """The intrinsics are quoted at 640x400 and the field of view does not
+    change with resolution, so an 800P frame needs no edit here."""
+    small = dv.footprint_geometry((400, 640))
+    big = dv.footprint_geometry((800, 1280))
+    assert big.fx == pytest.approx(2 * small.fx)
+    assert (big.col_edges[-1] - big.col_edges[0]) == pytest.approx(
+        2 * (small.col_edges[-1] - small.col_edges[0]), abs=2)
+
+
+# --- the four scenes that matter -------------------------------------------
+
+def test_an_all_far_frame_leaves_every_probe_clear():
+    scan = dv.free_by_column(np.full((400, 640), 3000, dtype=np.uint16))
+    assert marks(scan) == "." * dv.PROBE_COLUMNS
+    assert not scan.blocked.any()
+
+
+def test_a_wall_blocks_every_probe_for_being_near():
+    scan = dv.free_by_column(np.full((400, 640), 200, dtype=np.uint16))
+    assert marks(scan) == "N" * dv.PROBE_COLUMNS
+    assert np.all(scan.distance_mm == 200)
+
+
+def test_a_corner_blocks_only_the_probes_it_covers():
+    """The case the old check could not see at all: something across one side
+    of the car. Left half of the frame is a wall, right half is open floor."""
+    frame = ground_depth(invalid=0.2)
+    frame[:, :320] = 250
+    scan = dv.free_by_column(frame)
+    assert set(marks(scan)) == {"N", "."}
+    assert marks(scan).startswith("N"), "the blocked side has to be the left one"
+    assert marks(scan).endswith("."), "the open side has to stay open"
+
+
+def test_an_all_zeros_frame_blocks_every_probe_for_no_return():
+    """A stereo pair that returns nothing is too close, too dark or too
+    featureless, and all three are reasons to stop."""
+    scan = dv.free_by_column(np.zeros((400, 640), dtype=np.uint16))
+    assert marks(scan) == "?" * dv.PROBE_COLUMNS
+    assert np.all(np.isinf(scan.distance_mm))
+
+
+def test_a_single_near_column_blocks_only_itself():
+    frame = ground_depth(invalid=0.25)
+    geo = dv.footprint_geometry(frame.shape)
+    frame[geo.row_top:geo.row_bottom, geo.col_edges[-2]:geo.col_edges[-1]] = 300
+    scan = dv.free_by_column(frame)
+    assert marks(scan) == "." * (dv.PROBE_COLUMNS - 1) + "N"
+    assert scan.distance_mm[-1] == 300
+
+
+# --- fail-closed inflation, which is the risk this change carries ----------
+
+def test_a_clear_floor_is_not_blocked_even_with_most_of_it_unmeasurable():
+    """THE test for the risk. Under 10% valid was rare across 2,500 centre
+    pixels; spread over a band that includes frame edges and far field it
+    could have become routine, and the car would reverse on a metronome --
+    which would read as a regression in the stuck detector that just shipped.
+
+    The rule asks for FAR evidence per probe, not validity, so a scene that is
+    plainly far survives heavy dropout."""
+    for dropout in (0.0, 0.3, 0.5, 0.7, 0.85):
+        scan = dv.free_by_column(ground_depth(invalid=dropout))
+        assert not scan.blocked.any(), f"blocked at {dropout:.0%} invalid: {marks(scan)}"
+
+
+def test_a_probe_that_is_mostly_far_and_partly_invalid_is_not_blocked():
+    """Invalidity only means "obstacle" inside the band where a reading would
+    have meant "too close". Half of this frame is missing and the rest is at
+    3 m, which is an answer, not an absence of one."""
+    frame = np.full((400, 640), 3000, dtype=np.uint16)
+    frame[np.random.default_rng(3).random(frame.shape) < 0.5] = 0
+    scan = dv.free_by_column(frame)
+    assert marks(scan) == "." * dv.PROBE_COLUMNS
+    assert np.all(scan.valid_fraction < 0.6)
+
+
+def test_a_probe_with_almost_nothing_valid_is_blocked_even_though_it_reads_far():
+    """The other side of the same rule. At 95% dropout a probe cannot produce
+    MIN_VALID_FRACTION of its samples as valid-and-far, so it has not earned
+    the right to call itself clear."""
+    frame = np.full((400, 640), 3000, dtype=np.uint16)
+    frame[np.random.default_rng(4).random(frame.shape) < 0.95] = 0
+    scan = dv.free_by_column(frame)
+    assert marks(scan) == "?" * dv.PROBE_COLUMNS
+
+
+def test_a_dead_probe_blocks_its_own_column_and_nothing_else():
+    """The validity rule is per probe, never over the whole band. One dead
+    column in an otherwise clean frame leaves the band 89% valid, so a
+    whole-region test would wave it through."""
+    frame = ground_depth()
+    geo = dv.footprint_geometry(frame.shape)
+    frame[:, geo.col_edges[3]:geo.col_edges[4]] = 0
+    scan = dv.free_by_column(frame)
+    assert marks(scan) == "...?....."
+    assert scan.valid_fraction.mean() > 0.8, "the band as a whole is healthy"
+
+
+def test_a_speckle_cannot_claim_a_probe():
+    """A plain minimum would hand the whole column to one bad pixel. The
+    reported distance is the k-th smallest, k being the same count the near
+    test wants, so a scatter below that count is ignored.
+
+    k is 13 samples out of 650 for a full probe, which is about 100 raw
+    pixels, and the spatial and speckle filters in oakd.py are already
+    supposed to have cleared anything that small."""
+    geo = dv.footprint_geometry((400, 640))
+    k = probe_k(geo, 4)
+    assert k > 1, "a k of 1 is a plain minimum and there is nothing to test"
+
+    scan = dv.free_by_column(speckled_depth(k - 1))
+    assert not scan.blocked.any(), marks(scan)
+    assert scan.distance_mm[4] > dv.CLEARANCE_MM
+
+    # And the other side of the line, so this is pinning a threshold and not
+    # just asserting that nothing ever blocks.
+    assert dv.free_by_column(speckled_depth(k)).reason[4] == dv.NEAR
+
+
+def test_the_reported_distance_and_the_near_verdict_are_the_same_statement():
+    """distance_mm < CLEARANCE_MM has to mean exactly "blocked for being
+    near", or the number in the telemetry and the decision on the car can
+    drift apart. The two speckle frames are the interesting ones: they sit
+    either side of the count, which is where a second statistic would show
+    up."""
+    corner = ground_depth()
+    corner[:, :320] = 250
+    k = probe_k(dv.footprint_geometry((400, 640)), 4)
+    frames = [ground_depth(), ground_depth(invalid=0.5),
+              np.full((400, 640), 200, dtype=np.uint16),
+              np.zeros((400, 640), dtype=np.uint16),
+              corner,
+              speckled_depth(k - 1), speckled_depth(k),
+              speckled_depth(max(1, k // 3))]
+    for frame in frames:
+        scan = dv.free_by_column(frame)
+        for i, reason in enumerate(scan.reason):
+            assert (scan.distance_mm[i] < dv.CLEARANCE_MM) == (reason == dv.NEAR)
+
+
+# --- the two scenes the old check got wrong --------------------------------
+
+def test_the_old_centre_patch_would_have_missed_a_rock_in_front_of_a_wheel():
+    """The bug, stated as a scene. A 100 mm rock at 380 mm, directly in front
+    of the left wheel. It is 20 mm inside the clearance budget and it will
+    stop the car dead.
+
+    The old 50x50 centre patch is reproduced inline, and it reads the scene as
+    clear twice over: the rock is outside its 45 mm wide window, and it is 70
+    rows below the lowest row that window reached."""
+    frame = ground_depth(invalid=0.2)
+    geo = dv.footprint_geometry(frame.shape)
+    frame[row_for(100):, geo.col_edges[0]:geo.col_edges[2]] = 380
+
+    old_patch = frame[200 - 25:200 + 25, 320 - 25:320 + 25]
+    valid = old_patch[old_patch > 0]
+    assert valid.size >= old_patch.size * 0.1, "the old patch had plenty to look at"
+    assert np.mean(valid < dv.CLEARANCE_MM) <= 0.5, "and it called this clear"
+
+    scan = dv.free_by_column(frame)
+    assert marks(scan) == "NN......."
+    assert scan.distance_mm[0] == 380
+
+
+def test_an_overhang_the_car_drives_under_does_not_block():
+    """The reason the band has a top at all. Nothing above the lens axis can
+    be ground, so going higher costs nothing in false floor hits -- but a
+    doorway lintel the car passes under must not stop it."""
+    frame = ground_depth(invalid=0.2)
+    lintel = row_for(280)
+    assert lintel < dv.footprint_geometry(frame.shape).row_top
+    frame[:lintel, :] = 400
+    scan = dv.free_by_column(frame)
+    assert marks(scan) == "." * dv.PROBE_COLUMNS
+
+
+# --- what obstacle_in_front hands back and leaves behind -------------------
+
+def test_a_near_obstacle_and_a_blind_frame_report_different_reasons(d):
+    """Two completely different behaviours used to wear one function name, and
+    the journal could not tell them apart. On this stereo pair most real
+    triggers are probably the no-return kind: subpixel with extended
+    disparity off puts minimum range at 348 mm against a 400 mm budget, so
+    there are 52 mm of graded warning before the blind zone."""
+    assert d.obstacle_in_front(np.full((400, 640), 200, dtype=np.uint16)) is True
+    assert d.last_block_reason == dv.NEAR
+
+    assert d.obstacle_in_front(np.zeros((400, 640), dtype=np.uint16)) is True
+    assert d.last_block_reason == dv.NO_RETURN
+
+    assert d.obstacle_in_front(ground_depth()) is False
+    assert d.last_block_reason == dv.CLEAR
+
+
+def test_both_reasons_are_reported_when_both_fired(d):
+    frame = ground_depth()
+    geo = dv.footprint_geometry(frame.shape)
+    frame[:, geo.col_edges[0]:geo.col_edges[1]] = 250    # near
+    frame[:, geo.col_edges[-2]:geo.col_edges[-1]] = 0    # blind
+    assert d.obstacle_in_front(frame) is True
+    assert d.last_block_reason == dv.NEAR + "+" + dv.NO_RETURN
+
+
+def test_the_scan_is_left_on_the_driver_for_telemetry_to_publish(d):
+    """One read of the frame, several consumers. Nothing in the driver decides
+    on these -- they are there so whoever is publishing does not have to run
+    the check a second time."""
+    assert d.last_scan is None
+    d.obstacle_in_front(ground_depth())
+    assert d.last_scan is not None
+    assert d.last_scan.distance_mm.shape == (dv.PROBE_COLUMNS,)
+    assert d.last_scan.valid_fraction.shape == (dv.PROBE_COLUMNS,)
+    assert len(d.last_scan.reason) == dv.PROBE_COLUMNS
+    assert d.last_scan_ms > 0.0
+
+
+def test_the_check_fits_inside_the_tick_budget():
+    """The control loop targets 100 Hz, measures 75, and has a 190 ms stall in
+    its history, so the budget for this is sub-millisecond. Measured p50 is
+    about 0.07 ms on a laptop; the bar here is loose on purpose so it catches
+    a tenfold regression and never a slow machine."""
+    frame = ground_depth(invalid=0.25)
+    dv.free_by_column(frame)
+    times = []
+    for _ in range(200):
+        started = time.perf_counter()
+        dv.free_by_column(frame)
+        times.append((time.perf_counter() - started) * 1000.0)
+    assert float(np.median(times)) < 2.0, f"median {np.median(times):.3f} ms"
+
+
+def test_a_frame_too_small_for_the_band_still_decides_and_fails_closed():
+    """Degenerate shapes must not raise on the one thread that commands the
+    ESC. Nothing on the car produces these; the guards are there because an
+    exception out of tick() costs auto mode."""
+    assert dv.free_by_column(np.zeros((32, 32), dtype=np.uint16)).blocked.all()
+    assert not dv.free_by_column(np.full((32, 32), 3000, dtype=np.uint16)).blocked.any()
+    # Narrower than the probe count cannot be laid out at all, and that too
+    # has to come back as a stop rather than an exception.
+    assert dv.free_by_column(np.full((4, 4), 3000, dtype=np.uint16)).blocked.any()
