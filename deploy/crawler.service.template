@@ -46,6 +46,18 @@ Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/bin/sh -c 'until "@PIGS@" t >/dev/null 2>&1; do sleep 0.25; done'
 # Quoted, because an unquoted path with a space in it splits into extra
 # arguments and argparse rejects them.
+#
+# No telemetry flag here on purpose. The Foxglove server is on by default, so
+# the car is watchable at ws://<pi>:8765 without the unit mentioning it, and
+# --no-telemetry is the off switch if I ever want it gone. Two flags are worth
+# knowing about if I do edit this line:
+#   --telemetry-camera   open the OAK-D at boot so the camera and IMU channels
+#                        work in manual too. Costs a USB enumeration and about
+#                        a watt on every single boot, which is why it is not
+#                        here. Auto mode opens the camera anyway.
+#   --telemetry-port N   if 8765 is ever taken.
+# Whatever the flag says, the interpreter above has to have foxglove-sdk in
+# it. Without it the car drives exactly as before and the log says so.
 ExecStart="@PYTHON@" "@REPO_DIR@/main.py" --mode manual
 # The last line of defence. If the process was SIGKILLed, or crashed hard, or
 # TimeoutStopSec ran out, nothing in Python got to disarm anything -- and

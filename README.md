@@ -96,3 +96,80 @@ touching `/etc`, which is how I check it before it goes anywhere.
 
 Auto mode also needs a udev rule for the OAK-D, which the installer does not
 write -- see the comment at the top of it.
+
+## Watching it in Foxglove
+
+The car serves the Foxglove WebSocket protocol on port 8765 while it runs.
+[Foxglove](https://foxglove.dev) on the laptop opens it directly: **Open
+connection -> Foxglove WebSocket ->**
+
+```
+ws://192.168.68.56:8765
+```
+
+On a Mac that is `brew install --cask foxglove`, and then `open -a Foxglove`
+-- the cask installs an app, not a command.
+
+Seven channels. The four JSON ones carry a named schema so Studio labels them:
+
+| topic | schema | rate | what it is |
+| --- | --- | --- | --- |
+| `/controller` | `crawler.Controller` | 20 Hz | every axis and button by raw SDL index, the named view through `Joystick`'s own maps, the calibrated trigger rest, and the throttle and steering the code derived |
+| `/vehicle` | `crawler.Vehicle` | 20 Hz | mode, commanded throttle and steering, the ESC pulse width that was written, and the pigpio read-back with its age |
+| `/diagnostics` | `crawler.Diagnostics` | 4 Hz | mode, pad connected, auto available, camera state and error, last error, loop rate and worst tick |
+| `/imu` | `crawler.Imu` | 20 Hz | the OAK-D's accelerometer and gyro, downsampled from 100 Hz |
+| `/camera/depth` | `foxglove.CompressedImage` | 8 Hz | depth, colourmapped over a fixed 300-3000 mm window |
+| `/camera/disparity` | `foxglove.CompressedImage` | 8 Hz | disparity, per-frame stretch |
+| `/camera/rectified_left` | `foxglove.CompressedImage` | 2 Hz | the actual mono picture |
+
+The image channels use a well-known Foxglove schema, so the Image panel finds
+them on its own with no layout to build. There is no well-known Foxglove IMU
+schema -- the SDK ships forty-odd and none of them is an IMU -- so `/imu` is
+JSON and the panel for it is Plot.
+
+```sh
+./run.sh                             # telemetry on, no camera in manual
+./run.sh --telemetry-camera          # also open the OAK-D, so the camera
+                                     #   channels work while hand driving
+./run.sh --no-telemetry              # no server, no thread, no port bound
+./run.sh --telemetry-port 9000       # somewhere else
+```
+
+Telemetry is on by default and `--telemetry-camera` is off by default. The
+camera one costs a USB enumeration and about a watt on every boot, and the
+mode that has to always work does not need a picture. In auto the camera is
+up anyway, so the camera channels flow either way.
+
+None of it can delay a throttle command. The control loop calls `wants()`,
+which is a couple of dict lookups, and `offer()`, which drops a value into a
+one-deep mailbox and returns; the JSON, the colourmapping, the JPEG and the
+socket writes are all on the telemetry thread. Every channel is gated on the
+server's own subscriber count, so with Foxglove shut nothing is built and
+nothing is encoded. Measured on the car with a client subscribed to all seven
+and the camera running: p50 23 us, p99 147 us, worst 720 us, against a 10 ms
+tick.
+
+And it is never fatal. A missing `foxglove-sdk`, a port already bound, a
+laptop that closed mid-frame -- all logged and swallowed. `Not starting
+telemetry, driving as normal` in the log means exactly that.
+
+### Two things that have to be true on the car
+
+The OAK-D needs its udev rule or only root can see it -- `depthai` reports
+`Cannot find any device with given deviceInfo` to everyone else, which is the
+same thing auto mode has always hit:
+
+```sh
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' \
+  | sudo tee /etc/udev/rules.d/80-movidius.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+And the interpreter the service runs has to have the SDK in it. The installed
+unit still points at the old `env/`, which `uv sync` does not touch:
+
+```sh
+env/bin/pip install foxglove-sdk==0.30.2        # keep the service on env/
+# or move the service onto the uv venv instead:
+sudo ./deploy/install-service.sh --python "$PWD/.venv/bin/python" --start
+```
