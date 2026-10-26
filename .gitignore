@@ -1,6 +1,12 @@
 env
 __pycache__/
 
+# uv-created environments. `env` above is the old hand-rolled venv the service
+# still runs out of; `.venv` is what `uv sync` makes, and `.venv-uv` is the
+# scratch one I built beside it to prove uv worked before touching anything.
+.venv
+.venv-uv
+
 # Runtime output. Both of these are written by every run, so tracking them
 # meant the tree was dirty the moment I drove the car. The versions already
 # committed stay in history -- in particular the app.log from 2025-04-27,

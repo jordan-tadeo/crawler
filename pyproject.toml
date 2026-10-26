@@ -1,0 +1,85 @@
+[project]
+name = "crawler"
+version = "0.1.0"
+description = "RC rock crawler control for a Raspberry Pi 4 -- hand driving over a Bluetooth pad, and an OAK-D auto mode."
+readme = "README.md"
+requires-python = "==3.11.*"
+
+# These are the pinned, known-working aarch64 set that is on the car right now,
+# read off the venv that the live service runs out of. They are pins and not
+# floors on purpose: every one of these has a wheel for cp311 + linux aarch64,
+# and a resolver left free to pick something newer is a resolver that can take
+# the car off the road. Bumping one is a deliberate act with the wheels checked
+# first, not a side effect of a sync.
+#
+# numpy is the one to be loudest about: numpy 2.x breaks both depthai and
+# TensorFlow, and everything here is built against 1.x. ==1.26.4, not >=.
+dependencies = [
+    "pigpio==1.78",
+    "pygame==2.6.1",
+    "depthai==2.30.0.0",
+    "numpy==1.26.4",
+    "opencv-python==4.11.0.86",
+    "Adafruit-Blinka==8.56.0",
+    "adafruit-circuitpython-pca9685==3.4.17",
+    "adafruit-circuitpython-motor==3.4.15",
+]
+
+[project.optional-dependencies]
+# PersonFollower.py and the two scratch_* / convert_* bench scripts, and
+# nothing else. PersonFollower is retired and imported by nothing. TensorFlow
+# is by a wide margin the biggest and most aarch64-fragile thing in this
+# project, so it does not belong in the install that has to come up on boot.
+#
+#   uv sync --extra vision
+vision = [
+    "tensorflow==2.19.0",
+    "tensorflow-hub==0.16.1",
+    "tflite-runtime==2.14.0",
+]
+
+# Deliberately empty, and the emptiness is the point.
+#
+# `main.py --dashboard` imports PyQt5, and PyQt5 cannot be a pip dependency on
+# this machine. PyQt5 5.15.x publishes no linux_aarch64 wheel -- 5.15.9 ships
+# x86_64 manylinux, x86_64 macOS, win32 and win_amd64, and that is it -- so pip
+# would fall back to the sdist and try to compile Qt bindings on the Pi, which
+# needs the Qt5 dev headers and sip and takes hours when it works at all.
+#
+# So PyQt5 comes from apt:
+#
+#   sudo apt install python3-pyqt5
+#
+# which installs 5.15.9 (arm64) into /usr/lib/python3/dist-packages. A venv
+# only sees that if it was created to see it, so the environment that runs
+# --dashboard has to be made with:
+#
+#   uv venv --python /usr/bin/python3 --system-site-packages
+#
+# Same reason requires-python is pinned to ==3.11.* above and the interpreter
+# is named explicitly: apt's PyQt5 is built for the system 3.11, and a
+# uv-managed CPython would not find dist-packages at all.
+dashboard = []
+
+[tool.uv]
+# This is a flat pile of modules driven by `python main.py`, not a package to
+# build and install. Without this, uv tries to build `crawler` itself and wants
+# a build backend it has no use for.
+package = false
+
+# The Mac this is committed from is macOS arm64 with none of the car's hardware
+# libraries on it, and the lock has to be good for the Pi regardless. This makes
+# uv fail the lock outright if it cannot cover cp311 + linux aarch64, instead of
+# quietly resolving something that only works on the laptop.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+# Not a dependency, on purpose: opencv-contrib-python is installed on the car,
+# but nothing here needs it. Every cv2 call in the project -- VideoCapture,
+# CAP_PROP_FPS, resize, rectangle, circle, line, putText, imwrite, imshow,
+# waitKey, destroyAllWindows, accumulateWeighted, applyColorMap, normalize --
+# is in the base module. There is no cv2.ximgproc, cv2.aruco, cv2.tracking or
+# anything else from contrib anywhere in the tree. Installing opencv-python and
+# opencv-contrib-python together is a known way to get two copies of the same
+# native extension fighting over one `cv2` name, so only the base one is here.
