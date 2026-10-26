@@ -1,3 +1,23 @@
+"""RETIRED. Nothing imports this, and main.py does not touch it any more.
+
+Keeping it for the history and because the shape of process_and_adjust is
+worth coming back to, but do not wire it up again as it stands:
+
+  - It cannot work. On a "person" label process_frame returns the geometric
+    centre of the frame, a constant, and adjust_servos then finds that centre
+    inside its own +/-50 px dead band and moves nothing. There is no
+    localisation anywhere in here, only a whole-image classifier.
+  - The hardware is gone. The pan/tilt pair is not bolted to the car.
+  - MODEL_DIR and LABELS_PATH below point at models/mobilenet_v2 and
+    labels/ImageNetLabels.txt. Neither directory exists in this checkout and
+    neither ever has, so __init__ raises FileNotFoundError on the first line
+    that looks for them. They are env-var overridable and they look like
+    working defaults; they are not.
+
+It also drags TensorFlow in at import time, which is the reason the boot
+path no longer goes anywhere near it.
+"""
+
 import tensorflow as tf
 from USBCamera import USBCamera
 from VehicleController import VehicleController
