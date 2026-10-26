@@ -1,0 +1,433 @@
+{
+  "configById": {
+    "Image!cam_depth": {
+      "synchronize": false,
+      "imageMode": {
+        "imageTopic": "/camera/depth",
+        "imageSchemaName": "foxglove.CompressedImage",
+        "rotation": 0,
+        "flipHorizontal": false,
+        "flipVertical": false
+      },
+      "foxglovePanelTitle": "Depth (8 Hz)"
+    },
+    "Image!cam_disparity": {
+      "synchronize": false,
+      "imageMode": {
+        "imageTopic": "/camera/disparity",
+        "imageSchemaName": "foxglove.CompressedImage",
+        "rotation": 0,
+        "flipHorizontal": false,
+        "flipVertical": false
+      },
+      "foxglovePanelTitle": "Disparity (8 Hz)"
+    },
+    "Image!cam_left": {
+      "synchronize": false,
+      "imageMode": {
+        "imageTopic": "/camera/rectified_left",
+        "imageSchemaName": "foxglove.CompressedImage",
+        "rotation": 0,
+        "flipHorizontal": false,
+        "flipVertical": false
+      },
+      "foxglovePanelTitle": "Rectified left (2 Hz)"
+    },
+    "Plot!vehicle_cmd": {
+      "paths": [
+        {
+          "enabled": true,
+          "color": "#4e98e2",
+          "label": "steering_front",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/vehicle.steering_front",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#2fc4c4",
+          "label": "steering_rear",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/vehicle.steering_rear",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#e8912d",
+          "label": "throttle",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/vehicle.throttle",
+          "timestampMethod": "receiveTime"
+        }
+      ],
+      "minYValue": -1.1,
+      "maxYValue": 1.1,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "sliding",
+      "playbackBarPosition": "right",
+      "yAxisLabel": "-1 .. 1",
+      "followingViewWidth": 20,
+      "sidebarDimension": 120,
+      "showYAxisGridLines": true,
+      "foxglovePanelTitle": "Steering + throttle commanded (/vehicle)"
+    },
+    "Plot!esc": {
+      "paths": [
+        {
+          "enabled": true,
+          "color": "#59c072",
+          "label": "esc_pulse_us (written)",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/vehicle.esc_pulse_us",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#e05252",
+          "label": "esc_pulse_us_readback (pigpio, ~1 Hz)",
+          "lineSize": 1.5,
+          "showLine": true,
+          "lineInterpolation": "step",
+          "value": "/vehicle.esc_pulse_us_readback",
+          "timestampMethod": "receiveTime"
+        }
+      ],
+      "minYValue": 1000.0,
+      "maxYValue": 2000.0,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "sliding",
+      "playbackBarPosition": "right",
+      "yAxisLabel": "microseconds",
+      "followingViewWidth": 20,
+      "sidebarDimension": 120,
+      "showYAxisGridLines": true,
+      "foxglovePanelTitle": "ESC pulse width (/vehicle)"
+    },
+    "Plot!controller_axes": {
+      "paths": [
+        {
+          "enabled": true,
+          "color": "#4e98e2",
+          "label": "axes[0]",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/controller.axes[0]",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#e8912d",
+          "label": "axes[1]",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/controller.axes[1]",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#59c072",
+          "label": "axes[2]",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/controller.axes[2]",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#e05252",
+          "label": "axes[3]",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/controller.axes[3]",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#b07cd8",
+          "label": "axes[4]",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/controller.axes[4]",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#2fc4c4",
+          "label": "axes[5]",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/controller.axes[5]",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#d9c54a",
+          "label": "axes[6]",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/controller.axes[6]",
+          "timestampMethod": "receiveTime"
+        }
+      ],
+      "minYValue": -1.1,
+      "maxYValue": 1.1,
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "sliding",
+      "playbackBarPosition": "right",
+      "yAxisLabel": "raw axis value",
+      "followingViewWidth": 20,
+      "sidebarDimension": 120,
+      "showYAxisGridLines": true,
+      "foxglovePanelTitle": "Controller axes by raw index (/controller)"
+    },
+    "Plot!imu": {
+      "paths": [
+        {
+          "enabled": true,
+          "color": "#4e98e2",
+          "label": "accel_x m/s^2",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/imu.accel_x",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#2fc4c4",
+          "label": "accel_y m/s^2",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/imu.accel_y",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#59c072",
+          "label": "accel_z m/s^2",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/imu.accel_z",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#e8912d",
+          "label": "gyro_x rad/s",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/imu.gyro_x",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#d9c54a",
+          "label": "gyro_y rad/s",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/imu.gyro_y",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#e05252",
+          "label": "gyro_z rad/s",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/imu.gyro_z",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#b07cd8",
+          "label": "accel_magnitude",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/imu.accel_magnitude",
+          "timestampMethod": "receiveTime"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "sliding",
+      "playbackBarPosition": "right",
+      "yAxisLabel": "m/s^2 and rad/s",
+      "followingViewWidth": 20,
+      "sidebarDimension": 120,
+      "showYAxisGridLines": true,
+      "foxglovePanelTitle": "IMU (/imu -- only while the OAK-D is running)"
+    },
+    "Plot!loop": {
+      "paths": [
+        {
+          "enabled": true,
+          "color": "#59c072",
+          "label": "loop_hz",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/diagnostics.loop_hz",
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "enabled": true,
+          "color": "#e05252",
+          "label": "loop_tick_max_ms",
+          "lineSize": 1.5,
+          "showLine": true,
+          "value": "/diagnostics.loop_tick_max_ms",
+          "timestampMethod": "receiveTime"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "timeWindowMode": "sliding",
+      "playbackBarPosition": "right",
+      "yAxisLabel": "Hz and ms",
+      "followingViewWidth": 20,
+      "sidebarDimension": 120,
+      "showYAxisGridLines": true,
+      "foxglovePanelTitle": "Control loop health (/diagnostics)"
+    },
+    "StateTransitions!diagnostics": {
+      "paths": [
+        {
+          "value": "/diagnostics.mode",
+          "label": "mode",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/diagnostics.controller_connected",
+          "label": "controller_connected",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/diagnostics.auto_available",
+          "label": "auto_available",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/diagnostics.camera_state",
+          "label": "camera_state",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/diagnostics.camera_error",
+          "label": "camera_error",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/diagnostics.last_error",
+          "label": "last_error",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/vehicle.mode",
+          "label": "vehicle mode",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        }
+      ],
+      "isSynced": true,
+      "xAxisRange": 20,
+      "timeWindowMode": "sliding",
+      "playbackBarPosition": "right",
+      "showPoints": true,
+      "showLegend": true,
+      "foxglovePanelTitle": "Health (/diagnostics)"
+    },
+    "RawMessages!vehicle": {
+      "expansion": "all",
+      "topicPath": "/vehicle",
+      "fontSize": 11,
+      "foxglovePanelTitle": "/vehicle raw"
+    }
+  },
+  "layout": {
+    "direction": "column",
+    "first": {
+      "direction": "row",
+      "first": "Image!cam_depth",
+      "second": {
+        "direction": "row",
+        "first": "Image!cam_disparity",
+        "second": "Image!cam_left",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 33.34
+    },
+    "second": {
+      "direction": "column",
+      "first": {
+        "direction": "row",
+        "first": "Plot!vehicle_cmd",
+        "second": {
+          "direction": "row",
+          "first": "Plot!controller_axes",
+          "second": "Plot!imu",
+          "splitPercentage": 50
+        },
+        "splitPercentage": 33.34
+      },
+      "second": {
+        "direction": "row",
+        "first": "Plot!esc",
+        "second": {
+          "direction": "row",
+          "first": "Plot!loop",
+          "second": {
+            "direction": "column",
+            "first": "StateTransitions!diagnostics",
+            "second": "RawMessages!vehicle",
+            "splitPercentage": 58
+          },
+          "splitPercentage": 50
+        },
+        "splitPercentage": 33.34
+      },
+      "splitPercentage": 51.5
+    },
+    "splitPercentage": 28
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  }
+}
