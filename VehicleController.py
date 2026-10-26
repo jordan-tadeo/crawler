@@ -1,10 +1,13 @@
-import pigpio
-import board
-import busio
-from adafruit_pca9685 import PCA9685
-from adafruit_motor import servo
 from typing import Tuple
 import Logger
+
+# pigpio, board, busio, adafruit_pca9685 and adafruit_motor are imported
+# inside __init__, not here. None of them exist off the Pi, and at module
+# scope they made this file impossible to even import on my laptop -- which
+# meant the pulse-width arithmetic in set_throttle and the angle maths in the
+# steering setters had never run anywhere but on the car. Constructing a
+# VehicleController still needs every one of them, so nothing changes on the
+# Pi; it is only reading the file that got cheaper.
 
 # Constants for control of the Quicrun 880 ESC.
 #
@@ -37,6 +40,12 @@ class VehicleController:
     '''
 
     def __init__(self, logger: Logger.Logger) -> None:
+        import pigpio
+        import board
+        import busio
+        from adafruit_pca9685 import PCA9685
+        from adafruit_motor import servo
+
         self.logger = logger
         # Setup pigpio for ESC control
         self.pi = pigpio.pi()
