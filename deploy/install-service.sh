@@ -114,9 +114,23 @@ fi
 
 # pigpio is a hard requirement -- VehicleController raises if the daemon is
 # not up -- but only wire the dependency if the unit is actually installed.
+#
+# This used to be `systemctl list-unit-files pigpiod.service | grep -q pigpiod`,
+# and that is a race I lost roughly twice in every twenty-five runs. `grep -q`
+# exits the instant it matches, systemctl gets EPIPE and dies on SIGPIPE with
+# 141, and `set -o pipefail` at the top of this script hands that 141 back as
+# the status of the whole pipeline -- so a pigpiod that is sitting right there,
+# enabled, reads as missing. When it loses, the unit gets written with no
+# pigpiod dependency AND no ExecStartPre socket wait, which is precisely the
+# boot restart-loop the template warns about: the service comes up before the
+# daemon's socket is listening, VehicleController raises, Restart=on-failure
+# goes round again. An intermittent dead car out of a clean install.
+#
+# No pipe, no race. `list-unit-files UNIT --no-legend` prints one line for a
+# unit that exists and exits 0, and prints nothing and exits 1 for one that
+# does not, so the output is the whole answer.
 PIGPIO_UNIT=""
-if systemctl list-unit-files pigpiod.service >/dev/null 2>&1 &&
-   systemctl list-unit-files pigpiod.service | grep -q pigpiod; then
+if [[ -n "$(systemctl list-unit-files pigpiod.service --no-legend 2>/dev/null || true)" ]]; then
   PIGPIO_UNIT="pigpiod.service"
 else
   echo "WARNING: pigpiod.service not found. Install it with: sudo apt install pigpio" >&2
