@@ -14,3 +14,50 @@ __pycache__/
 app.log
 app.log.*
 log/*.csv
+
+# Downloaded model weights and the archives they arrive in.
+#
+# This is the rule I actually needed. The checkout on the car is sitting on
+# faster_rcnn_openimages_v4_inception_resnet_v2.tar.gz at 229 MiB, four
+# yolov5/yolov8 .pt files at another 45 MiB, and models/ and labels/ beside
+# them -- every one of them untracked, with nothing stopping them. One
+# absent-minded `git add -A` on the car puts a 229 MiB tarball into a public
+# repo, and history is forever: no later `git rm` takes it back out, every
+# clone from then on pays for it, and the only fix is a rewrite that breaks
+# every checkout anybody already has. None of it is mine to begin with, it is
+# all redownloadable from upstream, so none of it belongs in here.
+#
+# *.pb and *.tflite are in the list on purpose even though saved_model.pb and
+# model.tflite were tracked until I deleted them. Weights are weights whether
+# I committed them once or not.
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.pb
+*.h5
+# depthai compiles its own models down to these, and will again the day I give
+# the OAK-D a neural network to run.
+*.blob
+*.superblob
+# Archives. Nothing in this project is a .tar.gz I wrote.
+*.tar.gz
+*.tgz
+*.zip
+# The two asset directories the retired TensorFlow experiment wanted. Neither
+# has ever existed anywhere but on the car.
+models/
+labels/
+
+# Not a dependency file any more, and not to be treated as one. This project is
+# on uv: pyproject.toml plus uv.lock is the whole answer to "what gets
+# installed", and the lock pins the entire graph with hashes, which a six-line
+# requirements.txt never did. The copy on the car is from April 2025 and names
+# six packages where pyproject names nine, so `pip install -r` against it would
+# quietly build a different environment than the one the car is running. It has
+# never been tracked in this repo and it is not going to start now. The one
+# sitting on the car is safe to delete next time I am in that directory.
+requirements.txt
+
+# pytest's cache.
+.pytest_cache/
