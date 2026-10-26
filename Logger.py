@@ -17,8 +17,14 @@ class Logger:
         console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(subject)s - %(message)s')
         console_handler.setFormatter(console_formatter)
 
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
+        # getLogger returns the same process-global logger every time, and
+        # addHandler just appends -- so a second Logger() anywhere in the
+        # process would give it a second file handler and a second console
+        # handler, and every line after that would be written twice. Only one
+        # of these is built today. This is so that stays true by accident.
+        if not self.logger.handlers:
+            self.logger.addHandler(file_handler)
+            self.logger.addHandler(console_handler)
 
     def log(self, level, subject, message):
         extra = {"subject": subject}
