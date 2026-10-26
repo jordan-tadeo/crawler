@@ -150,7 +150,7 @@ Seven channels. The four JSON ones carry a named schema so Studio labels them:
 | --- | --- | --- | --- |
 | `/controller` | `crawler.Controller` | 20 Hz | every axis and button by raw SDL index, the named view through `Joystick`'s own maps, the calibrated trigger rest, and the throttle and steering the code derived |
 | `/vehicle` | `crawler.Vehicle` | 20 Hz | mode, commanded throttle and steering, the ESC pulse width that was written, and the pigpio read-back with its age |
-| `/diagnostics` | `crawler.Diagnostics` | 4 Hz | mode, pad connected, auto available, camera state and error, last error, loop rate and worst tick |
+| `/diagnostics` | `crawler.Diagnostics` | 4 Hz | mode, pad connected, auto available, camera state and error, last error, loop rate and worst tick, and whether this run is being recorded -- which file, how big, and why not if not |
 | `/imu` | `crawler.Imu` | 20 Hz | the OAK-D's accelerometer and gyro, downsampled from 100 Hz |
 | `/camera/depth` | `foxglove.CompressedImage` | 8 Hz | depth, colourmapped over a fixed 300-3000 mm window |
 | `/camera/disparity` | `foxglove.CompressedImage` | 8 Hz | disparity, per-frame stretch |
@@ -185,7 +185,125 @@ tick.
 
 And it is never fatal. A missing `foxglove-sdk`, a port already bound, a
 laptop that closed mid-frame -- all logged and swallowed. `Not starting
-telemetry, driving as normal` in the log means exactly that.
+telemetry, driving as normal` in the log means exactly that. A port that
+cannot be bound now costs the live view only: the channels are built before
+the socket, so the recording below carries on without it.
+
+### Recording it
+
+Every run is written to `log/mcap/`, from service start, whether or not
+Foxglove is open. That is the whole point -- the run worth looking at is
+always the one that just ended badly, and by then the laptop is shut.
+
+```sh
+./pull-recordings.sh                 # newest 5 onto the laptop, checked
+./pull-recordings.sh --list          # what the car is holding, copy nothing
+./pull-recordings.sh --all
+./pull-recordings.sh -n 20 -o ~/Desktop/crawl
+```
+
+Then `open -a Foxglove` and drag a file from `recordings/` onto the window.
+**Open connection** is for live; a file is a drag, or **File -> Open local
+file**. The same panels work on a file as on the socket.
+
+`pull-recordings.sh` also says what is in each file -- per topic, the message
+count, the rate and the schema -- which answers "did that run record what I
+think it did" without opening anything. A run with no `/camera/depth` in it
+was a run with the camera shut, not a bug.
+
+```sh
+./run.sh --no-record                 # drive, do not write it down
+./run.sh --record-dir /mnt/usb/runs  # somewhere other than log/mcap
+./run.sh --no-telemetry              # record, but bind no socket
+./run.sh --no-telemetry --no-record  # no thread, no socket, no file
+```
+
+The filenames are `crawler-<UTC>Z-p<pid>-<NNN>.mcap`. The pid is in there
+because this Pi has no RTC: at boot the clock is whatever the last shutdown
+wrote until NTP lands, so two boots genuinely can produce the same second.
+
+#### What it costs
+
+An MCAP writer in this SDK is a *sink*, exactly like a connected Studio
+client, so opening one makes `has_sinks()` true and the existing
+`wants()`/`offer()` path does the rest. There is no second encode and no
+second thread. The consequence is that "nothing is built when nobody is
+watching" now means **no laptop and no recording**: with recording on, the
+publisher thread colourmaps and JPEG-encodes the camera channels whenever the
+camera is up.
+
+Measured on the car, 120 s a condition, a 100 Hz replica of the control
+loop's telemetry block, camera up, nothing connected to the socket:
+
+| | p50 | p90 | p99 | max | process CPU |
+| --- | --- | --- | --- | --- | --- |
+| recording off | 9 us | 13 us | 25 us | 109 us | 16.0% of a core |
+| recording on | 11 us | 190 us | 268 us | 831 us | 33.8% of a core |
+
+Camera shut, which is how the service actually boots: 7/8/10/54 us and 2.0%
+off, 9/120/151/240 us and 3.0% on.
+
+So about 240 us at p99 against a 10 ms tick, which is 2.4% of it, and the
+same order as the p99 147 us already measured for having Studio connected --
+for the same reason. The p90 jump is not `offer()` getting slower, it is the
+GIL coming back from a publisher thread that is now busy in zstd and cv2. The
+18 points of extra CPU is that thread, on a 4-core Pi, so about 4.5% of the
+machine, and none of it on the thread that commands the throttle.
+
+#### What it costs on the card
+
+Measured, read back out of a finished file over its own 125 s span:
+
+| | bytes/s | per hour |
+| --- | --- | --- |
+| camera up, all seven channels | 71.0 KiB/s | **250 MiB** |
+| camera shut, the three JSON channels | 1.2 KiB/s | **4 MiB** |
+
+The camera is 80% of that and it is the part zstd cannot help with -- the
+payload is already JPEG. Whole-file compression came out at 0.69 of the raw
+message bytes, which is the JSON half compressing well and the images not at
+all. Per channel, raw: depth 32.1 KiB/s, disparity 29.3, rectified_left 20.9,
+controller 12.5, vehicle 4.0, imu 3.3, diagnostics 1.1.
+
+A full SD card is a dead car, and worse than dead: a Pi that cannot write is
+a Pi whose filesystem corrupts, and the only thing that can take the ESC back
+to neutral is this process staying alive. So there are two brakes and they do
+not trust each other:
+
+- a new segment every **128 MiB** (about half an hour of auto driving), and
+  the oldest segments deleted once `log/mcap/` passes **8 GiB** -- 64
+  segments, about 33 hours of auto driving, 8% of this card. That is a ring
+  buffer at the file level, which is the only shape available: this SDK's
+  writer has no ring mode and building one would mean re-encoding every
+  message to drop the old ones.
+- under **4 GiB free on the volume**, recording stops dead and says so once
+  -- even if `log/mcap/` is well inside its own budget, because something
+  else filling the card is not something pruning my own directory can fix.
+
+Nothing in `recording.py` can reach the hardware. A disk-full, a write error,
+a read-only filesystem, a missing SDK: `start()` returns False, `tick()`
+returns, `stop()` returns, and the car drives exactly as it did. `tests/
+test_recording.py` pins that, because it is the requirement that matters more
+than the rest put together.
+
+#### Two things I had to measure rather than assume
+
+**zstd buffers a whole chunk before writing anything.** Twenty seconds into a
+recording the file on the card held 128 bytes, and 24 003 after close -- all
+of it still in memory. A run that ends with the battery out never reaches
+close(). So the recorder flushes every five seconds, which bounds that to
+five seconds of loss. With the camera up, five seconds is already about a
+megabyte, so the chunking is unchanged.
+
+**A run that is killed loses its index, not its data.** Only `close()` writes
+the summary and the message index. On a recording killed with `SIGKILL`,
+every message was still there and streamed back fine with its schemas, but
+the *indexed* reader -- the fast path Studio takes -- refused the file
+outright, and `disable_seeking` makes no difference. `pull-recordings.sh`
+detects that and rewrites the file with an index, which is the `mcap recover`
+operation done through the `mcap` Python library so there is no Go toolchain
+to install; `uv run --with mcap` builds the environment for it and leaves
+nothing behind. The original is kept as `.orig`.
 
 ### Two things that have to be true on the car
 

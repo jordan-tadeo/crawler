@@ -38,8 +38,31 @@ drop the old ones, on a Pi that is already missing its loop target.
 So the ring is at the file level instead. One segment per SEGMENT_BYTES, a
 new file when that fills, and the oldest files deleted when the directory
 goes over MAX_TOTAL_BYTES. That is a coarse ring buffer with no per-message
-work at all: the newest DISK_BUDGET of driving is always on the card and
-nothing older can accumulate.
+work at all: the newest 8 GiB of driving is always on the card and nothing
+older can accumulate.
+
+What it costs, measured on the car
+----------------------------------
+A 100 Hz replica of main.py's telemetry block, 120 s a condition, camera up,
+nothing connected to the socket:
+
+                              block on the control thread        process
+                           p50     p90     p99     max           CPU
+  recording off            9 us   13 us   25 us   109 us         16.0%
+  recording ON            11 us  190 us  268 us   831 us         33.8%
+
+With the camera shut, which is how the service actually boots: 7/8/10/54 us
+and 2.0% off, 9/120/151/240 us and 3.0% on.
+
+So the loop pays about 240 us at p99 against a 10 ms tick, which is 2.4% of
+it, and the p90 jump is not the offer() calls getting slower -- they are two
+dict writes -- it is the GIL coming back from a publisher thread that is now
+busy in zstd and cv2. It is the same order as the p99 147 us already measured
+and accepted for having Studio connected, and for the same reason: a sink is
+a sink.
+
+The 18 points of extra CPU is the publisher thread, on a 4-core Pi, so about
+4.5% of the machine. None of it is on the thread that commands the throttle.
 
 It records whatever is published, not a list of topics
 -----------------------------------------------------
@@ -102,25 +125,43 @@ DEFAULT_DIR = "log/mcap"
 SUFFIX = ".mcap"
 PREFIX = "crawler-"
 
-# Rotate a segment at this size. 256 MiB is about twenty minutes of driving
-# with the camera up (measured 203 KiB/s all seven channels; see README), and
-# a couple of days of manual driving without it. Small enough that pruning
-# has somewhere useful to cut, large enough that rotations are rare -- each
-# one closes a zstd writer, which flushes a chunk and writes a summary, and
-# that is milliseconds on the publisher thread.
-SEGMENT_BYTES = 256 * 1024 * 1024
+# The two rates everything below is sized off, both measured on the car over
+# 120 s at the real publish rates, read back out of the finished file:
+#
+#   camera up, all seven channels   71.0 KiB/s   250 MiB/hour
+#   camera shut, the three JSON     1.2 KiB/s      4 MiB/hour
+#
+# The camera is 80% of that, and it is the part zstd cannot help with: the
+# payload is already JPEG. Whole-file compression came out at 0.69 of the raw
+# message bytes, which is the JSON half compressing well and the images not
+# at all. Per channel, raw: depth 32.1 KiB/s, disparity 29.3, rectified_left
+# 20.9, controller 12.5, vehicle 4.0, imu 3.3, diagnostics 1.1.
+#
+# Worth knowing which case is which. The service boots into manual with the
+# camera shut, so a boot-and-drive run is the 4 MiB/hour one. 250 MiB/hour is
+# auto mode, or manual with --telemetry-camera.
 
-# What the whole directory is allowed to hold. 8 GiB is roughly eleven hours
-# of camera-up driving, and it is 8% of the free space on the card, which
-# leaves the other 92% for everything that is not telemetry. I would rather
-# have eleven hours and a card I never think about than a hundred hours and a
+# Rotate a segment at this size. 128 MiB is about half an hour of auto
+# driving at the measured 250 MiB/hour, and a file that size is a reasonable
+# scp off the car over wifi. Small enough that pruning has somewhere useful
+# to cut, large enough that rotations are rare -- each one closes a zstd
+# writer, which flushes and writes a summary, and that is milliseconds on the
+# publisher thread.
+SEGMENT_BYTES = 128 * 1024 * 1024
+
+# What the whole directory is allowed to hold: 64 full segments. At the
+# measured camera-up rate that is about 33 hours of auto driving, and at the
+# manual rate it is years. It is also 8% of the 99 GB free on this card,
+# which leaves the other 92% for everything that is not telemetry. I would
+# rather have 33 hours and a card I never think about than 400 hours and a
 # number I have to go and check.
 MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 
 # The filesystem floor. Under this much free on the volume log/ lives on,
 # recording stops and says so once. 4 GiB is far more headroom than apt or a
 # journal rotation needs; the point is that the number is reached long before
-# anything else on the Pi starts failing.
+# anything else on the Pi starts failing. This is the brake that works when
+# the thing filling the card is not me.
 MIN_FREE_BYTES = 4 * 1024 * 1024 * 1024
 
 # How often tick() does any work at all. Everything it does -- two stats and
@@ -288,7 +329,7 @@ class Recorder:
             # away. Not worth stopping a recording that is otherwise fine.
             self.error = str(e)
 
-    def _flush(self) -> None:
+    def _flush(self) -> bool:
         """Close the open chunk, so what is on the card is what happened.
 
         This is not optional and it is the thing I got wrong first. zstd
@@ -308,17 +349,27 @@ class Recorder:
         megabyte) and with it down the chunks get small and compress a little
         worse -- on 1.2 KiB/s of JSON, which is not a number worth
         protecting.
+
+        Returns whether it worked, and the caller cares: a flush that raised
+        means this interval's bytes did NOT land, so the growth check in
+        _check must not then forgive the error on the strength of the
+        *previous* flush's bytes. Getting that order wrong made a card that
+        had started refusing writes look healthy for ever, because every
+        failed flush was pardoned by the last successful one. A test caught
+        that, which is the only reason I know about it.
         """
         writer = self._writer
         if writer is None:
-            return
+            return False
         try:
             writer.flush()
+            return True
         except Exception as e:
             self.note_write_error(e)
+            return False
 
     def _check(self, now: float) -> None:
-        self._flush()
+        flushed = self._flush()
         if not self.active:
             # The flush was the write error that used up the last of
             # MAX_WRITE_ERRORS. Nothing below has anything to rotate.
@@ -335,7 +386,7 @@ class Recorder:
             return
 
         size = _size(self.path)
-        if size is not None and size > self.bytes_written:
+        if flushed and size is not None and size > self.bytes_written:
             # The file is growing, so whatever raised on the way through
             # channel.log() was not this. Forget the count: a laptop that
             # closed mid-frame raises on the same call a bad card does, and
