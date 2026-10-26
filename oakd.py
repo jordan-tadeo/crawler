@@ -17,18 +17,26 @@ service user can open it, or dai.Device() just fails. Put this in
 
 I am not installing that from install-service.sh -- it is a one-time
 system change and I want to run it myself.
+
+Who owns one of these: camera.CameraHub, and nothing else. dai.Device() takes
+exclusive USB access and blocks for seconds while the device boots, so there
+is one instance per process, it is constructed on a background thread, and the
+hub is the only thing that reads the queues. Consumers take a
+camera.StreamView instead of an OakD -- same getters, one slot each, nobody
+stealing anybody's frames.
+
+The colourmapping that used to live in here has moved to StreamView for that
+reason. get_depth_colormap() pulled a frame off the depth queue as a side
+effect of drawing a picture, so a debug pane and the driver were competing for
+the same packets. Everything in here now is a raw frame off one queue.
 """
 
 import depthai as dai
-import numpy as np
-import cv2
 
 
 class OakD:
-    def __init__(self):
+    def __init__(self, rectified: bool = True):
         self.pipeline = dai.Pipeline()
-
-        self.smoothed_depth = None
 
         # Mono cameras
         cam_left = self.pipeline.create(dai.node.MonoCamera)
@@ -91,6 +99,21 @@ class OakD:
         xout_disp.setStreamName("disparity")
         stereo.disparity.link(xout_disp.input)
 
+        # The rectified left mono image: the actual camera picture, which
+        # neither depth nor disparity shows me. Worth having in Foxglove for
+        # checking where the thing is pointed and whether a lens is dirty --
+        # a depth map looks much the same either way.
+        #
+        # Opt-in, because an XLink stream costs USB bandwidth from the moment
+        # it is linked whether or not anybody drains it, and auto mode does
+        # not want to pay for a picture it does not look at. The hub only asks
+        # for it when telemetry is going to carry it.
+        self.rectified = rectified
+        if rectified:
+            xout_rect = self.pipeline.create(dai.node.XLinkOut)
+            xout_rect.setStreamName("rectified_left")
+            stereo.rectifiedLeft.link(xout_rect.input)
+
         # Start device
         self.device = dai.Device(self.pipeline)
         self.closed = False
@@ -100,6 +123,9 @@ class OakD:
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
         self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
         self.imu_queue = self.device.getOutputQueue("imu", 10, False)
+        self.rectified_queue = (
+            self.device.getOutputQueue("rectified_left", 2, False)
+            if rectified else None)
 
     def get_imu_sample(self):
         if self.imu_queue is None:
@@ -121,53 +147,37 @@ class OakD:
     # getters return None, driver.tick() zeroes the throttle, and I restart
     # the service.
 
-    def get_depth_frame(self):
-        """Latest depth frame, or None if there is not one waiting."""
-        if self.depth_queue is None:
+    def _try_frame(self, queue, label):
+        """Newest frame off one queue, or None. Never waits, never raises.
+
+        The X_LINK_ERROR case is a real one and it is not fatal: the link
+        drops, this hands back None, and whoever asked treats a missing frame
+        the way it already has to -- driver.tick() zeroes the throttle.
+        """
+        if queue is None:
             return None
         try:
-            packet = self.depth_queue.tryGet()
+            packet = queue.tryGet()
         except RuntimeError as e:
             if "X_LINK_ERROR" in str(e):
-                print("[OakD] Stream error - no depth this tick.")
+                print(f"[OakD] Stream error - no {label} this tick.")
                 return None
             raise
         if packet is None:
             return None
         return packet.getFrame()
 
-    def get_depth_colormap(self):
-        frame = self.get_depth_frame()
-        if frame is None:
-            # np.clip() of None is a TypeError, and this is a debug pane, so
-            # no frame just means no picture.
-            return None
+    def get_depth_frame(self):
+        """Latest depth frame in millimetres, or None if none is waiting."""
+        return self._try_frame(self.depth_queue, "depth")
 
-        frame = np.clip(frame, 300, 3000).astype(np.float32)
+    def get_disparity_frame(self):
+        """Latest raw disparity frame, or None."""
+        return self._try_frame(self.disparity_queue, "disparity")
 
-        if self.smoothed_depth is None:
-            self.smoothed_depth = frame.copy()
-        else:
-            cv2.accumulateWeighted(frame, self.smoothed_depth, 0.3)  # alpha = 0.3
-
-        norm = ((self.smoothed_depth - 300) / (3000 - 300) * 255).astype(np.uint8)
-        return cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-
-    def get_disparity_colormap(self):
-        if self.disparity_queue is None:
-            return None
-        try:
-            packet = self.disparity_queue.tryGet()
-        except RuntimeError as e:
-            if "X_LINK_ERROR" in str(e):
-                return None
-            raise
-        if packet is None:
-            return None
-        disp_frame = packet.getFrame()
-        disp_normalized = cv2.normalize(disp_frame, None, 0, 255, cv2.NORM_MINMAX)
-        disp_normalized = np.uint8(disp_normalized)
-        return cv2.applyColorMap(disp_normalized, cv2.COLORMAP_JET)
+    def get_rectified_left_frame(self):
+        """Latest rectified left mono frame, or None if not enabled."""
+        return self._try_frame(self.rectified_queue, "rectified left")
 
     def close(self):
         """Release the device. Safe to call twice."""
@@ -177,6 +187,7 @@ class OakD:
         self.depth_queue = None
         self.disparity_queue = None
         self.imu_queue = None
+        self.rectified_queue = None
         try:
             self.device.close()
         except Exception as e:

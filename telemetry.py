@@ -215,6 +215,30 @@ IMAGE_CHANNELS = {
     "rectified_left": "/camera/rectified_left",
 }
 
+# How to turn each one's raw frame into something that can be looked at.
+#
+# This runs on the publisher thread, not on whoever handed the frame over. The
+# camera reader offers each frame exactly as it came off the queue -- 16-bit
+# millimetres for depth, raw disparity, 8-bit grey for the rectified mono --
+# and all the clipping, normalising, colourmapping, downscaling and JPEG
+# happens in here, behind the has_sinks() gate. Nobody watching, nothing
+# computed, and none of it anywhere near the control thread.
+DEPTH_JET = "depth_jet"
+DISPARITY_JET = "disparity_jet"
+GREY = "grey"
+
+IMAGE_RENDER = {
+    "depth": DEPTH_JET,
+    "disparity": DISPARITY_JET,
+    "rectified_left": GREY,
+}
+
+# The window depth is colourmapped across, in millimetres. The same numbers
+# the dashboard has always used: under 300 mm the stereo pair has nothing
+# useful to say, and past 3 m this car does not care.
+DEPTH_NEAR_MM = 300
+DEPTH_FAR_MM = 3000
+
 JSON_TOPICS = {
     "controller": "/controller",
     "vehicle": "/vehicle",
@@ -467,7 +491,7 @@ class Telemetry:
             channel.log(payload, log_time=log_time)
             return
 
-        data = self._encode_jpeg(payload)
+        data = self._encode_jpeg(payload, IMAGE_RENDER.get(key, GREY))
         if data is None:
             return
 
@@ -484,14 +508,22 @@ class Telemetry:
             log_time=log_time,
         )
 
-    def _encode_jpeg(self, frame):
-        """Downscale and JPEG one frame. None if it cannot be done.
+    def _encode_jpeg(self, frame, how):
+        """Render one raw camera frame to JPEG bytes. None if it cannot be.
 
-        cv2 and numpy are imported here rather than at module scope. Phase one
-        of this -- controller, vehicle, diagnostics -- has no business needing
-        opencv installed, and this file has to import on a machine that has
-        none of the car's libraries on it.
+        Downscale first, then colourmap. That order is not cosmetic: it is a
+        4x reduction in pixels before the expensive part, and INTER_NEAREST on
+        a depth map is the right resampler anyway -- averaging two depths that
+        are a metre apart invents a surface that is not there.
+
+        cv2 and numpy are imported here rather than at module scope, and
+        cached. The controller, vehicle and diagnostics channels have no
+        business needing opencv installed, and this file has to import on a
+        laptop that has none of the car's libraries on it.
         """
+        if frame is None:
+            return None
+
         if self._cv2 is None:
             try:
                 import cv2
@@ -502,10 +534,7 @@ class Telemetry:
                 self.error = f"no opencv for image telemetry: {e}"
                 return None
 
-        cv2 = self._cv2
-
-        if frame is None:
-            return None
+        cv2, np = self._cv2, self._np
 
         height, width = frame.shape[:2]
         longest = max(height, width)
@@ -514,6 +543,23 @@ class Telemetry:
             frame = cv2.resize(frame, (max(1, int(width * scale)),
                                        max(1, int(height * scale))),
                                interpolation=cv2.INTER_NEAREST)
+
+        if how == DEPTH_JET:
+            # Millimetres to a fixed window, so the colours mean the same
+            # distance from one frame to the next. A per-frame normalise would
+            # make an empty corridor look exactly like a wall at arm's length.
+            frame = np.clip(frame, DEPTH_NEAR_MM, DEPTH_FAR_MM)
+            frame = ((frame - DEPTH_NEAR_MM)
+                     * (255.0 / (DEPTH_FAR_MM - DEPTH_NEAR_MM))).astype(np.uint8)
+            frame = cv2.applyColorMap(frame, cv2.COLORMAP_JET)
+        elif how == DISPARITY_JET:
+            # Disparity has no fixed unit to key off, so this one does get a
+            # per-frame min/max stretch. Same as the dashboard pane.
+            frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
+            frame = cv2.applyColorMap(np.uint8(frame), cv2.COLORMAP_JET)
+        elif frame.dtype != np.uint8:
+            frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
+            frame = np.uint8(frame)
 
         ok, buf = cv2.imencode(".jpg", frame,
                                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])

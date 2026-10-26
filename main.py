@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 
+import camera
 import Logger as lg
 
 MANUAL = "manual"
@@ -78,44 +79,84 @@ class ModeSwitch:
 
 
 class AutoPilot:
-    """Lazy wrapper around the OAK-D driver.
+    """Auto mode, driven off the shared camera.
 
-    Nothing is constructed until auto mode is actually asked for, and a
-    failure to construct it is logged and swallowed rather than raised. An
-    unplugged camera or a missing depthai should cost me auto mode, not the
-    ability to drive the car by hand.
+    It does not own the camera any more. camera.CameraHub does, main builds
+    it, and this takes a view() on it -- a private one-deep slot per stream,
+    so the driver and telemetry and the dashboard all read the same device
+    without competing for the same packets.
 
-    step() runs on the control loop's own thread. Driver.tick() never blocks,
-    so ticking it at 10 Hz from inside a 100 Hz loop is just a timestamp
+    What has NOT changed: a failure to get a camera is logged and swallowed
+    rather than raised. An unplugged OAK-D or a missing depthai costs me auto
+    mode, never the ability to drive the car by hand.
+
+    What has changed, and it matters: resume() does not block any more. It
+    used to call dai.Device(), which takes seconds, on the control loop --
+    seconds in which nothing polled the stop signal or the controller while
+    pigpio sat there emitting the last pulse width it was given. Now the hub
+    opens the device on a thread of its own and resume() just asks whether it
+    is up yet. If it is not, auto refuses for now and manual keeps the wheels,
+    and pressing START again a couple of seconds later gets me auto.
+
+    step() still runs on the control loop's own thread. Driver.tick() never
+    blocks, so ticking it at 10 Hz from inside a 100 Hz loop is a timestamp
     comparison.
     """
 
-    def __init__(self, vecon, logger):
+    def __init__(self, vecon, logger, hub=None):
         self.vecon = vecon
         self.logger = logger
-        self.oakd = None
         self.driver = None
         self.unavailable = False
         self._next_tick = 0.0
-        # Set once a CameraHub exists. None means no camera at all, which is
-        # the normal state on a manual boot.
-        self.hub = None
+        # The shared camera, or None if this process was started without one.
+        self.hub = hub
 
     def resume(self):
-        """Start or restart auto mode. True if it is running."""
+        """Start or restart auto mode. True if it is running.
+
+        Never blocks and never raises. False can mean three different things
+        and only one of them is permanent:
+
+          no hub at all, or the hub failed      -> unavailable, latched
+          the hub is still opening the device   -> try again in a moment
+          Driver would not construct            -> unavailable, latched
+        """
         if self.unavailable:
             return False
 
         if self.driver is None:
-            try:
-                from oakd import OakD
-                from driver import Driver
+            hub = self.hub
+            if hub is None:
+                self.unavailable = True
+                self.logger.log("error", "Auto mode unavailable",
+                                "no camera in this process")
+                return False
 
-                self.oakd = OakD()
-                self.driver = Driver(self.vecon, self.oakd)
+            # Kick it off if nobody has yet. Returns immediately.
+            if hub.state == camera.OFF:
+                hub.start()
+
+            if hub.state == camera.STARTING:
+                # Not a failure. Do not latch unavailable -- the device takes
+                # a few seconds and the next press of START will find it up.
+                self.logger.log("info", "Mode",
+                                "Camera is still coming up, press START again")
+                return False
+
+            if hub.state != camera.READY:
+                self.unavailable = True
+                self.logger.log("error", "Auto mode unavailable",
+                                hub.error or hub.state)
+                print(f"[auto] unavailable: {hub.error or hub.state}",
+                      file=sys.stderr)
+                return False
+
+            try:
+                from driver import Driver
+                self.driver = Driver(self.vecon, hub.view("auto"))
             except Exception as e:
                 self.unavailable = True
-                self._release()
                 self.logger.log("error", "Auto mode unavailable", str(e))
                 print(f"[auto] unavailable: {e}", file=sys.stderr)
                 return False
@@ -156,42 +197,28 @@ class AutoPilot:
         self.vecon.return_neutral()
 
     def stop(self):
+        """Give up the driver. The camera is not mine to close.
+
+        main owns the hub and closes it, because the camera outlives auto
+        mode now -- telemetry is still publishing frames in manual.
+        """
         self.driver = None
-        self._release()
 
     # ---- what telemetry asks about the camera ----------------------------
     #
-    # These three are the whole of AutoPilot's telemetry surface. They never
-    # touch the device and never block: the camera is owned by a CameraHub on
-    # its own thread, and all three of these read a field it has already set.
+    # Both of these are read off a field the hub's own thread has already set.
+    # Neither touches the device, neither can block, and neither raises, so
+    # the control loop can call them inside the /diagnostics block.
 
     def camera_state(self) -> str:
         if self.hub is None:
-            return "off"
+            return camera.OFF
         return self.hub.state
 
     def camera_error(self) -> str:
         if self.hub is None:
             return ""
         return self.hub.error or ""
-
-    def pump_telemetry(self, tele, now):
-        """Offer whatever the camera has, if anybody is watching it.
-
-        Called from the control loop every tick. With no camera, or with
-        Foxglove shut, this is one None check and three dict lookups.
-        """
-        if self.hub is None:
-            return
-        self.hub.pump_telemetry(tele, now)
-
-    def _release(self):
-        if self.oakd is not None:
-            try:
-                self.oakd.close()
-            except Exception as e:
-                print(f"[auto] OAK-D close failed: {e}", file=sys.stderr)
-            self.oakd = None
 
 
 def read_pad_intent(joystick):
@@ -383,8 +410,6 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
                 tick_count = 0
                 window_started = now
 
-            autopilot.pump_telemetry(tele, now)
-
             # Reading the state is three pigpio and I2C round trips, and this
             # loop runs at 100 Hz. Doing it every tick was about 54 MB of log
             # an hour: app.log rotating every eleven minutes, journald's rate
@@ -454,6 +479,25 @@ def parse_args(argv=None):
         default=8765,
         help="port for the Foxglove WebSocket server (default: 8765)",
     )
+    # Off by default, and this one I thought about for a while.
+    #
+    # Turning it on means opening the OAK-D on every boot, including the
+    # manual boot the service does -- a USB enumeration and a pipeline upload
+    # that takes seconds, about a watt, and a whole new way for the one code
+    # path that has to always work to have a bad day. The camera is not worth
+    # that to the mode that is just driving the car.
+    #
+    # So the default leaves boot exactly as it was: no camera in manual, and
+    # auto opens it on the first press of START. Ask for this when I want to
+    # see what the camera sees while hand driving, which is a thing I do at a
+    # desk, not a thing the car does unattended. In auto the camera is up
+    # anyway, so /camera and /imu start flowing with or without this flag.
+    parser.add_argument(
+        "--telemetry-camera",
+        action="store_true",
+        help="open the OAK-D at startup so camera and IMU telemetry work in "
+             "manual mode too (default: off, and auto mode opens it anyway)",
+    )
     return parser.parse_args(argv)
 
 
@@ -494,7 +538,6 @@ def main(argv=None):
     vecon = vc.VehicleController(logger=log)
     vecon.return_neutral()
 
-    autopilot = AutoPilot(vecon, log)
     modes = ModeSwitch(args.mode, log)
 
     # Before the joystick, because Joystick() blocks waiting for a pad and I
@@ -505,6 +548,31 @@ def main(argv=None):
     tele = tm.Telemetry(logger=log, port=args.telemetry_port)
     if args.telemetry:
         tele.start()
+
+    # One camera for the whole process, and constructing it opens nothing --
+    # no USB, no depthai import, no risk. The rectified mono stream is only
+    # linked when telemetry is going to carry it, so with telemetry off the
+    # pipeline is byte for byte the one auto mode has always run.
+    hub = camera.CameraHub(logger=log, tele=tele if args.telemetry else None,
+                           rectified=args.telemetry)
+    autopilot = AutoPilot(vecon, log, hub=hub)
+
+    # Who gets the device opened at startup, and who waits for it:
+    #
+    #   --telemetry-camera   start it now, do not wait. Manual driving comes
+    #                        up immediately and the camera joins when it is
+    #                        ready. This is the one that must not block.
+    #   --mode auto          start it and wait, up to OPEN_TIMEOUT. The
+    #                        control loop has not started yet, so waiting
+    #                        here is safe and it is what the old code did.
+    #   --dashboard          same, since the depth panes are its whole job.
+    #   otherwise            nothing. The first press of START starts it.
+    if args.telemetry_camera or modes.mode == AUTO or args.dashboard:
+        hub.start()
+    if modes.mode == AUTO or args.dashboard:
+        if not hub.wait_ready():
+            log.log("warning", "Camera",
+                    f"Camera did not come up: {hub.error or hub.state}")
 
     joystick = js.Joystick(stop_event=stop_event)
 
@@ -519,8 +587,11 @@ def main(argv=None):
             control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele)
         finally:
             # After control_loop's own finally, which is what disarms the ESC.
-            # Telemetry goes last because it is the one thing in this process
-            # that does not matter.
+            # The camera and the telemetry server go last because they are the
+            # two things in this process that do not matter -- and because a
+            # USB device that refuses to close must not get between SIGTERM
+            # and the ESC reaching neutral.
+            hub.close()
             tele.stop()
         return 0
 
@@ -529,13 +600,12 @@ def main(argv=None):
     from PyQt5.QtWidgets import QApplication
     import Dashboard as db
 
-    # The dashboard's whole job is the depth panes, so bring the camera up
-    # even in manual. Worth knowing: its QTimers pull from the same depth
-    # queue the driver does, so in auto the two steal frames from each other
-    # and neither gets the full rate. It is a debug flag, not a boot path.
-    if autopilot.resume() and modes.mode == MANUAL:
-        autopilot.pause()
-
+    # The camera is already up by here -- wait_ready() above saw to it -- so
+    # the dashboard gets its own view on it and nothing needs resuming. The
+    # frame stealing this used to warn about is gone with it: its QTimers used
+    # to tryGet() the same depth queue the driver did, and a queue hands each
+    # packet to exactly one caller, so in auto the two of them halved each
+    # other's rate. One reader in camera.CameraHub, one slot each, no race.
     worker = threading.Thread(
         target=control_loop,
         args=(joystick, vecon, autopilot, modes, log, stop_event, tele),
@@ -544,13 +614,14 @@ def main(argv=None):
     worker.start()
 
     app = QApplication(sys.argv[:1])
-    dashboard = db.Dashboard(oakd=autopilot.oakd)
+    dashboard = db.Dashboard(oakd=hub.view("dashboard"))
     dashboard.show()
     try:
         return app.exec_()
     finally:
         stop_event.set()
         worker.join(timeout=5)
+        hub.close()
         tele.stop()
 
 

@@ -3,11 +3,15 @@
 Takes whatever it is given and guards for the rest, so it works with just an
 OAK-D, just a PersonFollower, or neither.
 
-Two things to know before trusting what you see here. The depth and disparity
-timers pull from the same device queues the driver does, so in auto mode the
-dashboard and the driver steal frames from each other and neither gets the
-full rate. And nothing imports PersonFollower any more -- the type hint used
-to, which dragged the whole of TensorFlow in just to draw a window.
+The `oakd` argument is a camera.StreamView now, not an OakD. Same getters, but
+a view has its own one-deep slot per stream and one reader thread fills every
+view -- so the frame stealing this file used to warn about is gone. These
+timers used to tryGet() the same device queues the driver did, and a queue
+hands each packet to exactly one caller, so in auto mode the dashboard and the
+driver halved each other's rate.
+
+Still true: nothing imports PersonFollower any more. The type hint used to,
+which dragged the whole of TensorFlow in just to draw a window.
 """
 
 from PyQt5.QtWidgets import QMainWindow, QGridLayout, QLabel, QWidget
