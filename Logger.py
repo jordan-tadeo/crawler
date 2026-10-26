@@ -46,8 +46,38 @@ class Logger:
             base, ext = os.path.splitext(csv_file)
             os.rename(csv_file, f"{base}_{timestamp}{ext}")
 
+        # Write whatever keys the state dict actually has, not five fixed
+        # ones. It used to index message['pan'] and message['tilt'] straight,
+        # so the moment get_state stopped reporting the gimbal that is not
+        # attached any more, this raised a KeyError once a second.
+        fields = list(message.keys())
+
+        # A file that already has rows has a column order, and the first row
+        # of it says what that order is. Append to that order, blank for a key
+        # this sample happens not to carry.
+        header = None
+        if os.path.exists(csv_file) and os.path.getsize(csv_file) > 0:
+            with open(csv_file, newline='') as file:
+                header = next(csv.reader(file), None)
+
+        if header is not None:
+            known = header[2:] if header[:2] == ['timestamp', 'subject'] else None
+            if known is None or any(key not in known for key in fields):
+                # Either this file predates the header row, or I am logging a
+                # column it does not have. Appending would leave one file
+                # holding two different shapes and nothing could read it, so
+                # the old rows go aside under a dated name and this starts
+                # clean.
+                base, ext = os.path.splitext(csv_file)
+                os.rename(csv_file, f"{base}_{timestamp}{ext}")
+                header = None
+            else:
+                fields = known
+
         with open(csv_file, mode='a', newline='') as file:
             writer = csv.writer(file)
-            
-            writer.writerow([timestamp, subject, message['throttle'], message['front_s'], message['rear_s'], message['pan'], message['tilt']])
+
+            if header is None:
+                writer.writerow(['timestamp', 'subject'] + fields)
+            writer.writerow([timestamp, subject] + [message.get(key, '') for key in fields])
             file.flush()

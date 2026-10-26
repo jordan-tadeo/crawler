@@ -243,7 +243,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event):
                 vecon.return_neutral()
                 log.log("warning", "Mode", "Auto gave up, dropping to manual")
 
-            # Reading the state is five pigpio and I2C round trips, and this
+            # Reading the state is three pigpio and I2C round trips, and this
             # loop runs at 100 Hz. Doing it every tick was about 54 MB of log
             # an hour: app.log rotating every eleven minutes, journald's rate
             # limit blown inside two, and a file open-write-flush every 10 ms

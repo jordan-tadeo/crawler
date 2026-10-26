@@ -58,7 +58,10 @@ class VehicleController:
         self.pca = PCA9685(self.i2c)
         self.pca.frequency = SERVO_FREQ
 
-        # Initialize servos
+        # Initialize servos. Building the pan and tilt objects costs no bus
+        # traffic -- a Servo only writes when something sets .angle -- and
+        # set_pan_tilt still needs them, so they stay as the seam for putting
+        # the gimbal back on. Nothing on the live path touches them now.
         self.pan_servo = servo.Servo(self.pca.channels[PAN_CHANNEL], actuation_range=180)
         self.tilt_servo = servo.Servo(self.pca.channels[TILT_CHANNEL], actuation_range=180)
         self.front_steering_servo = servo.Servo(self.pca.channels[FRONT_STEERING_CHANNEL], actuation_range=180)
@@ -72,9 +75,13 @@ class VehicleController:
         self.return_neutral()
 
     def get_state(self) -> dict:
-        ''' 
-        Get the current state of the ESC and servos.
-        Returns a tuple of (throttle, front_steering, rear_steering, pan, tilt).
+        '''
+        Get the current state of the ESC and the steering.
+        Returns a dict of throttle, front_s and rear_s.
+
+        Pan and tilt are not in here. The gimbal is off the vehicle, so
+        reading its two angles was two I2C round trips a second spent asking
+        hardware that is not bolted on. Put them back here if it goes back on.
         '''
 
         try:
@@ -95,23 +102,9 @@ class VehicleController:
             self.logger.log("error", "Error reading state", f"Error reading rear steering: {e}")
             rear_steering = None
 
-        try:
-            pan = self.pan_servo.angle
-        except Exception as e:
-            self.logger.log("error", "Error reading state", f"Error reading pan angle: {e}")
-            pan = None
-
-        try:
-            tilt = self.tilt_servo.angle
-        except Exception as e:
-            self.logger.log("error", "Error reading state", f"Error reading tilt angle: {e}")
-            tilt = None
-
         return {"throttle": throttle,
                 "front_s": front_steering,
-                "rear_s": rear_steering,
-                "pan": pan,
-                "tilt": tilt}
+                "rear_s": rear_steering}
     
     def set_throttle(self, value) -> int:
         ''' 
@@ -149,8 +142,15 @@ class VehicleController:
         return front_angle, rear_angle
     
     def set_pan_tilt(self, pan, tilt) -> Tuple[int, int]:
-        ''' 
+        '''
         Set the pan and tilt angles for the servos.
+
+        Nothing calls this. The pan/tilt gimbal is not on the vehicle any
+        more, and its only callers were in PersonFollower, which is retired.
+        I am keeping this method and PAN_CHANNEL/TILT_CHANNEL on disk on
+        purpose: if the gimbal goes back on, this is the seam -- wire a caller
+        to it, and put pan and tilt back into get_state and return_neutral.
+        Until then the live path does not touch channels 12 and 13 at all.
         '''
 
         # Restrict values to the range [-1, 1]
@@ -167,13 +167,16 @@ class VehicleController:
         return pan_angle, tilt_angle
     
     def return_neutral(self) -> None:
-        ''' 
-        Set the ESC and servos to neutral position.
+        '''
+        Set the ESC and the steering to neutral position.
+
+        This runs on every mode change, on every controller dropout and once
+        at the end of __init__, so it is the hottest path in the class. Pan
+        and tilt used to be centred in here too: two I2C writes to a gimbal
+        that is not attached, every single time, each one able to raise.
         '''
 
         self.pi.set_servo_pulsewidth(ESC_GPIO_PIN, ESC_NEUTRAL_PW)
-        self.pan_servo.angle = 90
-        self.tilt_servo.angle = 90
         self.front_steering_servo.angle = 90
         self.rear_steering_servo.angle = 90
     
@@ -182,11 +185,12 @@ class VehicleController:
         Stop the ESC, then centre the servos, then let the hardware go.
 
         The ESC goes first and on its own. return_neutral() touches the I2C
-        bus for four servos before it is done, and one I2C error in there used
-        to throw straight past set_servo_pulsewidth(pin, 0) -- so the one step
-        that actually stops the car got skipped because a servo I do not even
-        have attached did not answer. Every step is on its own now and a
-        failure in one cannot cost me the next.
+        bus for the steering before it is done, and one I2C error in there
+        used to throw straight past set_servo_pulsewidth(pin, 0) -- so the one
+        step that actually stops the car got skipped because a servo I do not
+        even have attached did not answer. Every step is on its own now and a
+        failure in one cannot cost me the next. The two servos I do not have
+        attached are no longer centred in here either.
         '''
 
         try:
@@ -200,9 +204,7 @@ class VehicleController:
             print(f"[Shutdown] could not stop the ESC pulse: {e}")
 
         for name, s in (("front steering", self.front_steering_servo),
-                        ("rear steering", self.rear_steering_servo),
-                        ("pan", self.pan_servo),
-                        ("tilt", self.tilt_servo)):
+                        ("rear steering", self.rear_steering_servo)):
             try:
                 s.angle = 90
             except Exception as e:
