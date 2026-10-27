@@ -815,6 +815,17 @@ def test_each_row_carries_the_newest_imu_sample_and_its_age():
     assert row["mode"] == "record"
 
 
+def test_each_row_says_which_way_the_cars_own_sweep_could_turn():
+    """Something near on the left: the sweep clears to the right only."""
+    scan = dv.free_by_column(graze_frame())
+    assert (dv.turn_sweep_clears(scan, -1), dv.turn_sweep_clears(scan, 1)) == (
+        False, True)
+    tele = SessionTele()
+    tap = fp.FootprintTap(view=FrameView(graze_frame()), tele=tele)
+    row = tap.after_drive(0.0, fp.RECORD, (0.0, 0.0, 0.0))
+    assert (row["sweep_clears_left"], row["sweep_clears_right"]) == (False, True)
+
+
 def test_the_footprint_schema_covers_every_field_a_row_has():
     tele = SessionTele()
     tap = fp.FootprintTap(view=FrameView(far_frame()), tele=tele)
@@ -957,3 +968,120 @@ def test_auto_waits_out_a_release_instead_of_latching_unavailable():
     pilot = mn.AutoPilot(FakeVecon(), FakeLogger(), hub=hub)
     assert pilot.resume() is False
     assert pilot.unavailable is False
+
+
+# --- the throttle latch -----------------------------------------------------
+
+
+class TriggerPad(FakePad):
+    """A pad whose throttle follows a plan, one value per loop pass."""
+
+    def __init__(self, plan):
+        super().__init__()
+        self.plan = list(plan)
+        self.axes["LEFT_X"] = -0.3
+
+    def step(self):
+        super().step()
+        if self.plan:
+            self.throttle = self.plan.pop(0)
+
+
+HELD, LET_GO, AGAIN = 12, 3, 5
+
+
+def after_handover(throttles, index):
+    """The throttles commanded from `index` on, split at the first live one."""
+    tail = throttles[index:]
+    live = next((i for i, t in enumerate(tail) if t != 0.0), len(tail))
+    return tail[:live], tail[live:]
+
+
+def test_leaving_record_with_rt_held_holds_the_throttle_until_it_is_let_go(
+        monkeypatch):
+    """The 0.2 to full-range jump, gone: Y tap out with RT still at full."""
+    head = hold_y(1.0) + [()] * 5 + [(mn.RECORD_BUTTON,), ()]
+    script = head + [()] * (HELD + LET_GO + AGAIN)
+    plan = [1.0] * (len(head) + HELD) + [0.0] * LET_GO + [1.0] * AGAIN
+    pad = TriggerPad(plan)
+    out = run(pad, script, monkeypatch=monkeypatch)
+    assert out["modes"].mode == mn.MANUAL
+
+    throttles = out["vecon"].throttles
+    last_record = max(i for i, t in enumerate(throttles) if t == pytest.approx(0.2))
+    held, live = after_handover(throttles, last_record + 1)
+    assert len(held) >= HELD + LET_GO
+    assert live == [1.0] * AGAIN
+    # Steering was never held: the sticks drove every one of those passes.
+    steer = -0.3 * mn.STEERING_LIMIT_PERC / 100
+    assert out["vecon"].steerings[-(HELD + LET_GO + AGAIN):] == [
+        pytest.approx(dv.steering_pair(steer))] * (HELD + LET_GO + AGAIN)
+
+
+def test_out_of_auto_into_manual_the_trigger_has_to_let_go_first(monkeypatch):
+    head = [()] * 3 + [(mn.MODE_TOGGLE_BUTTON,), ()]
+    script = head + [()] * (HELD + LET_GO + AGAIN)
+    plan = [1.0] * (len(head) + HELD) + [0.0] * LET_GO + [1.0] * AGAIN
+    pad = TriggerPad(plan)
+    out = run(pad, script, mode=mn.AUTO, monkeypatch=monkeypatch)
+    assert out["modes"].mode == mn.MANUAL
+    held, live = after_handover(out["vecon"].throttles, 0)
+    assert len(held) >= HELD + LET_GO
+    assert live == [1.0] * AGAIN
+
+
+def test_a_pad_that_comes_back_after_record_is_held_too(monkeypatch):
+    class Dropping(TriggerPad):
+        def is_connected(self):
+            return not (ENTRY + 3 <= self.frames < ENTRY + 8)
+
+    script = hold_y(1.0) + [()] * (5 + 5 + HELD + LET_GO + AGAIN)
+    plan = [1.0] * (len(script) - LET_GO - AGAIN) + [0.0] * LET_GO + [1.0] * AGAIN
+    pad = Dropping(plan)
+    out = run(pad, script, monkeypatch=monkeypatch)
+    assert out["modes"].mode == mn.MANUAL
+    throttles = out["vecon"].throttles
+    last_record = max(i for i, t in enumerate(throttles) if t == pytest.approx(0.2))
+    held, live = after_handover(throttles, last_record + 1)
+    assert len(held) >= HELD
+    assert live == [1.0] * AGAIN
+
+
+def test_manual_from_boot_is_not_held(monkeypatch):
+    pad = TriggerPad([1.0] * 10)
+    out = run(pad, [()] * 10, monkeypatch=monkeypatch)
+    assert out["vecon"].throttles == [1.0] * 10
+
+
+def test_a_stale_read_never_counts_as_let_go():
+    class Stale:
+        def triggers_at_rest(self):
+            raise RuntimeError("stale handle")
+
+    latch = mn.ThrottleLatch()
+    latch.arm(mn.RECORD)
+    assert latch.gate(Stale(), 1.0) == 0.0
+    assert latch.held is True
+
+
+def test_triggers_at_rest_reads_both_triggers_against_their_rest():
+    import Joystick as js
+
+    class Handle:
+        def __init__(self):
+            self.axes = {js.XBOX_AXES["RT"]: -1.0, js.XBOX_AXES["LT"]: -1.0}
+
+        def get_axis(self, index):
+            return self.axes[index]
+
+    pad = object.__new__(js.Joystick)
+    pad.joystick = Handle()
+    pad._trigger_rest = {"RT": -1.0, "LT": -1.0}
+    assert pad.triggers_at_rest() is True
+    pad.joystick.axes[js.XBOX_AXES["LT"]] = 0.0     # LT half pulled
+    assert pad.triggers_at_rest() is False
+    pad.joystick.axes[js.XBOX_AXES["LT"]] = -1.0
+    pad.joystick.axes[js.XBOX_AXES["RT"]] = -0.85   # RT at 7.5%, past 5%
+    assert pad.triggers_at_rest() is False
+    pad.joystick = None                              # a stale handle
+    assert pad.triggers_at_rest() is False

@@ -222,6 +222,23 @@ class Joystick:
         # function and hand back None.
         return 0.0
 
+    def triggers_at_rest(self) -> bool:
+        """Both triggers under TRIGGER_DEADZONE right now. False on any doubt.
+
+        What main.ThrottleLatch waits for before it lets the pad's throttle
+        through again. Its own read rather than read_throttle() == 0.0,
+        because read_throttle turns a stale handle into a 0.0, and a latch
+        that took that as "released" would let the next good read through at
+        whatever the trigger is really at.
+        """
+        try:
+            rest = self._trigger_rest
+            rt = trigger_pull(self.get_axis("RT"), rest.get("RT", SAFE_TRIGGER_REST))
+            lt = trigger_pull(self.get_axis("LT"), rest.get("LT", SAFE_TRIGGER_REST))
+        except Exception:
+            return False
+        return rt < TRIGGER_DEADZONE and lt < TRIGGER_DEADZONE
+
     def wait_for_connection(self, stop_event=None, poll_interval: float = 1.0):
         """Wait for a controller. Returns True once one is attached.
 

@@ -16,7 +16,9 @@ holds it is `footprint.py` (the rows), `policy_input.py` (the picture) and
   reverse speed (`Driver.reverse_speed`, -0.6). Steering is unchanged. Any
   fresh press of Y goes back to manual (one buzz); START ends the session and
   goes to auto; losing the pad ends it at neutral. A and B marks work as
-  always.
+  always. Back in manual, from record or from auto, the throttle stays 0
+  until both triggers have been let go once (`main.ThrottleLatch`). Manual
+  writes no rows, so this never shows up in the data.
 - **Auto** writes the same rows for the autopilot's own decisions, into the
   rolling recording, from the frame the driver actually scanned.
 - **Manual** writes no rows.
@@ -93,9 +95,24 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `probe_blocked` | bool[9] | per probe |
 | `probe_reason` | str[9] | `"near"`, `"no_return"` or `""` |
 | `probe_marks` | str | the nine as one string: `N` near, `?` no return, `.` clear |
+| `sweep_clears_left`, `sweep_clears_right` | bool | `driver.turn_sweep_clears(scan, -1)` / `(scan, +1)`: could a full-lock turn that way begin now without the car's swept corner touching anything the fan sees |
 | `scan_ms` | float | time the scan took |
-| `verdict_action`, `verdict_steer`, `verdict_reason` | str, float, str | what `driver.read_the_gradient()` says about this scan: `forward`, `evade` or `reverse` |
+| `verdict_action`, `verdict_steer`, `verdict_reason` | str, float, str | what `driver.read_the_gradient()` says about this scan: `forward`, `evade` or `reverse`. `verdict_steer` is -1 (left) or +1 (right) on an evade, otherwise the cruise bias or 0 |
 | `committed_action`, `committed_steer`, `committed_reason` | str, float, str | auto only: what the driver actually did after its evade latch. Empty in record |
+
+The reason strings are free text: the first word names the rule, and a number
+after it is that rule's measure. As of `driver.py` at `11cecdd`:
+
+- forward: `clear`
+- reverse: `no_return`; `floor <mm>` (nearest blocked probe under
+  `REVERSE_FLOOR_MM`, 200 mm); `split`; `spans`; `wide <n>`; `middle` (an exact
+  tie); `shallow <ratio>`; `tight <mm>` (the sweep cannot clear the turn side)
+- evade: `graze <ratio>` (off an edge block); `dodge <ratio>` (around a
+  block in the middle)
+- committed only: `holding out`, `evade flipped`, `evade timeout`
+
+Split on the first space to get the rule. The list moves with `driver.py`, so
+treat an unknown first word as a new rule, not an error.
 
 The probe and verdict fields are the rule-based driver's opinion, recorded as
 a baseline to beat. In record **nothing acts on them**; the wheels get only

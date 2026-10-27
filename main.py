@@ -227,6 +227,59 @@ class RecordButton:
         return None
 
 
+class ThrottleLatch:
+    """Throttle held at 0 after a handover, until both triggers let go.
+
+    Leaving record with RT still held used to jump the car from auto's
+    forward speed (0.2) to full manual range on the very next tick: the same
+    finger, a 5x bigger throttle, and nothing to tell me. Out of auto it was
+    the same, from wherever the trigger happened to be resting. pigpio latches
+    the last pulse width, so a jump like that is not a twitch, it is the car
+    leaving at full speed.
+
+    So any handover into manual from a mode that drove at a lower cap or
+    that the pad did not drive at all -- record, or auto -- arms this, and the
+    throttle stays 0 until both triggers have read under TRIGGER_DEADZONE at
+    least once since. After that the pad passes straight through. Steering is
+    never held: it is not the thing that leaves.
+
+    Which handovers arm it is decided by the control loop from which mode
+    drove the previous pass, not at each place that changes the mode, so a
+    new way out of record or auto cannot forget to.
+    """
+
+    FROM = (RECORD, AUTO)
+
+    def __init__(self, logger=None):
+        self.logger = logger
+        self.held = False
+
+    def arm(self, came_from):
+        if self.held:
+            return
+        self.held = True
+        message = (f"Throttle held at 0 after {came_from}, "
+                   f"until both triggers are released")
+        print(f"[manual] {message}")
+        if self.logger is not None:
+            self.logger.log("info", "Manual", message)
+
+    def gate(self, joystick, throttle):
+        """`throttle`, or 0.0 while held. Never raises."""
+        if not self.held:
+            return throttle
+        try:
+            released = bool(joystick.triggers_at_rest())
+        except Exception:
+            released = False
+        if released:
+            self.held = False
+            if self.logger is not None:
+                self.logger.log("info", "Manual", "Triggers released, throttle live")
+            return throttle
+        return 0.0
+
+
 def auto_speed_limits(driver=None):
     """(forward, reverse): the throttles auto drives at, read off a Driver.
 
@@ -610,12 +663,12 @@ def read_pad_intent(joystick, split=False):
     return (throttle,) + dv.steering_pair(left)
 
 
-def drive_manual(joystick, vecon, log, split=False):
+def drive_manual(joystick, vecon, log, split=False, latch=None):
     """drive_pad() at full range, returning only the command."""
-    return drive_pad(joystick, vecon, log, split)[0]
+    return drive_pad(joystick, vecon, log, split, latch=latch)[0]
 
 
-def drive_pad(joystick, vecon, log, split=False, limits=None):
+def drive_pad(joystick, vecon, log, split=False, limits=None, latch=None):
     """One tick of hand driving. Anything that goes wrong in here means neutral.
 
     Returns what it commanded, so the caller does not have to read the pad a
@@ -629,6 +682,9 @@ def drive_pad(joystick, vecon, log, split=False, limits=None):
     is in force has already been settled and both numbers go to the hardware in
     the one set_steering call.
 
+    `latch` is a ThrottleLatch or None; while it holds, the throttle
+    commanded is 0 and the steering is the sticks'.
+
     `limits` is record mode's (forward, reverse) and None for manual. Returns
     ((throttle, front, rear) as commanded, the trigger before scaling, ok),
     and ok False means a pad read raised and the car was sent to neutral.
@@ -638,6 +694,8 @@ def drive_pad(joystick, vecon, log, split=False, limits=None):
             joystick, split)
         throttle = (pad_throttle if limits is None
                     else scale_throttle(pad_throttle, limits))
+        if latch is not None:
+            throttle = latch.gate(joystick, throttle)
 
         vecon.set_throttle(throttle)
         vecon.set_steering(steering_front, steering_rear)
@@ -698,6 +756,12 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
         tap = fp.FootprintTap(tele=tele)
     if record_button is None:
         record_button = RecordButton()
+
+    # Which mode drove the previous pass, so a handover into manual from
+    # record or auto -- by any path, the disconnect wait included -- arms the
+    # throttle latch on the first manual pass after it.
+    latch = ThrottleLatch(log)
+    drove_last = modes.mode
 
     vehicle_state = None
     state_read_at = 0.0
@@ -802,8 +866,11 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 log.log("info", "Mode", "Switched to manual")
 
             pad_throttle = None
+            if modes.mode == MANUAL and drove_last in ThrottleLatch.FROM:
+                latch.arm(drove_last)
+            drove_last = modes.mode
             if modes.mode == MANUAL:
-                drive_manual(joystick, vecon, log, steer.split)
+                drive_manual(joystick, vecon, log, steer.split, latch)
             elif modes.mode == RECORD:
                 _, pad_throttle, ok = drive_pad(joystick, vecon, log,
                                                 steer.split, session.limits)

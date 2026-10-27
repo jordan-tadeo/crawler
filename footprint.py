@@ -79,6 +79,14 @@ def _num(value, fallback=-1.0) -> float:
     return value if math.isfinite(value) else fallback
 
 
+def _sweep_clears(scan, side) -> bool:
+    """driver.turn_sweep_clears(), and False if it cannot say."""
+    try:
+        return bool(dv.turn_sweep_clears(scan, side))
+    except Exception:
+        return False
+
+
 def feature_row(scan, verdict, command, mode, source, shape, scan_ms=0.0,
                 committed=None, pad_throttle=None, limits=None,
                 steering_mode=""):
@@ -95,6 +103,11 @@ def feature_row(scan, verdict, command, mode, source, shape, scan_ms=0.0,
         "probe_blocked": [bool(b) for b in scan.blocked],
         "probe_reason": [str(r) for r in scan.reason],
         "probe_marks": dv.probe_marks(scan),
+        # Could a full-lock turn that way begin now without touching anything
+        # the fan sees? The driver's own sweep test, asked both ways: side -1
+        # is left and +1 right, as read_the_gradient passes it.
+        "sweep_clears_left": _sweep_clears(scan, -1.0),
+        "sweep_clears_right": _sweep_clears(scan, 1.0),
         "scan_ms": _num(scan_ms, 0.0),
         "verdict_action": str(verdict.action),
         "verdict_steer": _num(verdict.steer, 0.0),

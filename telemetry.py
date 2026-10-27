@@ -320,6 +320,9 @@ JSON_SCHEMAS = {
         "probe_blocked": {"type": "array", "items": _BOOL},
         "probe_reason": {"type": "array", "items": _STR},
         "probe_marks": _STR,
+        # driver.turn_sweep_clears(scan, -1) and (scan, +1).
+        "sweep_clears_left": _BOOL,
+        "sweep_clears_right": _BOOL,
         "scan_ms": _NUM,
         # read_the_gradient() on this scan, unlatched.
         "verdict_action": _STR,

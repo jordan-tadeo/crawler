@@ -282,7 +282,10 @@ than clipped: full RT is auto's forward speed and full LT auto's reverse speed,
 read off `driver.Driver`, so whatever auto drives at, I drive at. Steering is
 unchanged. Any fresh press of Y is back to manual (one buzz) and gives the
 camera back; START ends the session and goes to auto; losing the pad ends it
-at neutral. Y does nothing in auto. No flag, so nothing in the unit file
+at neutral. Y does nothing in auto. Coming back to manual from record or
+from auto, the throttle stays at 0 until both triggers have been let go once,
+so leaving record with RT still held is not a jump from 0.2 to full; the
+steering is live the whole time. No flag, so nothing in the unit file
 changes. With `--no-telemetry --no-record` there is no publisher thread to
 write with, so record refuses and says so.
 

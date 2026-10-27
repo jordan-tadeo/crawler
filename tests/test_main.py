@@ -98,6 +98,11 @@ class FakePad:
             raise RuntimeError("stale handle")
         return self.throttle
 
+    def triggers_at_rest(self):
+        if self.raises:
+            raise RuntimeError("stale handle")
+        return self.throttle == 0.0
+
     def get_axis(self, name, limit_perc=100):
         if self.raises:
             raise RuntimeError("stale handle")
