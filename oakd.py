@@ -32,6 +32,44 @@ the same packets. Everything in here now is a raw frame off one queue.
 """
 
 import depthai as dai
+import numpy as np
+
+
+def frame_from_payload(packet, label=""):
+    """An ImgFrame's pixels, worked out from the payload instead of the label.
+
+    getFrame() trusts ImgFrame.getType(), and with extended disparity on, that
+    label is wrong. depthai 2.30 reports maxDisparity as 8170 rather than 190
+    as soon as any post-processing filter is enabled -- spatial, temporal or
+    speckle, any one of them is enough -- and because 8170 does not fit in a
+    byte the disparity output gets stamped Type.RAW16. The firmware still sends
+    one byte per pixel, so getFrame() asks for 512000 bytes, finds 256000 and
+    raises. Measured on the car: extended plus filters is RAW16 carrying
+    1.00 bytes/px, extended with no filters is RAW8 carrying 1.00, and subpixel
+    plus filters is RAW16 genuinely carrying 2.00. So only the combination this
+    pipeline now runs is mislabelled, which is why it never showed up before.
+
+    Depth is not affected -- it is real millimetres, RAW16, two bytes a pixel in
+    every configuration -- so nothing the driver reads goes through here. It is
+    the disparity stream, which only ever becomes a picture for me to look at.
+
+    Returns None rather than raising on anything it cannot make sense of, which
+    is the contract every getter in this file keeps: a missing frame is a case
+    the callers already handle, an exception on the camera thread is not.
+    """
+    data = packet.getData()
+    width, height = packet.getWidth(), packet.getHeight()
+    pixels = width * height
+    if pixels <= 0 or data.size == 0 or data.size % pixels:
+        print(f"[OakD] {label}: {data.size} bytes for {width}x{height}, dropped.")
+        return None
+    per_pixel = data.size // pixels
+    if per_pixel == 1:
+        return data.reshape(height, width)
+    if per_pixel == 2:
+        return data.view(np.uint16).reshape(height, width)
+    print(f"[OakD] {label}: {per_pixel} bytes per pixel, dropped.")
+    return None
 
 
 class OakD:
@@ -64,8 +102,39 @@ class OakD:
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
         stereo.setConfidenceThreshold(245)
         stereo.setLeftRightCheck(True)
-        stereo.setSubpixel(True)
-        stereo.setExtendedDisparity(False)
+        # Extended disparity rather than subpixel. These two are mutually
+        # exclusive on RVC2, so it is a trade and not an addition: extended
+        # runs the stereo engine twice, once at half resolution, and
+        # concatenates the result into a 190 level disparity search instead of
+        # 95. That halves the minimum measurable depth --
+        # fx * baseline / levels = 441.25 * 75 / 190 = 174 mm against 348 --
+        # which is what I actually want, because the obstacle trigger is at
+        # 400 mm and with subpixel on there were only 52 mm of measurable
+        # warning above the blind zone. Now there are 226 mm.
+        #
+        # What I give up is subpixel interpolation, so depth comes back
+        # quantised to whole disparity levels. One level is Z^2 / (fx*baseline)
+        # = 4.8 mm at the 400 mm trigger and 24.5 mm at the 900 mm floor clip,
+        # where subpixel's eighth-of-a-level gave 0.6 mm and 3.1 mm. Neither
+        # matters here: 4.8 mm of jitter on a 400 mm threshold is 1.2%, and the
+        # floor clip at 899 is a band edge with 12 degrees of pitch margin
+        # behind it, not a measurement anybody reads. 174 mm of range is worth
+        # more than a millimetre of precision I never look at.
+        #
+        # Measured, 300 frames a side, same scene, camera not moved: nearest
+        # valid depth went from 319 mm on subpixel to 165 mm on extended, and
+        # readings in the 200-250 mm band exist only on extended -- 25130 pixel
+        # samples against zero. 12.1 fps and 0.64 s of frame latency either
+        # way, so the second stereo pass costs nothing measurable here.
+        #
+        # One surprise worth writing down: 348 was never the hard floor the
+        # arithmetic says. Subpixel returned depth down to 319 mm, roughly 4%
+        # of valid pixels sitting under 348, because the spatial and temporal
+        # filters below interpolate across the edge of the search range. So
+        # the gain is real but it is a floor dropping from ~320 to ~165, not
+        # from 348 to 174.
+        stereo.setSubpixel(False)
+        stereo.setExtendedDisparity(True)
         stereo.setRectifyEdgeFillColor(0)
         stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # Optional
         stereo.setPostProcessingHardwareResources(2, 3)
@@ -165,7 +234,12 @@ class OakD:
             raise
         if packet is None:
             return None
-        return packet.getFrame()
+        try:
+            return packet.getFrame()
+        except RuntimeError as e:
+            if "enough data" not in str(e):
+                raise
+            return frame_from_payload(packet, label)
 
     def get_depth_frame(self):
         """Latest depth frame in millimetres, or None if none is waiting."""

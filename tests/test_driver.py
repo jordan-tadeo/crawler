@@ -21,6 +21,7 @@ Three separate faults produced that, and there is a test for each:
 Everything here is arithmetic on numbers and numpy arrays. No OAK-D, no pigpio.
 """
 
+import pathlib
 import time
 
 import numpy as np
@@ -656,10 +657,13 @@ def speckled_depth(near_samples, probe=4):
 
 
 # The stereo pair's minimum range, which is the floor every near reading sits
-# above: fx * baseline / disparity_levels = 441.25 * 75 / 95. Inside it
-# nothing comes back at all, which is what makes a closing obstacle flip to
-# NO_RETURN instead of reading nearer and nearer.
-MIN_Z_MM = dv.FX_AT_640 * 75.0 / 95.0
+# above: fx * baseline / disparity_levels = 441.25 * 75 / 190 = 174.2 mm.
+# 190 levels because oakd.py runs extended disparity; on subpixel it was 95
+# and this read 348.4. Inside the floor nothing comes back at all, so an
+# obstacle that gets there flips to NO_RETURN instead of reading nearer and
+# nearer -- but at 174 mm that is now well below REVERSE_FLOOR_MM, so in
+# practice the car reverses long before a real obstacle arrives down here.
+MIN_Z_MM = dv.FX_AT_640 * 75.0 / 190.0
 
 
 def sampled_columns(geo):
@@ -968,9 +972,10 @@ def test_an_overhang_the_car_drives_under_does_not_block():
 def test_a_near_obstacle_and_a_blind_frame_report_different_reasons(d):
     """Two completely different behaviours used to wear one function name, and
     the journal could not tell them apart. On this stereo pair most real
-    triggers are probably the no-return kind: subpixel with extended
-    disparity off puts minimum range at 348 mm against a 400 mm budget, so
-    there are 52 mm of graded warning before the blind zone."""
+    triggers should be the near kind: extended disparity puts minimum range at
+    174 mm against a 400 mm budget, so there are 226 mm of measurable approach
+    before the blind zone, and a no-return now means dark or featureless
+    rather than merely close."""
     assert d.obstacle_in_front(np.full((400, 640), 200, dtype=np.uint16)) is True
     assert d.last_block_reason == dv.NEAR
 
@@ -1455,6 +1460,26 @@ def test_the_reverse_floor_sits_between_the_blind_zone_and_the_trigger():
     fire -- nothing is measurable down there -- and at or above the trigger it
     would swallow the whole feature."""
     assert MIN_Z_MM < dv.REVERSE_FLOOR_MM < dv.CLEARANCE_MM
+
+
+def test_the_fixtures_depth_floor_matches_the_stereo_config_on_the_car():
+    """MIN_Z_MM above is the one number in this file that describes hardware
+    rather than arithmetic, and nothing else here can catch it going stale.
+
+    Every near-range scene is clipped at it, so if oakd.py went back to
+    subpixel the whole gradient suite would quietly keep modelling a camera
+    with a 174 mm floor while the car had a 348 mm one -- and every test would
+    still pass, because the scenes it clips are all well above both numbers.
+    So assert the coupling directly: 190 disparity levels is extended
+    disparity with subpixel off, and that is a claim about oakd.py.
+
+    Read as text rather than imported, because importing oakd constructs a
+    dai.Device and there is no camera on the laptop.
+    """
+    source = (pathlib.Path(__file__).resolve().parent.parent / "oakd.py").read_text()
+    assert "stereo.setExtendedDisparity(True)" in source
+    assert "stereo.setSubpixel(False)" in source
+    assert MIN_Z_MM == pytest.approx(dv.FX_AT_640 * 75.0 / 190.0)
 
 
 def test_two_separate_obstacles_are_not_a_surface():

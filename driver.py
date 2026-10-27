@@ -236,12 +236,29 @@ FOOTPRINT_MARGIN_MM = 20.0
 
 # How close something has to be before it counts. Same 400 mm the old default
 # had and the same meaning, promoted to a name because three things derive
-# from it now. Worth knowing where it sits: setSubpixel(True) with extended
-# disparity off gives this stereo pair a minimum range of
-# fx * baseline / disparity_levels = 441.25 * 75 / 95 = 348 mm, so there are
-# 52 mm of graded warning between first sight and the blind zone. Most real
-# triggers will therefore be the no-return kind rather than a measured
-# distance, which is exactly why the two are reported apart.
+# from it now. Worth knowing where it sits: oakd.py runs extended disparity
+# with subpixel off, which gives this stereo pair 190 disparity levels and a
+# minimum range of
+# fx * baseline / disparity_levels = 441.25 * 75 / 190 = 174 mm, so the whole
+# band from 400 mm down to 174 is measurable -- 226 mm of graded warning
+# before anything falls into the blind zone.
+#
+# That is the opposite of how this read when the pair was on subpixel and 95
+# levels. 348 mm of minimum range left about 52 mm of measurable approach, so
+# most triggers were expected to be the no-return kind: something arriving
+# already too close to measure. With 226 mm of room the usual trigger should
+# now be a measured NEAR distance, and a NO_RETURN means what it says --
+# dark, featureless or outside the overlap -- rather than just "near". The two
+# are still reported apart because they still mean different things; it is the
+# expected mix that has moved.
+#
+# Both those figures are the arithmetic, and the arithmetic is a little
+# pessimistic at the near end: measured on the car the old config returned
+# depth down to 319 mm rather than stopping dead at 348, and the new one down
+# to 165 rather than 174, because the post-processing filters interpolate past
+# the edge of the search range. The shape of the argument survives it -- the
+# measurable approach went from about 80 mm to about 235 mm -- but do not read
+# 174 as a cliff.
 CLEARANCE_MM = 400.0
 
 # Mono camera intrinsics at THE_400_P, and the loudest assumption in this
@@ -553,16 +570,30 @@ def free_by_column(depth, threshold_mm=CLEARANCE_MM) -> FootprintScan:
 # the safety argument reads one condition at a time, which is why the rules
 # are numbered in the code as well as here.
 
-# How close is too close to steer. The stereo pair's minimum range is
-# fx * baseline / disparity_levels = 441.25 * 75 / 95 = 348.4 mm, so a
-# measured near reading always lies in [348.4, 400). Inside this floor there
-# is no room left to rotate along a surface and the next few millimetres are
-# the blind zone, so it reverses.
+# How close is too close to steer. Inside this floor there is no room left to
+# rotate along a surface, so it reverses instead.
 #
-# 11.6 mm of margin above minZ, which is not as thin as it looks: at 360 mm
-# one full disparity pixel is Z^2 / (fx * baseline) = 360^2 / 33094 = 3.9 mm
-# and subpixel is on, so 11.6 mm is about 24 depth steps rather than a
-# rounding error.
+# This number used to be justified by the sensor: minimum range was 348.4 mm
+# and 360 sat 11.6 mm above it, so the floor was very nearly the last
+# measurable reading. Extended disparity moved minimum range down to
+# fx * baseline / disparity_levels = 441.25 * 75 / 190 = 174.2 mm, and that
+# argument is gone with it -- a measured near reading now lies anywhere in
+# [174.2, 400), and 360 is less than half way down the band.
+#
+# It stays at 360 anyway, for a different and better reason: the gate is
+# maneuverability-bound now, not sensor-bound. A full-lock turn at distance Z
+# buys only about Z^2 / 2R of lateral offset before the nose covers the
+# distance, and with a full-lock radius anywhere near this car's own length
+# that is tens of millimetres by the time Z is under 300 mm -- 64 mm at
+# Z = 300 and R = 700. Tens of millimetres clears nothing, so steering down
+# there is not a maneuver, it is a slower collision.
+#
+# Where exactly it stops being a maneuver depends on a full-lock turn radius
+# I have not measured. Until I do, 360 is deliberately conservative: it gives
+# up the 174-360 mm band that the sensor can now see rather than guess at a
+# radius, and the cost of giving it up is reversing out of something I might
+# have grazed past. That is the cheap direction. Retune it off a measurement,
+# not off this comment.
 REVERSE_FLOOR_MM = 360.0
 
 # How much of the car is allowed to be in the thing being steered around.
@@ -704,10 +735,13 @@ def read_the_gradient(scan) -> SteerVerdict:
     contribute to the open side of the ratio and can never be counted in the
     width. One anywhere in the fan vetoes the whole feature.
 
-    That also supplies the abort signal for free. An obstacle being grazed
-    that closes to under 348 mm stops being measurable at all, flips to
-    NO_RETURN, and the very next scan reverses: the thing disappearing into
-    the blind zone is itself the reason to stop.
+    R2 supplies the abort signal for free, and since extended disparity it is
+    R2 and not R1 that does it. An obstacle being grazed that keeps closing
+    crosses REVERSE_FLOOR_MM at 360 mm and the next scan reverses, while still
+    being perfectly measurable -- the blind zone is down at 174 mm now and a
+    closing obstacle no longer reaches it before the floor catches it. R1 is
+    still the backstop for a column that goes unmeasurable for any of the
+    other reasons, but it is no longer the thing that ends a graze.
     """
     blocked = [i for i in range(PROBE_COLUMNS) if scan.blocked[i]]
 

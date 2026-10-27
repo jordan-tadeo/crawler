@@ -323,8 +323,12 @@ IMAGE_RENDER = {
 }
 
 # The window depth is colourmapped across, in millimetres. The same numbers
-# the dashboard has always used: under 300 mm the stereo pair has nothing
-# useful to say, and past 3 m this car does not care.
+# the dashboard has always used: past 3 m this car does not care, and the
+# bottom of the window is a picture-making choice rather than a sensor limit.
+# It was very nearly a sensor limit once -- minimum range was 348 mm on
+# subpixel -- but extended disparity reads down past 200 mm (165 measured), so
+# 300 now clips real depth off the near end of the colourmap. Only the
+# colourmap: the driver reads the raw depth frame and never comes through here.
 DEPTH_NEAR_MM = 300
 DEPTH_FAR_MM = 3000
 
