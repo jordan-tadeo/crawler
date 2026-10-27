@@ -910,7 +910,7 @@ class AutoPilot:
                         f"({model.representation}, {model.contract})")
         return policy.PolicyDriver(self.command, view, model)
 
-    def step(self, now, takeover=None):
+    def step(self, now, takeover=None, split=False):
         """One pass of auto mode. False means hand the wheels back to manual.
 
         The driver still decides at AUTO_TICK_INTERVAL. What changed is that it
@@ -929,6 +929,10 @@ class AutoPilot:
         standing command written straight away, so letting go puts the
         autopilot's own command on the wheels and never a straight or a stop
         of its own.
+
+        `split` is SteerMode.split this pass. A learned driver with a mode
+        head starts from it when auto engages, follows it while my hand has
+        the steering, and takes it on an L3 press (policy.ModeLatch).
         """
         if self.unavailable or self.driver is None:
             return False
@@ -938,6 +942,12 @@ class AutoPilot:
                 self._next_tick = now + AUTO_TICK_INTERVAL
                 self.driver.human_throttle = bool(
                     takeover is not None and takeover.throttle)
+                # The pad's side of a learned driver's steering mode (see
+                # policy.PolicyDriver): my SteerMode, and whether my hand has
+                # the steering. The rules driver never reads either.
+                self.driver.human_steering = bool(
+                    takeover is not None and takeover.steering)
+                self.driver.pad_split = bool(split)
                 self.driver.tick(now)
                 scan = self.driver.last_scan
                 if scan is not self._scan:
@@ -1330,7 +1340,9 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             # switch above: which way the sticks are mapped is not a property
             # of the mode, so a lap in auto leaves it exactly where I left it,
             # and pressing L3 while auto has the wheels sets up the mapping I
-            # want waiting for me when I take them back.
+            # want waiting for me when I take them back. Under a --policy
+            # model with a mode head the press also sets the mode the model
+            # drives with (policy.ModeLatch); the rules driver ignores it.
             #
             # No return_neutral() on a flip, unlike a mode switch. Nobody is
             # changing hands here -- the next tick is 10 ms away and commands
@@ -1376,7 +1388,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 vecon.return_neutral()
                 last_error = "auto parked on a pad fault"
                 log.log("warning", "Mode", "Pad fault in auto, parked to manual")
-            elif not autopilot.step(now, takeover):
+            elif not autopilot.step(now, takeover, steer.split):
                 takeover.drop("auto gave up")
                 modes.mode = MANUAL
                 vecon.return_neutral()

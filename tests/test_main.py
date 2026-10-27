@@ -183,8 +183,9 @@ class FakeAutopilot:
     def pause(self):
         self.pauses += 1
 
-    def step(self, now, takeover=None):
+    def step(self, now, takeover=None, split=False):
         self.steps += 1
+        self.split = split
         return True
 
     def stop(self):

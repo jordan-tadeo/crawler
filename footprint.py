@@ -87,6 +87,8 @@ AUTOPILOT_FIELDS = {
     "policy_steering_front": 0.0,
     "policy_reason": "",
     "policy_infer_ms": 0.0,
+    "policy_steer_mode": "",     # unified / split: the mode the model drove with
+    "policy_steer_mode_p": 0.0,  # the mode head's p of that mode; -1 with no head
 }
 
 

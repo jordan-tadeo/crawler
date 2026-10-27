@@ -133,13 +133,13 @@ def test_align_drops_what_cannot_be_a_label_and_says_why():
     rows = driving(8)
     rows[0][1]["mode"] = "manual"
     rows[1][1]["throttle"] = math.nan
-    rows[2][1]["steering_mode"] = pa.SPLIT
+    rows[2][1].update(steering_mode=pa.SPLIT, steering_rear=0.3)  # my right stick
     small = np.full((pl.INPUT_HEIGHT, pl.INPUT_WIDTH), 1500, np.uint16)
     frames = [(t, png(small, r["seq"])) for t, r in rows if r["seq"] != 3]  # one went missing
     connected = [(0.0, True), (0.55, False), (0.65, True)]  # off across tick 6
     session = footprint_session(rows, frames=frames, connected=connected)
     ticks, drops, _ = align(session)
-    assert drops == {"mode": 1, "bad command": 1, "split": 1, "no frame": 1, "pad": 1}
+    assert drops == {"mode": 1, "bad command": 1, "split rear": 1, "no frame": 1, "pad": 1}
     assert len(ticks) == 3
 
 
@@ -545,3 +545,159 @@ def test_the_dataset_tool_drops_the_old_caps_by_default(tmp_path, monkeypatch, c
     meta = json.loads(str(np.load(out)["meta"]))
     assert meta["sessions"] == ["old", "new"]
     assert meta["session_caps"]["old"] == [list(OLD)]
+
+
+# --- the steering mode -------------------------------------------------------
+
+U, SP = pl.STEER_MODES.index(pl.UNIFIED), pl.STEER_MODES.index(pl.SPLIT)
+
+
+def toggled(n=40, at=(2.0,), gap_after=None):
+    """n record rows 0.1 s apart, unified, flipping mode at each time in `at`.
+    Split rows carry a straight rear, the way I drive them."""
+    rows, mode = [], pl.UNIFIED
+    for i in range(n):
+        t = i * 0.1 + (1.0 if gap_after is not None and i > gap_after else 0.0)
+        if any(abs(t - a) < 1e-6 for a in at):
+            mode = pl.SPLIT if mode == pl.UNIFIED else pl.UNIFIED
+        r = row(i, front=0.3)
+        if mode == pl.SPLIT:
+            r.update(steering_mode=pl.SPLIT, steering_rear=0.0)
+        rows.append((t, r))
+    return footprint_session(rows)
+
+
+def test_split_with_the_rear_straight_is_kept_and_its_mode_is_the_label():
+    ticks, drops, _ = align(toggled())
+    assert not drops and len(ticks) == 40
+    assert [t.steer_mode for t in ticks[20:]] == [SP] * 20
+    assert pd.SPLIT_REAR_REST == 0.05
+
+
+def test_the_label_leads_a_toggle_and_the_input_is_the_mode_going_in():
+    """The toggle at 2.0 s: the half second before it wants split while the
+    car is still unified, the toggle tick goes in unified and comes out
+    split, and from the next tick on the car is in split."""
+    ticks, _, _ = align(toggled())
+    t_s = [round((t.t_ns - T0) / S, 1) for t in ticks]
+    k = t_s.index(2.0)
+    lead = round(pd.MODE_LEAD_S / 0.1)
+    assert [t.steer_mode for t in ticks[:k - lead]] == [U] * (k - lead)
+    assert [t.steer_mode for t in ticks[k - lead:k]] == [SP] * lead
+    assert [t.mode_in for t in ticks[:k + 1]] == [U] * (k + 1)
+    assert [t.mode_in for t in ticks[k + 1:]] == [SP] * (len(ticks) - k - 1)
+    window = [t.mode_switch for t in ticks]
+    assert window[k - 5:k + 6] == [True] * 11
+    assert not any(window[:k - 5]) and not any(window[k + 6:])
+
+
+def test_a_toggle_on_a_dropped_tick_still_counts():
+    session = toggled()
+    # The toggle's own row has no picture, so it is no tick -- but it was a toggle.
+    session = session._replace(frames=[f for f in session.frames if f.seq != 20])
+    ticks, drops, _ = align(session)
+    assert drops == {"no frame": 1}
+    assert pd.toggles_of(session.commands) == [(T0 + 2 * S, SP)]
+    after = [t for t in ticks if t.t_ns > T0 + 2 * S]
+    assert after[0].mode_in == SP and after[0].steer_mode == SP
+
+
+def test_a_mode_change_across_a_gap_is_not_a_toggle():
+    """Manual writes no rows, so a press in there cannot be placed."""
+    session = toggled(at=(2.9 + 1.0,), gap_after=28)
+    assert [c.steering_mode for c in session.commands][28:30] == [pl.UNIFIED, pl.SPLIT]
+    assert pd.toggles_of(session.commands) == []
+    ticks, _, _ = align(session)
+    assert not any(t.mode_switch for t in ticks)
+    assert all(t.mode_in == t.steer_mode for t in ticks)
+
+
+def test_the_dataset_arrays_and_meta_carry_the_mode(tmp_path, monkeypatch):
+    session = toggled(at=(1.0, 3.0))._replace(name="s")
+    session = session._replace(commands=[c._replace(forward_cap=pa.RUNTIME_CAPS[0],
+                                                    reverse_cap=pa.RUNTIME_CAPS[1])
+                                         for c in session.commands])
+    monkeypatch.setattr(pd, "read_session", lambda path, adapter=None: (session, False))
+    out = tmp_path / "d.npz"
+    assert pd.main([str(out), str(tmp_path / "s.mcap"), "--no-idle-rules"]) == 0
+    a = pe.load(str(out))
+    assert a["meta"]["steer_modes"] == list(pl.STEER_MODES)
+    assert a["meta"]["toggles"]["s"] == [T0 + 1 * S, T0 + 3 * S]
+    assert a["steer_mode"].dtype == np.int8 and (a["steer_mode"] == SP).sum() == 20
+    assert a["mode_switch"].sum() == 22
+
+
+def test_the_trainer_weights_the_switch_windows_up():
+    ticks, _, _ = align(toggled())
+    a = pd.to_arrays([(toggled(), ticks)])
+    w = pt.mode_weights(a, np.arange(len(ticks)), 7.0)
+    assert a["mode_switch"].sum() == 11
+    assert (w[a["mode_switch"]] == 7.0).all() and (w[~a["mode_switch"]] == 1.0).all()
+    assert pt.MODE_SWITCH_WEIGHT == 10.0
+    np.testing.assert_array_equal(pt.encode_modes(a["mode_in"][[0, -1]]),
+                                  np.concatenate([pl.encode_mode(False), pl.encode_mode(True)]))
+
+
+def test_time_blocks_are_contiguous_cover_every_decision_and_guard_their_edges():
+    session = toggled(n=100)
+    ticks, _, _ = align(session)
+    a = pd.to_arrays([(session, ticks)])
+    blocks = pt.time_blocks(a, 5, guard_s=0.45)
+    held = np.array([h for h, _ in blocks])
+    assert (held.sum(axis=0) == a["decision"]).all()     # every decision held out once
+    for h, guard in blocks:
+        idx = np.flatnonzero(h)
+        assert len(idx) == 20 and (np.diff(idx) == 1).all()   # one stretch of time
+        assert (guard >= h).all()
+        assert guard.sum() == 20 + 4 * (int(idx[0] > 0) + int(idx[-1] < 99))
+
+
+class ModeModel:
+    """A mode head that copies the mode going in: always-stay, as a model."""
+    representation = pl.IMAGE
+    uses_prev = False
+    has_mode = True
+    mode_switch = {"threshold": pl.MODE_THRESHOLD, "dwell_s": pl.MODE_DWELL_S,
+                   "min_interval_s": pl.MODE_MIN_INTERVAL_S}
+
+    def run(self, x, prev, mode):
+        return {**Forward().run(x, prev), pl.MODE_OUTPUT: mode_logits(bool(mode[0, SP]))}
+
+
+def mode_logits(split):
+    return np.array([[0.0, 6.0 if split else -6.0]], np.float32)
+
+
+def mode_arrays():
+    session = toggled(n=60, at=(3.0,))
+    ticks, _, _ = align(session)
+    a = pd.to_arrays([(session, ticks)])
+    a["meta"] = {"sessions": ["s"], "marks": {},
+                 "toggles": {"s": [t for t, _ in pd.toggles_of(session.commands)]}}
+    return a
+
+
+def test_a_head_that_only_copies_its_input_scores_always_stay_and_recalls_nothing():
+    a = mode_arrays()
+    s = pe.score(ModeModel(), a, [0], "pad", np.ones(60, bool))
+    # Six ticks where I wanted the other mode: the five-tick lead and the
+    # toggle's own tick, which goes in unified and comes out split.
+    assert s["mode_accuracy"] == s["mode_stay_accuracy"] == pytest.approx(54 / 60)
+    assert s["mode_switch_ticks"] == 6 and s["mode_switch_recall"] == 0.0
+    assert s["mode_latch_switches"] == 0 and s["mode_toggles"] == 1
+
+
+def test_a_head_that_knows_what_i_wanted_switches_the_latch_on_my_toggle(monkeypatch):
+    a = mode_arrays()
+
+    def oracle(model, data, i, split=None):
+        return {**Forward().run(None, None),
+                pl.MODE_OUTPUT: mode_logits(data["steer_mode"][i] == SP)}
+
+    monkeypatch.setattr(pe, "_run", oracle)
+    s = pe.score_ticks(ModeModel(), a, np.arange(60), "pad", 1.0)
+    assert s["mode_accuracy"] == 1.0 and s["mode_switch_recall"] == 1.0
+    assert s["mode_latch_switches"] == 1
+    assert s["mode_latch_toggles_matched"] == 1 and s["mode_latch_false_switches"] == 0
+    made = pe.latch_replay(ModeModel(), a, np.arange(60))
+    assert made == [(T0 + 3 * S, True)]   # the lead plus the dwell lands on the toggle

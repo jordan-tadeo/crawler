@@ -6,7 +6,7 @@ A small model, trained off the car by behaviour cloning, that looks at one
 downsampled depth frame and says three things: a direction (forward,
 reverse or stop), how hard as a fraction of that direction's speed cap, and
 a front steering fraction -- plus a rear one, if a model is ever trained on
-split steering. The frame reaches it either whole (IMAGE, a small 2-D CNN)
+split steering -- and, if it has the head, which steering mode it wants. The frame reaches it either whole (IMAGE, a small 2-D CNN)
 or as the column profile off the footprint's rows (PROFILE, column_profile.py),
 and the sidecar says which. PolicyDriver runs it where Driver.tick() runs read_the_gradient(),
 and it is a Driver: the recover phase machine, the stuck detector, the rear
@@ -71,6 +71,35 @@ Steering is in manual's units, a fraction of STEER_SCALE (main's
 STEERING_LIMIT_PERC, 70%), not of the autopilot's max_turn 0.6: the labels
 are what my stick put on the servos, and full lock is 0.7. The trainer
 writes the scale into the sidecar and PolicyModel refuses one that differs.
+
+Steering mode
+-------------
+L3 flips main.SteerMode between unified and split. I have only ever driven
+split with the left stick, so in my data split is two-wheel steering (rear
+held straight) and unified is four-wheel (rear counter-phase through
+driver.steering_pair()). A model with the mode head (the sidecar lists
+steer_modes) says which of the two it wants each tick, given the mode it is
+in now -- a third input, `mode`, a one-hot over STEER_MODES -- and the rear
+follows the rule manual's does: steering_pair(front) in unified, 0 in split.
+A split with my right stick on the rear is not modelled; the dataset drops
+those rows.
+
+A toggle is sticky and a head's answer is not, so the head does not switch
+the car. ModeLatch does: the other mode has to be above MODE_THRESHOLD for
+MODE_DWELL_S, and the last switch has to be MODE_MIN_INTERVAL_S ago. The
+sidecar carries the three numbers; these are the defaults. Who else sets it:
+
+  auto engages               the latch starts at the pad's SteerMode
+  my hand has the steering   my SteerMode and my sticks drive, as always;
+                             the latch follows my mode the whole time, so
+                             when I hand the steering back it is in my mode,
+                             and its interval starts again
+  L3 while the policy drives my press wins: the latch takes the pad's new
+                             mode and its interval starts again, so the model
+                             cannot undo the press for MODE_MIN_INTERVAL_S
+
+A model with no mode head runs fixed unified, which is what every model
+before the head did, whatever the pad's mode.
 
 The input contract
 ------------------
@@ -164,6 +193,27 @@ AUTOPILOT_POLICY = "policy"
 # the steering fraction.
 PREV_SIZE = len(ACTIONS) + 2
 
+# Steering modes, main.UNIFIED / main.SPLIT, in the order the mode head and
+# the mode input use. unified is four-wheel (rear = steering_pair(front)),
+# split is two-wheel (rear 0) -- the only split my data has.
+UNIFIED = "unified"
+SPLIT = "split"
+STEER_MODES = (UNIFIED, SPLIT)
+MODE_SIZE = len(STEER_MODES)
+# The graph's names for them. Two names because ONNX will not let an input
+# and an output share one.
+MODE_INPUT = "mode"
+MODE_OUTPUT = "mode_logits"
+
+# The mode latch. 0.7 for 0.5 s: six ticks in a row at 10 Hz of a head that
+# clearly wants the other mode, not one tick of a coin flip. 2 s between
+# switches, so it cannot flap even if the head does: my own toggles in the
+# data are 1.2 s apart at the closest, and a policy that toggles faster than
+# I do is not copying me.
+MODE_THRESHOLD = 0.7
+MODE_DWELL_S = 0.5
+MODE_MIN_INTERVAL_S = 2.0
+
 # How far past its range a continuous output may be before it is called
 # broken. The heads are a tanh and a sigmoid, so anything outside this is a
 # model that is not the one that was trained, and that is a reason to stop,
@@ -242,6 +292,13 @@ def encode_input(representation, small_mm):
     raise ValueError(f"unknown representation {representation!r}")
 
 
+def encode_mode(split):
+    """The mode the car is in as the model's third input, (1, MODE_SIZE)."""
+    out = np.zeros((1, MODE_SIZE), dtype=np.float32)
+    out[0, STEER_MODES.index(SPLIT if split else UNIFIED)] = 1.0
+    return out
+
+
 def encode_prev(action, magnitude, steer):
     """The previous decision as the model's second input, (1, PREV_SIZE)."""
     out = np.zeros((1, PREV_SIZE), dtype=np.float32)
@@ -250,6 +307,102 @@ def encode_prev(action, magnitude, steer):
     for i, value in ((-2, magnitude), (-1, steer)):
         value = float(value)
         out[0, i] = value if math.isfinite(value) else 0.0
+    return out
+
+
+def read_mode(outputs):
+    """The mode head -> (p_split, ""), (None, "") with no head, or None + why.
+
+    Checked like the other heads: two finite logits, or the tick is neutral.
+    """
+    if MODE_OUTPUT not in outputs:
+        return None, ""
+    try:
+        logits = np.asarray(outputs[MODE_OUTPUT], dtype=np.float64).ravel()
+    except (TypeError, ValueError):
+        return None, "mode missing"
+    if logits.shape != (MODE_SIZE,):
+        return None, "mode shape"
+    if not all(math.isfinite(v) for v in logits):
+        return None, "mode not finite"
+    e = np.exp(logits - logits.max())
+    return float(e[STEER_MODES.index(SPLIT)] / e.sum()), ""
+
+
+class ModeLatch:
+    """The steering mode the policy drives with. Switches slowly, on purpose.
+
+    update() takes the head's p(split) each tick and switches only when the
+    other mode has been above `threshold` for `dwell_s` and the last switch
+    was `min_interval_s` ago. set() is the pad -- auto engaging, my hand on
+    the steering, an L3 press: it takes the mode and restarts the interval.
+    """
+
+    def __init__(self, threshold=MODE_THRESHOLD, dwell_s=MODE_DWELL_S,
+                 min_interval_s=MODE_MIN_INTERVAL_S):
+        self.threshold = float(threshold)
+        self.dwell_s = float(dwell_s)
+        self.min_interval_s = float(min_interval_s)
+        self.split = False
+        self._since = None      # the last switch or set()
+        self._wanted = None     # when the other mode first went over threshold
+
+    def set(self, split, now):
+        self.split = bool(split)
+        self._since = now
+        self._wanted = None
+
+    def update(self, p_split, now):
+        """One tick of the head. True when this tick switched."""
+        p_other = (1.0 - p_split) if self.split else p_split
+        if not p_other > self.threshold:
+            self._wanted = None
+            return False
+        if self._wanted is None:
+            self._wanted = now
+        # 1 ms of slack: ticks are 0.1 s apart in float seconds, and five of
+        # them must make 0.5, not 0.49999.
+        if (now - self._wanted >= self.dwell_s - 1e-3
+                and (self._since is None
+                     or now - self._since >= self.min_interval_s - 1e-3)):
+            self.split = not self.split
+            self._since = now
+            self._wanted = None
+            return True
+        return False
+
+
+def check_sidecar(meta, inputs, outputs, where="sidecar"):
+    """The mode head's half of the contract. The latch's numbers, or None for
+    a model with no head (fixed unified). ValueError when the sidecar and the
+    graph disagree.
+
+    A sidecar that lists steer_modes needs a graph with a MODE_INPUT input
+    and a MODE_OUTPUT output, the modes in STEER_MODES' order, and latch numbers in range. One
+    that does not list them needs a graph with neither: a graph wanting a
+    mode input the runtime would not know to feed is not one this car runs.
+    """
+    inputs, outputs = set(inputs), set(outputs)
+    modes = meta.get("steer_modes")
+    if modes is None:
+        if MODE_INPUT in inputs or MODE_OUTPUT in outputs:
+            raise ValueError(f"{where}: the graph has a mode head the sidecar "
+                             f"does not declare (no steer_modes)")
+        return None
+    if not isinstance(modes, (list, tuple)) or tuple(modes) != STEER_MODES:
+        raise ValueError(f"{where}: steer_modes {modes} != {list(STEER_MODES)}")
+    if MODE_INPUT not in inputs or MODE_OUTPUT not in outputs:
+        raise ValueError(f"{where}: steer_modes declared but the graph has no "
+                         f"{MODE_INPUT!r} input and {MODE_OUTPUT!r} output")
+    switch = meta.get("mode_switch")
+    try:
+        out = {k: float(switch[k]) for k in ("threshold", "dwell_s", "min_interval_s")}
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f"{where}: mode_switch {switch!r} needs threshold, "
+                         f"dwell_s and min_interval_s as numbers") from None
+    if not (0.5 <= out["threshold"] < 1.0 and 0.0 <= out["dwell_s"] <= 10.0
+            and 0.0 <= out["min_interval_s"] <= 60.0):
+        raise ValueError(f"{where}: mode_switch {switch!r} out of range")
     return out
 
 
@@ -341,10 +494,18 @@ class PolicyModel:
         self.session = ort.InferenceSession(path, options,
                                             providers=["CPUExecutionProvider"])
         self.output_names = [o.name for o in self.session.get_outputs()]
+        # None: no mode head, fixed unified. Else the latch's numbers.
+        self.mode_switch = check_sidecar(
+            self.meta, [i.name for i in self.session.get_inputs()],
+            self.output_names, meta_path)
+        self.has_mode = self.mode_switch is not None
         self.path = path
 
-    def run(self, x, prev):
-        values = self.session.run(self.output_names, {"x": x, "prev": prev})
+    def run(self, x, prev, mode=None):
+        feed = {"x": x, "prev": prev}
+        if self.has_mode:
+            feed[MODE_INPUT] = mode if mode is not None else encode_mode(False)
+        values = self.session.run(self.output_names, feed)
         return dict(zip(self.output_names, values))
 
 
@@ -353,7 +514,12 @@ class PolicyDriver(dv.Driver):
 
     `model` is anything with .contract, .representation, .uses_prev and
     .run(x, prev) -> {name: array} -- a PolicyModel on the car, a stub in the
-    tests.
+    tests. One with .has_mode true is run as .run(x, prev, mode), and its
+    .mode_switch dict sets the latch.
+
+    AutoPilot.step() sets two things before each tick, as it sets
+    human_throttle: pad_split, the pad's SteerMode (None reads as unified),
+    and human_steering, whether my hand has the steering group.
     """
 
     def __init__(self, controller, oakd, model, downsample=None):
@@ -366,15 +532,48 @@ class PolicyDriver(dv.Driver):
         # throttle it commands.
         self.floor_veto = dv.ForwardFloorVeto(self.forward_speed)
         self._now = None  # the tick in progress, for the neutral path
+        self.has_mode = bool(getattr(model, "has_mode", False))
+        switch = getattr(model, "mode_switch", None) or {}
+        self.mode = ModeLatch(switch.get("threshold", MODE_THRESHOLD),
+                              switch.get("dwell_s", MODE_DWELL_S),
+                              switch.get("min_interval_s", MODE_MIN_INTERVAL_S))
+        self.pad_split = None
+        self.human_steering = False
+        self._pad_seen = None       # the pad's mode last tick; None until engaged
+        self._had_steering = False
         # Read-only bookkeeping, like last_scan and last_verdict.
         self.last_decision = None
         self.last_infer_ms = 0.0
+        self.last_split_p = -1.0    # the head's p(split); -1 with no head
+
+    def abort(self):
+        """Driver's abort, and the mode latch forgets the pad: the next tick
+        is an engage, and starts at whatever SteerMode is then."""
+        super().abort()
+        self._pad_seen = None
+
+    def _sync_mode(self, now):
+        """The pad's say in the policy's mode, before the model has its own.
+
+        Engaging, an L3 press and my hand on the steering all set the latch
+        to the pad's mode; handing the steering back sets it once more, which
+        restarts its interval.
+        """
+        pad = bool(self.pad_split)
+        if not self.has_mode:
+            self.mode.split = False
+        elif (self._pad_seen is None or pad != self._pad_seen
+                or self.human_steering or self._had_steering):
+            self.mode.set(pad, now)
+        self._pad_seen = pad
+        self._had_steering = bool(self.human_steering)
 
     def tick(self, now=None):
         """One pass. Anything that raises commands neutral first."""
         if now is None:
             now = time.monotonic()
         try:
+            self._sync_mode(now)
             self._tick(now)
         except Exception:
             self._neutral("exception")
@@ -430,6 +629,13 @@ class PolicyDriver(dv.Driver):
             "policy_steering_front": float(d.front) if d is not None else 0.0,
             "policy_reason": d.reason if d is not None else "",
             "policy_infer_ms": float(self.last_infer_ms),
+            # The mode the policy drove with, and the head's probability of
+            # that mode on its last answer: low while it wants to switch. -1
+            # with no head, which always drives unified.
+            "policy_steer_mode": SPLIT if self.mode.split else UNIFIED,
+            "policy_steer_mode_p": (-1.0 if self.last_split_p < 0
+                                    else self.last_split_p if self.mode.split
+                                    else 1.0 - self.last_split_p),
         }
 
     def _recover(self, now, reason):
@@ -489,7 +695,10 @@ class PolicyDriver(dv.Driver):
         prev = (encode_prev(*self._prev) if self.model.uses_prev
                 else np.zeros((1, PREV_SIZE), dtype=np.float32))
         started = time.perf_counter()
-        outputs = self.model.run(x, prev)
+        if self.has_mode:
+            outputs = self.model.run(x, prev, encode_mode(self.mode.split))
+        else:
+            outputs = self.model.run(x, prev)
         self.last_infer_ms = (time.perf_counter() - started) * 1000.0
 
         decided, why = read_output(outputs)
@@ -497,6 +706,16 @@ class PolicyDriver(dv.Driver):
             self._neutral(f"model {why}")
             return
         action, magnitude, steer, rear = decided
+        if self.has_mode:
+            p_split, why = read_mode(outputs)
+            if p_split is None:
+                self._neutral(f"model {why or 'mode missing'}")
+                return
+            self.last_split_p = p_split
+            # My hand on the steering means my mode: _sync_mode holds the
+            # latch to it, and the head does not get to move it.
+            if not self.human_steering:
+                self.mode.update(p_split, now)
 
         reason = "model"
         if action == FORWARD and self.floor_veto.vetoes():
@@ -513,10 +732,14 @@ class PolicyDriver(dv.Driver):
         # magnitude, steer and rear are already known finite and in range,
         # so none of these can exceed a cap or STEER_SCALE.
         front = steer * STEER_SCALE
-        if rear is None:
-            pair = dv.steering_pair(front)
-        else:
+        if rear is not None:
             pair = (front, rear * STEER_SCALE)
+        elif self.mode.split:
+            # Split as I drive it: the left stick on the front, the rear
+            # straight. A literal 0, never through steering_pair.
+            pair = (front, 0.0)
+        else:
+            pair = dv.steering_pair(front)
         # Steering first, as the autopilot orders them; main.DriverCommand
         # holds both and AutoPilot.step() writes them once.
         self.controller.set_steering(*pair)

@@ -587,3 +587,221 @@ def test_a_model_that_will_not_load_is_auto_unavailable_not_the_autopilot(tmp_pa
     assert pilot.resume() is False
     assert pilot.unavailable is True
     assert pilot.driver is None
+
+
+# --- the steering mode: 2WS / 4WS ---------------------------------------------
+
+SWITCH = {"threshold": pl.MODE_THRESHOLD, "dwell_s": pl.MODE_DWELL_S,
+          "min_interval_s": pl.MODE_MIN_INTERVAL_S}
+
+
+def split_logits(p):
+    """Mode logits whose softmax gives p(split) = p."""
+    return np.array([[0.0, math.log(p / (1.0 - p))]], dtype=np.float32)
+
+
+class ModeStub(StubModel):
+    """StubModel with a mode head: p(split) is whatever it is told."""
+
+    has_mode = True
+    mode_switch = SWITCH
+
+    def __init__(self, p_split=0.5, **kw):
+        kw.setdefault("logits", STOP)   # STOP still steers, and never arms STUCK
+        kw.setdefault("steer", 0.5)
+        super().__init__(**kw)
+        self.set_p(p_split)
+        self.modes = []
+
+    def set_p(self, p):
+        self.out[pl.MODE_OUTPUT] = split_logits(p)
+
+    def run(self, x, prev, mode):
+        self.modes.append(pl.STEER_MODES[int(np.argmax(mode))])
+        return super().run(x, prev)
+
+
+FRONT = 0.5 * pl.STEER_SCALE
+TWO_WHEEL = (FRONT, 0.0)
+FOUR_WHEEL = dv.steering_pair(FRONT)
+
+
+def mode_driver(p_split=0.5, pad_split=False):
+    d = policy_driver(ModeStub(p_split), clear())
+    d.pad_split = pad_split
+    return d
+
+
+def ticks_from(d, start, seconds):
+    """Tick at 10 Hz over [start, start + seconds); the mode after each."""
+    out = []
+    for k in range(int(round(seconds * 10))):
+        d.tick(start + k * 0.1)
+        out.append(d.mode.split)
+    return out
+
+
+def test_the_latch_switches_after_its_dwell_and_not_inside_its_interval():
+    latch = pl.ModeLatch(0.7, 0.5, 2.0)
+    latch.set(False, 0.0)
+    flips = [k for k in range(40) if latch.update(0.9, k * 0.1)]
+    assert flips == [20]                 # wanted from 0.0, but the interval is 2 s
+    flips = [k for k in range(40, 80) if latch.update(0.0, k * 0.1)]
+    assert flips == [45]                 # wanted from 4.0: the interval is past, the dwell is not
+
+    latch.set(False, 0.0)
+    assert not any(latch.update(0.9, 10.0 + k * 0.1) for k in range(5))  # 0.4 s
+    assert not latch.update(0.5, 10.5)   # one tick of doubt starts the dwell over
+    flips = [k for k in range(6, 20) if latch.update(0.9, 10.0 + k * 0.1)]
+    assert flips == [11]                 # 0.5 s after it came back
+    latch.set(False, 0.0)
+    assert not any(latch.update(0.7, 10.0 + k * 0.1) for k in range(50))  # past it, not at it
+
+
+def test_a_head_that_flickers_never_flaps_the_mode():
+    latch = pl.ModeLatch()
+    latch.set(False, 0.0)
+    assert not any(latch.update(0.95 if k % 2 else 0.05, k * 0.1) for k in range(200))
+    # One that always wants the other mode switches no faster than the interval.
+    latch.set(False, 0.0)
+    flips = [k * 0.1 for k in range(200)
+             if latch.update(0.01 if latch.split else 0.99, k * 0.1)]
+    assert 0 < len(flips) <= 20 / pl.MODE_MIN_INTERVAL_S
+    assert all(b - a >= pl.MODE_MIN_INTERVAL_S - 1e-6 for a, b in zip(flips, flips[1:]))
+
+
+def test_auto_engages_in_my_mode_and_drives_split_as_two_wheel_steering():
+    d = mode_driver(p_split=0.99, pad_split=True)
+    d.tick(T0)
+    assert d.controller.steerings[-1] == TWO_WHEEL
+    assert d.model.modes == [pl.SPLIT]   # the model is told the mode it is in
+    fields = d.policy_fields()
+    assert fields["policy_steer_mode"] == pl.SPLIT
+    assert fields["policy_steer_mode_p"] == pytest.approx(0.99, abs=1e-6)
+
+    d = mode_driver(p_split=0.5, pad_split=False)
+    d.tick(T0)
+    assert d.controller.steerings[-1] == FOUR_WHEEL
+    assert d.model.modes == [pl.UNIFIED]
+
+
+def test_the_policy_changes_mode_by_itself_only_after_dwell_and_interval():
+    d = mode_driver(p_split=0.01, pad_split=True)
+    modes = ticks_from(d, T0, 3.0)
+    assert modes[:20] == [True] * 20 and modes[20:] == [False] * 10
+    assert d.controller.steerings[-1] == FOUR_WHEEL
+    assert d.model.modes[19] == pl.SPLIT and d.model.modes[21] == pl.UNIFIED
+    assert d.policy_fields()["policy_steer_mode"] == pl.UNIFIED
+
+
+def test_my_hand_on_the_steering_holds_my_mode_and_hands_back_resynced():
+    d = mode_driver(p_split=0.99, pad_split=False)
+    d.human_steering = True
+    held = ticks_from(d, T0, 3.0)
+    assert not any(held)                 # the head wants split for 3 s; my hand says no
+    d.pad_split = True                   # L3 under my hand: the latch follows me at once
+    d.tick(T0 + 3.0)
+    assert d.mode.split
+    d.pad_split = False
+    d.tick(T0 + 3.1)
+    assert not d.mode.split
+    d.human_steering = False             # handed back at 3.2: the interval starts again
+    after = ticks_from(d, T0 + 3.2, 3.0)
+    assert after[:20] == [False] * 20 and after[20] is True
+
+
+def test_l3_while_the_policy_drives_sets_its_mode_and_restarts_its_interval():
+    d = mode_driver(p_split=0.5, pad_split=False)
+    assert not any(ticks_from(d, T0, 5.0))
+    d.pad_split = True                   # L3
+    d.model.set_p(0.01)                  # and the head would rather be unified
+    modes = ticks_from(d, T0 + 5.0, 3.0)
+    assert modes[:20] == [True] * 20     # my press holds for the whole interval
+    assert modes[20] is False
+    assert d.controller.steerings[-1] == FOUR_WHEEL
+
+
+def test_pausing_auto_forgets_the_mode_and_reengages_at_mine():
+    d = mode_driver(p_split=0.99, pad_split=False)
+    assert ticks_from(d, T0, 3.0)[-1] is True
+    d.abort()
+    d.model.set_p(0.5)
+    d.tick(T0 + 10.0)
+    assert not d.mode.split and d.controller.steerings[-1] == FOUR_WHEEL
+
+
+def test_a_model_with_no_mode_head_drives_unified_whatever_my_mode():
+    d = policy_driver(StubModel(STOP, steer=0.5), clear())
+    d.pad_split = True
+    d.tick(T0)
+    assert d.controller.steerings[-1] == FOUR_WHEEL
+    fields = d.policy_fields()
+    assert fields["policy_steer_mode"] == pl.UNIFIED and fields["policy_steer_mode_p"] == -1.0
+    assert pl.PolicyModel(str(FIXTURE)).has_mode is False   # the smoke model is one
+
+
+def test_a_mode_head_that_is_not_a_number_is_neutral():
+    d = mode_driver()
+    d.model.out[pl.MODE_OUTPUT] = np.array([[0.0, np.nan]], np.float32)
+    d.tick(T0)
+    assert neutral(d) and d.last_decision.reason == "model mode not finite"
+    d.model.out[pl.MODE_OUTPUT] = np.zeros((1, 3), np.float32)
+    d.tick(T0 + 0.1)
+    assert neutral(d) and d.last_decision.reason == "model mode shape"
+    del d.model.out[pl.MODE_OUTPUT]
+    d.tick(T0 + 0.2)
+    assert neutral(d) and d.last_decision.reason == "model mode missing"
+
+
+GRAPH = (["x", "prev", pl.MODE_INPUT], ["logits", "throttle", "steer", pl.MODE_OUTPUT])
+
+
+def test_a_sidecar_with_the_mode_head_must_match_the_graph():
+    meta = {"steer_modes": list(pl.STEER_MODES), "mode_switch": dict(SWITCH)}
+    assert pl.check_sidecar(meta, *GRAPH) == SWITCH
+    for bad in ({**meta, "steer_modes": [pl.SPLIT, pl.UNIFIED]},
+                {**meta, "steer_modes": "unified"},
+                {"steer_modes": list(pl.STEER_MODES)},
+                {**meta, "mode_switch": {**SWITCH, "threshold": 0.3}},
+                {**meta, "mode_switch": {**SWITCH, "min_interval_s": -1}},
+                {**meta, "mode_switch": {"threshold": 0.7}}):
+        with pytest.raises(ValueError):
+            pl.check_sidecar(bad, *GRAPH)
+    with pytest.raises(ValueError):
+        pl.check_sidecar(meta, ["x", "prev"], ["logits", "throttle", "steer"])
+
+
+def test_a_sidecar_without_the_mode_head_is_fixed_unified_unless_the_graph_has_one():
+    assert pl.check_sidecar({}, ["x", "prev"], ["logits", "throttle", "steer"]) is None
+    with pytest.raises(ValueError):
+        pl.check_sidecar({}, *GRAPH)
+
+
+def test_l3_in_policy_auto_reaches_the_model_and_the_footprint_rows(monkeypatch):
+    """Through the real control loop: L3 at 1 s switches the policy to split,
+    the rear goes straight, and the rows say so; my left stick after that
+    takes the steering in my mode."""
+    import footprint as fp
+    import test_takeover as tk
+    from test_record import SessionTele
+
+    def press(n, pad, cam):
+        if n == 64:
+            pad.down["LS"] = True
+        elif n == 65:
+            pad.down["LS"] = False
+
+    tele = SessionTele()
+    model = ModeStub(p_split=0.5)
+    out = run_policy(monkeypatch, model, 192, tk.chain(press, tk.at(160, LEFT_X=0.5)),
+                     tele=tele, tap=fp.FootprintTap(tele=tele))
+    driver, s = out["driver"], out["snaps"]
+    assert s[50]["steering"] == pytest.approx(FOUR_WHEEL)
+    assert s[100]["steering"] == pytest.approx(TWO_WHEEL)
+    assert driver.pad_split is True and driver.mode.split
+    assert s[-1]["steer_by"] == mn.PAD and driver.human_steering
+    assert s[-1]["steering"] == pytest.approx((tk.limited(0.5), 0.0))  # my split
+    rows = [row for row, _ in tele.of("footprint")]
+    modes = [row["policy_steer_mode"] for row in rows]
+    assert modes[0] == pl.UNIFIED and modes[-1] == pl.SPLIT
+    assert all(row["policy_steer_mode_p"] == pytest.approx(0.5, abs=1e-6) for row in rows)

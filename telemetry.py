@@ -369,6 +369,10 @@ JSON_SCHEMAS = {
         "policy_steering_front": _NUM,
         "policy_reason": _STR,
         "policy_infer_ms": _NUM,
+        # The steering mode the policy drove with, and its mode head's
+        # probability of that mode (-1 for a model with no head).
+        "policy_steer_mode": _STR,
+        "policy_steer_mode_p": _NUM,
     }),
 }
 

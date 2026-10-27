@@ -23,8 +23,29 @@ What gets dropped, and what is only left out of training
 --------------------------------------------------------
 Dropped, and counted in the report: a mode that makes no ticks, no frame at
 all yet, a frame older than --max-age-ms, the pad disconnected, a command
-that is not finite, and split steering (the model has no rear head until
-there is data that needs one -- the report says how much there was).
+that is not finite, and split steering with the rear off centre ("split
+rear": my right stick on the rear, which no head learns -- the report says
+how much there was).
+
+The steering mode
+-----------------
+Split with the rear straight is two-wheel steering and is kept: the mode
+head learns when I want it. Each tick carries three things about the mode,
+all worked out off the whole row stream, before any tick is dropped, so a
+toggle on a dropped tick still counts:
+
+  mode_in      the mode the car was in going into the tick: the previous
+               row's, or the tick's own after a gap (PREV_GAP_S). The
+               model's third input.
+  steer_mode   the mode I wanted: the tick's own, or the next toggle's if
+               that toggle is within MODE_LEAD_S. A toggle is a decision
+               made a moment before the thumb gets there, and the runtime's
+               latch needs MODE_DWELL_S of wanting before it switches, so a
+               label that only changed on the toggle's own tick would teach
+               the latch to switch half a second late.
+  mode_switch  within MODE_WINDOW_S of a toggle. The trainer weights these
+               up in the mode loss (policy_train.MODE_SWITCH_WEIGHT) and the
+               eval grades recall on them.
 
 Kept, with a mask: whether each group -- steering, and direction plus
 magnitude -- came off the pad. policy_adapters.control_sources() decides it
@@ -120,7 +141,17 @@ SETTLE_S = dv.SETTLE_SECONDS + TICK_S
 # /marks verdicts on a pad-driven tick, as stored in the .npz "mark" array.
 MARK_NONE, MARK_GOOD, MARK_BAD = 0, 1, -1
 
-DROP_REASONS = ("mode", "no frame", "stale", "pad", "bad command", "split",
+# The steering mode. A split row whose rear is further off centre than this
+# is my right stick steering the rear, which is not modelled; at or under it
+# the rear is straight, which is 2WS. Servo units. My one current-caps
+# session has 294 split rows and every rear in them is exactly 0.
+SPLIT_REAR_REST = 0.05
+# How long before a toggle the label says the new mode, and how far either
+# side of one a tick counts as part of the switch.
+MODE_LEAD_S = 0.5
+MODE_WINDOW_S = 0.5
+
+DROP_REASONS = ("mode", "no frame", "stale", "pad", "bad command", "split rear",
                 "idle lead", "idle trail", "exit reach", "handled", "parked")
 IDLE_REASONS = DROP_REASONS[6:]
 
@@ -181,11 +212,57 @@ class Tick(NamedTuple):
     accel: float = float("nan")
     gyro: float = float("nan")
     policy_drove: bool = False  # auto under --policy: a "driver" group is the model's
+    mode_in: int = 0            # pl.STEER_MODES index going into the tick
+    steer_mode: int = 0         # the mode I wanted: the label
+    mode_switch: bool = False   # within MODE_WINDOW_S of a toggle
 
 
 def _is_split(cmd):
-    """L3 split steering: the rear is its own stick, which no head learns yet."""
+    """L3 split steering, either kind."""
     return cmd.steering_mode == pa.SPLIT
+
+
+def _split_rear(cmd):
+    """Split with the rear off centre: my right stick, which no head learns."""
+    return _is_split(cmd) and abs(cmd.rear) > SPLIT_REAR_REST
+
+
+def _mode_index(cmd):
+    """pl.STEER_MODES index of a row. A row from before L3 existed is unified."""
+    return pl.STEER_MODES.index(pl.SPLIT if _is_split(cmd) else pl.UNIFIED)
+
+
+def toggles_of(commands):
+    """[(t_ns, new mode index)]: every L3 flip in a time-ordered row stream.
+
+    A change of mode across a gap longer than PREV_GAP_S is not a flip I can
+    place -- manual writes no rows, so a press there is somewhere in the gap.
+    """
+    out = []
+    for a, b in zip(commands, commands[1:]):
+        if (b.t_ns - a.t_ns) / 1e9 <= PREV_GAP_S and _mode_index(a) != _mode_index(b):
+            out.append((b.t_ns, _mode_index(b)))
+    return out
+
+
+def mode_labels(commands):
+    """Per command (mode_in, steer_mode, mode_switch). See the docstring."""
+    flips = toggles_of(commands)
+    times = [t for t, _ in flips]
+    out = []
+    for i, cmd in enumerate(commands):
+        own = _mode_index(cmd)
+        prev = commands[i - 1] if i else None
+        consecutive = prev is not None and (cmd.t_ns - prev.t_ns) / 1e9 <= PREV_GAP_S
+        mode_in = _mode_index(prev) if consecutive else own
+        want = own
+        k = bisect.bisect_right(times, cmd.t_ns)
+        if k < len(flips) and (times[k] - cmd.t_ns) / 1e9 <= MODE_LEAD_S and flips[k][1] != own:
+            want = flips[k][1]
+        near = any(abs(t - cmd.t_ns) / 1e9 <= MODE_WINDOW_S
+                   for t in times[max(0, k - 1):k + 1])
+        out.append((mode_in, want, near))
+    return out
 
 
 def _rear_off_pair(cmd):
@@ -336,7 +413,8 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     last_reverse = None
     prev_was_reverse = False
     prev_t = None
-    for cmd in commands:
+    modes = mode_labels(commands)
+    for cmd, (mode_in, steer_mode, mode_switch) in zip(commands, modes):
         if cmd.mode not in session.label_modes:
             drops["mode"] += 1
             prev_was_reverse = False
@@ -362,8 +440,8 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         if not all(math.isfinite(v) for v in (cmd.throttle, cmd.front, cmd.rear)):
             drops["bad command"] += 1
             continue
-        if _is_split(cmd):
-            drops["split"] += 1
+        if _split_rear(cmd):
+            drops["split rear"] += 1
             continue
 
         action = pa.action_of(cmd.throttle)
@@ -389,7 +467,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
             rule_action, float(rule_steer), decision, cmd.mode,
             cmd.steer_by == pa.BY_PAD, cmd.throttle_by == pa.BY_PAD,
             float(cmd.throttle), float(cmd.front), float(cmd.accel), float(cmd.gyro),
-            cmd.autopilot == pa.AUTOPILOT_POLICY))
+            cmd.autopilot == pa.AUTOPILOT_POLICY, mode_in, steer_mode, mode_switch))
         errors.append(age)
 
     if rules is not None:
@@ -509,6 +587,10 @@ def to_arrays(sessions_ticks):
         "throttle_label": np.array([r[2].throttle_label for r in rows], dtype=bool),
         "policy_drove": np.array([r[2].policy_drove for r in rows], dtype=bool),
         "mark": np.array([r[4] for r in rows], dtype=np.int8),
+        # pl.STEER_MODES indices. See "The steering mode" above.
+        "mode_in": np.array([r[2].mode_in for r in rows], dtype=np.int8),
+        "steer_mode": np.array([r[2].steer_mode for r in rows], dtype=np.int8),
+        "mode_switch": np.array([r[2].mode_switch for r in rows], dtype=bool),
         "prev": (np.stack([r[3] for r in rows]) if n
                  else np.zeros((0, pl.PREV_SIZE), np.float32)),
     }
@@ -680,6 +762,7 @@ def main(argv=None):
     kept, contracts, report = [], set(), []
     all_errors = []
     caps_by_session = {}
+    toggles_by_session = {}
     for path in args.mcaps:
         session, truncated = read_session(path, args.adapter)
         if args.modes:
@@ -693,6 +776,7 @@ def main(argv=None):
         caps_by_session[session.name] = [list(c) for c in caps]
         timeline = []
         ticks, drops, errors = align(session, args.max_age_ms, rules, timeline)
+        toggles_by_session[session.name] = [t for t, _ in toggles_of(session.commands)]
         splits = sum(1 for c in session.commands if _is_split(c))
         front_only = sum(1 for c in session.commands if _rear_off_pair(c))
         line = (f"{session.name}: {session.adapter}, {len(session.frames)} frames, "
@@ -702,7 +786,11 @@ def main(argv=None):
                 f"    dropped {dict(drops)}; split-steering commands in file: {splits}, "
                 f"rear not steering_pair(front): {front_only}\n"
                 f"    pad-labelled ticks: steering {sum(t.steer_label for t in ticks)}, "
-                f"throttle {sum(t.throttle_label for t in ticks)}")
+                f"throttle {sum(t.throttle_label for t in ticks)}\n"
+                f"    steering mode: {len(toggles_by_session[session.name])} toggles; kept ticks "
+                f"unified {sum(t.steer_mode == 0 for t in ticks)}, "
+                f"split {sum(t.steer_mode == 1 for t in ticks)}, "
+                f"inside a switch window {sum(t.mode_switch for t in ticks)}")
         flags = mark_flags(ticks, session.marks)
         kinds = Counter(str(m.get("kind", "?")).lower() for _, m in session.marks)
         line += (f"\n    marks: {kinds.get('good', 0)} good, {kinds.get('bad', 0)} bad; "
@@ -747,6 +835,13 @@ def main(argv=None):
         "runtime_caps": list(pa.RUNTIME_CAPS),
         "session_caps": {s.name: caps_by_session.get(s.name, []) for s, _ in kept},
         "marks": {s.name: [m for m in s.marks] for s, _ in kept},
+        # The steering mode: what the mode arrays index, how they were made,
+        # and every L3 flip (log time ns) in each session.
+        "steer_modes": list(pl.STEER_MODES),
+        "split_rear_rest": SPLIT_REAR_REST,
+        "mode_lead_s": MODE_LEAD_S,
+        "mode_window_s": MODE_WINDOW_S,
+        "toggles": {s.name: toggles_by_session.get(s.name, []) for s, _ in kept},
         "alignment_ms_histogram": {"edges": hist_edges[:-1], "counts": hist},
         "report": report,
     }

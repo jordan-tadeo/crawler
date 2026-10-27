@@ -62,14 +62,24 @@ def label_masks(data, label_mode):
     return steer | ~policy, throttle | ~policy
 
 
+def _run(model, data, i, split=None):
+    """One tick through the model. A mode head is fed `split`, or the
+    recorded mode going into the tick when that is None."""
+    x = pl.encode_input(model.representation, data["frames"][data["frame"][i]])
+    prev = (data["prev"][i:i + 1] if model.uses_prev
+            else np.zeros((1, pl.PREV_SIZE), dtype=np.float32))
+    if not getattr(model, "has_mode", False):
+        return model.run(x, prev)
+    if split is None:
+        split = int(data["mode_in"][i]) == pl.STEER_MODES.index(pl.SPLIT)
+    return model.run(x, prev, pl.encode_mode(split))
+
+
 def predict(model, data, ticks):
     """(actions, magnitudes, steers) for these tick indices."""
     actions, mags, steers = [], [], []
-    zero = np.zeros((1, pl.PREV_SIZE), dtype=np.float32)
     for i in ticks:
-        x = pl.encode_input(model.representation, data["frames"][data["frame"][i]])
-        prev = data["prev"][i:i + 1] if model.uses_prev else zero
-        decided, _ = pl.read_output(model.run(x, prev))
+        decided, _ = pl.read_output(_run(model, data, i))
         if decided is None:
             actions.append(STOP)
             mags.append(0.0)
@@ -80,6 +90,89 @@ def predict(model, data, ticks):
         mags.append(mag)
         steers.append(steer)
     return np.array(actions, dtype=np.int64), np.array(mags), np.array(steers)
+
+
+SPLIT_I = pl.STEER_MODES.index(pl.SPLIT)
+# A replayed latch switch matches one of my toggles if it lands this close to
+# it. The label leads a toggle by MODE_LEAD_S and the latch needs its dwell,
+# so a head that learned exactly the label switches on the toggle; a second
+# either side is "it switched for the same reason I did".
+LATCH_MATCH_S = 1.0
+
+
+def predict_mode(model, data, ticks):
+    """p(split) per tick, fed the recorded mode going in. nan on a bad answer."""
+    out = []
+    for i in ticks:
+        p, _ = pl.read_mode(_run(model, data, i))
+        out.append(np.nan if p is None else p)
+    return np.array(out, dtype=np.float64)
+
+
+def latch_replay(model, data, ticks):
+    """The runtime's ModeLatch over these ticks, fed its own mode, as the car
+    runs it. Starts each contiguous run (PREV_GAP_S) at the recorded mode,
+    as auto engaging does. [(t_ns, new split)] for every switch it made."""
+    switch = getattr(model, "mode_switch", None) or {}
+    latch = pl.ModeLatch(switch.get("threshold", pl.MODE_THRESHOLD),
+                         switch.get("dwell_s", pl.MODE_DWELL_S),
+                         switch.get("min_interval_s", pl.MODE_MIN_INTERVAL_S))
+    made, last_t = [], None
+    for i in ticks:
+        t_ns = int(data["t_ns"][i])
+        now = t_ns / 1e9
+        if last_t is None or (t_ns - last_t) / 1e9 > 0.25:
+            latch.set(int(data["mode_in"][i]) == SPLIT_I, now)
+        last_t = t_ns
+        p, _ = pl.read_mode(_run(model, data, i, latch.split))
+        if p is not None and latch.update(p, now):
+            made.append((t_ns, latch.split))
+    return made
+
+
+def mode_scores(model, data, ticks, s_ok):
+    """The mode head against always-stay, open loop and through the latch."""
+    if not getattr(model, "has_mode", False) or "steer_mode" not in data:
+        return {}
+    graded = ticks[s_ok]
+    truth = data["steer_mode"][graded].astype(np.int64)
+    stay = data["mode_in"][graded].astype(np.int64)
+    p = predict_mode(model, data, graded)
+    pred = np.where(np.isfinite(p) & (p > 0.5), SPLIT_I, 1 - SPLIT_I)
+    switch = truth != stay                 # the lead ticks: I wanted the other mode
+    window = data["mode_switch"][graded]
+
+    names = data["meta"]["sessions"]
+    t_lo, t_hi = (int(data["t_ns"][ticks].min()), int(data["t_ns"][ticks].max())) \
+        if len(ticks) else (0, -1)
+    sessions = set(int(s) for s in data["session"][ticks])
+    toggles = [t for sid in sessions
+               for t in data["meta"].get("toggles", {}).get(names[sid], [])
+               if t_lo <= t <= t_hi]
+    made = latch_replay(model, data, ticks)
+    matched = sum(1 for t in toggles
+                  if any(abs(m - t) / 1e9 <= LATCH_MATCH_S for m, _ in made))
+    false = sum(1 for m, _ in made
+                if not any(abs(m - t) / 1e9 <= LATCH_MATCH_S for t in toggles))
+
+    def acc(a, b):
+        return float(np.mean(a == b)) if len(a) else float("nan")
+
+    return {
+        "mode_ticks": int(len(graded)),
+        "mode_accuracy": acc(pred, truth),
+        "mode_stay_accuracy": acc(stay, truth),
+        "mode_split_ticks": int((truth == SPLIT_I).sum()),
+        "mode_switch_ticks": int(switch.sum()),
+        "mode_switch_recall": acc(pred[switch], truth[switch]),
+        "mode_window_ticks": int(window.sum()),
+        "mode_window_accuracy": acc(pred[window], truth[window]),
+        "mode_window_stay_accuracy": acc(stay[window], truth[window]),
+        "mode_toggles": len(toggles),
+        "mode_latch_switches": len(made),
+        "mode_latch_toggles_matched": matched,
+        "mode_latch_false_switches": false,
+    }
 
 
 def confusion(truth, pred):
@@ -137,6 +230,7 @@ def score_ticks(model, data, ticks, label_mode, median_mag):
         "steer_rule_mae": _mae(rule_steer[s_rule], true_steer[s_rule]),
         "steer_model_mae_where_rule_known": _mae(steer[s_rule], true_steer[s_rule]),
         "steer_straight_mae": _mae(np.zeros(int(s_ok.sum())), true_steer[s_ok]),
+        **mode_scores(model, data, np.asarray(ticks), s_ok),
     }
 
 
@@ -189,6 +283,17 @@ def format_scores(s):
         "confusion, rows truth / columns model, " + " ".join(pl.ACTIONS) + ": "
         + str(s["confusion"]),
     ]
+    if "mode_ticks" in s:
+        lines += [
+            f"steering mode ({s['mode_ticks']} ticks, {s['mode_split_ticks']} split): accuracy "
+            f"{s['mode_accuracy']:.3f} (always-stay {s['mode_stay_accuracy']:.3f}); "
+            f"switch recall {s['mode_switch_recall']:.3f} over {s['mode_switch_ticks']} lead "
+            f"ticks (always-stay 0); switch windows {s['mode_window_accuracy']:.3f} "
+            f"(always-stay {s['mode_window_stay_accuracy']:.3f}, {s['mode_window_ticks']} ticks)",
+            f"mode latch replay: {s['mode_latch_switches']} switches, "
+            f"{s['mode_latch_toggles_matched']} of {s['mode_toggles']} toggles matched "
+            f"within {LATCH_MATCH_S:.0f} s, {s['mode_latch_false_switches']} false",
+        ]
     return "\n".join(lines)
 
 

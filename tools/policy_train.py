@@ -1,6 +1,7 @@
 """Train a driving policy off a policy_dataset.py .npz, and export it to ONNX.
 
     python tools/policy_train.py DATA.npz OUT.onnx --representation profile --val SESSION
+    python tools/policy_train.py DATA.npz OUT.onnx --blocks 5
 
 Writes OUT.onnx and OUT.json (the sidecar policy.PolicyModel reads), then
 grades the exported file -- not the torch module -- with policy_eval, so the
@@ -16,10 +17,22 @@ The heads
   throttle  (1, 1)  sigmoid, the fraction of that direction's speed cap;
                     trained only on ticks that are moving
   steer     (1, 1)  tanh, front steering as a fraction of STEER_SCALE (0.7)
+  mode_logits (1, 2) logits over policy.STEER_MODES, the mode I want, given
+                    the third input `mode` (the one the car is in). The rear
+                    is not a head: unified is steering_pair(front) and split
+                    is 0, which is every split row the dataset keeps.
 
-Each group is trained only where it is a label: steering where steer_by is
-"pad", direction and throttle where throttle_by is "pad". --labels any
-drops that mask, which is what cloning the autopilot as a smoke test needs.
+Each group is trained only where it is a label: steering and the mode where
+steer_by is "pad", direction and throttle where throttle_by is "pad".
+--labels any drops that mask, which is what cloning the autopilot as a smoke
+test needs.
+
+The mode is sticky, so almost every tick's answer is "the one I am in", and
+a head that only copies its input scores 99%. What it is for is the few
+ticks around an L3 press, so those (policy_dataset's mode_switch, within
+MODE_WINDOW_S of a toggle) count MODE_SWITCH_WEIGHT times in the mode loss.
+The input also goes straight to the mode logits as well as through the
+trunk, so "stay" is cheap to learn and the trunk's job is the exception.
 
 /marks on pad-driven ticks (policy_dataset.mark_flags): a tick in a BAD
 window is out of training (and out of the val numbers); a tick in a GOOD
@@ -27,9 +40,19 @@ window counts --good-weight times in every head's loss. 2 by default: enough
 that a stretch I said was right pulls, not so much that a few seconds of it
 outvote the rest of the session.
 
-Both representations take the same two inputs, so the runtime has one code
-path: x (the frame, as policy.encode_input() builds it) and prev (the last
-decision, zeros when the sidecar says uses_prev_action is false).
+The val split
+-------------
+--val holds out whole sessions, which is the honest split when there are
+several. With one, --blocks N cuts the decision ticks into N contiguous
+stretches of time, holds each out in turn, trains on the rest less
+BLOCK_GUARD_S either side of the held-out stretch (neighbouring ticks are
+nearly the same picture), and reports every fold and the mean. Never a
+random split by tick. After the folds it trains once more on everything and
+exports that; its sidecar carries the fold numbers under "cv".
+
+All three inputs are always in the graph, so the runtime has one code path:
+x (the frame, as policy.encode_input() builds it), prev (the last decision,
+zeros when the sidecar says uses_prev_action is false) and mode.
 """
 
 import argparse
@@ -47,6 +70,13 @@ import policy as pl  # noqa: E402
 import policy_eval as pe  # noqa: E402
 
 GOOD_WEIGHT = 2.0
+# How much a tick inside a switch window counts in the mode loss. My one
+# session has 4 toggles and 36 window ticks against 1900; at 10 the window is
+# about a sixth of the mode loss, enough that the head cannot ignore it,
+# not so much that it learns to switch everywhere it saw full lock.
+MODE_SWITCH_WEIGHT = 10.0
+# Training ticks this close to a held-out block are left out of that fold.
+BLOCK_GUARD_S = 1.0
 
 
 def build_model(representation):
@@ -57,17 +87,22 @@ def build_model(representation):
         def __init__(self, width):
             super().__init__()
             # prev is always wired in, so every exported graph has the same
-            # two inputs; a model trained without it is fed zeros on both
-            # sides and its weights there never see a gradient.
-            self.trunk = nn.Sequential(nn.Linear(width + pl.PREV_SIZE, 64), nn.ReLU())
+            # inputs; a model trained without it is fed zeros on both sides
+            # and its weights there never see a gradient.
+            self.trunk = nn.Sequential(
+                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE, 64), nn.ReLU())
             self.logits = nn.Linear(64, len(pl.ACTIONS))
             self.throttle = nn.Linear(64, 1)
             self.steer = nn.Linear(64, 1)
+            self.mode = nn.Linear(64, pl.MODE_SIZE)
+            # The mode going in, straight to the mode logits: "stay" is one
+            # weight, and the trunk only has to learn when not to.
+            self.mode_skip = nn.Linear(pl.MODE_SIZE, pl.MODE_SIZE, bias=False)
 
-        def forward(self, features, prev):
-            h = self.trunk(torch.cat([features, prev], dim=1))
+        def forward(self, features, prev, mode):
+            h = self.trunk(torch.cat([features, prev, mode], dim=1))
             return (self.logits(h), torch.sigmoid(self.throttle(h)),
-                    torch.tanh(self.steer(h)))
+                    torch.tanh(self.steer(h)), self.mode(h) + self.mode_skip(mode))
 
     class ImageNet(nn.Module):
         """(1, 2, 50, 80) -> four strided convs, 25x40, 13x20, 7x10, 4x5."""
@@ -82,8 +117,8 @@ def build_model(representation):
                 nn.Flatten())
             self.heads = Heads(16 * 4 * 5)
 
-        def forward(self, x, prev):
-            return self.heads(self.features(x), prev)
+        def forward(self, x, prev, mode):
+            return self.heads(self.features(x), prev, mode)
 
     class ProfileNet(nn.Module):
         """(1, 3, 32) -> two 1-D convs along the columns -> the heads."""
@@ -96,8 +131,8 @@ def build_model(representation):
                 nn.Flatten())
             self.heads = Heads(16 * (cp.PROFILE_COLUMNS // 2))
 
-        def forward(self, x, prev):
-            return self.heads(self.features(x), prev)
+        def forward(self, x, prev, mode):
+            return self.heads(self.features(x), prev, mode)
 
     return ImageNet() if representation == pl.IMAGE else ProfileNet()
 
@@ -106,8 +141,16 @@ def encode_frames(frames, representation):
     return np.concatenate([pl.encode_input(representation, f) for f in frames])
 
 
+def encode_modes(mode_in):
+    """(N,) STEER_MODES indices -> (N, MODE_SIZE) one-hots, as encode_mode()."""
+    out = np.zeros((len(mode_in), pl.MODE_SIZE), dtype=np.float32)
+    out[np.arange(len(mode_in)), np.asarray(mode_in, dtype=np.int64)] = 1.0
+    return out
+
+
 def flip(x, prev):
-    """Mirror left-right: the frame's last axis, and every steering sign."""
+    """Mirror left-right: the frame's last axis, and every steering sign.
+    The steering mode has no side, so it goes through as it is."""
     import torch
 
     prev = prev.clone()
@@ -121,6 +164,12 @@ def tick_weights(data, idx, good_weight):
                     float(good_weight), 1.0).astype(np.float32)
 
 
+def mode_weights(data, idx, switch_weight=MODE_SWITCH_WEIGHT):
+    """Per training tick mode-loss factor: switch_weight inside a switch window."""
+    window = np.asarray(data.get("mode_switch", np.zeros(len(data["t_ns"]), bool)))[idx]
+    return np.where(window, float(switch_weight), 1.0).astype(np.float32)
+
+
 def _weighted(values, w):
     return (values * w).sum() / w.sum()
 
@@ -130,8 +179,29 @@ def training_mask(data, in_val, labelled):
     return ~in_val & data["decision"] & labelled & ~pe.bad_marked(data)
 
 
+def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
+    """[(held_out, guard)] boolean masks: n contiguous stretches of decision
+    ticks, in session-then-time order, equal by count. `guard` is every tick
+    of the held-out block's sessions within guard_s of it, the block too:
+    what a fold must not train on."""
+    order = np.lexsort((data["t_ns"], data["session"]))
+    order = order[data["decision"][order]]
+    out = []
+    for chunk in np.array_split(order, n):
+        held = np.zeros(len(data["t_ns"]), dtype=bool)
+        held[chunk] = True
+        guard = held.copy()
+        for sid in np.unique(data["session"][chunk]):
+            in_s = chunk[data["session"][chunk] == sid]
+            lo = data["t_ns"][in_s].min() - guard_s * 1e9
+            hi = data["t_ns"][in_s].max() + guard_s * 1e9
+            guard |= (data["session"] == sid) & (data["t_ns"] >= lo) & (data["t_ns"] <= hi)
+        out.append((held, guard))
+    return out
+
+
 def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
-          good_weight=GOOD_WEIGHT):
+          good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT):
     import torch
     from torch import nn
 
@@ -144,10 +214,13 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     x = x_all[data["frame"][idx]]
     prev = torch.from_numpy(data["prev"][idx] if uses_prev
                             else np.zeros_like(data["prev"][idx]))
+    mode_in = torch.from_numpy(encode_modes(data["mode_in"][idx]))
+    mode = torch.from_numpy(data["steer_mode"][idx].astype(np.int64))
     action = torch.from_numpy(data["action"][idx].astype(np.int64))
     mag = torch.from_numpy(data["magnitude"][idx])
     steer = torch.from_numpy(data["steer"][idx])
     w_all = torch.from_numpy(tick_weights(data, idx, good_weight))
+    w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
     steer_all, throttle_all = pe.label_masks(data, label_mode)
     steer_ok = torch.from_numpy(steer_all[idx])
     throttle_ok = torch.from_numpy(throttle_all[idx])
@@ -163,6 +236,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     weights = np.minimum(weights, 10.0)  # one example of a class must not own the loss
     ce = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32),
                              reduction="none")
+    ce_mode = nn.CrossEntropyLoss(reduction="none")
 
     opt = torch.optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-4)
     batch = 64
@@ -176,7 +250,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
             if torch.rand(1).item() < 0.5:
                 xb, pb = flip(xb, pb)
                 sb = -sb
-            logits, t_out, s_out = model(xb, pb)
+            logits, t_out, s_out, m_out = model(xb, pb, mode_in[b])
             tok, sok = throttle_ok[b], steer_ok[b]
             wb = w_all[b]
             moving = tok & (action[b] != pl.ACTIONS.index(pl.STOP))
@@ -187,11 +261,15 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 loss = loss + _weighted((t_out[moving, 0] - mag[b][moving]).abs(), wb[moving])
             if sok.any():
                 loss = loss + _weighted((s_out[sok, 0] - sb[sok]).abs(), wb[sok])
+                loss = loss + _weighted(ce_mode(m_out[sok], mode[b][sok]), w_mode[b][sok])
             opt.zero_grad()
             loss.backward()
             opt.step()
     model.eval()
     return model, weights.tolist()
+
+
+OUTPUTS = ["logits", "throttle", "steer", pl.MODE_OUTPUT]
 
 
 def export(model, representation, out_path, meta):
@@ -200,11 +278,52 @@ def export(model, representation, out_path, meta):
     shape = ((1, 2, pl.INPUT_HEIGHT, pl.INPUT_WIDTH) if representation == pl.IMAGE
              else (1, cp.PROFILE_FEATURES, cp.PROFILE_COLUMNS))
     torch.onnx.export(
-        model, (torch.zeros(shape), torch.zeros((1, pl.PREV_SIZE))), out_path,
-        input_names=["x", "prev"], output_names=["logits", "throttle", "steer"],
+        model, (torch.zeros(shape), torch.zeros((1, pl.PREV_SIZE)),
+                torch.zeros((1, pl.MODE_SIZE))), out_path,
+        input_names=["x", "prev", pl.MODE_INPUT], output_names=OUTPUTS,
         opset_version=17, dynamo=False)
+    write_sidecar(out_path, meta)
+
+
+def write_sidecar(out_path, meta):
     with open(os.path.splitext(out_path)[0] + ".json", "w") as f:
         json.dump(meta, f, indent=2)
+
+
+def mode_meta(switch_weight=MODE_SWITCH_WEIGHT):
+    """The mode head's half of the sidecar: what policy.check_sidecar reads."""
+    return {
+        "steer_modes": list(pl.STEER_MODES),
+        "mode_switch": {"threshold": pl.MODE_THRESHOLD, "dwell_s": pl.MODE_DWELL_S,
+                        "min_interval_s": pl.MODE_MIN_INTERVAL_S},
+        "mode_rear": {pl.UNIFIED: "steering_pair(front)", pl.SPLIT: 0.0},
+        "mode_not_modelled": "split with the right stick on the rear (|rear| > "
+                             "split_rear_rest); the dataset drops those rows",
+        "mode_switch_weight": float(switch_weight),
+    }
+
+
+def _mean_scores(folds):
+    """Fold scores -> the mean of every number, and the switch counts summed."""
+    keys = [k for k, v in folds[0].items() if isinstance(v, (int, float))]
+    out = {}
+    for k in keys:
+        vals = [f[k] for f in folds if isinstance(f.get(k), (int, float))
+                and np.isfinite(f[k])]
+        out[k] = float(np.mean(vals)) if vals else float("nan")
+    out["confusion"] = np.sum([f["confusion"] for f in folds], axis=0).tolist()
+    # Pooled where a fold mean would hide it: one toggle per fold at best.
+    for k in ("mode_switch_ticks", "mode_toggles", "mode_latch_switches",
+              "mode_latch_toggles_matched", "mode_latch_false_switches",
+              "mode_window_ticks"):
+        if k in folds[0]:
+            out[k + "_total"] = int(sum(f[k] for f in folds))
+    hits = sum(f["mode_switch_recall"] * f["mode_switch_ticks"] for f in folds
+               if f.get("mode_switch_ticks"))
+    if "mode_switch_ticks" in folds[0]:
+        n = sum(f["mode_switch_ticks"] for f in folds)
+        out["mode_switch_recall_pooled"] = float(hits / n) if n else float("nan")
+    return out
 
 
 def main(argv=None):
@@ -214,6 +333,9 @@ def main(argv=None):
     ap.add_argument("--representation", choices=pl.REPRESENTATIONS, default=pl.PROFILE)
     ap.add_argument("--val", action="append", default=None,
                     help="session name to hold out (repeatable); default the last one")
+    ap.add_argument("--blocks", type=int, default=0,
+                    help="instead of --val: N contiguous time blocks, each held out "
+                         "in turn, then a final model on everything")
     ap.add_argument("--labels", choices=("pad", "any"), default="pad",
                     help="pad: only hand-driven groups are labels. any: clone "
                          "whatever was commanded (the autopilot smoke test)")
@@ -224,6 +346,9 @@ def main(argv=None):
     ap.add_argument("--good-weight", type=float, default=GOOD_WEIGHT,
                     help="loss weight of a pad tick inside a GOOD /marks window "
                          f"(default {GOOD_WEIGHT}; BAD-window ticks are always left out)")
+    ap.add_argument("--switch-weight", type=float, default=MODE_SWITCH_WEIGHT,
+                    help="mode-loss weight of a tick inside a switch window "
+                         f"(default {MODE_SWITCH_WEIGHT})")
     args = ap.parse_args(argv)
 
     import torch
@@ -231,63 +356,109 @@ def main(argv=None):
     data = pe.load(args.data)
     meta_in = data["meta"]
     sessions = meta_in["sessions"]
-    val_names = args.val or [sessions[-1]]
-    unknown = [v for v in val_names if v not in sessions]
-    if unknown:
-        print(f"no such session {unknown}; have {sessions}")
+    if "steer_mode" not in data:
+        print(f"{args.data} has no steering-mode labels: rebuild it with policy_dataset.py")
         return 1
-    val_ids = [sessions.index(v) for v in val_names]
     if abs(float(meta_in.get("steer_scale", -1.0)) - pl.STEER_SCALE) > 1e-6:
         # Its steering labels are a fraction of a different lock; a model
         # trained on them would steer wrong, and the car refuses it anyway.
         print(f"{args.data} steers at {meta_in.get('steer_scale')}, the car at "
               f"{pl.STEER_SCALE}: rebuild it with policy_dataset.py")
         return 1
-    in_val = np.isin(data["session"], val_ids)
     steer_ok, throttle_ok = pe.label_masks(data, args.labels)
     labelled = steer_ok | throttle_ok
+    data["x"] = encode_frames(data["frames"], args.representation)
+    fit = dict(representation=args.representation, label_mode=args.labels,
+               uses_prev=args.prev, epochs=args.epochs, seed=args.seed,
+               good_weight=args.good_weight, switch_weight=args.switch_weight)
+    tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
+
+    cv = None
+    if args.blocks:
+        folds = []
+        for k, (held, guard) in enumerate(time_blocks(data, args.blocks)):
+            mask = training_mask(data, guard, labelled)
+            model, _ = train(data, train_mask=mask, **fit)
+            with torch.no_grad():
+                export(model, args.representation, tmp,
+                       {**_base_meta(meta_in, args, [], []), **mode_meta(args.switch_weight)})
+            graded = held & ~pe.bad_marked(data)
+            s = pe.score_ticks(pl.PolicyModel(tmp), data, np.flatnonzero(graded),
+                               args.labels, pe.median_training_magnitude(data, mask))
+            folds.append(s)
+            print(f"--- block {k + 1} of {args.blocks}: {int(graded.sum())} ticks held out, "
+                  f"{int(mask.sum())} trained")
+            print(pe.format_scores(s))
+        for ext in (".onnx", ".json"):
+            try:
+                os.remove(os.path.splitext(tmp)[0] + ext)
+            except OSError:
+                pass
+        cv = {"blocks": args.blocks, "guard_s": BLOCK_GUARD_S,
+              "mean": _mean_scores(folds), "folds": folds}
+        print(f"--- mean over {args.blocks} blocks")
+        print(pe.format_scores(cv["mean"]))
+        val_names, val_ids = [], []
+        in_val = np.zeros(len(data["t_ns"]), dtype=bool)
+    else:
+        val_names = args.val or [sessions[-1]]
+        unknown = [v for v in val_names if v not in sessions]
+        if unknown:
+            print(f"no such session {unknown}; have {sessions}")
+            return 1
+        val_ids = [sessions.index(v) for v in val_names]
+        in_val = np.isin(data["session"], val_ids)
+
     train_mask = training_mask(data, in_val, labelled)
     if not train_mask.any():
         print("no training ticks: every labelled decision is in --val, or nothing is "
               "pad-labelled (legacy files are all autopilot: try --labels any)")
         return 1
 
-    data["x"] = encode_frames(data["frames"], args.representation)
-    model, weights = train(data, args.representation, train_mask, args.labels,
-                           args.prev, args.epochs, args.seed, args.good_weight)
+    model, weights = train(data, train_mask=train_mask, **fit)
     params = int(sum(p.numel() for p in model.parameters()))
 
-    meta = {
-        "input_contract": meta_in["input_contract"],
-        "representation": args.representation,
-        "actions": list(pl.ACTIONS),
-        "uses_prev_action": bool(args.prev),
-        "outputs": ["logits", "throttle", "steer"],
-        "steer_scale": pl.STEER_SCALE,
-        "labels": args.labels,
-        "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids],
-        "val_sessions": val_names,
-        "train_decisions": int(train_mask.sum()),
-        "class_weights": weights,
-        "good_weight": args.good_weight,
-        "good_marked_train_ticks": int((train_mask & (pe.marks_of(data) == pe.MARK_GOOD)).sum()),
-        "bad_marked_left_out": int((data["decision"] & pe.bad_marked(data)).sum()),
-        "parameters": params,
-        "epochs": args.epochs,
-        "seed": args.seed,
-    }
+    meta = {**_base_meta(meta_in, args, val_ids, val_names), **mode_meta(args.switch_weight),
+            "train_decisions": int(train_mask.sum()),
+            "class_weights": weights,
+            "good_marked_train_ticks": int((train_mask & (pe.marks_of(data) == pe.MARK_GOOD)).sum()),
+            "bad_marked_left_out": int((data["decision"] & pe.bad_marked(data)).sum()),
+            "parameters": params}
     with torch.no_grad():
         export(model, args.representation, args.out, meta)
 
     model_rt = pl.PolicyModel(args.out)
-    scores = pe.score(model_rt, data, val_ids, args.labels, train_mask)
-    meta["val"] = scores
-    with open(os.path.splitext(args.out)[0] + ".json", "w") as f:
-        json.dump(meta, f, indent=2)
+    if cv is not None:
+        meta["cv"] = cv
+        # Graded on what it was trained on: a check the export works, not a score.
+        meta["train_fit"] = pe.score_ticks(
+            model_rt, data, np.flatnonzero(train_mask), args.labels,
+            pe.median_training_magnitude(data, train_mask))
+    else:
+        meta["val"] = pe.score(model_rt, data, val_ids, args.labels, train_mask)
+    write_sidecar(args.out, meta)
     print(f"{args.representation}: {params} parameters, "
           f"{os.path.getsize(args.out)} bytes, {int(train_mask.sum())} training decisions")
-    print(pe.format_scores(scores))
+    print(pe.format_scores(meta["val"] if cv is None else meta["train_fit"]))
     return 0
+
+
+def _base_meta(meta_in, args, val_ids, val_names):
+    sessions = meta_in["sessions"]
+    return {
+        "input_contract": meta_in["input_contract"],
+        "representation": args.representation,
+        "actions": list(pl.ACTIONS),
+        "uses_prev_action": bool(args.prev),
+        "outputs": OUTPUTS,
+        "steer_scale": pl.STEER_SCALE,
+        "labels": args.labels,
+        "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids],
+        "val_sessions": val_names,
+        "good_weight": args.good_weight,
+        "epochs": args.epochs,
+        "seed": args.seed,
+    }
 
 
 if __name__ == "__main__":

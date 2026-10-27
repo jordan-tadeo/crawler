@@ -105,7 +105,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `frame_width`, `frame_height` | int | depth frame size, 640x400 (0 if unknown) |
 | `throttle` | float | **the label.** Throttle that reached the ESC this tick, -1..1 (record: already scaled) |
 | `steering_front`, `steering_rear` | float | **the label.** Steering sent to each servo, -0.7..0.7 (the pad's LEFT_X past a 0.12 deadzone, rescaled, x 70%; recordings before the deadzone carry the stick's rest drift, up to about 0.07 raw); `rear` = -`front` in unified mode |
-| `steering_mode` | str | `"unified"` or `"split"` (L3 toggles) |
+| `steering_mode` | str | `"unified"` or `"split"` (L3 toggles): the pad's mode. See "The steering mode as a label" |
 | `steer_by` | str | `"pad"` or `"driver"`: who had the steering when this row's command went out. Always `"pad"` in record |
 | `throttle_by` | str | `"pad"` or `"driver"`: same, for the throttle |
 | `pad_throttle` | float | record, or auto with `throttle_by` `"pad"`: the trigger before scaling, -1..1. Otherwise 0 |
@@ -120,6 +120,8 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `policy_steering_front` | float | the model's front steering, in manual's units (full lock 0.7) |
 | `policy_reason` | string | why it did that: `model`, `model floor` (a forward held by `driver.ForwardFloorVeto`: something under `FORWARD_FLOOR_MM`, or a probe that went blind on the way in), `blind`, `stuck`, ... |
 | `policy_infer_ms` | float | the model's inference time that tick |
+| `policy_steer_mode` | string | the steering mode the model drove with, `unified` or `split` (`policy.ModeLatch`); always `unified` for a model with no mode head. Not the row's `steering_mode`, which is the pad's |
+| `policy_steer_mode_p` | float | the mode head's probability of `policy_steer_mode` on its last answer, low while it wants to switch; -1 with no head |
 | `depth_small` | bool | a `/policy/depth_small` picture carries this row's log time |
 | `depth_raw` | bool | a `/camera/depth_raw` frame carries this row's log time |
 | `probe_distance_mm` | float[9] | the hand-written scan, left to right; -1 means infinite |
@@ -167,6 +169,29 @@ Rows that do not exist: manual mode, and auto's 2.5 s recover manoeuvre (no
 scan, no decision) -- unless my hand has a group during it. Then the rows come
 at 10 Hz off the car's own view, `source` `"tap"`, `mode` `"auto"`, with a
 `/policy/depth_small` picture and no raw frame.
+
+## The steering mode as a label
+
+Unified drives both axles off the left stick, the rear counter-phase through
+`driver.steering_pair()`: four-wheel steering. Split puts the rear on the
+right stick, and I have never used it: in every split row of the current
+session the rear is exactly 0, so for me split is two-wheel steering. That
+is what the policy's mode head learns, and the rear is never a head of its
+own: unified is `steering_pair(front)`, split is 0.
+
+**A split row with the rear off centre is not modelled yet.**
+`tools/policy_dataset.py` drops it (`split rear`, past
+`SPLIT_REAR_REST` = 0.05 of servo travel) and the model's sidecar says so in
+`mode_not_modelled`. If I start crabbing or posing with the right stick,
+that is the data a rear head would need, and none exists today.
+
+Per tick the dataset carries `mode_in` (the mode going into the tick, the
+model's `mode` input), `steer_mode` (the mode I wanted: the tick's own, or
+the next toggle's for the `MODE_LEAD_S` = 0.5 s before it) and `mode_switch`
+(within 0.5 s of a toggle). All three come off the whole row stream before
+any tick is dropped, so a toggle on a dropped row still counts. A mode change
+across a gap in the rows is not a toggle: manual writes no rows, so a press
+there cannot be placed. The `.npz` meta lists every toggle per session.
 
 ## Throttle labels across speed caps
 

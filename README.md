@@ -184,6 +184,18 @@ under a policy the model's own command (after its floor veto), its reason
 and the sha256 of the `.onnx`, which during a takeover is not what reached
 the wheels.
 
+A model with the mode head also picks the steering mode: four-wheel
+(unified, the rear counter-phase through `steering_pair`) or two-wheel
+(split with the rear straight, which is the only split I drive). It starts
+in whatever mode the pad is in when auto engages, and only switches when its
+head has wanted the other mode at over 0.7 for 0.5 s and the last switch was
+2 s ago, so it cannot flap. L3 while it drives sets its mode to the pad's
+and restarts the 2 s, so my press sticks. While my stick has the steering my
+mode drives, and when I let go it carries on in my mode. The rows say
+`policy_steer_mode` and the head's confidence in it,
+`policy_steer_mode_p`. A model with no mode head drives four-wheel whatever
+the pad says, as every model before it did.
+
 The car runs the `.onnx` through onnxruntime and nothing else. Torch is only
 on the laptop. On the Pi 4 the default (column profile) model takes 0.35 ms
 to run and about 4.5 ms with its input made, against a 100 ms tick.
@@ -196,6 +208,7 @@ python3.11 -m venv ~/crawler-train && ~/crawler-train/bin/pip install -r tools/r
 ./pull-recordings.sh                              # into ~/crawler-data/mcap
 python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/crawler-record-*.mcap
 python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
+python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one session: time blocks
 python tools/policy_eval.py data.npz models/policy.onnx --out report.md
 ```
 
@@ -203,10 +216,14 @@ The dataset tool prints, per session, every tick it dropped and why, the
 not-driving spans (parked, idle, the reach for Y, the car in my hands) as a
 one-character-a-second timeline, and what the `/marks` did: a BAD window on
 my own driving comes out of training, a GOOD one counts double
-(`--good-weight`). Validate on a whole session, never a random tick. The
+(`--good-weight`). Validate on a whole session, never a random tick; with
+only one session, `--blocks 5` holds out five contiguous stretches of it in
+turn (with a second either side left out of training) and then trains the
+model it exports on all of it. The
 trainer prints the model against always-forward, the hand-written rule and
 the median throttle, which is the number that says whether it learned
-anything. Old rolling recordings work too with `--labels any`, but all they
+anything, and the mode head against always-stay: its recall on the ticks
+around each L3 press, and how many of my presses its latch reproduces. Old rolling recordings work too with `--labels any`, but all they
 can teach is a copy of the autopilot. A group a learned policy drove is never
 a label, not even with `--labels any`.
 
