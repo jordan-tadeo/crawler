@@ -358,6 +358,17 @@ JSON_SCHEMAS = {
         "imu_accel_x": _NUM, "imu_accel_y": _NUM, "imu_accel_z": _NUM,
         "imu_gyro_x": _NUM, "imu_gyro_y": _NUM, "imu_gyro_z": _NUM,
         "imu_age_ms": _NUM,
+        # Who drove auto's "driver" groups: "" in record, "rules" or
+        # "policy" in auto. The policy_* fields are a learned driver's own
+        # command after its floor veto, and its model's sha256; empty and
+        # zero under the rules.
+        "autopilot": _STR,
+        "policy_model": _STR,
+        "policy_action": _STR,
+        "policy_throttle": _NUM,
+        "policy_steering_front": _NUM,
+        "policy_reason": _STR,
+        "policy_infer_ms": _NUM,
     }),
 }
 

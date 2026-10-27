@@ -1,0 +1,20 @@
+# The laptop's training venv for tools/policy_*.py. Never the car's: torch is
+# not in pyproject.toml and must not be, the car only runs the exported .onnx
+# through onnxruntime. These are the versions the committed smoke model
+# (tests/fixtures/policy-smoke.onnx) was built and checked with, on macOS
+# arm64, Python 3.11.
+#
+#   python3.11 -m venv ~/crawler-train
+#   ~/crawler-train/bin/pip install -r tools/requirements-train.txt
+#
+# numpy stays on the car's pin, so a dataset built here reads back the same
+# there. onnxruntime matches uv.lock, so the eval runs the model the way the
+# car does.
+numpy==1.26.4
+torch==2.14.1
+onnx==1.23.2
+onnxruntime==1.31.1
+protobuf==7.36.2
+mcap==1.6.0
+mcap-protobuf-support==0.6.0
+opencv-python-headless==4.11.0.86

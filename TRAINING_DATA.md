@@ -105,6 +105,13 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `imu_accel_x/y/z` | float | newest OAK-D IMU sample at the tick, linear acceleration, m/s^2 |
 | `imu_gyro_x/y/z` | float | same sample, rad/s |
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
+| `autopilot` | string | who drove auto's `driver` groups: `""` in record, `rules` or `policy` (`main.py --policy`) |
+| `policy_model` | string | sha256 of the `.onnx` driving; `""` unless `autopilot` is `policy` |
+| `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
+| `policy_throttle` | float | the model's throttle after its floor veto; what it would have driven even while my trigger has the group |
+| `policy_steering_front` | float | the model's front steering, in manual's units (full lock 0.7) |
+| `policy_reason` | string | why it did that: `model`, `model floor`, `blind`, `stuck`, ... |
+| `policy_infer_ms` | float | the model's inference time that tick |
 | `depth_small` | bool | a `/policy/depth_small` picture carries this row's log time |
 | `depth_raw` | bool | a `/camera/depth_raw` frame carries this row's log time |
 | `probe_distance_mm` | float[9] | the hand-written scan, left to right; -1 means infinite |

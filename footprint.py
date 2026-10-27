@@ -72,6 +72,43 @@ AUTO = "auto"
 DRIVER = "driver"
 PAD = "pad"
 
+# Who was driving auto's "driver" groups, and what a learned one asked for.
+# Every row carries all of these, empty when they do not apply, so the
+# columns are the same in every row: autopilot is "" in record, "rules" for
+# the hand-written driver and "policy" for main.py --policy. The policy_*
+# fields are the model's own command after its floor veto -- what it would
+# have put on the wheels, which the row's throttle / steering_* are not
+# while my hand has a group.
+AUTOPILOT_FIELDS = {
+    "autopilot": "",
+    "policy_model": "",          # sha256 of the .onnx
+    "policy_action": "",         # forward / reverse / stop
+    "policy_throttle": 0.0,
+    "policy_steering_front": 0.0,
+    "policy_reason": "",
+    "policy_infer_ms": 0.0,
+}
+
+
+def autopilot_fields(driver):
+    """AUTOPILOT_FIELDS for a row, off the auto driver (None in record)."""
+    out = dict(AUTOPILOT_FIELDS)
+    if driver is None:
+        return out
+    out["autopilot"] = "rules"
+    fields = getattr(driver, "policy_fields", None)
+    if fields is None:
+        return out
+    try:
+        for key, value in fields().items():
+            if key in out:
+                out[key] = (str(value) if isinstance(out[key], str)
+                            else _num(value, 0.0))
+    except Exception:
+        out["autopilot"] = "policy"
+    return out
+
+
 IMU_FIELDS = ("imu_accel_x", "imu_accel_y", "imu_accel_z",
               "imu_gyro_x", "imu_gyro_y", "imu_gyro_z")
 
@@ -94,11 +131,15 @@ def _sweep_clears(scan, side) -> bool:
 
 def feature_row(scan, verdict, command, mode, source, shape, scan_ms=0.0,
                 committed=None, pad_throttle=None, limits=None,
-                steering_mode="", steer_by=PAD, throttle_by=PAD):
-    """One /footprint message. Pure: values in, a dict out."""
+                steering_mode="", steer_by=PAD, throttle_by=PAD,
+                autopilot=None):
+    """One /footprint message. Pure: values in, a dict out.
+
+    `autopilot` is autopilot_fields(driver); None is a record row's."""
     throttle, front, rear = command
     forward, reverse = limits if limits is not None else (-1.0, -1.0)
     return {
+        **(autopilot if autopilot is not None else AUTOPILOT_FIELDS),
         "mode": mode,
         "source": source,
         "frame_width": int(shape[1]) if shape is not None else 0,
@@ -244,7 +285,8 @@ class FootprintTap:
         if scan is None or scan is self._last_driver_scan:
             if takeover and getattr(driver, "_phase", None) is not None:
                 return self._own_row(now, command, AUTO, pad_throttle, limits,
-                                     steering_mode, steer_by, throttle_by)
+                                     steering_mode, steer_by, throttle_by,
+                                     driver)
             return None
         self._last_driver_scan = scan
         # One rate for both kinds of row, so the tap's first row in a recover
@@ -261,7 +303,7 @@ class FootprintTap:
             committed=getattr(driver, "last_verdict", None),
             steering_mode=steering_mode, steer_by=steer_by,
             throttle_by=throttle_by, pad_throttle=pad_throttle,
-            limits=limits)
+            limits=limits, autopilot=autopilot_fields(driver))
         return self._offer(row, now, depth)
 
     # ---- record: our own scan, my hands' command -------------------------
@@ -272,7 +314,7 @@ class FootprintTap:
                              steering_mode, steer_by, throttle_by)
 
     def _own_row(self, now, command, mode, pad_throttle, limits,
-                 steering_mode, steer_by, throttle_by):
+                 steering_mode, steer_by, throttle_by, driver=None):
         """A row off our own view and our own scan, at the decision rate.
         The raw frame rides along on every raw_every-th one in record only."""
         if self.view is None or self.tele is None:
@@ -297,7 +339,8 @@ class FootprintTap:
         row = feature_row(scan, verdict, command, mode, "tap", depth.shape,
                           scan_ms, pad_throttle=pad_throttle, limits=limits,
                           steering_mode=steering_mode, steer_by=steer_by,
-                          throttle_by=throttle_by)
+                          throttle_by=throttle_by,
+                          autopilot=autopilot_fields(driver))
         if mode != RECORD:
             return self._offer(row, now, depth)
 

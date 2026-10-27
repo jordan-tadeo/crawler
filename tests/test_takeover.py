@@ -112,7 +112,7 @@ class Snapshots:
 
 
 def run_auto(monkeypatch, passes, cam, plan=None, pad=None, tap=None,
-             tele=None):
+             tele=None, make_driver=dv.Driver):
     """control_loop in auto over a real AutoPilot and Driver.
 
     `plan(i, pad, cam)` runs before pass i reads anything, so it is the
@@ -135,7 +135,7 @@ def run_auto(monkeypatch, passes, cam, plan=None, pad=None, tap=None,
     log = FakeLogger()
     vecon = PassVecon(pad)
     pilot = mn.AutoPilot(vecon, log)
-    driver = pilot.driver = dv.Driver(pilot.command, cam)
+    driver = pilot.driver = make_driver(pilot.command, cam)
     assert pilot.resume()
     snaps = Snapshots()
     takeover = mn.Takeover(log, snaps)

@@ -110,10 +110,11 @@ module names are load-bearing in `main.py` and in the systemd unit.
 ```
 
 `run.sh` and the installer both look for `env/bin/python` first, then
-`.venv/bin/python`, then system `python3`. `env` is the old hand-rolled venv
-that the installed service still points at, so on the car it keeps winning
-until it is deleted -- re-running the installer never quietly moves a working
-service onto a different interpreter. `CRAWLER_PYTHON=... ./run.sh`, or
+`.venv/bin/python`, then system `python3`. `env` is the old hand-rolled venv.
+The installed service has been moved onto `.venv` (its `ExecStart` names
+`.venv/bin/python` outright), but `env/` is still on the car, so `run.sh` in a
+shell keeps picking it until it is deleted -- and re-running the installer
+without `--python` would pick it too. `CRAWLER_PYTHON=... ./run.sh`, or
 `--python PATH` on the installer, overrides that.
 
 ## Service
@@ -134,6 +135,75 @@ touching `/etc`, which is how I check it before it goes anywhere.
 
 Auto mode also needs a udev rule for the OAK-D, which the installer does not
 write -- see the comment at the top of it.
+
+## A learned autopilot
+
+Off unless I ask for it. `main.py --policy models/policy.onnx` makes START
+hand the wheels to a small network instead of the hand-written rules, behind
+vetoes of its own: no frame, a stale frame or a blind frame is neutral, a
+forward with anything under `REVERSE_FLOOR_MM` becomes throttle 0 with its
+steering still going out (the same `floor_vetoes_forward` my trigger is held
+by), and an output that is not finite or not in range is neutral, never
+clamped (a nan through `min(1, v)` is full forward). The stuck detector still
+fires, and is the only thing that runs the canned backup-and-turn. A model
+that will not load is auto unavailable, not a quiet fall back to the rules.
+
+Every tick it picks forward, reverse or stop, a throttle as a fraction of the
+speed cap (forward 0.2, reverse -0.6, so never faster than auto already
+drives) and a front steer in manual's units, a fraction of the pad's full
+lock (0.7). A reverse is the model's too, decided again every tick, so it can
+stop backing up the moment the picture says so. It writes into the same held
+command the rules do, so takeover works over it unchanged: my stick or my
+trigger replaces its group, and stuck stays off while the throttle is mine.
+Every `/footprint` row in auto says `autopilot` `rules` or `policy`, and
+under a policy the model's own command (after its floor veto), its reason
+and the sha256 of the `.onnx`, which during a takeover is not what reached
+the wheels.
+
+The car runs the `.onnx` through onnxruntime and nothing else. Torch is only
+on the laptop. On the Pi 4 the default (column profile) model takes 0.35 ms
+to run and about 4.5 ms with its input made, against a 100 ms tick.
+
+Building one, on the laptop, in its own venv; torch never goes near the car
+or `pyproject.toml`:
+
+```sh
+python3.11 -m venv ~/crawler-train && ~/crawler-train/bin/pip install -r tools/requirements-train.txt
+./pull-recordings.sh                              # into ~/crawler-data/mcap
+python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/crawler-record-*.mcap
+python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
+python tools/policy_eval.py data.npz models/policy.onnx --out report.md
+```
+
+The dataset tool prints, per session, every tick it dropped and why, the
+not-driving spans (parked, idle, the reach for Y, the car in my hands) as a
+one-character-a-second timeline, and what the `/marks` did: a BAD window on
+my own driving comes out of training, a GOOD one counts double
+(`--good-weight`). Validate on a whole session, never a random tick. The
+trainer prints the model against always-forward, the hand-written rule and
+the median throttle, which is the number that says whether it learned
+anything. Old rolling recordings work too with `--labels any`, but all they
+can teach is a copy of the autopilot. A group a learned policy drove is never
+a label, not even with `--labels any`.
+
+Putting it on the car (`models/` is gitignored, so the file is only ever one
+I copied there). onnxruntime is in `pyproject.toml` and `uv.lock`, aarch64
+wheel included, so `uv sync` in the checkout puts it in the `.venv` the
+service runs:
+
+```sh
+ssh jtpi mkdir -p Documents/py/crawler/models
+scp models/policy.onnx models/policy.json jtpi:Documents/py/crawler/models/
+ssh jtpi 'cd Documents/py/crawler && ~/.local/bin/uv sync'
+sudo systemctl edit crawler                       # ExecStart= then ExecStart=... --policy models/policy.onnx
+```
+
+A model trained before the steering moved to manual's units says
+`steer_scale` 0.6 in its `.json`, and the car refuses it; retrain it.
+
+Whether it drives well is something I find out by driving behind it with a
+hand on START. The numbers say whether it agrees with me on recorded frames,
+not whether it is any good on new ones.
 
 ## Watching it in Foxglove
 
@@ -434,11 +504,13 @@ echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' \
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-And the interpreter the service runs has to have the SDK in it. The installed
-unit still points at the old `env/`, which `uv sync` does not touch:
+And the interpreter the service runs has to have the SDK in it. The
+installed unit runs `.venv/bin/python`, so `uv sync` is all it takes; a unit
+installed from an older checkout may still point at `env/`, which `uv sync`
+does not touch:
 
 ```sh
-env/bin/pip install foxglove-sdk==0.30.2        # keep the service on env/
-# or move the service onto the uv venv instead:
+~/.local/bin/uv sync
+# a unit still on env/: move it onto the uv venv
 sudo ./deploy/install-service.sh --python "$PWD/.venv/bin/python" --start
 ```

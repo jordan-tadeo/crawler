@@ -36,6 +36,10 @@ log/
 *.pt
 *.pth
 *.onnx
+# Except the one the tests run through onnxruntime: a 77 KB smoke policy,
+# trained on two autopilot sessions, there so the runtime is tested against a
+# real exported graph and not only a stub. It drives nothing.
+!tests/fixtures/*.onnx
 *.tflite
 *.pb
 *.h5
