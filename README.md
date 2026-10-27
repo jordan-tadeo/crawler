@@ -3,7 +3,9 @@
 RC rock crawler control for a Raspberry Pi 4. It boots into hand driving off a
 Bluetooth pad; START hands the car to the OAK-D for auto mode. A and B mark
 the moment, good and bad, so a run can be read back afterwards instead of
-remembered.
+remembered. Holding Y for a second in manual starts a record session: I drive
+at auto's speeds and every decision is written down as training data for the
+learned policy (see `TRAINING_DATA.md`).
 
 The car is a Pi 4 on Raspberry Pi OS Bookworm 64-bit, aarch64, Python 3.11.2.
 That is the only machine this actually drives on. A laptop checkout is for
@@ -269,6 +271,44 @@ once.
 The filenames are `crawler-<UTC>Z-p<pid>-<NNN>.mcap`. The pid is in there
 because this Pi has no RTC: at boot the clock is whatever the last shutdown
 wrote until NTP lands, so two boots genuinely can produce the same second.
+
+#### Recording training drives
+
+Hold **Y for one second** in manual: two buzzes, and the car is in record
+mode. The camera opens (3.3 s on the car, off the control loop) and a new file
+starts, `crawler-record-<UTC>Z-p<pid>-001.mcap`, one per session and never
+pruned by the ring. It drives like manual with the throttle scaled rather
+than clipped: full RT is auto's forward speed and full LT auto's reverse speed,
+read off `driver.Driver`, so whatever auto drives at, I drive at. Steering is
+unchanged. Any fresh press of Y is back to manual (one buzz) and gives the
+camera back; START ends the session and goes to auto; losing the pad ends it
+at neutral. Y does nothing in auto. No flag, so nothing in the unit file
+changes. With `--no-telemetry --no-record` there is no publisher thread to
+write with, so record refuses and says so.
+
+Every decision (10 Hz, auto's rate) writes one `/footprint` row with the
+command on the wheels and the IMU, one 80x50 `/policy/depth_small` picture at
+the same log time, and every fifth one the full lossless frame on
+`/camera/depth_raw`. Auto writes the same rows and pictures for its own
+decisions. The schema, and how to pair them, is in `TRAINING_DATA.md`;
+`deploy/footprint_dump.py` turns a pile of sessions into one table plus the
+pictures, and `--verify` re-runs this checkout's `driver.py` and
+`policy_input.py` over the raw frames to check the rows.
+
+Nothing the record side computes can reach the wheels: `footprint.py` is never
+handed the controller, and a test drives record mode over frames the rules
+would reverse and swerve on and checks every command is my sticks, scaled.
+
+What it costs, on the car (Pi 4, real OAK-D, record session, desk scene):
+
+- Loop period with the full-res frame as RawImage was p99 34 ms; as a 16-bit
+  PNG it is encoded with the GIL released (24 ms, 133 KB a frame, level 1).
+- The downsample is 2.8 ms p50, 5.0 ms p99 a tick, on the control loop, at
+  10 Hz. A picture is 4.4 KB as PNG.
+- On the card, on top of the 10.8 MiB/min the camera channels cost when
+  driving: pictures 2.5 MiB/min, rows 0.3, raw frames at 2 Hz about 15.5. So
+  about **29 MiB/min with the raw frames, 14 without**: 98 GB free is about
+  50 hours of record sessions.
 
 #### What it costs
 

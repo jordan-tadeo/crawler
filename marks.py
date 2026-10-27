@@ -448,6 +448,22 @@ class MarkPad:
 
     # ---- rumble ----------------------------------------------------------
 
+    def buzz(self, pulses, now):
+        """Queue `pulses` buzzes on the same scheduler marks use. Never raises.
+
+        Here so record mode's enter and exit buzzes go through the one rumble
+        scheduler in the process -- two of them would fight over the motor --
+        and inherit its slow-call and no-support switches for free. A buzz
+        asked for while a mark's pulses are still playing replaces them.
+        """
+        try:
+            if not self._rumble_ok:
+                return
+            self._pulses_left = int(pulses)
+            self._next_pulse_at = now
+        except Exception:
+            pass
+
     def _request_rumble(self, kind, now):
         """Queue the pulses for one mark and fire the first of them now."""
         if not self._rumble_ok:

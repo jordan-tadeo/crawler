@@ -126,6 +126,19 @@ DEFAULT_DIR = "log/mcap"
 SUFFIX = ".mcap"
 PREFIX = "crawler-"
 
+# A record session's file: one per session, entered with a hold of Y in
+# manual. Same directory and still crawler-*, so pull-recordings.sh and
+# mcap_check.py pick them up with no change -- but a letter after the dash
+# where the ring has a digit, so the ring's pruning never counts one as its
+# own and the data I drove for on purpose is not the thing a long week of
+# idle boots deletes first.
+SESSION_PREFIX = PREFIX + "record-"
+
+# A session is one file, so it does not rotate. This is a ceiling for a
+# session that somehow never ends, not a size I expect to see: at the measured
+# record rate it is hours.
+SESSION_SEGMENT_BYTES = 16 * 1024 * 1024 * 1024
+
 # The two rates everything below is sized off. Both measured by reading a
 # finished file back over its own span, and the first of them off a real run
 # -- 469 s with the camera up and the car actually being driven, which the
@@ -209,7 +222,7 @@ def _repo_path(path: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
 
 
-def segment_name(when=None, pid=None, index=0) -> str:
+def segment_name(when=None, pid=None, index=0, prefix=PREFIX) -> str:
     """The filename for one segment. Unique across runs and across reboots.
 
     Three parts, and each one is load-bearing:
@@ -228,7 +241,7 @@ def segment_name(when=None, pid=None, index=0) -> str:
     when = time.gmtime(when if when is not None else time.time())
     pid = os.getpid() if pid is None else pid
     stamp = time.strftime("%Y%m%d-%H%M%S", when)
-    return f"{PREFIX}{stamp}Z-p{pid}-{index:03d}{SUFFIX}"
+    return f"{prefix}{stamp}Z-p{pid}-{index:03d}{SUFFIX}"
 
 
 class Recorder:
@@ -245,9 +258,13 @@ class Recorder:
     def __init__(self, logger=None, directory=DEFAULT_DIR,
                  segment_bytes=SEGMENT_BYTES,
                  max_total_bytes=MAX_TOTAL_BYTES,
-                 min_free_bytes=MIN_FREE_BYTES):
+                 min_free_bytes=MIN_FREE_BYTES,
+                 prefix=PREFIX):
+        """`max_total_bytes` None means never prune, which is what a record
+        session asks for: the floor still stops it, the ring never eats it."""
         self.logger = logger
         self.directory = _repo_path(directory)
+        self.prefix = prefix
         self.segment_bytes = segment_bytes
         self.max_total_bytes = max_total_bytes
         self.min_free_bytes = min_free_bytes
@@ -443,7 +460,8 @@ class Recorder:
         for _ in range(16):
             self._index += 1
             path = os.path.join(self.directory,
-                                segment_name(index=self._index))
+                                segment_name(index=self._index,
+                                             prefix=self.prefix))
             if os.path.exists(path):
                 continue
             try:
@@ -486,7 +504,7 @@ class Recorder:
         except Exception:
             return out
         for name in names:
-            if not name.startswith(PREFIX) or not name.endswith(SUFFIX):
+            if not self._is_mine(name):
                 continue
             path = os.path.join(self.directory, name)
             size = _size(path)
@@ -494,6 +512,16 @@ class Recorder:
                 continue
             out.append((path, size))
         return out
+
+    def _is_mine(self, name) -> bool:
+        """A file this recorder wrote: its prefix, then the timestamp's digit.
+
+        The digit is what keeps the ring (crawler-2026...) and the record
+        sessions (crawler-record-2026...) out of each other's budgets.
+        """
+        rest = name[len(self.prefix):]
+        return (name.startswith(self.prefix) and name.endswith(SUFFIX)
+                and rest[:1].isdigit())
 
     def _prune(self) -> None:
         """Delete oldest segments until the directory is inside its budget.
@@ -503,6 +531,8 @@ class Recorder:
         deleting the open file would leave the writer appending to an inode
         with no name and the run would vanish on close.
         """
+        if self.max_total_bytes is None:
+            return
         segments = self._segments()
         total = sum(size for _, size in segments)
         if total <= self.max_total_bytes:

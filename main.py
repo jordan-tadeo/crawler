@@ -1,12 +1,19 @@
 """Entry point for the crawler.
 
-Two drive modes:
+Three drive modes:
 
   manual  the Xbox controller drives throttle and both steering axles. Default.
   auto    the OAK-D roomba: driver.Driver crawls forward on stereo depth and
           backs out of whatever it runs into.
+  record  manual, with the triggers scaled down to auto's own speeds, the
+          camera open and the run written to one MCAP of its own -- with the
+          autopilot's footprint features next to my command on every decision
+          (/footprint). Training data for a learned steering policy. Hold Y
+          for a second in manual to enter it, tap Y to leave. footprint.py has
+          the rest, including why nothing it computes can reach the wheels.
 
-Press START on the controller to switch between them without restarting.
+Press START on the controller to switch between manual and auto without
+restarting. START in record ends the recording and goes to auto.
 
 In manual the left stick steers both axles counter-phase, through the same
 driver.steering_pair() every auto steering decision goes through -- one
@@ -41,6 +48,7 @@ nothing on this thread is allowed to block.
 """
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -53,6 +61,7 @@ import Logger as lg
 
 MANUAL = "manual"
 AUTO = "auto"
+RECORD = "record"
 
 # Button that flips between the two modes. START and BACK are the two buttons
 # that cannot be hit by accident while driving.
@@ -78,6 +87,17 @@ SPLIT = "split"
 # deliberately and stay in while I position the car, not something I dab at for
 # half a second.
 STEER_SPLIT_BUTTON = "LS"
+
+# Y, the record button. Held for RECORD_HOLD_SECONDS in manual it enters
+# record; any press in record leaves. A hold to get in so a thumb brushing it
+# does not start a camera and a file; a tap to get out because leaving is the
+# safe direction and should never be hard. Nothing else on the pad reads Y.
+RECORD_BUTTON = "Y"
+RECORD_HOLD_SECONDS = 1.0
+
+# The camera view the autopilot's driver reads. The footprint tap reads the
+# same one (never takes from it) for the frame behind each auto decision.
+AUTO_VIEW = "auto"
 
 # A and B are the two mark buttons. Which is which, and everything about what
 # a mark is, lives in marks.py -- this file only polls it.
@@ -140,9 +160,231 @@ class ModeSwitch:
         if not self._toggle.pressed(joystick):
             return False
 
-        self.mode = AUTO if self.mode == MANUAL else MANUAL
+        # Record goes to auto, not to manual: START means "auto" from either
+        # of the two modes my hands are driving in.
+        self.mode = MANUAL if self.mode == AUTO else AUTO
         self.logger.log("info", "Mode", f"Switched to {self.mode}")
         return True
+
+
+ENTER_RECORD = "enter"
+EXIT_RECORD = "exit"
+
+
+class RecordButton:
+    """Y: hold to enter record from manual, any press to leave it.
+
+    The hold fires at the threshold while Y is still down, and that press is
+    then spent: the release after it, and the rest of the hold, do nothing. So
+    the only thing that can leave record is a fresh press.
+
+    Y does nothing in auto, and a press that began in auto stays spent: hold
+    Y, press START to manual, and the hold does not quietly carry over into a
+    record session I never asked for.
+
+    Never raises. A read that fails reads as "not down" and forgets the hold,
+    same as ButtonEdge.
+    """
+
+    def __init__(self, button=RECORD_BUTTON, hold_seconds=RECORD_HOLD_SECONDS):
+        self.button = button
+        self.hold_seconds = hold_seconds
+        self._down_since = None
+        self._spent = False
+
+    def poll(self, joystick, now, mode):
+        """ENTER_RECORD, EXIT_RECORD or None."""
+        try:
+            down = bool(joystick.get_button(self.button))
+        except Exception:
+            down = False
+
+        if not down:
+            self._down_since = None
+            self._spent = False
+            return None
+
+        if self._spent:
+            return None
+
+        edge = self._down_since is None
+        if edge:
+            self._down_since = now
+
+        if mode == RECORD:
+            if edge:
+                self._spent = True
+                return EXIT_RECORD
+            return None
+
+        if mode != MANUAL:
+            self._spent = True
+            return None
+
+        if now - self._down_since >= self.hold_seconds:
+            self._spent = True
+            return ENTER_RECORD
+        return None
+
+
+def auto_speed_limits(driver=None):
+    """(forward, reverse): the throttles auto drives at, read off a Driver.
+
+    The live driver's if there is one -- that is what auto is actually using
+    -- and otherwise a fresh Driver's defaults. Never a literal copied in
+    here: the speeds are tuned in driver.py and record follows them.
+
+    Anything wrong with what comes back -- no driver, a missing attribute, a
+    forward speed that is not forward -- is (0.0, 0.0), a car that does not
+    move. Never a guess.
+    """
+    try:
+        if driver is None:
+            driver = dv.Driver(None, None)
+        forward = float(driver.forward_speed)
+        reverse = float(driver.reverse_speed)
+    except Exception:
+        return 0.0, 0.0
+    if not (0.0 < forward <= 1.0 and -1.0 <= reverse < 0.0):
+        return 0.0, 0.0
+    return forward, reverse
+
+
+def scale_throttle(value, limits):
+    """A full-range trigger reading scaled into auto's speeds.
+
+    Scaled, not clipped: full RT is the forward limit and full LT the reverse
+    limit, so the whole trigger travel is still mine for fine control. A nan
+    or an infinity is 0.0 -- the explicit test first, because min() and max()
+    hand a nan straight back out as a limit.
+    """
+    try:
+        value = float(value)
+    except Exception:
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    value = 1.0 if value > 1.0 else -1.0 if value < -1.0 else value
+    forward, reverse = limits
+    return value * forward if value >= 0.0 else -value * reverse
+
+
+class RecordSession:
+    """The camera and the file for one record session. Never blocks.
+
+    begin() asks telemetry for a session file -- one attribute assignment; the
+    publisher thread opens it -- and starts the camera if it is not up, which
+    returns at once and opens on the hub's own thread. The car drives,
+    speed-capped, from the first tick; rows start when depth does.
+
+    end() hands the file back to the ring and, if this session is the thing
+    that opened the camera, gives the camera back too -- on a thread of the
+    hub's own, because shut at idle in manual is how this car is meant to sit.
+    Going to auto keeps it: auto is about to need it.
+    """
+
+    def __init__(self, tele, hub, logger, make_recorder=None, markpad=None):
+        self.tele = tele
+        self.hub = hub
+        self.logger = logger
+        self.make_recorder = make_recorder
+        self.markpad = markpad
+
+        self.active = False
+        self.limits = (0.0, 0.0)
+        self.started_at = 0.0
+        self._opened_camera = False
+        self._logged_depth = False
+
+    def begin(self, now, driver=None) -> bool:
+        if self.active:
+            return True
+        limits = auto_speed_limits(driver)
+        if limits == (0.0, 0.0):
+            self._say("warning", "Not recording: no usable auto speeds to cap at")
+            return False
+        try:
+            recorder = self.make_recorder() if self.make_recorder else None
+            ok = recorder is not None and self.tele.begin_session(recorder)
+        except Exception as e:
+            self._say("warning", f"Not recording: {e}")
+            return False
+        if not ok:
+            self._say("warning", "Not recording: telemetry is off in this "
+                      "process (--no-telemetry --no-record)")
+            return False
+
+        self.active = True
+        self.limits = limits
+        self.started_at = now
+        self._logged_depth = False
+        self._opened_camera = False
+        self._want_camera()
+        self._buzz(2, now)
+        self._say("info", f"Recording, throttle capped at "
+                  f"{limits[0]:+.2f}/{limits[1]:+.2f}")
+        return True
+
+    def tick(self, now):
+        """Once a pass in record. Two attribute reads on an ordinary tick."""
+        if not self.active:
+            return
+        self._want_camera()
+        hub = self.hub
+        if (not self._logged_depth and hub is not None
+                and hub.state == camera.READY):
+            self._logged_depth = True
+            self._say("info", f"Depth is up {now - self.started_at:.1f} s "
+                      f"into the session (open took "
+                      f"{hub.open_seconds:.1f} s)")
+
+    def end(self, now, keep_camera=False, why="") -> None:
+        if not self.active:
+            return
+        self.active = False
+        try:
+            self.tele.end_session()
+        except Exception:
+            pass
+        if self._opened_camera and not keep_camera and self.hub is not None:
+            try:
+                self.hub.release()
+            except Exception:
+                pass
+        self._opened_camera = False
+        self._buzz(1, now)
+        self._say("info", f"Stopped recording after "
+                  f"{now - self.started_at:.0f} s" + (f": {why}" if why else ""))
+
+    def _want_camera(self):
+        """Ask for the camera until it is coming up. Returns at once.
+
+        Asked every pass rather than once, because a release from the last
+        session may still be finishing and start() refuses until it has.
+        """
+        hub = self.hub
+        if hub is None:
+            return
+        try:
+            if hub.state == camera.OFF:
+                if hub.start():
+                    self._opened_camera = True
+        except Exception:
+            pass
+
+    def _buzz(self, pulses, now):
+        if self.markpad is not None:
+            try:
+                self.markpad.buzz(pulses, now)
+            except Exception:
+                pass
+
+    def _say(self, level, message):
+        print(f"[record] {message}")
+        try:
+            self.logger.log(level, "Record", message)
+        except Exception:
+            pass
 
 
 class SteerMode:
@@ -230,6 +472,18 @@ class AutoPilot:
         if self.unavailable:
             return False
 
+        hub = self.hub
+        if (self.driver is not None and hub is not None
+                and hub.state in (camera.OFF, camera.STARTING,
+                                  camera.RELEASING)):
+            # A driver from an earlier lap, on a camera that has since been
+            # given back -- a record session closes the camera it opened.
+            # Same answer as the first open: start it, and START again.
+            hub.start()
+            self.logger.log("info", "Mode",
+                            "Camera is still coming up, press START again")
+            return False
+
         if self.driver is None:
             hub = self.hub
             if hub is None:
@@ -242,8 +496,9 @@ class AutoPilot:
             if hub.state == camera.OFF:
                 hub.start()
 
-            if hub.state == camera.STARTING:
-                # Not a failure. Do not latch unavailable -- the device takes
+            if hub.state in (camera.STARTING, camera.RELEASING):
+                # Not a failure. RELEASING is a record session's camera
+                # still being given back; START again finds it reopening. Do not latch unavailable -- the device takes
                 # a few seconds and the next press of START will find it up.
                 self.logger.log("info", "Mode",
                                 "Camera is still coming up, press START again")
@@ -259,7 +514,7 @@ class AutoPilot:
 
             try:
                 from driver import Driver
-                self.driver = Driver(self.vecon, hub.view("auto"))
+                self.driver = Driver(self.vecon, hub.view(AUTO_VIEW))
             except Exception as e:
                 self.unavailable = True
                 self.logger.log("error", "Auto mode unavailable", str(e))
@@ -356,6 +611,11 @@ def read_pad_intent(joystick, split=False):
 
 
 def drive_manual(joystick, vecon, log, split=False):
+    """drive_pad() at full range, returning only the command."""
+    return drive_pad(joystick, vecon, log, split)[0]
+
+
+def drive_pad(joystick, vecon, log, split=False, limits=None):
     """One tick of hand driving. Anything that goes wrong in here means neutral.
 
     Returns what it commanded, so the caller does not have to read the pad a
@@ -368,14 +628,20 @@ def drive_manual(joystick, vecon, log, split=False):
     never be half-reassigned: by the time anything is commanded, which mapping
     is in force has already been settled and both numbers go to the hardware in
     the one set_steering call.
+
+    `limits` is record mode's (forward, reverse) and None for manual. Returns
+    ((throttle, front, rear) as commanded, the trigger before scaling, ok),
+    and ok False means a pad read raised and the car was sent to neutral.
     """
     try:
-        throttle, steering_front, steering_rear = read_pad_intent(joystick,
-                                                                  split)
+        pad_throttle, steering_front, steering_rear = read_pad_intent(
+            joystick, split)
+        throttle = (pad_throttle if limits is None
+                    else scale_throttle(pad_throttle, limits))
 
         vecon.set_throttle(throttle)
         vecon.set_steering(steering_front, steering_rear)
-        return throttle, steering_front, steering_rear
+        return (throttle, steering_front, steering_rear), pad_throttle, True
     except Exception as e:
         # A pad that re-pairs at a different SDL index leaves a handle whose
         # get_axis raises, or worse, keeps answering with stale values. An
@@ -386,11 +652,12 @@ def drive_manual(joystick, vecon, log, split=False):
         except Exception:
             pass
         log.log("warning", "Manual", f"Dropped a tick, holding neutral: {e}")
-        return 0.0, 0.0, 0.0
+        return (0.0, 0.0, 0.0), 0.0, False
 
 
 def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
-                 markpad=None, steer=None):
+                 markpad=None, steer=None, session=None, tap=None,
+                 record_button=None, clock=time.monotonic):
     """Poll the controller and drive whichever mode is current.
 
     Only one mode ever has the wheels: auto runs as a step() on this thread
@@ -421,6 +688,17 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     if steer is None:
         steer = SteerMode(log)
 
+    # Record mode. A session with no recorder factory refuses to begin, and a
+    # tap with no view writes nothing, so the defaults are inert.
+    import footprint as fp
+    if session is None:
+        session = RecordSession(tele, getattr(autopilot, "hub", None), log,
+                                markpad=markpad)
+    if tap is None:
+        tap = fp.FootprintTap(tele=tele)
+    if record_button is None:
+        record_button = RecordButton()
+
     vehicle_state = None
     state_read_at = 0.0
     next_state_poll = 0.0
@@ -433,11 +711,11 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     last_error = ""
     tick_max_ms = 0.0
     tick_count = 0
-    window_started = time.monotonic()
+    window_started = clock()
 
     try:
         while not stop_event.is_set():
-            now = time.monotonic()
+            now = clock()
             pygame.event.pump()
 
             joystick.update_connection_status()
@@ -450,6 +728,9 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                         autopilot.pause()
                         modes.mode = MANUAL
                         log.log("warning", "Mode", "Parked auto, back to manual")
+                    if modes.mode == RECORD:
+                        session.end(now, why="lost the controller")
+                        modes.mode = MANUAL
                     vecon.return_neutral()
                     was_connected = False
                     last_error = "controller disconnected"
@@ -465,6 +746,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                         "last_error": last_error,
                         "loop_hz": 0.0,
                         "loop_tick_max_ms": tick_max_ms,
+                        "camera_open_s": _camera_open_s(autopilot),
                         **tele.recording_status(),
                         **markpad.counts(),
                     }, now)
@@ -478,9 +760,14 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 log.log("info", "Controller", "Controller back")
                 was_connected = True
 
+            was_mode = modes.mode
             if modes.poll(joystick):
                 # Hand the wheels over cleanly in either direction.
                 vecon.return_neutral()
+                if was_mode == RECORD:
+                    # The session ends here whatever auto says next. The
+                    # camera stays: auto is the thing about to want it.
+                    session.end(now, keep_camera=True, why="START, to auto")
                 if modes.mode == AUTO:
                     if not autopilot.resume():
                         modes.mode = MANUAL
@@ -501,8 +788,32 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             # reason. The throttle is not touched at all.
             steer.poll(joystick)
 
+            # Y. Neither direction touches the wheels: nobody is changing
+            # hands, and the next line commands this tick off the sticks under
+            # whichever throttle range is now in force.
+            action = record_button.poll(joystick, now, modes.mode)
+            if action == ENTER_RECORD and modes.mode == MANUAL:
+                if session.begin(now, autopilot.driver):
+                    modes.mode = RECORD
+                    log.log("info", "Mode", "Switched to record")
+            elif action == EXIT_RECORD and modes.mode == RECORD:
+                session.end(now, why="Y")
+                modes.mode = MANUAL
+                log.log("info", "Mode", "Switched to manual")
+
+            pad_throttle = None
             if modes.mode == MANUAL:
                 drive_manual(joystick, vecon, log, steer.split)
+            elif modes.mode == RECORD:
+                _, pad_throttle, ok = drive_pad(joystick, vecon, log,
+                                                steer.split, session.limits)
+                session.tick(now)
+                if not ok:
+                    # A stale handle. drive_pad has already held neutral --
+                    # the manual path, unchanged -- and the session is over.
+                    session.end(now, why="pad read failed")
+                    modes.mode = MANUAL
+                    last_error = "record ended on a pad fault"
             elif not autopilot.step(now):
                 modes.mode = MANUAL
                 vecon.return_neutral()
@@ -517,6 +828,20 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             # a mark is never worth a tick of this loop.
             markpad.poll(joystick, now, modes.mode, vecon,
                          autopilot.driver, autopilot)
+
+            # The decision record. Handed the command as three floats read
+            # back off the controller AFTER this pass commanded it -- never
+            # the controller -- so it is what reached the ESC and nothing in
+            # there can send anything back. footprint.py never raises.
+            tap.after_drive(
+                now, modes.mode,
+                (float(vecon.last_throttle or 0.0),
+                 float(vecon.last_steering_front or 0.0),
+                 float(vecon.last_steering_rear or 0.0)),
+                driver=autopilot.driver if modes.mode == AUTO else None,
+                pad_throttle=pad_throttle,
+                limits=session.limits if modes.mode == RECORD else None,
+                steering_mode=steer.name)
 
             # Telemetry. Every one of these is the same shape: ask whether
             # anybody is watching the channel and whether its rate gate has
@@ -577,6 +902,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     "last_error": last_error,
                     "loop_hz": (tick_count / elapsed) if elapsed > 0 else 0.0,
                     "loop_tick_max_ms": tick_max_ms,
+                    "camera_open_s": _camera_open_s(autopilot),
                     # Four attribute reads off the Recorder. This is how I
                     # check from Studio that the run I am watching is also
                     # being written down, instead of sshing in to look.
@@ -609,7 +935,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             # evidence that the telemetry block costs nothing, and if it ever
             # stops costing nothing it shows up here and gets published on
             # /diagnostics as loop_tick_max_ms.
-            tick_ms = (time.monotonic() - now) * 1000.0
+            tick_ms = (clock() - now) * 1000.0
             if tick_ms > tick_max_ms:
                 tick_max_ms = tick_ms
             tick_count += 1
@@ -621,10 +947,23 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
         print("\n[Shutdown] Stopping ESC and Servos...")
         autopilot.stop()
         vecon.close()
+        # After the wheels. tele.stop() closes whichever file is open, so
+        # this is only the bookkeeping and the journal line.
+        try:
+            session.end(clock(), keep_camera=True, why="shutting down")
+        except Exception:
+            pass
         # Last, and after the wheels are dealt with: the mark writer may have
         # a row still in hand, and it is the only thing in this process that
         # SIGTERM could cost me.
         markpad.stop()
+
+
+def _camera_open_s(autopilot) -> float:
+    try:
+        return float(autopilot.hub.open_seconds)
+    except Exception:
+        return 0.0
 
 
 def parse_args(argv=None):
@@ -811,6 +1150,27 @@ def main(argv=None):
     import marks as mk
     markpad = mk.MarkPad(logger=log, tele=tele)
 
+    # Record mode's two halves. Neither opens anything until Y is held: the
+    # session's recorder is built on begin, and the tap's view is a one-deep
+    # slot on a camera that is shut until somebody asks for it.
+    import footprint as fp
+    import recording
+
+    def session_recorder():
+        return recording.Recorder(
+            logger=log,
+            directory=args.record_dir or recording.DEFAULT_DIR,
+            prefix=recording.SESSION_PREFIX,
+            segment_bytes=recording.SESSION_SEGMENT_BYTES,
+            max_total_bytes=None,
+        )
+
+    session = RecordSession(tele, hub, log, make_recorder=session_recorder,
+                            markpad=markpad)
+    # The driver's own view, so auto rows shrink the frame it scanned.
+    tap = fp.FootprintTap(view=hub.view("footprint"), tele=tele,
+                          auto_view=hub.view(AUTO_VIEW))
+
     joystick = js.Joystick(stop_event=stop_event)
 
     if modes.mode == AUTO and not autopilot.resume():
@@ -822,7 +1182,7 @@ def main(argv=None):
     if not args.dashboard:
         try:
             control_loop(joystick, vecon, autopilot, modes, log, stop_event,
-                         tele, markpad)
+                         tele, markpad, session=session, tap=tap)
         finally:
             # After control_loop's own finally, which is what disarms the ESC.
             # The camera and the telemetry server go last because they are the
@@ -848,6 +1208,7 @@ def main(argv=None):
         target=control_loop,
         args=(joystick, vecon, autopilot, modes, log, stop_event, tele,
               markpad),
+        kwargs={"session": session, "tap": tap},
         daemon=True,
     )
     worker.start()

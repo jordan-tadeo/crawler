@@ -108,6 +108,12 @@ INTERVALS = {
     "depth": 0.125,       # 8 Hz
     "disparity": 0.125,   # 8 Hz
     "rectified_left": 0.5,  # 2 Hz -- this is for checking aim, not for driving
+    # Both gated by footprint.FootprintTap, which offers at the decision rate
+    # and every RAW_DEPTH_EVERY-th decision. A second gate in here could only
+    # ever drop a row or split a frame from the row it belongs to.
+    "footprint": 0.0,
+    "depth_raw": 0.0,
+    "depth_small": 0.0,
 }
 
 # Longest side of an image channel after downscaling, in pixels. The mono
@@ -240,6 +246,10 @@ JSON_SCHEMAS = {
         # taking my eyes somewhere useless.
         "marks_good": _INT,
         "marks_bad": _INT,
+        # True while a record session (hold Y in manual) owns the file, and
+        # how long the camera took to come up the last time anything asked.
+        "recording_session": _BOOL,
+        "camera_open_s": _NUM,
     }),
     "imu": _schema("crawler.Imu", {
         # Straight off the OAK-D's BNO086: linear acceleration in m/s^2 and
@@ -294,6 +304,53 @@ JSON_SCHEMAS = {
         "accel_mean": _NUM,
         "camera_state": _STR,
     }),
+    # One row per decision: what the footprint scan saw, what the gradient
+    # rules would have done about it, and what the car was actually commanded
+    # on that same tick. Built by footprint.py -- see there for why the rows
+    # in record mode drive nothing.
+    "footprint": _schema("crawler.Footprint", {
+        "seq": _INT,             # per process, so a dropped row is visible
+        "mode": _STR,            # manual is never here; record or auto
+        "source": _STR,          # "driver": auto's own scan; "tap": ours
+        "frame_width": _INT,
+        "frame_height": _INT,
+        # Per probe, left to right. -1 distance is inf in driver.py.
+        "probe_distance_mm": {"type": "array", "items": _NUM},
+        "probe_valid_fraction": {"type": "array", "items": _NUM},
+        "probe_blocked": {"type": "array", "items": _BOOL},
+        "probe_reason": {"type": "array", "items": _STR},
+        "probe_marks": _STR,
+        "scan_ms": _NUM,
+        # read_the_gradient() on this scan, unlatched.
+        "verdict_action": _STR,
+        "verdict_steer": _NUM,
+        "verdict_reason": _STR,
+        # What auto actually did with it after the evade latch. Empty in
+        # record, where nothing acts on the verdict at all.
+        "committed_action": _STR,
+        "committed_steer": _NUM,
+        "committed_reason": _STR,
+        # The command on this tick, as it reached the ESC and the servos.
+        "throttle": _NUM,
+        "steering_front": _NUM,
+        "steering_rear": _NUM,
+        "steering_mode": _STR,
+        # Record only: the trigger before scaling, and the scale.
+        "pad_throttle": _NUM,
+        "forward_limit": _NUM,
+        "reverse_limit": _NUM,
+        # A raw /camera/depth_raw frame carries this row's exact log time.
+        "depth_raw": _BOOL,
+        # A /policy/depth_small frame carries this row's exact log time and
+        # frame_id "footprint/<seq>".
+        "depth_small": _BOOL,
+        # The newest OAK-D IMU sample at this tick: linear acceleration in
+        # m/s^2 and gyro in rad/s, the same numbers /imu carries. imu_age_ms
+        # is how old it was; -1 and zeros when there has been none.
+        "imu_accel_x": _NUM, "imu_accel_y": _NUM, "imu_accel_z": _NUM,
+        "imu_gyro_x": _NUM, "imu_gyro_y": _NUM, "imu_gyro_z": _NUM,
+        "imu_age_ms": _NUM,
+    }),
 }
 
 # The image channels, which do get a well-known schema: foxglove.CompressedImage,
@@ -338,9 +395,33 @@ JSON_TOPICS = {
     "diagnostics": "/diagnostics",
     "imu": "/imu",
     "marks": "/marks",
+    "footprint": "/footprint",
 }
 
-ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
+# Raw depth: the uint16 millimetres exactly as the driver scans them, as a
+# 16-bit greyscale PNG in a foxglove.CompressedImage. Lossless, so a recording
+# can be re-scanned through driver.free_by_column() later with whatever the
+# rules have become by then. The JPEG on /camera/depth is a picture and cannot
+# do that.
+#
+# PNG and not a foxglove.RawImage, and that was measured, not guessed. A
+# RawImage hands 512 KB a frame to the SDK, whose protobuf encode and zstd
+# chunk compression run with the GIL held: at 2 Hz that took the control
+# loop's p99 period from 13.7 ms to 34.1 ms on the car. cv2.imencode releases
+# the GIL while it compresses, and what reaches the SDK is about 130 KB that
+# zstd waves through.
+RAW_DEPTH_CHANNELS = {
+    "depth_raw": "/camera/depth_raw",
+    # policy_input.depth_small() of the frame each decision used: 80x50, the
+    # same 16-bit PNG, about 4.5 KB. Offered as (frame, frame_id).
+    "depth_small": "/policy/depth_small",
+}
+
+# zlib level 1. Measured on the car over real frames: 133 KB in 24 ms; level 3
+# is 123 KB in 36 ms. The 8% is not worth half again the encode.
+DEPTH_PNG_LEVEL = 1
+
+ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS) + tuple(RAW_DEPTH_CHANNELS)
 
 
 class Telemetry:
@@ -374,6 +455,15 @@ class Telemetry:
         # loop's lifetime -- no window where a channel has a file sink but
         # nothing is draining the mailboxes into it.
         self.recorder = recorder
+
+        # A record session's own Recorder. The control thread asks for one
+        # with begin_session() -- one attribute assignment -- and the
+        # publisher thread does the swap: the ring segment closes, the
+        # session file opens, and at no moment are both writing, so the
+        # session's minutes are in exactly one file. end_session() reverses
+        # it and the ring carries on in a fresh segment.
+        self._session_request = None
+        self._session = None
 
         self._server = None
         self._channels = {}
@@ -453,6 +543,9 @@ class Telemetry:
             for key, topic in IMAGE_CHANNELS.items():
                 self._channels[key] = CompressedImageChannel(topic=topic)
 
+            for key, topic in RAW_DEPTH_CHANNELS.items():
+                self._channels[key] = CompressedImageChannel(topic=topic)
+
         except Exception as e:
             self.error = str(e)
             self._channels = {}
@@ -519,6 +612,25 @@ class Telemetry:
                 print(f"[telemetry] server stop failed: {e}")
 
     # ---- the control thread's half ---------------------------------------
+
+    def begin_session(self, recorder) -> bool:
+        """Ask for `recorder` to own the file. One assignment, never blocks.
+
+        False when there is no publisher thread to do it -- --no-telemetry
+        --no-record -- and then there is no session either.
+        """
+        if not self.running:
+            return False
+        self._session_request = recorder
+        return True
+
+    def end_session(self) -> None:
+        """Hand the file back to the ring. One assignment, never blocks."""
+        self._session_request = None
+
+    @property
+    def session_active(self) -> bool:
+        return self._session is not None
 
     def wants(self, key: str, now: float) -> bool:
         """Is this channel worth building a message for right now?
@@ -590,17 +702,57 @@ class Telemetry:
         try:
             self._drain_forever(recorder)
         finally:
-            if recorder is not None:
+            for r in (self._session, recorder):
+                if r is not None:
+                    try:
+                        r.stop()
+                    except Exception:
+                        pass
+            self._session = None
+
+    def _swap_session(self, ring):
+        """Make the file owner match what the control thread asked for.
+
+        Close first, then open, so no message lands in two files. The gap is
+        a few milliseconds with no sink, which costs at worst a sample.
+        """
+        wanted = self._session_request
+        if wanted is self._session:
+            return
+        if self._session is not None:
+            try:
+                self._session.stop()
+            except Exception:
+                pass
+            self._session = None
+            if ring is not None and wanted is None:
                 try:
-                    recorder.stop()
+                    ring.start()
+                except Exception as e:
+                    self.error = str(e)
+        if wanted is not None:
+            if ring is not None:
+                try:
+                    ring.stop()
                 except Exception:
                     pass
+            try:
+                wanted.start()
+            except Exception as e:
+                self.error = str(e)
+            self._session = wanted
+        # A sink just came or went. Notice now rather than at the next poll,
+        # so the first decision of a session is in the session's file.
+        self._refresh_watched()
 
-    def _drain_forever(self, recorder):
+    def _drain_forever(self, ring):
         next_sink_poll = 0.0
 
         while not self._stop.is_set():
             now = time.monotonic()
+
+            self._swap_session(ring)
+            recorder = self._session if self._session is not None else ring
 
             if now >= next_sink_poll:
                 next_sink_poll = now + SINK_POLL_INTERVAL
@@ -661,6 +813,15 @@ class Telemetry:
             channel.log(payload, log_time=log_time)
             return
 
+        if key in RAW_DEPTH_CHANNELS:
+            frame_id = "oakd"
+            if isinstance(payload, tuple):
+                payload, frame_id = payload
+            message = self.depth_png(payload, log_time, frame_id)
+            if message is not None:
+                channel.log(message, log_time=log_time)
+            return
+
         data = self._encode_jpeg(payload, IMAGE_RENDER.get(key, GREY))
         if data is None:
             return
@@ -676,6 +837,36 @@ class Telemetry:
                 format="jpeg",
             ),
             log_time=log_time,
+        )
+
+    @staticmethod
+    def depth_png(frame, log_time, frame_id="oakd"):
+        """One depth frame as a lossless 16-bit PNG CompressedImage, or None.
+
+        uint16 in, uint16 out: no clip, no scale, no colourmap. Anything that
+        is not a 2-D uint16 frame is refused rather than squeezed into one.
+        """
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return None
+        if frame is None or frame.ndim != 2 or frame.dtype != np.uint16:
+            return None
+        ok, buf = cv2.imencode(".png", frame,
+                               [int(cv2.IMWRITE_PNG_COMPRESSION),
+                                DEPTH_PNG_LEVEL])
+        if not ok:
+            return None
+
+        from foxglove.messages import CompressedImage, Timestamp
+
+        return CompressedImage(
+            timestamp=Timestamp(sec=log_time // 1_000_000_000,
+                                nsec=log_time % 1_000_000_000),
+            frame_id=str(frame_id),
+            data=buf.tobytes(),
+            format="png",
         )
 
     def _encode_jpeg(self, frame, how):
@@ -749,13 +940,15 @@ class Telemetry:
         alternative is a lock the control thread has to take, and this file
         does not hand the control thread locks.
         """
-        recorder = self.recorder
+        session = self._session
+        recorder = session if session is not None else self.recorder
         if recorder is None:
             return {
                 "recording": False,
                 "recording_file": "",
                 "recording_mib": 0.0,
                 "recording_error": "",
+                "recording_session": False,
             }
         try:
             path = recorder.path or ""
@@ -764,6 +957,7 @@ class Telemetry:
                 "recording_file": os.path.basename(path) if path else "",
                 "recording_mib": round(recorder.bytes_written / 1048576.0, 1),
                 "recording_error": str(recorder.error or ""),
+                "recording_session": session is not None,
             }
         except Exception as e:
             return {
@@ -771,6 +965,7 @@ class Telemetry:
                 "recording_file": "",
                 "recording_mib": 0.0,
                 "recording_error": str(e),
+                "recording_session": False,
             }
 
     def _log(self, level, subject, message):
