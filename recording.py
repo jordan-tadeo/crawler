@@ -39,7 +39,8 @@ So the ring is at the file level instead. One segment per SEGMENT_BYTES, a
 new file when that fills, and the oldest files deleted when the directory
 goes over MAX_TOTAL_BYTES. That is a coarse ring buffer with no per-message
 work at all: the newest 8 GiB of driving is always on the card and nothing
-older can accumulate.
+older can accumulate. 8 GiB is 12.6 hours of auto driving at the rate
+measured below, or years of hand driving with the camera shut.
 
 What it costs, measured on the car
 ----------------------------------
@@ -125,36 +126,45 @@ DEFAULT_DIR = "log/mcap"
 SUFFIX = ".mcap"
 PREFIX = "crawler-"
 
-# The two rates everything below is sized off, both measured on the car over
-# 120 s at the real publish rates, read back out of the finished file:
+# The two rates everything below is sized off. Both measured by reading a
+# finished file back over its own span, and the first of them off a real run
+# -- 469 s with the camera up and the car actually being driven, which the
+# service recorded by itself while I was not looking:
 #
-#   camera up, all seven channels   71.0 KiB/s   250 MiB/hour
-#   camera shut, the three JSON     1.2 KiB/s      4 MiB/hour
+#   camera up, all seven channels   184.9 KiB/s   650 MiB/hour
+#   camera shut, the three JSON       1.2 KiB/s     4 MiB/hour
 #
-# The camera is 80% of that, and it is the part zstd cannot help with: the
-# payload is already JPEG. Whole-file compression came out at 0.69 of the raw
-# message bytes, which is the JSON half compressing well and the images not
-# at all. Per channel, raw: depth 32.1 KiB/s, disparity 29.3, rectified_left
-# 20.9, controller 12.5, vehicle 4.0, imu 3.3, diagnostics 1.1.
+# The camera is 90% of that and it is the part zstd cannot help with, the
+# payload being JPEG already -- whole-file compression came out at 0.87 of
+# the raw message bytes on the real run. Per channel: disparity 117.3 KiB/s,
+# depth 60.4, rectified_left 13.9, controller 12.2, vehicle 5.0, imu 3.2,
+# diagnostics 1.3.
+#
+# Do not size this off a bench run. A static scene on a desk measured 71
+# KiB/s, 2.6x low, and the whole gap is one channel: /camera/disparity went
+# from 5 098 bytes a frame to 17 053. Disparity gets a per-frame min/max
+# stretch, so a real driving scene is high-entropy noise and JPEGs three
+# times larger than a flat close-up of nothing. 650 MiB/hour is the number.
 #
 # Worth knowing which case is which. The service boots into manual with the
-# camera shut, so a boot-and-drive run is the 4 MiB/hour one. 250 MiB/hour is
+# camera shut, so a boot-and-drive run is the 4 MiB/hour one. 650 MiB/hour is
 # auto mode, or manual with --telemetry-camera.
 
-# Rotate a segment at this size. 128 MiB is about half an hour of auto
-# driving at the measured 250 MiB/hour, and a file that size is a reasonable
-# scp off the car over wifi. Small enough that pruning has somewhere useful
-# to cut, large enough that rotations are rare -- each one closes a zstd
-# writer, which flushes and writes a summary, and that is milliseconds on the
-# publisher thread.
+# Rotate a segment at this size. 128 MiB is about twelve minutes of auto
+# driving at the measured rate, and a file that size is a 20-second scp off
+# the car over wifi. Small enough that pruning has somewhere useful to cut
+# and that pulling one run is quick, large enough that rotations are rare --
+# each one closes a zstd writer, which flushes and writes a summary, and that
+# is milliseconds on the publisher thread.
 SEGMENT_BYTES = 128 * 1024 * 1024
 
 # What the whole directory is allowed to hold: 64 full segments. At the
-# measured camera-up rate that is about 33 hours of auto driving, and at the
+# measured camera-up rate that is 12.6 hours of auto driving, and at the
 # manual rate it is years. It is also 8% of the 99 GB free on this card,
 # which leaves the other 92% for everything that is not telemetry. I would
-# rather have 33 hours and a card I never think about than 400 hours and a
-# number I have to go and check.
+# rather have 12 hours and a card I never think about than 150 hours and a
+# number I have to go and check -- and if I ever want more, this is the one
+# line to change.
 MAX_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 
 # The filesystem floor. Under this much free on the volume log/ lives on,

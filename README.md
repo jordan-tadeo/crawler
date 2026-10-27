@@ -252,30 +252,39 @@ machine, and none of it on the thread that commands the throttle.
 
 #### What it costs on the card
 
-Measured, read back out of a finished file over its own 125 s span:
+Measured by reading a finished file back over its own span. The camera-up
+number is off a real 469 s run with the car being driven, which the service
+recorded by itself while I was not watching:
 
 | | bytes/s | per hour |
 | --- | --- | --- |
-| camera up, all seven channels | 71.0 KiB/s | **250 MiB** |
+| camera up, all seven channels | 184.9 KiB/s | **650 MiB** |
 | camera shut, the three JSON channels | 1.2 KiB/s | **4 MiB** |
 
-The camera is 80% of that and it is the part zstd cannot help with -- the
-payload is already JPEG. Whole-file compression came out at 0.69 of the raw
-message bytes, which is the JSON half compressing well and the images not at
-all. Per channel, raw: depth 32.1 KiB/s, disparity 29.3, rectified_left 20.9,
-controller 12.5, vehicle 4.0, imu 3.3, diagnostics 1.1.
+The camera is 90% of that and it is the part zstd cannot help with -- the
+payload is already JPEG. Whole-file compression came out at 0.87 of the raw
+message bytes, the JSON half compressing well and the images not at all. Per
+channel: disparity 117.3 KiB/s, depth 60.4, rectified_left 13.9, controller
+12.2, vehicle 5.0, imu 3.2, diagnostics 1.3.
+
+**Do not size this off a bench run.** A static scene on a desk measured 71
+KiB/s, which is 2.6x low, and the whole gap is one channel:
+`/camera/disparity` went from 5 098 bytes a frame to 17 053. It gets a
+min/max stretch, so a real driving scene is high-entropy noise and JPEGs
+three times larger than a flat close-up of nothing.
 
 A full SD card is a dead car, and worse than dead: a Pi that cannot write is
 a Pi whose filesystem corrupts, and the only thing that can take the ESC back
 to neutral is this process staying alive. So there are two brakes and they do
 not trust each other:
 
-- a new segment every **128 MiB** (about half an hour of auto driving), and
-  the oldest segments deleted once `log/mcap/` passes **8 GiB** -- 64
-  segments, about 33 hours of auto driving, 8% of this card. That is a ring
-  buffer at the file level, which is the only shape available: this SDK's
-  writer has no ring mode and building one would mean re-encoding every
-  message to drop the old ones.
+- a new segment every **128 MiB** (about twelve minutes of auto driving, a
+  20-second scp), and the oldest segments deleted once `log/mcap/` passes
+  **8 GiB** -- 64 segments, 12.6 hours of auto driving, 8% of this card.
+  That is a ring buffer at the file level, which is the only shape
+  available: this SDK's writer has no ring mode and building one would mean
+  re-encoding every message to drop the old ones. `MAX_TOTAL_BYTES` in
+  `recording.py` is the one line to change if I want more than 12 hours.
 - under **4 GiB free on the volume**, recording stops dead and says so once
   -- even if `log/mcap/` is well inside its own budget, because something
   else filling the card is not something pruning my own directory can fix.
@@ -304,6 +313,11 @@ detects that and rewrites the file with an index, which is the `mcap recover`
 operation done through the `mcap` Python library so there is no Go toolchain
 to install; `uv run --with mcap` builds the environment for it and leaves
 nothing behind. The original is kept as `.orig`.
+
+The newest file is normally one of the ones it repairs, and that is not the
+car crashing: it is the run happening right now, still open, with its index
+not written yet. Pulling it gives a snapshot up to the last flush, which is
+at most five seconds behind.
 
 ### Two things that have to be true on the car
 

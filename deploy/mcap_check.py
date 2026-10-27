@@ -140,10 +140,16 @@ def main(argv):
             report(path, schemas, channels, messages)
             continue
 
+        # Two innocent reasons for no index and one guilty one, and from
+        # here they are indistinguishable: the newest file is the run that is
+        # happening right now and is still open, and the one before it may be
+        # a run that ended with the battery out. Either way the fix is the
+        # same, so say both rather than accuse the car of crashing every
+        # time I pull the live run.
         broken += 1
-        print(f"  {os.path.basename(path)}  no index -- that run did not "
-              f"shut down cleanly" + (", and the tail is truncated"
-                                      if truncated else ""))
+        print(f"  {os.path.basename(path)}  no index -- either it is the run "
+              f"still being written, or that run did not shut down cleanly"
+              + (", and the tail is truncated" if truncated else ""))
         if not messages:
             print("    nothing recoverable in it, leaving it alone")
             continue
@@ -157,7 +163,9 @@ def main(argv):
         report(path, schemas, channels, messages)
 
     if broken:
-        print(f"\n{broken} file(s) needed repairing. Studio will open them now.")
+        print(f"\n{broken} file(s) needed an index writing. Studio will open "
+              f"them now. A snapshot of the run that is still going is "
+              f"normally one of them.")
     return 0
 
 
