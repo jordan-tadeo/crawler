@@ -535,7 +535,14 @@ class Driver:
         # they are not to be nudged from a desk.
         self.forward_speed = 0.2    # very slow forward motion
         self.reverse_speed = -0.6   # very slow backup
-        self.max_turn = 0.6         # limit to avoid servo damage when steering against an object
+        # Limit to avoid servo damage when steering against an object -- and
+        # it now bounds every steering angle auto commands, which is what that
+        # sentence always claimed and did not do. It used to be read only by
+        # begin_recover(); tick() drove the forward path straight off
+        # get_steering_bias(), which saturates at 1.0 with a wall down one
+        # side. Same 0.6 as it has always been, still a bench number, still
+        # not to be nudged from a desk.
+        self.max_turn = 0.6
         # Still my bench number, and still the same quantity: the smoothed
         # linear accel magnitude in m/s^2. What changed is that it is no longer
         # the only test. It is one of two OR'd terms now and the gyro is the one
@@ -911,7 +918,31 @@ class Driver:
             self.begin_recover(now)
             return
 
-        self.controller.set_steering(*steering_pair(self.get_steering_bias(depth)))
+        # max_turn, applied where it was always meant to be. Its comment says
+        # "limit to avoid servo damage when steering against an object" and
+        # until now that was a lie: the constant was referenced only by
+        # begin_recover(), so the forward path -- the one path that actually
+        # drives at a wall -- was unbounded. A wall down one side makes
+        # get_steering_bias() saturate at exactly 1.0000 (measured, on a frame
+        # with one side at 1500 mm and the other at 4000), and that commanded
+        # full lock while the car leaned on it. It did that to one servo
+        # before; it does it to two now, which is what made this worth fixing
+        # rather than noting.
+        #
+        # So: nothing new, no new number, my own bench constant finally
+        # governing every auto steering command -- forward through here,
+        # recovery through begin_recover()'s max_turn-derived magnitudes, which
+        # it already did. The rear is covered for free, because steering_pair()
+        # clamps the rear to the front's magnitude.
+        #
+        # np.clip and not max(-m, min(m, v)), which is not a style choice.
+        # min(0.6, nan) is 0.6, so the plain clamp turns a nan bias into a
+        # commanded hard turn -- and a nan is meant to reach set_steering() and
+        # be rejected into neutral there. np.clip propagates it. It is also the
+        # same idiom get_steering_bias() already ends on, which is untouched.
+        front = float(np.clip(self.get_steering_bias(depth),
+                              -self.max_turn, self.max_turn))
+        self.controller.set_steering(*steering_pair(front))
         self.controller.set_throttle(self.forward_speed)
         if self._throttle_since is None:
             self._throttle_since = now

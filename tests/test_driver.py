@@ -1058,9 +1058,10 @@ def test_the_rear_can_never_exceed_the_front(monkeypatch, ratio, front):
 
 @pytest.mark.parametrize("ratio", [1.0, 1.5, 100.0])
 def test_a_recover_never_commands_past_max_turn_on_either_axle(d, monkeypatch, ratio):
-    """The recover path is the one place the front is bounded by max_turn, so
-    it is the one place the bound can be checked end to end. The turn
-    direction is a random pick of four, so this asks for all of them."""
+    """The recover path picks its magnitudes off max_turn, so the bound can be
+    checked end to end here. The turn direction is a random pick of four, so
+    this asks for all of them. The forward path is bounded too now -- see
+    further down -- but it was not when this test was written."""
     monkeypatch.setattr(dv, "REAR_STEER_RATIO", ratio)
     for _ in range(50):
         d.begin_recover(100.0)
@@ -1081,3 +1082,123 @@ def test_a_nan_angle_is_left_for_the_one_place_that_writes_hardware():
     wired."""
     front, rear = dv.steering_pair(float("nan"))
     assert np.isnan(front) and np.isnan(rear)
+
+
+# --- max_turn bounds the forward path too -----------------------------------
+#
+# self.max_turn = 0.6 carries the comment "limit to avoid servo damage when
+# steering against an object", and until now that sentence was not true of the
+# path it describes. The constant was referenced in exactly one place,
+# begin_recover(), and tick() fed get_steering_bias() straight into
+# steering_pair(). Measured on a frame with one side at 1500 mm and the other
+# at 4000: the bias saturates at exactly 1.0000, so the car commanded full
+# lock on the front while it leaned against the wall. The four-wheel change
+# put a second servo under the same load, which is what turned a note into a
+# fix. The number 0.6 has not moved; what changed is that it now governs.
+
+
+def wall_on_one_side(near_mm=1500, far_mm=4000, left=True):
+    """A clear footprint with a wall down one side.
+
+    Both sides are well past CLEARANCE_MM, so obstacle_in_front() is False and
+    the forward path is the one that runs -- which is the point. This is the
+    exact scene the max_turn comment describes and the one that used to
+    saturate.
+    """
+    depth = np.full((400, 640), far_mm, dtype=np.uint16)
+    if left:
+        depth[:, :320] = near_mm
+    else:
+        depth[:, 320:] = near_mm
+    return depth
+
+
+def test_a_wall_down_one_side_saturates_the_bias(d):
+    """The premise, asserted rather than assumed. If this scene ever stops
+    saturating, the clamp below is being tested against nothing."""
+    depth = wall_on_one_side()
+    assert d.obstacle_in_front(depth) is False
+    assert d.get_steering_bias(depth) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("left,expected_front", [(True, 0.6), (False, -0.6)])
+def test_the_forward_path_never_commands_past_max_turn(d, left, expected_front):
+    """The fix. Saturated both ways, and the sign has to survive the clamp --
+    a bound that forgot which way to turn would steer into the wall."""
+    d.camera.depth = wall_on_one_side(left=left)
+    d.camera.imu = MOVING_IMU
+
+    d.tick(100.0)
+
+    front, rear = d.controller.steerings[-1]
+    assert front == pytest.approx(expected_front)
+    assert rear == pytest.approx(-expected_front)
+    assert abs(front) <= d.max_turn + 1e-12
+    assert abs(rear) <= d.max_turn + 1e-12
+
+
+def test_a_bias_inside_max_turn_is_passed_through_untouched(d):
+    """A bound, not a gain. Scaling every angle by max_turn would make the car
+    lazier at every bias instead of capping only the hard ones."""
+    depth = clear_depth()
+    depth[:, :320] = 2800
+    d.camera.depth = depth
+    d.camera.imu = MOVING_IMU
+    bias = d.get_steering_bias(depth)
+    assert 0 < bias < d.max_turn, "the scene has to ask for less than the cap"
+
+    d.tick(100.0)
+
+    front, _ = d.controller.steerings[-1]
+    assert front == pytest.approx(bias)
+
+
+def test_the_bound_is_the_constant_and_not_a_literal(d):
+    """max_turn is the knob. Turning it has to move the forward path, or 0.6
+    has been copied into tick() and there are two limits again."""
+    d.max_turn = 0.25
+    d.camera.depth = wall_on_one_side()
+    d.camera.imu = MOVING_IMU
+
+    d.tick(100.0)
+
+    front, rear = d.controller.steerings[-1]
+    assert front == pytest.approx(0.25)
+    assert rear == pytest.approx(-0.25)
+
+
+def test_the_clamp_does_not_turn_a_nan_into_a_hard_turn(d, monkeypatch):
+    """The trap worth a test of its own. min(0.6, nan) is 0.6, so a plain
+    max/min clamp converts an unmeasurable bias into a commanded full
+    deflection -- the exact opposite of a safety limit, and the same shape as
+    the bug that once made a nan throttle read as full forward. A nan has to
+    reach set_steering(), which is the one place that writes hardware and the
+    one place that rejects it into neutral on both channels."""
+    monkeypatch.setattr(dv.Driver, "get_steering_bias",
+                        lambda self, depth: float("nan"))
+    d.camera.depth = clear_depth()
+    d.camera.imu = MOVING_IMU
+
+    d.tick(100.0)
+
+    front, rear = d.controller.steerings[-1]
+    assert np.isnan(front), "a clamp must not invent an angle out of a nan"
+    assert np.isnan(rear)
+
+
+def test_max_turn_bounds_every_auto_steering_command(d):
+    """Both auto paths, end to end, which is the claim the comment on the
+    constant now makes. Forward through tick(), recovery through
+    begin_recover()'s max_turn-derived magnitudes -- which were already
+    bounded, and are asserted here so that "already" is on the record."""
+    d.camera.depth = wall_on_one_side()
+    d.camera.imu = MOVING_IMU
+    d.tick(100.0)
+
+    for _ in range(50):
+        d.begin_recover(100.0)
+
+    assert d.controller.steerings
+    for front, rear in d.controller.steerings:
+        assert abs(front) <= d.max_turn + 1e-12
+        assert abs(rear) <= d.max_turn + 1e-12
