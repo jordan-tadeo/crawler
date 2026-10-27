@@ -8,6 +8,9 @@ Two drive modes:
 
 Press START on the controller to switch between them without restarting.
 
+A marks the moment as a good call and B marks it as a bad one, in either mode.
+That is for the review loop and not for driving: see marks.py.
+
 One thread owns the ESC and the servos. Auto mode is not a thread of its own,
 it is a step() call on this loop, so a mode switch can never leave two owners
 writing opposing commands to the same hardware.
@@ -39,6 +42,9 @@ AUTO = "auto"
 # Button that flips between the two modes. START and BACK are the two buttons
 # that cannot be hit by accident while driving.
 MODE_TOGGLE_BUTTON = "START"
+
+# A and B are the two mark buttons. Which is which, and everything about what
+# a mark is, lives in marks.py -- this file only polls it.
 
 LOOP_INTERVAL = 0.01
 AUTO_TICK_INTERVAL = 0.1
@@ -261,7 +267,8 @@ def drive_manual(joystick, vecon, log):
         return 0.0, 0.0, 0.0
 
 
-def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
+def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
+                 markpad=None):
     """Poll the controller and drive whichever mode is current.
 
     Only one mode ever has the wheels: auto runs as a step() on this thread
@@ -274,10 +281,17 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
     whether Foxglove is installed, running or being watched.
     """
     import pygame
+    import marks as mk
     import telemetry as tm
 
     if tele is None:
         tele = tm.Telemetry()  # never started, so every call below is a no-op
+
+    # `markpad` is a marks.MarkPad -- the two mark buttons. Same deal as tele:
+    # one built here is harmless, because a MarkPad that never sees a press
+    # opens no file and starts no thread.
+    if markpad is None:
+        markpad = mk.MarkPad(logger=log, tele=tele)
 
     vehicle_state = None
     state_read_at = 0.0
@@ -324,6 +338,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
                         "loop_hz": 0.0,
                         "loop_tick_max_ms": tick_max_ms,
                         **tele.recording_status(),
+                        **markpad.counts(),
                     }, now)
                 # Interruptible, so a systemctl stop does not sit here until
                 # TimeoutStopSec runs out and systemd SIGKILLs us past
@@ -352,6 +367,15 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
                 vecon.return_neutral()
                 last_error = "auto gave up"
                 log.log("warning", "Mode", "Auto gave up, dropping to manual")
+
+            # After driving, not before: the snapshot a mark carries is meant
+            # to say what the car was being commanded at the moment I pressed
+            # the button, and before the drive call that would be last tick's.
+            # poll() cannot raise, does no file I/O and takes no lock anything
+            # else wants -- see marks.py, which is written around the fact that
+            # a mark is never worth a tick of this loop.
+            markpad.poll(joystick, now, modes.mode, vecon,
+                         autopilot.driver, autopilot)
 
             # Telemetry. Every one of these is the same shape: ask whether
             # anybody is watching the channel and whether its rate gate has
@@ -410,6 +434,9 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
                     # check from Studio that the run I am watching is also
                     # being written down, instead of sshing in to look.
                     **tele.recording_status(),
+                    # Two ints off the MarkPad. Same idea: the receipt that the
+                    # button I just pressed did something.
+                    **markpad.counts(),
                 }, now)
                 tick_max_ms = 0.0
                 tick_count = 0
@@ -447,6 +474,10 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None):
         print("\n[Shutdown] Stopping ESC and Servos...")
         autopilot.stop()
         vecon.close()
+        # Last, and after the wheels are dealt with: the mark writer may have
+        # a row still in hand, and it is the only thing in this process that
+        # SIGTERM could cost me.
+        markpad.stop()
 
 
 def parse_args(argv=None):
@@ -627,6 +658,12 @@ def main(argv=None):
             log.log("warning", "Camera",
                     f"Camera did not come up: {hub.error or hub.state}")
 
+    # The two mark buttons. Built before the joystick for the same reason
+    # telemetry is: it costs nothing to exist, and a press has to be able to
+    # land the instant there is a pad to press.
+    import marks as mk
+    markpad = mk.MarkPad(logger=log, tele=tele)
+
     joystick = js.Joystick(stop_event=stop_event)
 
     if modes.mode == AUTO and not autopilot.resume():
@@ -637,7 +674,8 @@ def main(argv=None):
 
     if not args.dashboard:
         try:
-            control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele)
+            control_loop(joystick, vecon, autopilot, modes, log, stop_event,
+                         tele, markpad)
         finally:
             # After control_loop's own finally, which is what disarms the ESC.
             # The camera and the telemetry server go last because they are the
@@ -661,7 +699,8 @@ def main(argv=None):
     # other's rate. One reader in camera.CameraHub, one slot each, no race.
     worker = threading.Thread(
         target=control_loop,
-        args=(joystick, vecon, autopilot, modes, log, stop_event, tele),
+        args=(joystick, vecon, autopilot, modes, log, stop_event, tele,
+              markpad),
         daemon=True,
     )
     worker.start()

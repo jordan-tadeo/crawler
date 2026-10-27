@@ -1,7 +1,9 @@
 # crawler
 
 RC rock crawler control for a Raspberry Pi 4. It boots into hand driving off a
-Bluetooth pad; START hands the car to the OAK-D for auto mode.
+Bluetooth pad; START hands the car to the OAK-D for auto mode. A and B mark
+the moment, good and bad, so a run can be read back afterwards instead of
+remembered.
 
 The car is a Pi 4 on Raspberry Pi OS Bookworm 64-bit, aarch64, Python 3.11.2.
 That is the only machine this actually drives on. A laptop checkout is for
@@ -144,14 +146,15 @@ ws://192.168.68.56:8765
 On a Mac that is `brew install --cask foxglove`, and then `open -a Foxglove`
 -- the cask installs an app, not a command.
 
-Seven channels. The four JSON ones carry a named schema so Studio labels them:
+Eight channels. The five JSON ones carry a named schema so Studio labels them:
 
 | topic | schema | rate | what it is |
 | --- | --- | --- | --- |
 | `/controller` | `crawler.Controller` | 20 Hz | every axis and button by raw SDL index, the named view through `Joystick`'s own maps, the calibrated trigger rest, and the throttle and steering the code derived |
 | `/vehicle` | `crawler.Vehicle` | 20 Hz | mode, commanded throttle and steering, the ESC pulse width that was written, and the pigpio read-back with its age |
-| `/diagnostics` | `crawler.Diagnostics` | 4 Hz | mode, pad connected, auto available, camera state and error, last error, loop rate and worst tick, and whether this run is being recorded -- which file, how big, and why not if not |
+| `/diagnostics` | `crawler.Diagnostics` | 4 Hz | mode, pad connected, auto available, camera state and error, last error, loop rate and worst tick, whether this run is being recorded -- which file, how big, and why not if not -- and how many moments I have marked good and bad so far |
 | `/imu` | `crawler.Imu` | 20 Hz | the OAK-D's accelerometer and gyro, downsampled from 100 Hz |
+| `/marks` | `crawler.Mark` | on a press | one message per press of A or B, carrying the window it stands for and a snapshot of what the car was doing and seeing |
 | `/camera/depth` | `foxglove.CompressedImage` | 8 Hz | depth, colourmapped over a fixed 300-3000 mm window |
 | `/camera/disparity` | `foxglove.CompressedImage` | 8 Hz | disparity, per-frame stretch |
 | `/camera/rectified_left` | `foxglove.CompressedImage` | 2 Hz | the actual mono picture |
@@ -207,9 +210,47 @@ Then `open -a Foxglove` and drag a file from `recordings/` onto the window.
 file**. The same panels work on a file as on the socket.
 
 `pull-recordings.sh` also says what is in each file -- per topic, the message
-count, the rate and the schema -- which answers "did that run record what I
-think it did" without opening anything. A run with no `/camera/depth` in it
-was a run with the camera shut, not a bug.
+count, the rate and the schema, plus how many moments I marked -- which
+answers "did that run record what I think it did" without opening anything. A
+run with no `/camera/depth` in it was a run with the camera shut, not a bug.
+
+### Marking a moment
+
+While I am driving, in either mode: **A** means the car just made the right
+call and **B** means it got it wrong. The pad buzzes once for A and twice for
+B, so I know it took without looking at anything. Holding the button is one
+mark, not a stream of them.
+
+A mark is a *window*, not an instant, and that is the part worth
+understanding. I press the button after I have seen the behaviour and judged
+it, so the decision I am marking happened before the press -- and a full
+recovery is 2.0 s of reverse plus 0.5 s of settle. So each mark carries
+4 seconds of look-back and 1 second of lead, which reaches past the whole
+recovery and into the approach that caused it.
+
+Each mark lands in three places: the MCAP on `/marks`, which is the record; a
+line in the journal, so `journalctl -u crawler | grep Mark` finds it with no
+tooling at all; and a row in `log/marks.csv`, which is append-only across
+runs and which I can `cat` on the car.
+
+```sh
+# on the laptop, after ./pull-recordings.sh
+uv run --with mcap python deploy/mcap_check.py --marks recordings
+uv run --with mcap python deploy/mcap_check.py --window 2 recordings/<file>.mcap
+```
+
+`--marks` lists every mark with its wall-clock time, its offset into the run
+and the snapshot taken at the press: the mode, the commanded throttle and
+steering, the footprint scan and its block reason, the recover phase, and what
+the IMU was saying. `--window N` dumps every message on every channel inside
+that mark's window, which is what the algorithm actually saw.
+
+Nothing about this is allowed to cost a tick. The button poll cannot raise, it
+does no file I/O, and the CSV row and the journal line go out on a writer
+thread of their own -- so a card that stalls mid-write costs me a line in a
+file, never the control loop. The rumble call is timed, and if one ever comes
+back slow, rumble switches itself off for the rest of the run and says so
+once.
 
 ```sh
 ./run.sh --no-record                 # drive, do not write it down

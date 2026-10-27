@@ -94,6 +94,11 @@ INTERVALS = {
     "controller": 0.05,   # 20 Hz -- fast enough to watch a trigger move
     "vehicle": 0.05,      # 20 Hz -- commanded values only, see below
     "diagnostics": 0.25,  # 4 Hz, and it only changes on an event anyway
+    # Not a rate at all. /marks is an event channel -- the control loop offers
+    # a mark the tick the button goes down and never calls wants() on it -- so
+    # a gate here could only ever lose me a press. Zero so that if something
+    # does start asking wants("marks"), the answer is always yes.
+    "marks": 0.0,
     "imu": 0.05,          # 20 Hz, downsampled from the sensor's 100 Hz
     "depth": 0.125,       # 8 Hz
     "disparity": 0.125,   # 8 Hz
@@ -218,6 +223,12 @@ JSON_SCHEMAS = {
         "recording_file": _STR,
         "recording_mib": _NUM,
         "recording_error": _STR,
+        # How many moments I have marked in this run, by button. Live in
+        # Studio this is the receipt that the button is working at all --
+        # pressing A and watching the count tick is a check I can do without
+        # taking my eyes somewhere useless.
+        "marks_good": _INT,
+        "marks_bad": _INT,
     }),
     "imu": _schema("crawler.Imu", {
         # Straight off the OAK-D's BNO086: linear acceleration in m/s^2 and
@@ -229,6 +240,48 @@ JSON_SCHEMAS = {
         "accel_x": _NUM, "accel_y": _NUM, "accel_z": _NUM,
         "gyro_x": _NUM, "gyro_y": _NUM, "gyro_z": _NUM,
         "accel_magnitude": _NUM,
+    }),
+    # One message per press of a mark button. See marks.py for what a mark is
+    # and why it is a window rather than an instant; everything in here is a
+    # snapshot taken at the press, guarded field by field, so a mark made in
+    # manual mode with no camera up is still a complete message -- it just has
+    # nothing to say about the footprint.
+    "marks": _schema("crawler.Mark", {
+        "kind": _STR,            # "good" or "bad"
+        "button": _STR,          # "A" or "B"
+        "sequence": _INT,        # nth mark of this run, both kinds together
+        "good_count": _INT,
+        "bad_count": _INT,
+        "utc": _STR,
+        # Monotonic, and the two window bounds in the same clock. The window
+        # is the substantive part: I press the button after I have seen the
+        # behaviour and judged it, so the decision worth reading happened
+        # before the press.
+        "mono_s": _NUM,
+        "window_start_s": _NUM,
+        "window_end_s": _NUM,
+        "lookback_s": _NUM,
+        "lead_s": _NUM,
+        "mode": _STR,
+        "throttle": _NUM,
+        "steering_front": _NUM,
+        "steering_rear": _NUM,
+        "esc_pulse_us": _INT,
+        # What auto mode was thinking, where there was an auto mode to ask.
+        # -1 in any distance means the probe had nothing measurable to say,
+        # which is inf in driver.py and not a number JSON will carry.
+        "block_reason": _STR,
+        "near_distance_mm": _NUM,
+        "probe_distance_mm": {"type": "array", "items": _NUM},
+        "probe_blocked": {"type": "array", "items": _BOOL},
+        "scan_blocked": _BOOL,
+        "scan_ms": _NUM,
+        "recovery_phase": _STR,
+        "recovery_remaining_s": _NUM,
+        "motion_evidence": _STR,
+        "gyro_mean": _NUM,
+        "accel_mean": _NUM,
+        "camera_state": _STR,
     }),
 }
 
@@ -269,6 +322,7 @@ JSON_TOPICS = {
     "vehicle": "/vehicle",
     "diagnostics": "/diagnostics",
     "imu": "/imu",
+    "marks": "/marks",
 }
 
 ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)

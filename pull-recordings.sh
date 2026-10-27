@@ -15,6 +15,11 @@
 # Then: open -a Foxglove, and drag the file in. Open connection is for live;
 # a file is File -> Open local file, or just a drag onto the window.
 #
+# Or read the marks instead of looking at it. Every file's summary below says
+# how many moments I marked with A and B while driving, and
+# `deploy/mcap_check.py --marks` lists them with the snapshot taken at each
+# press. --window N on one of them dumps everything the car saw around it.
+#
 # Why there is a repair step at all. Only close() writes an MCAP's summary and
 # message index, and a run that ends with the battery out never reaches
 # close(). Measured: every message survives and streams back fine with its
@@ -38,7 +43,7 @@ while [[ $# -gt 0 ]]; do
     --all)      COUNT=0; shift ;;
     --list)     LIST_ONLY=1; shift ;;
     -o|--out)   OUT="$2"; shift 2 ;;
-    -h|--help)  sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -94,3 +99,8 @@ uv run --quiet --with mcap python "$REPO_DIR/deploy/mcap_check.py" "$OUT"
 
 echo
 echo "Open one: open -a Foxglove   then drag a file from $OUT onto the window."
+# The summary above already says how many marks each file has. This is the
+# command that turns that count into something I can act on, which is the only
+# reason the mark buttons are worth having.
+echo "Read the marks: uv run --with mcap python deploy/mcap_check.py --marks $OUT"
+echo "Then one of them: ... --window N <file>"

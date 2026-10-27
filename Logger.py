@@ -37,6 +37,18 @@ def _prepare(path):
     return path
 
 
+def log_path(path):
+    '''The public name for _prepare, for the other files that write under log/.
+
+    marks.py keeps its own append-only CSV rather than going through
+    Logger.csv, because that one rotates and a mark file wants every row it
+    has ever had. It still needs the same two things resolved the same way:
+    anchored to this checkout, with the folder made if it is missing. One copy
+    of that rule, here, where the reasons for it are written down.
+    '''
+    return _prepare(path)
+
+
 class Logger:
     def __init__(self, log_file="app.log", max_size=10 * 1024 * 1024, backup_count=1):
         log_file = _prepare(log_file)
