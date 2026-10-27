@@ -194,6 +194,12 @@ JSON_SCHEMAS = {
     }),
     "vehicle": _schema("crawler.Vehicle", {
         "mode": _STR,
+        # "unified" or "split": whether the left stick is driving both axles
+        # counter-phase or the two sticks own one axle each. Here and not on
+        # /controller because it changes what the two steering numbers below
+        # mean, and a rear angle that looks wrong is the first place I will
+        # check which mapping was in force. Auto always steers unified.
+        "steering_mode": _STR,
         "throttle": _NUM,
         "steering_front": _NUM,
         "steering_rear": _NUM,

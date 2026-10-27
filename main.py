@@ -8,6 +8,13 @@ Two drive modes:
 
 Press START on the controller to switch between them without restarting.
 
+In manual the left stick steers both axles counter-phase, through the same
+driver.steering_pair() every auto steering decision goes through -- one
+definition of how this car steers, not one per mode. Click the left stick (L3)
+to split the axles across the two sticks instead, each independent, which is
+the escape hatch for a crab walk or for posing the car on an obstacle. It is a
+toggle, not a hold, and it survives a lap in auto.
+
 A marks the moment as a good call and B marks it as a bad one, in either mode.
 That is for the review loop and not for driving: see marks.py.
 
@@ -18,6 +25,13 @@ writing opposing commands to the same hardware.
 The heavy imports (depthai, PyQt5) are deferred on purpose: manual driving is
 the mode that has to come up on a headless boot, and it must not depend on
 the vision stack being installed or the camera being plugged in.
+
+`driver` is imported up here rather than deferred, which is a change: manual
+steering now calls driver.steering_pair(), so the module has to be here before
+the first tick. driver imports numpy and nothing else -- no depthai, no device
+-- and numpy costs 246 ms once on the car's own interpreter, measured, against
+a boot that already waits on pigpiod. A missing numpy is then a loud failure at
+startup instead of a per-tick exception that quietly held the wheels straight.
 
 The thing to keep in mind everywhere below: pigpio latches a servo pulse
 width and emits it forever. There is no hardware failsafe on this car and no
@@ -34,6 +48,7 @@ import threading
 import time
 
 import camera
+import driver as dv
 import Logger as lg
 
 MANUAL = "manual"
@@ -42,6 +57,27 @@ AUTO = "auto"
 # Button that flips between the two modes. START and BACK are the two buttons
 # that cannot be hit by accident while driving.
 MODE_TOGGLE_BUTTON = "START"
+
+# How the two sticks map onto the two steering axles.
+#
+#   unified  the left stick alone, both axles, counter-phase, through
+#            driver.steering_pair(). The default, and the same arithmetic auto
+#            drives on -- a hallway corner needs a radius the front axle alone
+#            does not have, and that is as true with my hand on the stick as
+#            it is under the camera.
+#   split    left stick front, right stick rear, each independent and no ratio
+#            applied. Crab walking and odd poses, which is exactly the thing a
+#            ratio would take away.
+UNIFIED = "unified"
+SPLIT = "split"
+
+# L3, the left stick click. Nothing else on the pad reads it.
+#
+# A toggle rather than a hold, on purpose: pressing down on the same stick I am
+# trying to deflect precisely is awkward, and split is a mode I go into
+# deliberately and stay in while I position the car, not something I dab at for
+# half a second.
+STEER_SPLIT_BUTTON = "LS"
 
 # A and B are the two mark buttons. Which is which, and everything about what
 # a mark is, lives in marks.py -- this file only polls it.
@@ -55,33 +91,96 @@ STEERING_LIMIT_PERC = 70
 STATE_POLL_INTERVAL = 1.0
 
 
+class ButtonEdge:
+    """One pad button, reported once per press.
+
+    START's mode toggle and L3's steering toggle want the identical thing --
+    the press edge, a hold that does not retrigger, and a read that cannot
+    raise -- so it is written once here instead of twice below. marks.py keeps
+    its own because a mark carries a snapshot and a rumble with it and shares
+    nothing else with this.
+
+    Never raises. No pad attached yet, or a stale handle after one re-pairs at
+    a different SDL index, reads as "not pressed" and forgets whatever it
+    thought the button was doing. That second part matters: the first read
+    after the pad comes back is an edge again rather than a phantom hold, and
+    nothing downstream of here can be left half-applied by a pad fault,
+    because nothing downstream of here has been told anything yet.
+    """
+
+    def __init__(self, button):
+        self.button = button
+        self._was_down = False
+
+    def pressed(self, joystick) -> bool:
+        try:
+            down = bool(joystick.get_button(self.button))
+        except Exception:
+            self._was_down = False
+            return False
+
+        edge = down and not self._was_down
+        self._was_down = down
+        return edge
+
+
 class ModeSwitch:
     """The current drive mode, plus edge detection for the toggle button."""
 
     def __init__(self, mode, logger):
         self.mode = mode
         self.logger = logger
-        self._toggle_was_down = False
+        self._toggle = ButtonEdge(MODE_TOGGLE_BUTTON)
 
     def poll(self, joystick):
         """Flip the mode on a press of the toggle button. Returns True on flip.
 
         A hold must not retrigger, so the press edge is what counts.
         """
-        try:
-            down = bool(joystick.get_button(MODE_TOGGLE_BUTTON))
-        except Exception:
-            # No controller attached yet, or a stale handle after a dropout.
-            self._toggle_was_down = False
+        if not self._toggle.pressed(joystick):
             return False
 
-        pressed = down and not self._toggle_was_down
-        self._toggle_was_down = down
+        self.mode = AUTO if self.mode == MANUAL else MANUAL
+        self.logger.log("info", "Mode", f"Switched to {self.mode}")
+        return True
 
-        if pressed:
-            self.mode = AUTO if self.mode == MANUAL else MANUAL
-            self.logger.log("info", "Mode", f"Switched to {self.mode}")
-        return pressed
+
+class SteerMode:
+    """Which sticks drive which axles, plus edge detection for L3.
+
+    Its own object and not a field on ModeSwitch, because it outlives a mode
+    switch: a lap in auto and back does not forget which way I left the sticks.
+    It lives as long as the control loop does, which is as long as the process.
+    Starting state is unified, the new default.
+
+    No rumble on the flip. A mark already buzzes once for a good call and twice
+    for a bad one, and a third meaning on the same motor would muddy a signal I
+    have only just started trusting. The journal line here and the
+    steering_mode field on /vehicle are the receipt instead.
+    """
+
+    def __init__(self, logger, split=False):
+        self.split = split
+        self.logger = logger
+        self._toggle = ButtonEdge(STEER_SPLIT_BUTTON)
+
+    @property
+    def name(self) -> str:
+        return SPLIT if self.split else UNIFIED
+
+    def poll(self, joystick) -> bool:
+        """Flip unified/split on a press of L3. Returns True on flip.
+
+        Cannot raise -- see ButtonEdge -- so it can be called before the drive
+        call rather than inside it, and a pad fault can never leave the pair of
+        axles half-reassigned.
+        """
+        if not self._toggle.pressed(joystick):
+            return False
+
+        self.split = not self.split
+        self.logger.log("info", "Steering", f"Steering is {self.name}")
+        return True
 
 
 class AutoPilot:
@@ -227,29 +326,52 @@ class AutoPilot:
         return self.hub.error or ""
 
 
-def read_pad_intent(joystick):
+def read_pad_intent(joystick, split=False):
     """What the pad is asking for: (throttle, steering front, steering rear).
 
     Reads only. Pulled out of drive_manual so telemetry can report what the
     sticks are saying while auto has the wheels, without there being a second
     copy of the three readings that could drift away from the ones that
     actually drive the car.
+
+    Unified -- `split` false, the default -- is the left stick alone, handed to
+    driver.steering_pair(). That is deliberately the same function every auto
+    steering decision goes through, called and not copied: whether this car
+    steers counter-phase or crabs is decided in one place, and nobody has yet
+    put the wheels off the ground and confirmed which one (f, -f) actually is
+    on this linkage. If it comes back mirrored, REAR_STEER_RATIO's sign is the
+    single thing that changes and my hand on the stick inherits the fix with
+    nothing in this file moving.
+
+    Split reads the right stick for the rear and applies no ratio at all. A
+    pose is the whole point of it and a ratio is exactly what would take the
+    pose away, so it does not go through steering_pair and must not.
     """
-    return (
-        joystick.read_throttle(),
-        joystick.get_axis("LEFT_X", limit_perc=STEERING_LIMIT_PERC),
-        joystick.get_axis("RIGHT_X", limit_perc=STEERING_LIMIT_PERC),
-    )
+    throttle = joystick.read_throttle()
+    left = joystick.get_axis("LEFT_X", limit_perc=STEERING_LIMIT_PERC)
+    if split:
+        return (throttle, left,
+                joystick.get_axis("RIGHT_X", limit_perc=STEERING_LIMIT_PERC))
+    return (throttle,) + dv.steering_pair(left)
 
 
-def drive_manual(joystick, vecon, log):
+def drive_manual(joystick, vecon, log, split=False):
     """One tick of hand driving. Anything that goes wrong in here means neutral.
 
     Returns what it commanded, so the caller does not have to read the pad a
     second time to report it.
+
+    `split` is passed in already read, never polled in here. The toggle is a
+    button read and a button read off a stale handle raises -- inside this try
+    it would be swallowed into "dropped a tick", which would turn an awkward
+    thumb press into a silent neutral. It is also why the pair of axles can
+    never be half-reassigned: by the time anything is commanded, which mapping
+    is in force has already been settled and both numbers go to the hardware in
+    the one set_steering call.
     """
     try:
-        throttle, steering_front, steering_rear = read_pad_intent(joystick)
+        throttle, steering_front, steering_rear = read_pad_intent(joystick,
+                                                                  split)
 
         vecon.set_throttle(throttle)
         vecon.set_steering(steering_front, steering_rear)
@@ -268,7 +390,7 @@ def drive_manual(joystick, vecon, log):
 
 
 def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
-                 markpad=None):
+                 markpad=None, steer=None):
     """Poll the controller and drive whichever mode is current.
 
     Only one mode ever has the wheels: auto runs as a step() on this thread
@@ -292,6 +414,12 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     # opens no file and starts no thread.
     if markpad is None:
         markpad = mk.MarkPad(logger=log, tele=tele)
+
+    # Unified/split. Built here and not in main() because this loop is the only
+    # thing that reads it and the loop runs once for the life of the process,
+    # which is exactly how long the toggle is meant to hold its state.
+    if steer is None:
+        steer = SteerMode(log)
 
     vehicle_state = None
     state_read_at = 0.0
@@ -360,8 +488,21 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 else:
                     autopilot.pause()
 
+            # Polled in both modes and deliberately not folded into the mode
+            # switch above: which way the sticks are mapped is not a property
+            # of the mode, so a lap in auto leaves it exactly where I left it,
+            # and pressing L3 while auto has the wheels sets up the mapping I
+            # want waiting for me when I take them back.
+            #
+            # No return_neutral() on a flip, unlike a mode switch. Nobody is
+            # changing hands here -- the next tick is 10 ms away and commands
+            # the new mapping off the sticks as they are actually sitting, and
+            # a neutral in between would be a jolt in the steering for no
+            # reason. The throttle is not touched at all.
+            steer.poll(joystick)
+
             if modes.mode == MANUAL:
-                drive_manual(joystick, vecon, log)
+                drive_manual(joystick, vecon, log, steer.split)
             elif not autopilot.step(now):
                 modes.mode = MANUAL
                 vecon.return_neutral()
@@ -392,7 +533,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 # and the sticks are still worth seeing. Three cached SDL
                 # reads off the event pump that already happened; no syscall.
                 try:
-                    intent = read_pad_intent(joystick)
+                    intent = read_pad_intent(joystick, steer.split)
                 except Exception:
                     intent = (0.0, 0.0, 0.0)
                 tele.offer("controller",
@@ -402,6 +543,12 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 readback_age = now - state_read_at if state_read_at else -1.0
                 tele.offer("vehicle", {
                     "mode": modes.mode,
+                    # Unified or split. On /vehicle rather than /controller
+                    # because it is a property of how the car is being
+                    # commanded, not of what the pad reads -- and next to
+                    # steering_front/steering_rear, which is where I will be
+                    # looking when the rear number is not what I expected.
+                    "steering_mode": steer.name,
                     # What the last command asked for, recorded by
                     # VehicleController as it wrote it. Free; no bus traffic.
                     "throttle": float(vecon.last_throttle or 0.0),
