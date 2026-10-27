@@ -111,6 +111,21 @@ LOOP_INTERVAL = 0.01
 AUTO_TICK_INTERVAL = 0.1
 STEERING_LIMIT_PERC = 70
 
+# The steering sticks' deadzone, in raw axis units, before STEERING_LIMIT_PERC.
+# A let-go LEFT_X settles anywhere from 0.02 to 0.07 and stays there (p99
+# 0.094, max 0.106 over 44 rests; RIGHT_X up to 0.064), so without one the car
+# steers a little every time I let go of the stick, and every "straight" row a
+# record session writes is labelled a few percent off straight. 0.12 is the
+# number the takeover already uses for "let go" -- see STICK_RELEASE -- so the
+# stick means the same thing to manual, record and takeover. Outside it the
+# travel is rescaled, so full deflection is still full lock: see stick_steer().
+STICK_DEADZONE = 0.12
+
+# How long the pad can go without proving it is there before a record session
+# is called off. Not "the sticks did not move": a pad sitting still on the
+# table reads the same numbers for minutes on end, which is a working pad.
+PAD_SILENCE_SECONDS = 5.0
+
 # How often the loop is allowed to read and log the vehicle state. See the
 # comment at the call site -- this is not cosmetic.
 STATE_POLL_INTERVAL = 1.0
@@ -396,7 +411,14 @@ class RecordSession:
                       f"into the session (open took "
                       f"{hub.open_seconds:.1f} s)")
 
-    def end(self, now, keep_camera=False, why="") -> None:
+    def end(self, now, keep_camera=False, why="", alarm_pad=None) -> None:
+        """Close the file, and the camera if this session opened it.
+
+        `alarm_pad` is the Joystick when the session is ending because the pad
+        went: then it is the one long pulse, which the pad may well not be
+        there to feel, instead of the ordinary one-buzz exit. See
+        marks.MarkPad.alarm.
+        """
         if not self.active:
             return
         self.active = False
@@ -410,7 +432,13 @@ class RecordSession:
             except Exception:
                 pass
         self._opened_camera = False
-        self._buzz(1, now)
+        if alarm_pad is None:
+            self._buzz(1, now)
+        elif self.markpad is not None:
+            try:
+                self.markpad.alarm(alarm_pad, now)
+            except Exception:
+                pass
         self._say("info", f"Stopped recording after "
                   f"{now - self.started_at:.0f} s" + (f": {why}" if why else ""))
 
@@ -502,9 +530,10 @@ class SteerMode:
 DRIVER = "driver"
 PAD = "pad"
 
-# The sticks have no deadzone anywhere else in this file -- manual passes the
-# axis straight through -- so these two are new, and they are off a recording
-# rather than a guess. Measured on 2026-10-27 over every /controller sample in
+# Both are on the raw axis, read alongside the intent and never worked back out
+# of it, so STICK_DEADZONE -- which is the same 0.12 as STICK_RELEASE, applied
+# to what the sticks command -- does not move either one. They are off a
+# recording rather than a guess. Measured on 2026-10-27 over every /controller sample in
 # nine of the car's MCAPs (103,517 samples, the pad under xpadneo), taking the
 # stretches where a stick sat within 0.01 of itself for a second or more (44
 # on LEFT_X, 60 on RIGHT_X):
@@ -670,21 +699,23 @@ class Takeover:
         """Read the pad and update both groups. False on a pad fault."""
         self.released = ()
         try:
-            intent = tuple(float(v) for v in read_pad_intent(joystick, split))
+            intent, raw = read_pad(joystick, split)
+            intent = tuple(float(v) for v in intent)
+            sticks = tuple(float(v) for v in raw if v is not None)
         except Exception as e:
             self.drop(f"pad read failed: {e}")
             return False
-        if not _finite(*intent):
+        if not _finite(*intent, *sticks):
             self.drop("the pad read a nan")
             return False
         self.intent = intent
 
-        # In raw axis units, so the thresholds above are the recording's own
-        # numbers. Unified reads LEFT_X alone; intent[2] is then the rear the
-        # pair derived from it, not a stick, and is not looked at.
-        scale = STEERING_LIMIT_PERC / 100
-        sticks = intent[1:] if split else intent[1:2]
-        deflection = max(abs(v) for v in sticks) / scale
+        # The raw axes, read once alongside the intent and never worked back
+        # out of it: the intent has been through STICK_DEADZONE, and dividing
+        # a rescaled number by the steering limit is no longer the stick. So
+        # the thresholds above stay the recording's own numbers, untouched by
+        # the deadzone. Unified reads LEFT_X alone.
+        deflection = max(abs(v) for v in sticks)
 
         # read_throttle() already applies TRIGGER_DEADZONE and reads 0.0
         # inside it. The triggers rest at exactly -1.0 (98.5% of every
@@ -975,6 +1006,46 @@ class AutoPilot:
         return self.hub.error or ""
 
 
+def stick_steer(raw):
+    """One raw steering axis as the angle it commands, before steering_pair.
+
+    Zero inside STICK_DEADZONE, then linear from the edge of it to full
+    deflection, so 0.12 commands 0 and 1.0 still commands the whole of
+    STEERING_LIMIT_PERC -- the deadzone takes the rest drift out without
+    taking any lock away. The sign is kept. Past 1.0 is clamped to 1.0.
+
+    Not a number in, the same not-a-number out, never a 0.0: a NaN is a pad
+    fault, and Takeover and set_steering() each look for it and act on it.
+    A max() would quietly turn it into straight ahead.
+    """
+    if not math.isfinite(raw):
+        return raw
+    magnitude = abs(raw)
+    if magnitude <= STICK_DEADZONE:
+        return 0.0
+    magnitude = min(magnitude, 1.0)
+    scaled = (magnitude - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)
+    scaled *= STEERING_LIMIT_PERC / 100
+    return scaled if raw > 0.0 else -scaled
+
+
+def read_pad(joystick, split=False):
+    """(intent, raw sticks): read_pad_intent's answer, and what it came from.
+
+    The raw sticks are (LEFT_X, RIGHT_X) exactly as the pad reads them, with
+    RIGHT_X None in unified, where it is not read at all. Takeover decides on
+    those and not on the intent, because its thresholds are measured on the
+    raw axis and a deadzone in between would move them.
+    """
+    throttle = joystick.read_throttle()
+    left = float(joystick.get_axis("LEFT_X"))
+    if split:
+        right = float(joystick.get_axis("RIGHT_X"))
+        return ((throttle, stick_steer(left), stick_steer(right)),
+                (left, right))
+    return (throttle,) + dv.steering_pair(stick_steer(left)), (left, None)
+
+
 def read_pad_intent(joystick, split=False):
     """What the pad is asking for: (throttle, steering front, steering rear).
 
@@ -995,13 +1066,12 @@ def read_pad_intent(joystick, split=False):
     Split reads the right stick for the rear and applies no ratio at all. A
     pose is the whole point of it and a ratio is exactly what would take the
     pose away, so it does not go through steering_pair and must not.
+
+    Both steering axes go through stick_steer(), here and only here, so
+    manual, record, a takeover and the /controller channel all see the same
+    deadzone.
     """
-    throttle = joystick.read_throttle()
-    left = joystick.get_axis("LEFT_X", limit_perc=STEERING_LIMIT_PERC)
-    if split:
-        return (throttle, left,
-                joystick.get_axis("RIGHT_X", limit_perc=STEERING_LIMIT_PERC))
-    return (throttle,) + dv.steering_pair(left)
+    return read_pad(joystick, split)[0]
 
 
 def drive_manual(joystick, vecon, log, split=False, latch=None):
@@ -1113,6 +1183,8 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     state_read_at = 0.0
     next_state_poll = 0.0
     was_connected = joystick.is_connected()
+    # When the pad last proved it is there. See PAD_SILENCE_SECONDS.
+    heard_at = clock()
 
     # Diagnostics bookkeeping. tick_max_ms is the number that matters: it is
     # the longest this loop has spent on one pass since the last diagnostics
@@ -1131,7 +1203,18 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             joystick.update_connection_status()
             if not joystick.is_connected():
                 if was_connected:
+                    vecon.return_neutral()
                     log.log("warning", "Controller", "Lost the controller, holding neutral")
+                    was_connected = False
+                    last_error = "controller disconnected"
+                    # First, and past the 4 Hz gate: the row that says the
+                    # pad went, in whatever file is open right now. Offered
+                    # before the session ends so it is the session file's last
+                    # row -- telemetry drains the mailboxes into a session
+                    # before it closes it. Gated, it was usually eaten: the
+                    # loop parks in the wait below and there is no next pass.
+                    _offer_connection(tele, now, modes.mode, False, last_error,
+                                      autopilot, tick_max_ms, markpad)
                     # Losing the pad means losing the only way to stop the
                     # car, so auto does not get to keep driving without it.
                     takeover.drop("lost the controller")
@@ -1140,27 +1223,17 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                         modes.mode = MANUAL
                         log.log("warning", "Mode", "Parked auto, back to manual")
                     if modes.mode == RECORD:
-                        session.end(now, why="lost the controller")
+                        # A Y tap's ending -- the file closed, the camera
+                        # given back if the session opened it -- with the long
+                        # pulse instead of the one buzz.
+                        session.end(now, why="lost the controller",
+                                    alarm_pad=joystick)
                         modes.mode = MANUAL
+                    # Pictures with no driving in them. The rolling file
+                    # carries on with everything else and the camera stays up
+                    # for whoever wanted it; only its channels stop.
+                    _mute_camera(tele)
                     vecon.return_neutral()
-                    was_connected = False
-                    last_error = "controller disconnected"
-                # Say so once before parking in the wait below, or the last
-                # thing Foxglove ever saw would be a connected pad.
-                if tele.wants("diagnostics", now):
-                    tele.offer("diagnostics", {
-                        "mode": modes.mode,
-                        "controller_connected": False,
-                        "auto_available": not autopilot.unavailable,
-                        "camera_state": autopilot.camera_state(),
-                        "camera_error": autopilot.camera_error(),
-                        "last_error": last_error,
-                        "loop_hz": 0.0,
-                        "loop_tick_max_ms": tick_max_ms,
-                        "camera_open_s": _camera_open_s(autopilot),
-                        **tele.recording_status(),
-                        **markpad.counts(),
-                    }, now)
                 # Interruptible, so a systemctl stop does not sit here until
                 # TimeoutStopSec runs out and systemd SIGKILLs us past
                 # vecon.close().
@@ -1170,6 +1243,32 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             if not was_connected:
                 log.log("info", "Controller", "Controller back")
                 was_connected = True
+                heard_at = now
+                _unmute_camera(tele)
+                _offer_connection(tele, now, modes.mode, True, last_error,
+                                  autopilot, tick_max_ms, markpad)
+
+            # A pad that is attached but has stopped answering. Not the sticks
+            # sitting still -- a pad left alone on the table reads the same
+            # numbers for minutes and is a working pad -- but no proof it is
+            # there at all, for PAD_SILENCE_SECONDS. Record is what this ends:
+            # in manual the wheels already go to neutral on every failed read.
+            if _pad_heard(joystick):
+                heard_at = now
+            elif (modes.mode == RECORD
+                    and now - heard_at >= PAD_SILENCE_SECONDS):
+                vecon.return_neutral()
+                last_error = (f"record ended: no pad for "
+                              f"{PAD_SILENCE_SECONDS:.0f} s")
+                log.log("warning", "Controller",
+                        f"Nothing from the controller for "
+                        f"{now - heard_at:.1f} s, holding neutral")
+                _offer_connection(tele, now, modes.mode, False, last_error,
+                                  autopilot, tick_max_ms, markpad)
+                session.end(now, why="the controller went quiet",
+                            alarm_pad=joystick)
+                modes.mode = MANUAL
+                log.log("info", "Mode", "Switched to manual")
 
             was_mode = modes.mode
             if modes.poll(joystick):
@@ -1392,6 +1491,66 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
         markpad.stop()
 
 
+def _offer_connection(tele, now, mode, connected, last_error, autopilot,
+                      tick_max_ms, markpad):
+    """The /diagnostics row for a pad that just went or came back.
+
+    Past the rate gate, because this is an event and not a sample. Never
+    raises: it is called on the way to neutral and on the way back.
+    """
+    try:
+        payload = {
+            "mode": mode,
+            "controller_connected": bool(connected),
+            "auto_available": not autopilot.unavailable,
+            "camera_state": autopilot.camera_state(),
+            "camera_error": autopilot.camera_error(),
+            "last_error": last_error,
+            "loop_hz": 0.0,
+            "loop_tick_max_ms": tick_max_ms,
+            "camera_open_s": _camera_open_s(autopilot),
+            **tele.recording_status(),
+            **markpad.counts(),
+        }
+        offer_now = getattr(tele, "offer_now", None)
+        if offer_now is not None:
+            offer_now("diagnostics", payload, now)
+        else:
+            tele.offer("diagnostics", payload, now)
+    except Exception:
+        pass
+
+
+def _mute_camera(tele):
+    import telemetry as tm
+    try:
+        tele.mute(tm.CAMERA_KEYS)
+    except Exception:
+        pass
+
+
+def _unmute_camera(tele):
+    try:
+        tele.unmute()
+    except Exception:
+        pass
+
+
+def _pad_heard(joystick) -> bool:
+    """Did the pad prove it is there on this pass?
+
+    Joystick.heard(). A pad object without one -- an older stand-in -- counts
+    as heard; one whose heard() raises is a dead handle and does not.
+    """
+    heard = getattr(joystick, "heard", None)
+    if heard is None:
+        return True
+    try:
+        return bool(heard())
+    except Exception:
+        return False
+
+
 def _camera_open_s(autopilot) -> float:
     try:
         return float(autopilot.hub.open_seconds)
@@ -1604,7 +1763,11 @@ def main(argv=None):
     tap = fp.FootprintTap(view=hub.view("footprint"), tele=tele,
                           auto_view=hub.view(AUTO_VIEW))
 
+    # Booting with no pad is the same as losing one: the camera may already
+    # be up, and nothing it writes before there is a pad has driving in it.
+    _mute_camera(tele)
     joystick = js.Joystick(stop_event=stop_event)
+    _unmute_camera(tele)
 
     if modes.mode == AUTO and not autopilot.resume():
         modes.mode = MANUAL

@@ -41,7 +41,7 @@ STILL = {"accel": [0.0, 0.0, 0.0], "gyro": [0.0, 0.0, 0.0]}
 
 
 def limited(raw):
-    return raw * mn.STEERING_LIMIT_PERC / 100
+    return mn.stick_steer(raw)
 
 
 class Camera:

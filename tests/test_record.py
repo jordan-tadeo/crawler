@@ -61,12 +61,29 @@ class SessionTele:
         self.session = None
         self.begins = 0
         self.ends = 0
+        self.events = []
+        self.muted = frozenset()
 
     def wants(self, key, now):
         return key in self.channels
 
     def offer(self, key, payload, now):
         self.offers.append((key, payload, now))
+
+    def offer_now(self, key, payload, now):
+        # Past the gate: in the log as an offer, and in `events` in order
+        # with the session's end, which is what the drain-before-close is for.
+        self.offers.append((key, payload, now))
+        self.events.append(("offer_now", key, dict(payload)))
+        return True
+
+    def mute(self, keys):
+        self.muted = frozenset(keys)
+        self.events.append(("mute", frozenset(keys)))
+
+    def unmute(self):
+        self.muted = frozenset()
+        self.events.append(("unmute",))
 
     def recording_status(self):
         return {}
@@ -81,6 +98,7 @@ class SessionTele:
     def end_session(self):
         self.ends += 1
         self.session = None
+        self.events.append(("end_session",))
 
     def of(self, key):
         return [(p, now) for k, p, now in self.offers if k == key]
@@ -140,9 +158,13 @@ class FakeAutopilot:
 class BuzzPad(FakeMarkPad):
     def __init__(self):
         self.buzzes = []
+        self.alarms = []
 
     def buzz(self, pulses, now):
         self.buzzes.append(pulses)
+
+    def alarm(self, joystick, now):
+        self.alarms.append(now)
 
 
 class FrameView:
@@ -552,7 +574,7 @@ def test_steering_in_record_is_manual_steering(monkeypatch):
     pad = FakePad()
     pad.axes["LEFT_X"] = 0.5
     out = run(pad, hold_y(1.0) + [()] * 3, monkeypatch=monkeypatch)
-    limited = 0.5 * mn.STEERING_LIMIT_PERC / 100
+    limited = mn.stick_steer(0.5)
     assert out["vecon"].steerings[-1] == pytest.approx((limited, -limited))
 
 
@@ -581,7 +603,7 @@ def test_in_record_the_features_never_reach_the_wheels(monkeypatch, frame):
     assert rows, "no features were recorded"
     assert all(row["verdict_action"] == verdict.action for row in rows)
 
-    steer = -0.3 * mn.STEERING_LIMIT_PERC / 100
+    steer = mn.stick_steer(-0.3)
     record_throttles = out["vecon"].throttles[ENTRY:]
     record_steerings = out["vecon"].steerings[ENTRY:]
     assert record_throttles and record_steerings
@@ -1013,7 +1035,7 @@ def test_leaving_record_with_rt_held_holds_the_throttle_until_it_is_let_go(
     assert len(held) >= HELD + LET_GO
     assert live == [1.0] * AGAIN
     # Steering was never held: the sticks drove every one of those passes.
-    steer = -0.3 * mn.STEERING_LIMIT_PERC / 100
+    steer = mn.stick_steer(-0.3)
     assert out["vecon"].steerings[-(HELD + LET_GO + AGAIN):] == [
         pytest.approx(dv.steering_pair(steer))] * (HELD + LET_GO + AGAIN)
 

@@ -116,6 +116,11 @@ RUMBLE_MS = 160
 RUMBLE_GAP_MS = 140
 RUMBLE_PULSES = {GOOD: 1, BAD: 2}
 
+# One long pulse: a record session that ended because the pad went quiet or
+# went away. Six times a mark's buzz, so it cannot be mistaken for the one
+# and two of a mark or of record's own enter and exit.
+RUMBLE_ALARM_MS = 1000
+
 # How long a rumble call is allowed to take before I stop making them.
 #
 # pygame's rumble() wraps SDL_JoystickRumble, which starts an effect and
@@ -185,6 +190,10 @@ class MarkPad:
         self._rumble_ok = True
         self._pulses_left = 0
         self._next_pulse_at = 0.0
+        # The long pulse. Owed when it could not be delivered -- a pad that
+        # has gone cannot feel it -- and paid on the next poll, which is the
+        # first pass after the pad is back.
+        self._alarm_owed = False
 
         # Marks waiting for their turn on the /marks channel. The mailbox in
         # telemetry.py is one deep per channel and drop-oldest, which is right
@@ -464,6 +473,54 @@ class MarkPad:
         except Exception:
             pass
 
+    def alarm(self, joystick, now):
+        """One long pulse, now if the pad will take it. Never raises.
+
+        Tried at once, because the loop may be about to park in
+        wait_for_connection and stop polling. A pad that has gone does not
+        take it, and that is not the pad saying it has no rumble: the attempt
+        failing never switches rumble off, it just leaves the pulse owed for
+        the first poll after the pad comes back, so I still find out why the
+        recording stopped. Whatever short pulses were queued are dropped --
+        the one long pulse is the whole message.
+        """
+        try:
+            self._pulses_left = 0
+            if not self._rumble_ok:
+                return
+            took = self._try_alarm(joystick)
+            try:
+                connected = bool(joystick.is_connected())
+            except Exception:
+                connected = False
+            # A handle that has lost its pad can still say yes, so a pad that
+            # is not connected owes it whatever the call returned.
+            self._alarm_owed = not (took and connected)
+        except Exception:
+            pass
+
+    @property
+    def alarm_owed(self) -> bool:
+        return self._alarm_owed
+
+    def _try_alarm(self, joystick) -> bool:
+        """The long pulse, once. True if the pad took it."""
+        handle = getattr(joystick, "joystick", None)
+        if handle is None:
+            return False
+        started = time.monotonic()
+        try:
+            played = handle.rumble(RUMBLE_LOW, RUMBLE_HIGH, RUMBLE_ALARM_MS)
+        except Exception:
+            return False
+        cost = (time.monotonic() - started) * 1000.0
+        if cost > RUMBLE_SLOW_MS:
+            # The one failure that is about the loop, not the pad.
+            self._no_rumble(f"a rumble call cost {cost:.0f} ms, which the "
+                            f"control loop cannot pay")
+            return True
+        return bool(played)
+
     def _request_rumble(self, kind, now):
         """Queue the pulses for one mark and fire the first of them now."""
         if not self._rumble_ok:
@@ -473,6 +530,16 @@ class MarkPad:
 
     def _service_rumble(self, joystick, now):
         """Fire a pulse if one is due. A float compare on an ordinary tick."""
+        if self._alarm_owed:
+            # poll() only runs on a pass the loop got a pad for, so this is
+            # the pad that came back. One go: a pad that is here and still
+            # refuses is not going to take it at 100 Hz either.
+            self._alarm_owed = False
+            if self._rumble_ok:
+                self._try_alarm(joystick)
+            self._next_pulse_at = now + (RUMBLE_ALARM_MS
+                                         + RUMBLE_GAP_MS) / 1000.0
+            return
         if self._pulses_left <= 0:
             return
         if now < self._next_pulse_at:

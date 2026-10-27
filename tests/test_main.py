@@ -40,11 +40,11 @@ import main as mn
 def limited(value):
     """A stick reading as read_pad_intent sees it.
 
-    STEERING_LIMIT_PERC is 70 and every axis read goes through it, so the
-    mapping tests below would otherwise be full of 0.28s. The limit itself has
-    its own test, which pins the literal.
+    Every steering axis goes through the deadzone and STEERING_LIMIT_PERC, so
+    the mapping tests below would otherwise be full of 0.2227s. The curve
+    itself has its own tests, which pin the literals.
     """
-    return value * mn.STEERING_LIMIT_PERC / 100
+    return mn.stick_steer(value)
 
 
 class FakeLogger:

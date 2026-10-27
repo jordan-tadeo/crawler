@@ -431,6 +431,13 @@ DEPTH_PNG_LEVEL = 1
 
 ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS) + tuple(RAW_DEPTH_CHANNELS)
 
+# Everything the camera produces, which is what stops being written while
+# there is no pad: a file of nothing but pictures and IMU has no driving in it
+# to pair them with, and one afternoon of those was 77 MB. The control loop's
+# own channels are not in here -- /diagnostics is what says the pad went.
+CAMERA_KEYS = frozenset(("imu",) + tuple(IMAGE_CHANNELS)
+                        + tuple(RAW_DEPTH_CHANNELS))
+
 
 class Telemetry:
     """The channels, the WebSocket server, the recorder, and the one thread.
@@ -498,6 +505,11 @@ class Telemetry:
 
         # Rate gates, advanced in offer() by whichever thread offered.
         self._next_at = {key: 0.0 for key in ALL_KEYS}
+
+        # Channels nobody gets to write to right now, whoever is watching.
+        # Replaced whole by mute()/unmute() rather than edited, so the camera
+        # thread reading it in wants() sees one set or the other, never half.
+        self._muted = frozenset()
 
         self._cv2 = None
         self._np = None
@@ -652,7 +664,40 @@ class Telemetry:
             return False
         if not self._watched.get(key, False):
             return False
+        if key in self._muted:
+            return False
         return now >= self._next_at.get(key, 0.0)
+
+    def mute(self, keys) -> None:
+        """Stop writing `keys` until unmute(). One assignment, never blocks.
+
+        wants() says no to them, so nothing is encoded for them either, and
+        offer() drops anything that asked before the swap.
+        """
+        self._muted = frozenset(keys)
+
+    def unmute(self) -> None:
+        self._muted = frozenset()
+
+    @property
+    def muted(self) -> frozenset:
+        return self._muted
+
+    def offer_now(self, key: str, payload, now: float) -> bool:
+        """offer(), past the rate gate. For an event that must not wait.
+
+        A pad that comes or goes is one row I cannot afford to have a 4 Hz
+        gate eat: the loop parks in wait_for_connection straight after, so
+        there is no next pass for it to go out on. Still nothing unless
+        something is listening -- a file or Studio -- and still never blocks.
+        True if it was handed over.
+        """
+        if not self.running or not self._watched.get(key, False):
+            return False
+        if key in self._muted:
+            return False
+        self.offer(key, payload, now)
+        return True
 
     def offer(self, key: str, payload, now: float) -> None:
         """Hand a message over and return. Never blocks, never raises.
@@ -662,6 +707,8 @@ class Telemetry:
         place. Dropping is the designed behaviour, not a failure.
         """
         if not self.running:
+            return
+        if key in self._muted:
             return
 
         mailbox = self._mail.get(key)
@@ -728,6 +775,11 @@ class Telemetry:
         if wanted is self._session:
             return
         if self._session is not None:
+            # What the control loop offered just before it ended the session
+            # belongs in the session's file -- the row that says the pad went
+            # above all, offered on the same pass as the end. Without this the
+            # swap goes first and that row opens the next ring segment.
+            self._drain_mail(self._session)
             try:
                 self._session.stop()
             except Exception:
@@ -772,34 +824,38 @@ class Telemetry:
                 # without a syscall.
                 recorder.tick(now)
 
-            for key in ALL_KEYS:
-                try:
-                    log_time, payload = self._mail[key].get_nowait()
-                except queue.Empty:
-                    continue
-                except Exception:
-                    continue
-
-                # Outside the mailbox lock, always. Encoding a JPEG while
-                # holding it would hand the control thread a lock that is
-                # held for milliseconds, which is the one thing this whole
-                # file is built to prevent.
-                try:
-                    self._emit(key, payload, log_time)
-                except Exception as e:
-                    # A client that went away mid-write lands here. It is not
-                    # worth a log line per frame, and it is certainly not
-                    # worth stopping for.
-                    self.error = str(e)
-                    if recorder is not None:
-                        # channel.log() writes to every sink and does not say
-                        # which one failed, so the recorder counts this and
-                        # forgets the count again as soon as it can see its
-                        # own file growing. A card that has genuinely started
-                        # refusing writes is the case it is looking for.
-                        recorder.note_write_error(e)
+            self._drain_mail(recorder)
 
             self._stop.wait(DRAIN_INTERVAL)
+
+    def _drain_mail(self, recorder):
+        """Emit whatever is in the mailboxes, once each. Publisher thread."""
+        for key in ALL_KEYS:
+            try:
+                log_time, payload = self._mail[key].get_nowait()
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+            # Outside the mailbox lock, always. Encoding a JPEG while
+            # holding it would hand the control thread a lock that is
+            # held for milliseconds, which is the one thing this whole
+            # file is built to prevent.
+            try:
+                self._emit(key, payload, log_time)
+            except Exception as e:
+                # A client that went away mid-write lands here. It is not
+                # worth a log line per frame, and it is certainly not
+                # worth stopping for.
+                self.error = str(e)
+                if recorder is not None:
+                    # channel.log() writes to every sink and does not say
+                    # which one failed, so the recorder counts this and
+                    # forgets the count again as soon as it can see its
+                    # own file growing. A card that has genuinely started
+                    # refusing writes is the case it is looking for.
+                    recorder.note_write_error(e)
 
     def _refresh_watched(self):
         for key, channel in self._channels.items():

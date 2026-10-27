@@ -144,6 +144,7 @@ class Joystick:
 
         self.connected = False
         self.joystick = None
+        self._heard = False
         # Safe until a sample proves otherwise, every time I take a handle.
         self._invalidate_calibration()
 
@@ -309,7 +310,27 @@ class Joystick:
             self.joystick.get_axis(0)
         except Exception:
             self.connected = False
+            self._heard = False
             self._invalidate_calibration()
             return
 
         self.connected = True
+        self._heard = True
+
+    def heard(self) -> bool:
+        """Did the pad prove it is there at the last update_connection_status?
+
+        What main's PAD_SILENCE_SECONDS watchdog counts, and deliberately not
+        "did a value change": evdev only passes a value on when it changes, so
+        a pad sitting still sends nothing at all -- the car's own recordings
+        have a connected pad reading identical axes for up to 900 s -- and
+        silence from SDL cannot tell a still pad from a quiet one.
+
+        So today this is the handle answering, the one thing this process can
+        see that a still pad never fails. The input reports underneath are the
+        better signal and are not reachable: xpadneo's udev rule sets the
+        pad's hidraw node to mode 0000. Anything that can see them later sets
+        this from them and the watchdog needs no change.
+        """
+        return bool(self.connected and self.joystick is not None
+                    and getattr(self, "_heard", False))

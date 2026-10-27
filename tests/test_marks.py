@@ -626,3 +626,59 @@ def test_the_control_loop_polls_the_mark_buttons():
     loop = source.split("def control_loop", 1)[1].split("\ndef ", 1)[0]
     assert "markpad.poll(" in loop
     assert "markpad.counts()" in loop
+
+
+# ---- the long pulse --------------------------------------------------------
+
+
+def test_the_alarm_is_one_long_pulse_unlike_any_mark_or_record_buzz(
+        markpad, pad):
+    pad.is_connected = lambda: True
+    markpad.alarm(pad, 1.0)
+    assert pad.joystick.calls == [(mk.RUMBLE_LOW, mk.RUMBLE_HIGH,
+                                   mk.RUMBLE_ALARM_MS)]
+    assert mk.RUMBLE_ALARM_MS >= 4 * mk.RUMBLE_MS
+    assert markpad.alarm_owed is False
+    # One pulse and only one, however long the loop polls after it.
+    for tick in range(300):
+        markpad.poll(pad, 1.0 + tick * 0.01, "manual")
+    assert len(pad.joystick.calls) == 1
+
+
+def test_the_alarm_replaces_a_queued_buzz(markpad, pad):
+    pad.is_connected = lambda: True
+    markpad.buzz(2, 1.0)
+    markpad.alarm(pad, 1.0)
+    for tick in range(300):
+        markpad.poll(pad, 1.0 + tick * 0.01, "manual")
+    assert [c[2] for c in pad.joystick.calls] == [mk.RUMBLE_ALARM_MS]
+
+
+@pytest.mark.parametrize("gone", ["disconnected", "raises", "refused"])
+def test_an_alarm_the_pad_cannot_feel_is_tried_then_played_on_reconnect(
+        tmp_path, gone):
+    """Tried at once; a gone pad does not switch rumble off; the first poll
+    after it is back plays it, once."""
+    handle = FakeHandle(raises=RuntimeError("gone") if gone == "raises"
+                        else None, result=gone != "refused")
+    pad = FakePad(handle=handle)
+    pad.is_connected = lambda: gone != "disconnected"
+    board = mk.MarkPad(logger=FakeLogger(), tele=FakeTele(),
+                       csv_path=str(tmp_path / "marks.csv"))
+    try:
+        board.alarm(pad, 1.0)
+        assert len(handle.calls) == 1, "it is tried even with the pad gone"
+        assert board.alarm_owed is True
+        assert board._rumble_ok is True
+
+        back = FakePad()
+        back.is_connected = lambda: True
+        board.poll(back, 9.0, "manual")
+        assert back.joystick.calls == [(mk.RUMBLE_LOW, mk.RUMBLE_HIGH,
+                                        mk.RUMBLE_ALARM_MS)]
+        assert board.alarm_owed is False
+        for tick in range(300):
+            board.poll(back, 9.0 + tick * 0.01, "manual")
+        assert len(back.joystick.calls) == 1
+    finally:
+        board.stop()

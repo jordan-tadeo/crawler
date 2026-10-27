@@ -30,10 +30,18 @@ holds it is `footprint.py` (the rows), `policy_input.py` (the picture) and
   record's. The rows' `steer_by` / `throttle_by` say which hand had each group.
 - **Manual** writes no rows.
 
-Files: a record session is `recordings/crawler-record-<UTC>Z-p<pid>-001.mcap`
-(`/home/jt/Documents/py/crawler/recordings/` on the car), one per session,
-never pruned by the ring; the rolling recording is `crawler-<UTC>Z-...mcap`.
-`./pull-recordings.sh` pulls both.
+Files: a record session is `log/mcap/crawler-record-<UTC>Z-p<pid>-001.mcap`
+(`/home/jt/Documents/py/crawler/log/mcap/` on the car, or `--record-dir`), one
+per session, never pruned by the ring; the rolling recording is
+`crawler-<UTC>Z-...mcap` in the same directory. `./pull-recordings.sh` pulls
+both, into `~/crawler-data/mcap/` by default.
+
+A record session ends on a Y tap, on START, on losing the pad, or when the pad
+has not proved it is there for 5 s; the last two buzz one long pulse instead
+of one short one. Either way the session's last `/diagnostics` row says
+`controller_connected: false`. With no pad connected the camera channels
+(`/camera/*`, `/imu`, `/policy/depth_small`) are not written at all, in any
+file, until it is back.
 
 ## The tick and how to pair things
 
@@ -88,7 +96,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `source` | str | `"tap"` (our own scan: record, or auto during a recover I have a hand in) or `"driver"` (auto: the driver's scan) |
 | `frame_width`, `frame_height` | int | depth frame size, 640x400 (0 if unknown) |
 | `throttle` | float | **the label.** Throttle that reached the ESC this tick, -1..1 (record: already scaled) |
-| `steering_front`, `steering_rear` | float | **the label.** Steering sent to each servo, -0.7..0.7 (the pad's LEFT_X x 70%); `rear` = -`front` in unified mode |
+| `steering_front`, `steering_rear` | float | **the label.** Steering sent to each servo, -0.7..0.7 (the pad's LEFT_X past a 0.12 deadzone, rescaled, x 70%; recordings before the deadzone carry the stick's rest drift, up to about 0.07 raw); `rear` = -`front` in unified mode |
 | `steering_mode` | str | `"unified"` or `"split"` (L3 toggles) |
 | `steer_by` | str | `"pad"` or `"driver"`: who had the steering when this row's command went out. Always `"pad"` in record |
 | `throttle_by` | str | `"pad"` or `"driver"`: same, for the throttle |
@@ -148,7 +156,7 @@ at 10 Hz off the car's own view, `source` `"tap"`, `mode` `"auto"`, with a
 ## Getting it out
 
 ```sh
-uv run --with mcap deploy/footprint_dump.py recordings/crawler-record-*.mcap -o rows.csv
+uv run --with mcap deploy/footprint_dump.py ~/crawler-data/mcap/crawler-record-*.mcap -o rows.csv
 uv run --with mcap --with pyarrow deploy/footprint_dump.py run.mcap -o rows.parquet
 uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
     deploy/footprint_dump.py run.mcap --small pictures/ --verify
