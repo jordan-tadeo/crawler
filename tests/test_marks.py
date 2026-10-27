@@ -197,7 +197,8 @@ def test_the_lookback_covers_a_whole_recovery_cycle():
     """reverse 2.0 + settle 0.5, and then the approach that caused it."""
     import driver as dv
 
-    assert mk.MARK_LOOKBACK_SECONDS > dv.REVERSE_SECONDS + 0.5
+    assert (mk.MARK_LOOKBACK_SECONDS
+            > dv.REVERSE_SECONDS + dv.SETTLE_SECONDS)
 
 
 def test_marking_works_in_manual_with_no_driver(markpad, pad):
