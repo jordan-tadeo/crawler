@@ -1278,22 +1278,29 @@ class Driver:
         """
         return bool(self.scan_footprint(depth_frame, threshold_mm).blocked.any())
 
-    def begin_recover(self, now):
-        """Start a backup-and-turn. Commands the first phase and returns."""
+    def begin_recover(self, now, turn=None, speed=None):
+        """Start a backup-and-turn. Commands the first phase and returns.
+
+        `turn` is the front angle to reverse on and `speed` the throttle.
+        None, which is every call in this file, means a random turn at
+        reverse_speed. policy.PolicyDriver passes what its model asked for,
+        already checked finite and already bounded by max_turn and
+        reverse_speed, so neither can be more than this file would command.
+        """
         print("[Driver] reversing and turning")
 
         # Pick a random direction, and a random amount of it. The old version
         # chose between max_turn/4 and max_turn -- two magnitudes, both
         # positive -- so the car always pivoted the same way and a corner that
         # beat it beat it forever. Both signs now.
-        self._turn_dir = random.choice([
+        self._turn_dir = turn if turn is not None else random.choice([
             -self.max_turn,
             -self.max_turn / 4,
             self.max_turn / 4,
             self.max_turn,
         ])
         self.controller.set_steering(*steering_pair(self._turn_dir))
-        self.controller.set_throttle(self.reverse_speed)
+        self.controller.set_throttle(self.reverse_speed if speed is None else speed)
 
         self._phase = _PHASE_REVERSE
         self._phase_until = now + REVERSE_SECONDS

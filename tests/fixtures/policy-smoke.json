@@ -1,0 +1,109 @@
+{
+  "input_contract": "legacy_jet",
+  "representation": "profile",
+  "actions": [
+    "forward",
+    "reverse",
+    "stop"
+  ],
+  "uses_prev_action": false,
+  "outputs": [
+    "logits",
+    "throttle",
+    "steer"
+  ],
+  "steer_scale": 0.6,
+  "labels": "any",
+  "train_sessions": [
+    "crawler-20261027-200959Z-p1143-001"
+  ],
+  "val_sessions": [
+    "crawler-20261027-204049Z-p2110-001"
+  ],
+  "train_decisions": 579,
+  "class_weights": [
+    1.0,
+    5.282045058497703,
+    10.0
+  ],
+  "good_weight": 2.0,
+  "good_marked_train_ticks": 0,
+  "bad_marked_left_out": 0,
+  "parameters": 18645,
+  "epochs": 60,
+  "seed": 1,
+  "val": {
+    "ticks": 349,
+    "direction_ticks": 349,
+    "direction_accuracy": 0.9684813753581661,
+    "direction_balanced_accuracy": 0.5912536443148688,
+    "always_forward_accuracy": 0.9828080229226361,
+    "always_forward_balanced_accuracy": 0.3333333333333333,
+    "rule_accuracy": 0.8853868194842407,
+    "rule_balanced_accuracy": 0.6287657920310982,
+    "confusion": [
+      [
+        334,
+        9,
+        0
+      ],
+      [
+        1,
+        4,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ],
+    "throttle_ticks": 348,
+    "throttle_mae": 0.00021552834017523405,
+    "throttle_median_baseline_mae": 0.0,
+    "steer_ticks": 349,
+    "steer_mae": 0.06560179985723429,
+    "steer_rule_mae": 0.1239103227853775,
+    "steer_model_mae_where_rule_known": 0.06560179985723429,
+    "steer_straight_mae": 0.04192949415726272,
+    "median_magnitude": 1.0,
+    "bad_marked_left_out": 0,
+    "per_session": {
+      "crawler-20261027-204049Z-p2110-001": {
+        "ticks": 349,
+        "direction_ticks": 349,
+        "direction_accuracy": 0.9684813753581661,
+        "direction_balanced_accuracy": 0.5912536443148688,
+        "always_forward_accuracy": 0.9828080229226361,
+        "always_forward_balanced_accuracy": 0.3333333333333333,
+        "rule_accuracy": 0.8853868194842407,
+        "rule_balanced_accuracy": 0.6287657920310982,
+        "confusion": [
+          [
+            334,
+            9,
+            0
+          ],
+          [
+            1,
+            4,
+            0
+          ],
+          [
+            1,
+            0,
+            0
+          ]
+        ],
+        "throttle_ticks": 348,
+        "throttle_mae": 0.00021552834017523405,
+        "throttle_median_baseline_mae": 0.0,
+        "steer_ticks": 349,
+        "steer_mae": 0.06560179985723429,
+        "steer_rule_mae": 0.1239103227853775,
+        "steer_model_mae_where_rule_known": 0.06560179985723429,
+        "steer_straight_mae": 0.04192949415726272
+      }
+    }
+  }
+}

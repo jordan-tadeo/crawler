@@ -503,7 +503,7 @@ class AutoPilot:
     comparison.
     """
 
-    def __init__(self, vecon, logger, hub=None):
+    def __init__(self, vecon, logger, hub=None, policy_path=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -511,6 +511,9 @@ class AutoPilot:
         self._next_tick = 0.0
         # The shared camera, or None if this process was started without one.
         self.hub = hub
+        # --policy: a learned model's .onnx. None is the hand-written
+        # autopilot, which is the default and stays the default.
+        self.policy_path = policy_path
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -566,8 +569,7 @@ class AutoPilot:
                 return False
 
             try:
-                from driver import Driver
-                self.driver = Driver(self.vecon, hub.view(AUTO_VIEW))
+                self.driver = self._build_driver(hub.view(AUTO_VIEW))
             except Exception as e:
                 self.unavailable = True
                 self.logger.log("error", "Auto mode unavailable", str(e))
@@ -576,6 +578,24 @@ class AutoPilot:
 
         self._next_tick = 0.0  # tick on the next step
         return True
+
+    def _build_driver(self, view):
+        """The autopilot, or with --policy the learned one on the same chassis.
+
+        A model that will not load is auto unavailable, the same as a camera
+        that will not open -- never a quiet fall back to the autopilot. I asked
+        for the model, and a car that drives on something else without saying
+        so is a test I cannot read.
+        """
+        if self.policy_path is None:
+            from driver import Driver
+            return Driver(self.vecon, view)
+        import policy
+        model = policy.PolicyModel(self.policy_path)
+        self.logger.log("info", "Mode",
+                        f"Auto is the policy in {self.policy_path} "
+                        f"({model.representation}, {model.contract})")
+        return policy.PolicyDriver(self.vecon, view, model)
 
     def step(self, now):
         """One pass of auto mode. False means hand the wheels back to manual."""
@@ -1113,6 +1133,17 @@ def parse_args(argv=None):
         default=None,
         help="where recordings go (default: log/mcap under the checkout)",
     )
+    # Off unless named. With it, START hands the wheels to a learned model
+    # instead of the hand-written rules -- behind the same floor, stuck and
+    # camera vetoes, which the model cannot see past. models/ is gitignored,
+    # so a model on the car is a file I copied there, never one git gave me.
+    parser.add_argument(
+        "--policy",
+        default=None,
+        metavar="MODEL.onnx",
+        help="drive auto with a learned policy (a .onnx with its .json "
+             "beside it) instead of the hand-written autopilot",
+    )
     return parser.parse_args(argv)
 
 
@@ -1192,7 +1223,7 @@ def main(argv=None):
     # always run.
     hub = camera.CameraHub(logger=log, tele=tele if channels_live else None,
                            rectified=channels_live)
-    autopilot = AutoPilot(vecon, log, hub=hub)
+    autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy)
 
     # Who gets the device opened at startup, and who waits for it:
     #

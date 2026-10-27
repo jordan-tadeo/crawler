@@ -135,6 +135,58 @@ touching `/etc`, which is how I check it before it goes anywhere.
 Auto mode also needs a udev rule for the OAK-D, which the installer does not
 write -- see the comment at the top of it.
 
+## A learned autopilot
+
+Off unless I ask for it. `main.py --policy models/policy.onnx` makes START
+hand the wheels to a small network instead of the hand-written rules, behind
+the same vetoes the rules have: no frame or a blind frame is neutral,
+anything under `REVERSE_FLOOR_MM` backs out before the model is asked, the
+stuck detector still fires, and an output that is not finite or not in range
+is neutral, never clamped (a nan through `min(1, v)` is full forward). A
+model that will not load is auto unavailable, not a quiet fall back to the
+rules. It picks forward, reverse or stop, a throttle as a fraction of the
+speed cap (forward 0.2, reverse -0.6, so never faster than auto already
+drives) and a front steer as a fraction of `max_turn`; a reverse is the
+ordinary recover at the model's speed and turn.
+
+The car runs the `.onnx` through onnxruntime and nothing else. Torch is only
+on the laptop. On the Pi 4 the default (column profile) model takes 0.35 ms
+to run and about 4.5 ms with its input made, against a 100 ms tick.
+
+Building one, on the laptop, in a venv with `torch`, `onnxruntime`, `mcap`,
+`mcap-protobuf-support` and `opencv-python-headless`:
+
+```sh
+./pull-recordings.sh
+python tools/policy_dataset.py data.npz recordings/crawler-record-*.mcap
+python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
+python tools/policy_eval.py data.npz models/policy.onnx --out report.md
+```
+
+The dataset tool prints, per session, every tick it dropped and why, the
+not-driving spans (parked, idle, the reach for Y, the car in my hands) as a
+one-character-a-second timeline, and what the `/marks` did: a BAD window on
+my own driving comes out of training, a GOOD one counts double
+(`--good-weight`). Validate on a whole session, never a random tick. The
+trainer prints the model against always-forward, the hand-written rule and
+the median throttle, which is the number that says whether it learned
+anything. Old rolling recordings work too with `--labels any`, but all they
+can teach is a copy of the autopilot.
+
+Putting it on the car (`models/` is gitignored, so the file is only ever one
+I copied there), and the service's interpreter needs onnxruntime as well:
+
+```sh
+ssh jtpi mkdir -p Documents/py/crawler/models
+scp models/policy.onnx models/policy.json jtpi:Documents/py/crawler/models/
+env/bin/pip install onnxruntime==1.31.1          # if the service is still on env/
+sudo systemctl edit crawler                       # ExecStart= then ExecStart=... --policy models/policy.onnx
+```
+
+Whether it drives well is something I find out by driving behind it with a
+hand on START. The numbers say whether it agrees with me on recorded frames,
+not whether it is any good on new ones.
+
 ## Watching it in Foxglove
 
 The car serves the Foxglove WebSocket protocol on port 8765 while it runs.

@@ -1,0 +1,272 @@
+"""Grade an exported policy against a dataset, and write a report a person can read.
+
+    python tools/policy_eval.py DATA.npz MODEL.onnx [--out REPORT.md] [--labels any]
+
+Runs the .onnx through policy.PolicyModel -- the class the car loads -- one
+tick at a time with policy.encode_input(), so what is graded is what would
+run. Needs numpy and onnxruntime only, no torch.
+
+Per session: the direction confusion matrix, throttle and steering error,
+and the baselines that make those numbers mean something:
+
+  direction   always-forward, and the gradient rule's own verdict
+  throttle    the median training magnitude, on every moving tick
+  steering    the gradient rule's steer (read_the_gradient(), as recorded on
+              /footprint or re-run on the legacy frame), and dead straight
+
+Then every /marks window: what was commanded across it, what the model would
+have said on the same frames, and what the rule said. That includes ticks
+inside a recover, which the model is never asked about on the car -- the
+window is about the moment, not the decision count.
+
+What this cannot grade: the safety veto (the floor and the stuck detector
+run on the raw frame and the IMU, which a dataset tick does not keep), and
+the model's own previous action -- a model trained with --prev is fed the
+recorded previous action here, which is kinder than the car will be.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import policy as pl  # noqa: E402
+
+FWD = pl.ACTIONS.index(pl.FORWARD)
+STOP = pl.ACTIONS.index(pl.STOP)
+
+
+def load(path):
+    z = np.load(path, allow_pickle=False)
+    data = {k: z[k] for k in z.files if k != "meta"}
+    data["meta"] = json.loads(str(z["meta"]))
+    return data
+
+
+def predict(model, data, ticks):
+    """(actions, magnitudes, steers) for these tick indices."""
+    actions, mags, steers = [], [], []
+    zero = np.zeros((1, pl.PREV_SIZE), dtype=np.float32)
+    for i in ticks:
+        x = pl.encode_input(model.representation, data["frames"][data["frame"][i]])
+        prev = data["prev"][i:i + 1] if model.uses_prev else zero
+        decided, _ = pl.read_output(model.run(x, prev))
+        if decided is None:
+            actions.append(STOP)
+            mags.append(0.0)
+            steers.append(0.0)
+            continue
+        action, mag, steer, _ = decided
+        actions.append(pl.ACTIONS.index(action))
+        mags.append(mag)
+        steers.append(steer)
+    return np.array(actions, dtype=np.int64), np.array(mags), np.array(steers)
+
+
+def confusion(truth, pred):
+    m = np.zeros((len(pl.ACTIONS), len(pl.ACTIONS)), dtype=np.int64)
+    for t, p in zip(truth, pred):
+        m[t, p] += 1
+    return m
+
+
+def balanced_accuracy(m):
+    rows = m.sum(1)
+    present = rows > 0
+    return float(np.mean(np.diag(m)[present] / rows[present])) if present.any() else float("nan")
+
+
+def _mae(a, b):
+    return float(np.mean(np.abs(np.asarray(a) - np.asarray(b)))) if len(a) else float("nan")
+
+
+def score_ticks(model, data, ticks, label_mode, median_mag):
+    """The numbers for one set of decision ticks."""
+    truth = data["action"][ticks].astype(np.int64)
+    pred, mag, steer = predict(model, data, ticks)
+    if label_mode == "any":
+        t_ok = s_ok = np.ones(len(ticks), dtype=bool)
+    else:
+        t_ok = data["throttle_label"][ticks]
+        s_ok = data["steer_label"][ticks]
+
+    m = confusion(truth[t_ok], pred[t_ok])
+    base = confusion(truth[t_ok], np.full(int(t_ok.sum()), FWD))
+    rule_known = data["rule_action"][ticks] >= 0
+    rule = confusion(truth[t_ok & rule_known], data["rule_action"][ticks][t_ok & rule_known])
+
+    moving = t_ok & (truth != STOP)
+    true_mag = data["magnitude"][ticks]
+    rule_steer = data["rule_steer"][ticks]
+    s_rule = s_ok & np.isfinite(rule_steer)
+    true_steer = data["steer"][ticks]
+    n = int(t_ok.sum())
+    return {
+        "ticks": int(len(ticks)),
+        "direction_ticks": n,
+        "direction_accuracy": float(np.trace(m) / n) if n else float("nan"),
+        "direction_balanced_accuracy": balanced_accuracy(m),
+        "always_forward_accuracy": float(np.trace(base) / n) if n else float("nan"),
+        "always_forward_balanced_accuracy": balanced_accuracy(base),
+        "rule_accuracy": (float(np.trace(rule) / rule.sum()) if rule.sum() else float("nan")),
+        "rule_balanced_accuracy": balanced_accuracy(rule),
+        "confusion": m.tolist(),
+        "throttle_ticks": int(moving.sum()),
+        "throttle_mae": _mae(mag[moving], true_mag[moving]),
+        "throttle_median_baseline_mae": _mae(np.full(int(moving.sum()), median_mag),
+                                             true_mag[moving]),
+        "steer_ticks": int(s_ok.sum()),
+        "steer_mae": _mae(steer[s_ok], true_steer[s_ok]),
+        "steer_rule_mae": _mae(rule_steer[s_rule], true_steer[s_rule]),
+        "steer_model_mae_where_rule_known": _mae(steer[s_rule], true_steer[s_rule]),
+        "steer_straight_mae": _mae(np.zeros(int(s_ok.sum())), true_steer[s_ok]),
+    }
+
+
+MARK_GOOD, MARK_BAD = 1, -1  # policy_dataset.MARK_GOOD / MARK_BAD
+
+
+def marks_of(data):
+    """The per-tick /marks flags, zeros for a dataset built before there were any."""
+    return data.get("mark", np.zeros(len(data["t_ns"]), dtype=np.int8))
+
+
+def bad_marked(data):
+    """Ticks a BAD mark says were bad driving: out of training and out of val."""
+    return marks_of(data) == MARK_BAD
+
+
+def median_training_magnitude(data, train_mask):
+    moving = train_mask & (data["action"] != STOP)
+    return float(np.median(data["magnitude"][moving])) if moving.any() else 1.0
+
+
+def score(model, data, session_ids, label_mode, train_mask):
+    """Pooled val numbers over these sessions, plus one block per session."""
+    median_mag = median_training_magnitude(data, train_mask)
+    graded = data["decision"] & ~bad_marked(data)
+    pooled = np.flatnonzero(np.isin(data["session"], session_ids) & graded)
+    out = score_ticks(model, data, pooled, label_mode, median_mag)
+    out["median_magnitude"] = median_mag
+    out["bad_marked_left_out"] = int((np.isin(data["session"], session_ids)
+                                      & data["decision"] & bad_marked(data)).sum())
+    out["per_session"] = {}
+    names = data["meta"]["sessions"]
+    for sid in session_ids:
+        ticks = np.flatnonzero((data["session"] == sid) & graded)
+        out["per_session"][names[sid]] = score_ticks(model, data, ticks, label_mode, median_mag)
+    return out
+
+
+def format_scores(s):
+    lines = [
+        f"direction ({s['direction_ticks']} ticks): accuracy {s['direction_accuracy']:.3f} "
+        f"(always-forward {s['always_forward_accuracy']:.3f}, rule {s['rule_accuracy']:.3f}); "
+        f"balanced {s['direction_balanced_accuracy']:.3f} "
+        f"(always-forward {s['always_forward_balanced_accuracy']:.3f}, "
+        f"rule {s['rule_balanced_accuracy']:.3f})",
+        f"throttle magnitude MAE ({s['throttle_ticks']} moving ticks): {s['throttle_mae']:.3f} "
+        f"(median {s['throttle_median_baseline_mae']:.3f})",
+        f"steering MAE ({s['steer_ticks']} ticks, fraction of max_turn): {s['steer_mae']:.3f} "
+        f"(rule {s['steer_rule_mae']:.3f}, straight {s['steer_straight_mae']:.3f})",
+        "confusion, rows truth / columns model, " + " ".join(pl.ACTIONS) + ": "
+        + str(s["confusion"]),
+    ]
+    return "\n".join(lines)
+
+
+def _counts(actions):
+    c = np.bincount(np.asarray(actions, dtype=np.int64), minlength=len(pl.ACTIONS))
+    return ", ".join(f"{a} {n}" for a, n in zip(pl.ACTIONS, c) if n) or "none"
+
+
+def marks_section(model, data):
+    lines = []
+    names = data["meta"]["sessions"]
+    for sid, name in enumerate(names):
+        for t_ns, mark in data["meta"]["marks"].get(name, []):
+            try:
+                offset = t_ns / 1e9 - float(mark["mono_s"])
+                lo = (float(mark["window_start_s"]) + offset) * 1e9
+                hi = (float(mark["window_end_s"]) + offset) * 1e9
+            except (KeyError, TypeError, ValueError):
+                continue
+            ticks = np.flatnonzero((data["session"] == sid)
+                                   & (data["t_ns"] >= lo) & (data["t_ns"] <= hi))
+            head = (f"- **{mark.get('kind', '?')}** ({mark.get('button', '')}) in {name} "
+                    f"at {float(mark['mono_s']):.1f} s, mode {mark.get('mode', '?')}")
+            if not len(ticks):
+                lines.append(head + ": no kept ticks in the window")
+                continue
+            pred, mag, steer = predict(model, data, ticks)
+            rule = data["rule_action"][ticks]
+            lines.append(head + f", {len(ticks)} ticks")
+            lines.append(f"  - commanded: {_counts(data['action'][ticks])}; "
+                         f"mean steer {np.mean(data['steer'][ticks]):+.2f}")
+            lines.append(f"  - model: {_counts(pred)}; mean steer {np.mean(steer):+.2f}, "
+                         f"mean throttle {np.mean(mag):.2f} of cap")
+            lines.append(f"  - rule: {_counts(rule[rule >= 0])}; "
+                         f"mean steer {np.nanmean(data['rule_steer'][ticks]):+.2f}")
+            seq = "".join(pl.ACTIONS[a][0].upper() for a in data["action"][ticks])
+            mseq = "".join(pl.ACTIONS[a][0].upper() for a in pred)
+            lines.append(f"  - tick by tick (F/R/S): commanded `{seq}`, model `{mseq}`")
+    return lines or ["- no marks in these sessions"]
+
+
+def report(model, data, label_mode, session_ids=None, train_mask=None):
+    names = data["meta"]["sessions"]
+    if session_ids is None:
+        session_ids = list(range(len(names)))
+    if train_mask is None:
+        train_mask = np.zeros(len(data["t_ns"]), dtype=bool)
+    s = score(model, data, session_ids, label_mode, train_mask)
+    meta = model.meta
+    out = [f"# Policy eval: {os.path.basename(model.path)}", "",
+           f"Representation **{meta.get('representation')}**, {meta.get('parameters')} "
+           f"parameters, input contract `{meta.get('input_contract')}`, labels "
+           f"`{label_mode}`. Trained on {meta.get('train_sessions')}, "
+           f"held out {meta.get('val_sessions')}.", "",
+           "Direction is graded on decision ticks only (not the inside of a recover). "
+           "Throttle is the fraction of that direction's cap, on moving ticks. Steering "
+           "is a fraction of max_turn (0.6), so 0.10 is 0.06 of servo travel.", "",
+           "## All graded sessions", "", "```", format_scores(s), "```", ""]
+    for name, block in s["per_session"].items():
+        out += [f"## {name}", "", "```", format_scores(block), "```", ""]
+    out += ["## Marks", ""] + marks_section(model, data) + [""]
+    return "\n".join(out), s
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("data")
+    ap.add_argument("model")
+    ap.add_argument("--out", default=None, help="write the markdown report here")
+    ap.add_argument("--labels", choices=("pad", "any"), default=None,
+                    help="default: whatever the model was trained with")
+    ap.add_argument("--session", action="append", default=None,
+                    help="grade only these sessions (default: all of them)")
+    args = ap.parse_args(argv)
+
+    data = load(args.data)
+    model = pl.PolicyModel(args.model)
+    label_mode = args.labels or model.meta.get("labels", "pad")
+    names = data["meta"]["sessions"]
+    ids = [names.index(n) for n in args.session] if args.session else None
+    train = np.isin(data["session"], [names.index(n) for n in
+                                      model.meta.get("train_sessions", []) if n in names])
+    text, _ = report(model, data, label_mode, ids, train & data["decision"])
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(text)
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
