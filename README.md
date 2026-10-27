@@ -140,8 +140,15 @@ The car serves the Foxglove WebSocket protocol on port 8765 while it runs.
 connection -> Foxglove WebSocket ->**
 
 ```
-ws://192.168.68.56:8765
+ws://jtpi.local:8765
 ```
+
+By name and not by address. The DHCP lease the car used to hold has already
+moved once, and the device holding that address now answers a ping and refuses
+SSH -- which looks exactly like the car being broken. `jtpi.local` is mDNS and
+resolves on the same wifi with nothing configured. If Foxglove ever cannot
+resolve it, `ssh jt@jtpi.local 'hostname -I'` says what the address is today
+and `ws://<that>:8765` works as the fallback.
 
 On a Mac that is `brew install --cask foxglove`, and then `open -a Foxglove`
 -- the cask installs an app, not a command.

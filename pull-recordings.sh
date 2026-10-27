@@ -30,7 +30,12 @@
 
 set -euo pipefail
 
-CAR="${CRAWLER_HOST:-jt@192.168.68.56}"
+# By name, not by address. The lease the car used to hold moved, and the device
+# that has that address now answers a ping and refuses SSH -- so a hardcoded
+# address fails in the one way that looks like the car being broken instead of
+# like a wrong address. jtpi.local is mDNS and needs nothing set up.
+# CRAWLER_HOST=jt@<address> still overrides it for a network with no mDNS.
+CAR="${CRAWLER_HOST:-jt@jtpi.local}"
 REMOTE_DIR="${CRAWLER_REMOTE_DIR:-/home/jt/Documents/py/crawler/log/mcap}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$REPO_DIR/recordings"

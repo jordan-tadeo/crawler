@@ -5,7 +5,12 @@ and the depth picture from the laptop while the car is being driven, instead
 of reading app.log afterwards. Foxglove Studio connects straight to the Pi --
 no broker, no rosbridge, no cloud:
 
-    ws://192.168.68.56:8765
+    ws://jtpi.local:8765
+
+By name rather than by address, because the address moved. The lease the car
+used to hold is on some other device now, and that device answers a ping and
+refuses SSH -- which is the most confusing possible way for this to break,
+because everything looks reachable and nothing works.
 
 The one rule this file exists to obey
 -------------------------------------
