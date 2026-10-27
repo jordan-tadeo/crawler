@@ -12,6 +12,11 @@ phase and returns, recovering() advances it on the next tick, and abort()
 drops it on the floor and zeroes the throttle. A START press, a controller
 dropout and a systemctl stop are all honoured inside one 10 ms tick, even
 halfway through a reverse.
+
+The reverse phase reads the IMU as it goes. Nothing on this car points
+backwards, so backing up is blind -- but the gyro is a contact sensor: a car
+commanded in reverse that has stopped shaking has hit something, and the
+reverse can end there instead of pushing for the rest of its two seconds.
 """
 
 import random
@@ -82,6 +87,30 @@ STUCK_CONFIRM_SAMPLES = 10
 # expired -- which is exactly what the journal shows: "Switched to auto" and
 # "STUCK - backing up to recover." stamped on the same second, every time.
 STUCK_ARM_SECONDS = 1.0
+
+# How many consecutive still samples end a reverse early. The gyro as a rear
+# bumper: there is no camera pointed backwards, so reversing is blind, but
+# there is a contact sensor on the car already. If I have commanded reverse
+# and the chassis is not shaking, I have backed into something.
+#
+# Deliberately much shorter than STUCK_CONFIRM_SAMPLES = 10. Reversing into a
+# wall wants a fast answer -- every tick spent pushing against it is a tick
+# not spent getting out -- and the two failures are not symmetric: a false
+# positive here costs me a recover that ended early, while a false positive on
+# the forward detector costs me a reverse I did not ask for.
+#
+# Four is not the whole delay and that is the point. A sample only counts once
+# the smoothing window is full, and begin_recover() empties it, so the first
+# five ticks of a reverse are spent filling it -- half a second, during which
+# the ESC has spun up and the car is either moving or it is not. Four samples
+# after that puts the verdict 0.9 s into a 2.0 s reverse: 0.5 s of smoothing
+# plus 0.4 s of confirmation, eight distinct IMU readings all agreeing. Going
+# to five would buy 10% more confidence for half of the time saved.
+#
+# A count of ticks and not a deadline, for the same reason STUCK_CONFIRM_SAMPLES
+# is: the loop does not always make its rate, and a count can only ever take
+# longer in real time, never fire early.
+REVERSE_STALL_SAMPLES = 4
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +463,15 @@ class Driver:
         self._throttle_since = None
         self._still_samples = 0
 
+        # Rear bumper state, and it is its own counter on purpose. The forward
+        # detector and the reverse bumper ask the same question of the same
+        # sensor in two completely different situations -- one while commanding
+        # forward throttle for a second, one while commanding reverse for two
+        # -- and sharing a count would let either one walk the other's
+        # evidence up. _throttle_since in particular is gated on FORWARD
+        # throttle and nothing in here writes it.
+        self._reverse_still_samples = 0
+
         # Tunable parameters. I set all four of these by feel on the bench and
         # they are not to be nudged from a desk.
         self.forward_speed = 0.2    # very slow forward motion
@@ -518,13 +556,20 @@ class Driver:
     def _clear_motion_evidence(self):
         """Forget everything the IMU said. Called whenever the car stops.
 
-        A recover reverses for two seconds and the smoothing windows are not
-        sampled while recover owns the wheels, so without this the first
-        readings after handing them back are a blend of before and after.
+        A recover reverses for two seconds and the smoothing windows ARE
+        sampled while recover owns the wheels now -- the rear bumper needs
+        them -- so this runs at both ends of a recover rather than just the
+        start. Without it the first forward readings after handing the wheels
+        back would be a mean over samples taken while the car was going the
+        other way.
+
+        Both counters, because both measure consecutive evidence and neither
+        has any business carrying a count across a stop.
         """
         self.imu_history.clear()
         self.gyro_history.clear()
         self._still_samples = 0
+        self._reverse_still_samples = 0
         self._throttle_since = None
 
     def stuck(self, imu, now) -> bool:
@@ -668,24 +713,93 @@ class Driver:
         self._phase_until = now + REVERSE_SECONDS
         self._clear_motion_evidence()
 
+    def _rear_bumper_hit(self) -> bool:
+        """Has the car reversed into something?
+
+        There is no camera pointed backwards, so a reverse is blind -- but
+        there is a contact sensor bolted to the car already and it is the
+        gyro. The car has been commanded in reverse at -0.6 and the chassis is
+        not shaking, so either the wheels are against something or it is up on
+        a ledge. Either way the reverse has stopped being useful and the two
+        remaining seconds of it are two seconds of pushing.
+
+        Its own counter, never the forward detector's. Same sensor, same
+        notion of motion -- I do not want two definitions of "is it moving" --
+        but the counts are separate and both are cleared at every stop, so
+        neither phase can walk the other's evidence up.
+
+        A sample only counts once the smoothing window is full.
+        begin_recover() empties it, so the first ticks of a reverse are a mean
+        over one or two readings taken while the ESC was still spinning up,
+        and those read STILL on a car that is about to move off perfectly
+        well. Waiting for the five samples is also the half second that stops
+        this firing before the car has had a chance to go anywhere, which is
+        why there is no separate arm delay.
+
+        UNKNOWN holds the count where it is and never adds to it, exactly as
+        in the forward detector: a dropped packet is not evidence of no
+        motion, and a blind reverse is the worst place to start guessing.
+        """
+        evidence = self.motion_evidence(self.camera.get_imu_sample())
+
+        if len(self.gyro_history) < self.imu_window_size:
+            return False
+
+        if evidence == MOVING:
+            self._reverse_still_samples = 0
+            return False
+
+        if evidence == STILL:
+            self._reverse_still_samples += 1
+
+        return self._reverse_still_samples >= REVERSE_STALL_SAMPLES
+
     def recovering(self, now):
-        """Advance the recover phases. True while recover owns the wheels."""
+        """Advance the recover phases. True while recover owns the wheels.
+
+        This reads the IMU during the reverse phase, which it did not use to.
+        tick() returns the moment this says True, so for the whole 2.5 seconds
+        of REVERSE plus SETTLE nothing in this file looked at depth OR at
+        motion -- and reverse is the one direction with nothing pointed down
+        it. The reverse phase is where the only sensor that can see behind the
+        car is worth reading.
+        """
         if self._phase is None:
             return False
 
-        if now < self._phase_until:
-            return True
-
         if self._phase == _PHASE_REVERSE:
+            # Asked every tick, and before the deadline, because it is
+            # accumulating evidence rather than answering a question. Short
+            # circuiting it on the last tick of a reverse would be harmless;
+            # skipping it on any other tick would not be.
+            hit = self._rear_bumper_hit()
+            if not hit and now < self._phase_until:
+                return True
+            if hit:
+                print("Rear bumper - something behind me, cutting the reverse.")
             self.controller.set_throttle(0)
             self._phase = _PHASE_SETTLE
             self._phase_until = now + SETTLE_SECONDS
             return True
 
-        # Settle is up: unwind the steering and hand the wheels back.
-        self.controller.set_steering(-self._turn_dir, 0)
+        if now < self._phase_until:
+            return True
+
+        # Settle is up: centre the steering and hand the wheels back.
+        #
+        # This used to command set_steering(-self._turn_dir, 0), which is the
+        # opposite front lock and a centred rear -- not centre, and not the
+        # counter-phase pair begin_recover() set either. Nothing is moving by
+        # here (the throttle went to zero a settle ago) so there was nothing
+        # to counter-steer, and it held a servo at full lock against nothing
+        # for up to a tick. Centre is what "unwind the steering" meant.
+        self.controller.set_steering(0, 0)
         self._phase = None
         self._phase_until = 0.0
+        # The bumper has been sampling the IMU for the length of the reverse,
+        # so unlike before there is real evidence in the windows now, and all
+        # of it was taken going the other way.
+        self._clear_motion_evidence()
         return False
 
     def abort(self):

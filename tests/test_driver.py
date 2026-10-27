@@ -350,6 +350,230 @@ def test_abort_is_safe_to_call_twice(d):
     assert d._phase is None
 
 
+def test_a_recover_hands_back_centred_steering(d):
+    """It used to hand back set_steering(-self._turn_dir, 0), which is the
+    opposite front lock and a centred rear -- not centre, and not the
+    counter-phase pair begin_recover() set. Nothing is moving by then, so
+    there was nothing to counter-steer with it."""
+    d.begin_recover(100.0)
+    d.recovering(100.0 + dv.REVERSE_SECONDS)
+    d.recovering(100.0 + dv.REVERSE_SECONDS + dv.SETTLE_SECONDS)
+    assert d.controller.steerings[-1] == (0, 0)
+
+
+# --- the gyro as a rear bumper ---------------------------------------------
+#
+# Nothing on this car points backwards, so a reverse is blind. The gyro is
+# the contact sensor: commanded in reverse at -0.6 and not shaking means the
+# wheels are against something, and the remaining seconds of the reverse are
+# seconds of pushing.
+#
+# All of it runs off the FakeCamera's single imu slot, which hands back the
+# same reading every call, so "reversing into a wall" is just loading STILL
+# and stepping the phase machine at 10 Hz.
+
+def reverse_for(d, ticks, imu_sample, start=100.0, step=0.1):
+    """Step recovering() at the 10 Hz tick with one IMU reading loaded.
+
+    Returns the tick number the reverse phase ended on, or None if it was
+    still reversing when the ticks ran out.
+    """
+    d.camera.imu = imu_sample
+    for i in range(1, ticks + 1):
+        d.recovering(start + i * step)
+        if d._phase != dv._PHASE_REVERSE:
+            return i
+    return None
+
+
+def test_a_blind_reverse_into_a_wall_ends_early(d):
+    """The whole point. Backed into something, so stop backing into it."""
+    d.begin_recover(100.0)
+    ended = reverse_for(d, ticks=20, imu_sample=STILL_IMU)
+    assert ended is not None, "it reversed into a wall for the full two seconds"
+    assert ended * 0.1 < dv.REVERSE_SECONDS
+    assert d._phase == dv._PHASE_SETTLE
+
+
+def test_the_bumper_waits_for_the_smoothing_window_to_fill(d):
+    """begin_recover() empties the window, so the first ticks of a reverse are
+    a mean over one or two readings taken while the ESC was still spinning up
+    -- which reads STILL on a car that is about to move off fine. This is also
+    the half second that stops it firing before the car has gone anywhere,
+    which is why there is no separate arm delay."""
+    d.begin_recover(100.0)
+    ended = reverse_for(d, ticks=20, imu_sample=STILL_IMU)
+    assert ended >= d.imu_window_size, f"fired on tick {ended}"
+    assert ended == d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 1
+
+
+def test_a_reverse_that_is_actually_moving_runs_its_full_duration(d):
+    """The car is backing up happily. Do not cut it short."""
+    d.begin_recover(100.0)
+    assert reverse_for(d, ticks=19, imu_sample=MOVING_IMU) is None
+    assert d._reverse_still_samples == 0
+
+
+def test_unknown_imu_samples_can_never_end_a_reverse(d):
+    """The same rule as the forward detector, in the one place guessing is
+    worst: no evidence is not evidence of no motion, and this one is acting on
+    a direction it cannot see."""
+    d.begin_recover(100.0)
+    assert reverse_for(d, ticks=19, imu_sample=None) is None
+    assert d._reverse_still_samples == 0
+
+
+def test_an_unknown_in_the_middle_of_a_reverse_holds_the_count(d):
+    """Held where it is, not added to and not reset -- the forward detector's
+    rule exactly. Every tick here stays inside the fixed reverse window, so
+    the only thing that could end the phase is the bumper."""
+    d.begin_recover(100.0)
+    one_short = d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 2
+    assert (one_short + 10) * 0.1 < dv.REVERSE_SECONDS, "the window has to fit"
+
+    d.camera.imu = STILL_IMU
+    for i in range(1, one_short + 1):
+        d.recovering(100.0 + i * 0.1)
+    assert d._reverse_still_samples == dv.REVERSE_STALL_SAMPLES - 1
+
+    d.camera.imu = None
+    for i in range(one_short + 1, one_short + 11):
+        d.recovering(100.0 + i * 0.1)
+    assert d._reverse_still_samples == dv.REVERSE_STALL_SAMPLES - 1
+    assert d._phase == dv._PHASE_REVERSE
+
+
+def test_one_moving_reading_resets_the_reverse_count(d):
+    """Evidence has to be consecutive, same as the forward detector. A car
+    that moves at all has not hit anything."""
+    d.begin_recover(100.0)
+    for i in range(1, d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 1):
+        d.camera.imu = STILL_IMU
+        d.recovering(100.0 + i * 0.1)
+    assert d._reverse_still_samples == dv.REVERSE_STALL_SAMPLES - 1
+
+    d.camera.imu = MOVING_IMU
+    d.recovering(100.9)
+    assert d._reverse_still_samples == 0
+    assert d._phase == dv._PHASE_REVERSE
+
+
+def test_the_bumper_is_deliberately_quicker_than_the_forward_detector(d):
+    """Reversing into a wall wants a fast answer and the two failures are not
+    symmetric: a false positive here ends a recover early, a false positive
+    forward starts a reverse nobody asked for."""
+    assert dv.REVERSE_STALL_SAMPLES < dv.STUCK_CONFIRM_SAMPLES
+    total = (d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 1) * 0.1
+    assert total < dv.REVERSE_SECONDS / 2.0
+
+
+def test_the_bumper_commands_neutral_when_it_fires(d):
+    """pigpio latches the last pulse width forever and there is no hardware
+    failsafe, so any path that ends the reverse and does not say so is a
+    command to keep reversing."""
+    d.begin_recover(100.0)
+    assert d.controller.throttles[-1] == d.reverse_speed
+    reverse_for(d, ticks=20, imu_sample=STILL_IMU)
+    assert d.controller.throttles[-1] == 0
+
+
+def test_the_bumper_cannot_shorten_the_settle(d):
+    """Ending the reverse early must not hand the wheels back early. Settle is
+    there so the car has stopped before the forward decision is taken on it."""
+    d.begin_recover(100.0)
+    ended = reverse_for(d, ticks=20, imu_sample=STILL_IMU)
+    handed_back_at = 100.0 + ended * 0.1 + dv.SETTLE_SECONDS
+    assert d.recovering(handed_back_at - 0.01) is True
+    assert d.recovering(handed_back_at) is False
+
+
+# --- the two detectors must not corrupt each other -------------------------
+
+def test_the_bumper_never_touches_the_forward_stuck_evidence(d):
+    """A new counter, not _still_samples, and _throttle_since is gated on
+    FORWARD throttle and stays that way. Sharing either would let one phase
+    walk the other's evidence up."""
+    d.begin_recover(100.0)
+    reverse_for(d, ticks=20, imu_sample=STILL_IMU)
+    assert d._reverse_still_samples >= dv.REVERSE_STALL_SAMPLES
+    assert d._still_samples == 0
+    assert d._throttle_since is None
+
+
+def test_a_recover_leaves_no_imu_evidence_behind_it(d):
+    """The windows ARE sampled during a reverse now, so they hold real
+    readings at hand-back -- and every one of them was taken going the other
+    way. The first forward reading afterwards must not be a mean with them."""
+    d.begin_recover(100.0)
+    ended = reverse_for(d, ticks=20, imu_sample=STILL_IMU)
+    assert d.gyro_history, "the bumper has to have been sampling"
+
+    d.recovering(100.0 + ended * 0.1 + dv.SETTLE_SECONDS)
+    assert d._phase is None
+    assert d.gyro_history == []
+    assert d.imu_history == []
+    assert d._reverse_still_samples == 0
+    assert d._still_samples == 0
+    assert d._throttle_since is None
+
+
+def test_a_bumped_reverse_does_not_leave_the_car_one_tick_from_stuck(d):
+    """The whole thing through tick(), and the failure mode worth pinning.
+
+    A car wedged against a wall reverses, the bumper cuts the reverse because
+    it is wedged at the back too, and the wheels come back. Every IMU sample
+    taken during that reverse said STILL. If any of them reaches the forward
+    detector, the car declares a stick before it has been given its full
+    second of commanded throttle and its full second of stillness -- and the
+    shipped bug this whole file is about was exactly a stick confirmed on
+    evidence it had not earned.
+
+    So the test is not "it does not fire", it is "it takes just as long to
+    fire as it would from cold".
+    """
+    # A second of ordinary forward driving first, so the forward detector has
+    # real state to be corrupted: throttle commanded, smoothing window full of
+    # STILL readings, and not yet armed.
+    d.camera.depth = clear_depth()
+    d.camera.imu = STILL_IMU
+    now = 100.0
+    for _ in range(10):
+        d.tick(now)
+        now += 0.1
+    assert d._throttle_since is not None
+    assert d.gyro_history
+    assert d.last_recovery_time == 0.0
+
+    # Then a wall. Long enough for a couple of bumper-cut recovers: the bumper
+    # fires 0.8 s in and settle is another 0.5 s.
+    d.camera.depth = blocked_depth()
+    for _ in range(30):
+        d.tick(now)
+        now += 0.1
+    assert any(t == d.reverse_speed for t in d.controller.throttles)
+    assert d.last_recovery_time == 0.0, "a wall is not a stick"
+
+    # Wall gone, car still not moving. A stick is a legitimate verdict from
+    # here -- it just has to cost full price again, timed from the first
+    # forward command after the wheels came back.
+    d.camera.depth = clear_depth()
+    first_forward = None
+    for _ in range(100):
+        d.tick(now)
+        if first_forward is None and d.controller.throttles[-1] == d.forward_speed:
+            first_forward = now
+        now += 0.1
+        if d.last_recovery_time:
+            break
+    assert d.last_recovery_time, "never confirmed a stick at all"
+
+    took = d.last_recovery_time - first_forward
+    full_price = dv.STUCK_ARM_SECONDS + (dv.STUCK_CONFIRM_SAMPLES - 1) * 0.1
+    assert took >= full_price - 1e-9, (
+        f"confirmed a stick {took:.2f} s after the wheels came back, against "
+        f"{full_price:.2f} s from cold -- evidence survived the recover")
+
+
 # --- steering bias ----------------------------------------------------------
 
 def test_an_even_scene_steers_straight(d):
