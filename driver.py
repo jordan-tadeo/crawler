@@ -8,10 +8,11 @@ whole decision is testable on a laptop with no car attached. Everything with
 a memory in it is on the Driver: the recover phase machine, the stuck
 evidence, and one latched evade direction.
 
-The steering half of that is new and deliberately narrow. Every probe inside
-the 400 mm budget used to mean a reverse; now one shape instead steers away
-and keeps driving, and the six gates that define that shape are in the block
-above the class. Everything else reverses exactly as it did.
+The steering half of that is deliberately narrow. Every probe inside the
+400 mm budget used to mean a reverse; now a small block -- off one edge or
+in the middle of the fan -- steers away and keeps driving when the car's own
+full-lock sweep says there is room, and the seven gates that define that are
+in the block above the class. Everything else reverses.
 
 Everything here is synchronous and non-blocking. The control loop owns the
 ESC and the servos on one thread and calls tick() about ten times a second,
@@ -136,11 +137,31 @@ UNKNOWN = "unknown"
 # exact multiple of 0.00106526 rad/s. Parked, the whole accel floor fits inside
 # 11 of its steps and the whole gyro floor inside 6 of its own.
 #
-# GYRO_MOVING_MIN sits at five times the measured parked maximum and about eight
-# times p99, which is 33 gyro steps against a parked floor of 6 -- clear of the
-# quantisation either way. The parked end of that range is measured. The rolling
-# end is not -- see the note in motion_evidence().
-GYRO_MOVING_MIN = 0.035  # rad/s
+# The rolling end, measured on 2026-10-27 off the /imu recording of a real auto
+# run: forward_speed 0.2 on a hard floor, armed (forward throttle for at least
+# STUCK_ARM_SECONDS), 772 windows of the same five-sample mean the driver takes:
+#
+#   gyro mean while rolling    p1 0.0146   p5 0.0173   p50 0.0356 rad/s
+#   accel mean while rolling   p1 0.106    p5 0.125    p50 0.188  m/s^2
+#
+# This was 0.035, five times the parked maximum, set before anyone had seen the
+# rolling number -- and the rolling median turned out to be 0.0356. Half of
+# every second of honest creeping read STILL on the gyro, the accel term at
+# stuck_threshold 0.2 sits on its own rolling median too, so 27% of armed
+# windows read STILL on both and ten of them in a row was a matter of time.
+# Four STUCK reverses in that run, three of them marked BAD, and in all four
+# the car was moving: the depth frames were changing at the same rate as a
+# known straight approach (frame-to-frame median 112-165 mm/s against 0 parked
+# and 166 approaching a wall), and the two seconds before each one never had a
+# window under 0.0142 rad/s.
+#
+# 0.010 is the geometric middle of the parked maximum (0.0069) and the rolling
+# p1 (0.0146), about nine gyro steps against the parked floor of six. Replayed
+# over that run nothing armed reads STILL at all. What has never been recorded
+# is a genuinely stalled car -- wheels against something, ESC pushing at 0.2 --
+# so whether a stall reads under 0.010 or buzzes above it is NOT measured.
+# That is a test to do with a hand on the car.
+GYRO_MOVING_MIN = 0.010  # rad/s
 
 # How much evidence before the car is allowed to call itself stuck. At the 10 Hz
 # tick this is a full second of consecutive confident no-motion readings, every
@@ -587,43 +608,81 @@ def free_by_column(depth, threshold_mm=CLEARANCE_MM) -> FootprintScan:
 # a pair of them -- [........N] 15 times, [N........] 12, [NN.......] 7,
 # [.......NN] 3.
 #
-# So exactly one pattern now steers instead of reversing: a block that is
-# entirely measured, contiguous, at most MAX_BLOCKED_PROBES wide, touching
-# exactly one edge of the fan, with OPEN_RATIO_MIN times as much room on the
-# open side and nothing closer than REVERSE_FLOOR_MM. Everything else reverses
-# exactly as it did before.
+# So a small block now steers instead of reversing: entirely measured,
+# contiguous, at most MAX_BLOCKED_PROBES wide, not spanning the fan, with
+# OPEN_RATIO_MIN times as much room on the side being turned toward, nothing
+# closer than REVERSE_FLOOR_MM, and every measured point in the fan outside the
+# circle the car sweeps at full lock. Everything else reverses.
 #
-# That is deliberately written as a narrowing of begin_recover()'s domain and
-# not as a new behaviour alongside it. Six gates in order, every one of them a
-# reason to reverse, and the evade is only what falls out of the bottom -- so
-# the safety argument reads one condition at a time, which is why the rules
-# are numbered in the code as well as here.
+# That used to be one edge only. A block that touched neither edge -- the
+# journal's "middle" -- reversed on the argument that steering away from it
+# meant steering into whatever was beside it. The run on 2026-10-27 says that
+# was the wrong call for this car in this house: 20 reversals in six minutes,
+# and the shapes it backed away from were [...N.....], [.N.......] and
+# [...NN....], single chair-leg sized things with eight probes of open floor
+# around them. The question was never "is there a gap to thread", it is "is
+# there room to turn away", and the probes beside the block answer that
+# directly: they are measured, and they are clear past the budget. So a middle
+# block now turns toward the side with more open probes, and the sweep check
+# below decides whether there is room to.
+#
+# Still a narrowing of begin_recover()'s domain and not a behaviour alongside
+# it. Seven gates in order, every one of them a reason to reverse, and the
+# evade is only what falls out of the bottom -- so the safety argument reads
+# one condition at a time, which is why the rules are numbered in the code as
+# well as here. Wide (3+), split and spanning blocks reverse exactly as before.
 
-# How close is too close to steer. Inside this floor there is no room left to
-# rotate along a surface, so it reverses instead.
+# The hard floor: inside this nothing steers, whatever the pattern.
 #
-# This number used to be justified by the sensor: minimum range was 348.4 mm
-# and 360 sat 11.6 mm above it, so the floor was very nearly the last
-# measurable reading. Extended disparity moved minimum range down to
-# fx * baseline / disparity_levels = 441.25 * 75 / 190 = 174.2 mm, and that
-# argument is gone with it -- a measured near reading now lies anywhere in
-# [174.2, 400), and 360 is less than half way down the band.
+# 360 until 2026-10-27, which was a deliberately conservative stand-in for a
+# turn radius nobody had measured. Two things moved. The camera now measures
+# cleanly down to about 165 mm (VERIFIED against a tape at 203 mm, read 207),
+# so a reading at 200-360 is a real distance and not the edge of the blind
+# zone. And the question of how close is too close to turn away is now asked
+# per scene, against the car's own sweep -- see TURN_RADIUS_MM -- rather than
+# answered once with a number that had to cover the worst pattern. With that
+# check in place a single floor only has to cover what the sweep model cannot:
+# readings so close that the frame age and the servo slew are most of the
+# distance. 200 mm is 35 mm above the measured near edge of the sensor and four
+# times the TURN_LAG_MM allowance, and nothing below it steers.
 #
-# It stays at 360 anyway, for a different and better reason: the gate is
-# maneuverability-bound now, not sensor-bound. A full-lock turn at distance Z
-# buys only about Z^2 / 2R of lateral offset before the nose covers the
-# distance, and with a full-lock radius anywhere near this car's own length
-# that is tens of millimetres by the time Z is under 300 mm -- 64 mm at
-# Z = 300 and R = 700. Tens of millimetres clears nothing, so steering down
-# there is not a maneuver, it is a slower collision.
+# Of the run's eight "floor" reversals, the ones at 160, 226 and 247 mm still
+# reverse (the first on this floor, the other two on the sweep check). This
+# number is not the knob for those; TURN_RADIUS_MM is.
+REVERSE_FLOOR_MM = 200.0
+
+# The full-lock turn, as one circle. ESTIMATED, off the 2026-10-27 recording,
+# and the single number most worth measuring with a tape: drive a full-lock
+# circle at forward_speed and halve its diameter.
 #
-# Where exactly it stops being a maneuver depends on a full-lock turn radius
-# I have not measured. Until I do, 360 is deliberately conservative: it gives
-# up the 174-360 mm band that the sensor can now see rather than guess at a
-# radius, and the cost of giving it up is reversing out of something I might
-# have grazed past. That is the cheap direction. Retune it off a measurement,
-# not off this comment.
-REVERSE_FLOOR_MM = 360.0
+# How it was estimated. Yaw is the IMU's gyro_x on this mounting (VERIFIED: it
+# goes positive on a right steer under throttle, and it is the axis that
+# carries 0.66-0.74 rad/s in a hand-driven right turn). During the two
+# graze-steers in the run, max_turn counter-phase at forward_speed 0.2, it read
+# 0.39 rad/s (20:10:44) and 0.32 rad/s (20:12:47) in the steady part of the
+# turn. Ground speed at forward_speed 0.2 is about 210 mm/s, off the closing
+# rate of three straight wall approaches in the depth stream (206, 210 and
+# 217 mm/s on the centre probes). 210 / 0.355 = 590 mm. The spread on that is
+# wide -- the turn may be slower than the straight line, and the two turns
+# disagree by 20% -- so read it as 450-750 mm. Counter-phase rear steer is
+# roughly half the radius front-only steering would give, so this is the
+# radius of a car that would turn in about 1.2 m on its front axle alone.
+TURN_RADIUS_MM = 590.0
+
+# How far the camera sits ahead of the point the car pivots about, which on a
+# symmetric counter-phase car is midway between the axles. ESTIMATED: nobody
+# has measured the wheelbase. 160 mm is half a 1/10 crawler's ~320 mm
+# wheelbase with the camera at the front axle, and if it is mounted ahead of
+# the axle the real number is larger, which only ever makes the sweep check
+# more conservative than it needs to be. Another number a tape settles.
+CAMERA_AHEAD_MM = 160.0
+
+# How much closer an obstacle gets before the turn has actually started.
+# ESTIMATED: the frame behind a decision is 88 ms old (measured, see
+# EVADE_SECONDS) and the servos take about 0.15 s to reach lock (yaw rises
+# from nothing to the turn rate in two or three 20 Hz samples in the run),
+# so about 0.24 s at 210 mm/s, which is 50 mm.
+TURN_LAG_MM = 50.0
 
 # How much of the car is allowed to be in the thing being steered around.
 # The probe boundaries land at these lateral offsets at the 400 mm budget,
@@ -632,6 +691,11 @@ REVERSE_FLOOR_MM = 360.0
 # at most 14.5 mm inside the tyre line, two reach 48.2 mm -- about one tyre
 # face -- and three reach 82 mm, which is most of the wheel. Two is the last
 # width where steering away is still a graze rather than a hope.
+#
+# The same limit holds for a block in the middle of the fan, where two probes
+# are about 68 mm of real width at the budget range -- a chair leg, a bin, a
+# shoe. Three in the middle is a third of the fan and is the start of something
+# the car is driving into rather than past, and it reverses as "wide".
 MAX_BLOCKED_PROBES = 2
 
 # How much more room the open side needs before the surface counts as shallow
@@ -639,16 +703,35 @@ MAX_BLOCKED_PROBES = 2
 #
 # For a flat surface the ratio is a statement about its angle and nothing
 # else: the fan's outer columns sit at tan = +/-0.383, so a plane at beta to
-# the image plane reads (1 + 0.383 tan beta) / (1 - 0.383 tan beta) across it,
-# and 2.0 is beta = 41 degrees. Below that the car is driving into it, not
-# along it.
+# the image plane reads (1 + 0.383 tan beta) / (1 - 0.383 tan beta) across it.
+# On the planar test fixture at a 390 mm near edge, 20 degrees reads 1.28, 30
+# reads 1.47 and 40 reads 1.76.
 #
-# The ceiling is the reason this cannot simply be raised to taste.
-# distance_mm is the near statistic of a probe whose lower rows terminate on
-# the floor inside FLOOR_CLEAR_MM, so an open probe reads about 899 whatever
-# is out there, and against a 400 mm trigger the ratio can never exceed about
-# 2.5. 2.0 leaves 20% of headroom. Past 2.2 the feature stops being reachable.
-OPEN_RATIO_MIN = 2.0
+# 2.0 until 2026-10-27, which is 41 degrees and was chosen without a turn
+# radius. Two marks from the run bracket the real answer, and both are oblique
+# walls across the whole fan, nearest at one edge (probe distances off the
+# /marks snapshot, VERIFIED):
+#
+#   BAD   [373 390 419 455 465 514 538 617 636]  ratio 1.71, about 38 degrees
+#   GOOD  [497 481 466 446 432 420 409 395 380]  ratio 1.31, about 21 degrees
+#
+# I wanted the first one steered along and the second one backed out of. 1.5
+# sits between them, and it is also about where the geometry puts it: a wall
+# can be turned away from when its distance from the full-lock turn centre is
+# more than the car's swept corner radius, and with TURN_RADIUS_MM at 590 and a
+# centre-probe distance of 430-470 mm that cut lands at 26-31 degrees, a ratio
+# of 1.45-1.55. ESTIMATED, because the radius is. The sweep check below asks
+# the same question directly of every probe; this is the angle limit that holds
+# whatever the radius turns out to be.
+#
+# One of the run's reversals, [........N] at 1.49, sits right on it and still
+# reverses. Whether that one should have steered is a feel call.
+#
+# The ceiling no longer binds. distance_mm on an open probe is about 899 (its
+# lower rows end on the floor), so the ratio tops out at 899 over the nearest
+# reading still allowed to steer, which is 4.5 with the floor at 200 instead of
+# 2.5 with it at 360.
+OPEN_RATIO_MIN = 1.5
 
 # Cruise steering: how much of max_turn a gradient with no obstacle in it is
 # allowed to ask for, and how much asymmetry it takes before it asks at all.
@@ -760,11 +843,97 @@ def cruise_bias(scan) -> float:
     return 0.0 if abs(bias) < CRUISE_DEADBAND else bias * CRUISE_TURN_FRACTION
 
 
+def _turn_side_mm(scan, i, side, distance):
+    """Where probe i's edge nearest the turn sits, in mm, at `distance`.
+
+    Measured along the direction being turned toward: positive is on the turn
+    side of the centreline, negative is on the side being turned away from.
+    The probe boundaries are rays from the lens, so the lateral offset of a
+    boundary scales with the distance it is read at, and the edge nearest the
+    turn is the worst case for anything inside that probe -- it is the point
+    the car's swinging corner gets to first.
+    """
+    geo = scan.geometry
+    edges = geo.col_edges
+    centre = (edges[0] + edges[-1]) / 2.0
+    edge = edges[i + 1] if side > 0 else edges[i]
+    return side * (edge - centre) / geo.fx * distance
+
+
+def turn_sweep_clears(scan, side) -> bool:
+    """Can a full-lock turn toward `side` begin now without touching anything
+    the fan can see? Pure, closed form, nine multiply-adds.
+
+    A counter-phase car at constant lock rotates about one fixed point: a
+    distance TURN_RADIUS_MM to the turn side of its pivot, which is
+    CAMERA_AHEAD_MM behind the lens. Every part of the car stays inside the
+    circle its outer front corner traces about that point, and the corner gets
+    to anything ahead of it before the rest of the body does. So a point the
+    camera measured is safe to turn away from exactly when it lies outside that
+    circle, once TURN_LAG_MM of approach is taken off for the frame age and the
+    servo slew:
+
+        (z + a)^2 + (R - p)^2  >  a^2 + (R + H)^2
+
+    with z the distance less the lag, p the point's lateral offset toward the
+    turn, a = CAMERA_AHEAD_MM, R = TURN_RADIUS_MM and H the half width
+    including FOOTPRINT_MARGIN_MM. Every probe is asked, blocked or clear, at
+    its turn-side edge -- so a wall that recedes into the clear probes is
+    tested along its whole visible length, not just at its nearest point.
+
+    Conservative, deliberately: it assumes the turn is held for as long as it
+    takes, where the real evade straightens out once the fan is clear. At the
+    estimated 590 mm radius this puts the closest a thing can be and still be
+    turned away from at about 257 mm for one edge probe, 284 for two, 316 for
+    a block two probes in, 351 for three in and 390 for one on the centreline
+    -- which leaves a centred block 10 mm of the trigger band, so in practice
+    it reverses. All of those move with TURN_RADIUS_MM, which is the point.
+    """
+    a = CAMERA_AHEAD_MM
+    r = TURN_RADIUS_MM
+    swept = a * a + (r + HALF_TRACK_MM + FOOTPRINT_MARGIN_MM) ** 2
+    for i in range(PROBE_COLUMNS):
+        distance = float(scan.distance_mm[i])
+        if not np.isfinite(distance):
+            # Only reachable on a NO_RETURN probe, which R1 has already
+            # reversed on. A point with no distance cannot be shown clear.
+            return False
+        z = distance - TURN_LAG_MM
+        if z <= 0.0:
+            return False
+        p = _turn_side_mm(scan, i, side, distance)
+        if (z + a) ** 2 + (r - p) ** 2 <= swept:
+            return False
+    return True
+
+
+def _roomier_side(scan, blocked) -> float:
+    """Which way to turn away from a block that touches neither edge.
+
+    More open probes first: they are measured, they are past the budget, and
+    they are where the car is going to be pointed. A tie -- only a single probe
+    dead on the centreline can make one -- goes to whichever side has more
+    measured room, each side's probes capped at FLOOR_CLEAR_MM so a column that
+    saw past the floor cannot win it. An exact tie on that too is 0.0, which
+    the caller reverses on rather than picking a side by coin.
+    """
+    left_open = blocked[0]
+    right_open = PROBE_COLUMNS - 1 - blocked[-1]
+    if left_open != right_open:
+        return 1.0 if right_open > left_open else -1.0
+    room = np.minimum(scan.distance_mm, FLOOR_CLEAR_MM)
+    left = float(room[:blocked[0]].mean())
+    right = float(room[blocked[-1] + 1:].mean())
+    if right == left:
+        return 0.0
+    return 1.0 if right > left else -1.0
+
+
 def read_the_gradient(scan) -> SteerVerdict:
     """What to do about one footprint scan. Pure: a scan in, a verdict out.
 
-    Six gates, in order, and every one of them reverses. The evade is what
-    comes out of the bottom when all six are satisfied, so this reads as the
+    Seven gates, in order, and every one of them reverses. The evade is what
+    comes out of the bottom when all seven are satisfied, so this reads as the
     old "anything inside 400 mm reverses" with its domain narrowed rather than
     as a second behaviour competing with it.
 
@@ -774,13 +943,10 @@ def read_the_gradient(scan) -> SteerVerdict:
     contribute to the open side of the ratio and can never be counted in the
     width. One anywhere in the fan vetoes the whole feature.
 
-    R2 supplies the abort signal for free, and since extended disparity it is
-    R2 and not R1 that does it. An obstacle being grazed that keeps closing
-    crosses REVERSE_FLOOR_MM at 360 mm and the next scan reverses, while still
-    being perfectly measurable -- the blind zone is down at 174 mm now and a
-    closing obstacle no longer reaches it before the floor catches it. R1 is
-    still the backstop for a column that goes unmeasurable for any of the
-    other reasons, but it is no longer the thing that ends a graze.
+    R2 is the hard floor and R7 is the per-scene one. An obstacle being steered
+    around that keeps closing fails R7 first, while it is still perfectly
+    measurable, and the next scan reverses; R2 is what is left for readings
+    so close that the lag is most of the distance.
     """
     blocked = [i for i in range(PROBE_COLUMNS) if scan.blocked[i]]
 
@@ -793,7 +959,7 @@ def read_the_gradient(scan) -> SteerVerdict:
 
     near = min(float(scan.distance_mm[i]) for i in blocked)
 
-    # R2. Already as close as the sensor can see.
+    # R2. Too close to steer, whatever the shape.
     if near < REVERSE_FLOOR_MM:
         return SteerVerdict(ACT_REVERSE, 0.0, f"floor {near:.0f}")
 
@@ -801,34 +967,53 @@ def read_the_gradient(scan) -> SteerVerdict:
     if blocked != list(range(blocked[0], blocked[-1] + 1)):
         return SteerVerdict(ACT_REVERSE, 0.0, "split")
 
-    # R4. A gap to thread, not a surface to graze. Steering away from
-    # something that does not touch an edge means steering into whatever is
-    # beside it, and at 400 mm a gap wide enough to thread barely exists --
-    # the whole fan is 306 mm of real width on a car 267 mm wide.
+    # R4. Touching both edges is a wall across the whole car, and there is no
+    # open side to turn toward.
     at_left = blocked[0] == 0
     at_right = blocked[-1] == PROBE_COLUMNS - 1
-    if at_left == at_right:              # neither edge, or both of them
-        return SteerVerdict(ACT_REVERSE, 0.0, "middle" if not at_left else "spans")
+    if at_left and at_right:
+        return SteerVerdict(ACT_REVERSE, 0.0, "spans")
 
     # R5. How much of the car may be in it.
     if len(blocked) > MAX_BLOCKED_PROBES:
         return SteerVerdict(ACT_REVERSE, 0.0, f"wide {len(blocked)}")
 
-    # R6. Shallow enough to rotate along? The open side is capped at the same
-    # FLOOR_CLEAR_MM the probes themselves terminate at, so the ratio cannot
-    # be inflated by a column that happened to see past the floor, and an
-    # infinity cannot reach the division.
+    # Which way. Away from an edge it touches; otherwise toward the roomier
+    # side, and a block with no roomier side reverses.
+    if at_left:
+        side = 1.0
+    elif at_right:
+        side = -1.0
+    else:
+        side = _roomier_side(scan, blocked)
+        if not side:
+            return SteerVerdict(ACT_REVERSE, 0.0, "middle")
+    turn_side = (range(blocked[-1] + 1, PROBE_COLUMNS) if side > 0
+                 else range(0, blocked[0]))
+
+    # R6. Shallow enough to rotate along? Asked of the side being turned
+    # toward, which for an edge block is every open probe and for a middle
+    # block is the half it is heading into. Capped at the same FLOOR_CLEAR_MM
+    # the probes themselves terminate at, so the ratio cannot be inflated by a
+    # column that happened to see past the floor, and an infinity cannot reach
+    # the division. Every probe in turn_side is CLEAR -- R1 has excluded
+    # NO_RETURN and the block is contiguous -- so the max has something in it.
     open_mm = min(FLOOR_CLEAR_MM,
-                  max(float(scan.distance_mm[i]) for i in range(PROBE_COLUMNS)
-                      if scan.reason[i] == CLEAR))
+                  max(float(scan.distance_mm[i]) for i in turn_side))
     ratio = open_mm / near
     if ratio < OPEN_RATIO_MIN:
         return SteerVerdict(ACT_REVERSE, 0.0, f"shallow {ratio:.2f}")
 
-    # Away from the blocked edge, at the full fraction. Nothing in between:
-    # the magnitude is not a function of the ratio, so it cannot dither, and
-    # the one number that bounds it is max_turn at the call site.
-    return SteerVerdict(ACT_EVADE, 1.0 if at_left else -1.0, f"graze {ratio:.2f}")
+    # R7. Room to actually turn away, off the car's own sweep.
+    if not turn_sweep_clears(scan, side):
+        return SteerVerdict(ACT_REVERSE, 0.0, f"tight {near:.0f}")
+
+    # At the full fraction. Nothing in between: the magnitude is not a
+    # function of the ratio, so it cannot dither, and the one number that
+    # bounds it is max_turn at the call site. "graze" off an edge, "dodge"
+    # around something in the middle, so the journal says which.
+    kind = "graze" if (at_left or at_right) else "dodge"
+    return SteerVerdict(ACT_EVADE, side, f"{kind} {ratio:.2f}")
 
 
 class Driver:
@@ -936,8 +1121,9 @@ class Driver:
         a crawler on real ground always shakes while it rolls.
 
         What I could not measure from a desk: how much gyro a creep at 0.2
-        actually produces. GYRO_MOVING_MIN is anchored off the parked end of
-        the range only, at 5x the measured parked maximum, which errs toward
+        actually produces. That one is measured now -- see GYRO_MOVING_MIN, and
+        the old 0.035 was its median. What follows was written when it was
+        anchored off the parked end of the range only, which erred toward
         calling the car moving -- that is, toward never recovering for no
         reason, which is the failure being fixed. The number still wants a pass
         on the bench with the wheels up before I treat it as a feel number.

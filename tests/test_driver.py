@@ -82,9 +82,34 @@ def test_the_measured_parked_floor_reads_as_still(d):
 
 
 def test_the_gyro_threshold_clears_the_measured_parked_maximum(d):
-    """GYRO_MOVING_MIN sits at 5x the parked max. If someone drops it to the
-    floor itself, a parked car starts reading as moving."""
+    """GYRO_MOVING_MIN sits between the parked max and the rolling p1. If
+    someone drops it to the floor itself, a parked car starts reading as
+    moving."""
     assert dv.GYRO_MOVING_MIN > 0.0069
+
+
+def test_the_slowest_measured_creep_reads_as_moving(d):
+    """The rolling end, measured off the 2026-10-27 run: the p1 of the
+    five-sample gyro mean while armed at forward_speed 0.2 was 0.0146 rad/s,
+    with the accel at its own p1 of 0.106 m/s^2. The old 0.035 threshold read
+    that as STILL -- it read a quarter of all honest creeping as STILL -- and
+    that is where four STUCK reverses on a moving car came from."""
+    creeping = imu(gyro=(0.0146, 0.0, 0.0), accel=(0.106, 0.0, 0.0))
+    for _ in range(d.imu_window_size):
+        evidence = d.motion_evidence(creeping)
+    assert evidence == dv.MOVING
+
+
+def test_a_creeping_car_is_never_called_stuck(d):
+    """The same thing through stuck(), over the length it takes to fire: the
+    slowest two seconds before any of the run's four STUCKs never had a window
+    under 0.0142 rad/s, with the accel term underneath stuck_threshold the
+    whole way. Armed, cooled down, thirty ticks of it -- three times the run of
+    STILL a stick needs -- and it must not fire once."""
+    creeping = imu(gyro=(0.0142, 0.0, 0.0), accel=(0.16, 0.0, 0.0))
+    d._throttle_since = 0.0
+    for k in range(dv.STUCK_CONFIRM_SAMPLES * 3):
+        assert d.stuck(creeping, 100.0 + 0.1 * k) is False, f"fired on tick {k}"
 
 
 def test_the_accelerometer_is_a_second_opinion_not_the_primary_test(d):
@@ -1442,17 +1467,26 @@ def test_an_obstacle_closing_in_stops_being_an_evade():
 def test_something_as_close_as_the_sensor_can_see_reverses():
     """R2, at the number. Inside REVERSE_FLOOR_MM there is no room left to
     rotate along a surface and the next few millimetres are the blind zone.
-    355 and 365 mm bracket the shipped 360, written as literals so that moving
-    the constant does not quietly move the scene with it."""
+    195 and 205 mm bracket the shipped 200, written as literals so that moving
+    the constant does not quietly move the scene with it.
+
+    This used to bracket 360, and 355 used to reverse here. It now steers:
+    one edge probe at 355 is well outside the full-lock sweep, and the floor
+    is only the backstop under R7. Just above the floor still reverses, on the
+    sweep rather than the floor."""
     verdict = dv.read_the_gradient(
-        dv.free_by_column(probe_scene([355.0] + [899.0] * 8)))
+        dv.free_by_column(probe_scene([195.0] + [899.0] * 8)))
     assert verdict.action == dv.ACT_REVERSE
     assert verdict.reason.startswith("floor")
     assert verdict.steer == 0.0
 
-    just_clear = dv.read_the_gradient(
-        dv.free_by_column(probe_scene([365.0] + [899.0] * 8)))
-    assert just_clear.action == dv.ACT_EVADE
+    just_over = dv.read_the_gradient(
+        dv.free_by_column(probe_scene([205.0] + [899.0] * 8)))
+    assert just_over.action == dv.ACT_REVERSE
+    assert just_over.reason == "tight 205"
+
+    assert dv.read_the_gradient(
+        dv.free_by_column(probe_scene([355.0] + [899.0] * 8))).action == dv.ACT_EVADE
 
 
 def test_the_reverse_floor_sits_between_the_blind_zone_and_the_trigger():
@@ -1492,22 +1526,101 @@ def test_two_separate_obstacles_are_not_a_surface():
     assert verdict.reason == "split"
 
 
-def test_a_gap_to_thread_is_not_a_surface_to_graze():
-    """R4. Steering away from something that touches neither edge means
-    steering into whatever is beside it, and at 400 mm the whole fan is only
-    306 mm of real width on a car 267 mm wide, so a threadable gap barely
-    exists. Deliberate: these are the events to re-read after a session if he
-    wants more forward motion out of it."""
-    for depths in ([899.0] * 4 + [390.0] + [899.0] * 4,          # ....N....
-                   [899.0] * 7 + [390.0] + [899.0],              # .......N.
-                   [390.0] + [899.0] * 7 + [899.0]):             # N........ (control)
-        verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(depths)))
-        if depths[0] == 390.0:
-            assert verdict.action == dv.ACT_EVADE
-        else:
-            assert verdict.action == dv.ACT_REVERSE
-            assert verdict.steer == 0.0
-            assert verdict.reason == "middle"
+@pytest.mark.parametrize("depths, steer", [
+    ([899.0] * 7 + [390.0] + [899.0], -1.0),          # .......N.  left, 7 open
+    ([899.0] * 6 + [390.0] + [899.0] * 2, -1.0),      # ......N..  left, 6 open
+    ([899.0] * 2 + [390.0] + [899.0] * 6, 1.0),       # ..N......  right, 6 open
+    ([899.0] * 3 + [390.0] * 2 + [899.0] * 4, 1.0),   # ...NN....  right, 4 vs 3
+])
+def test_a_block_in_the_middle_is_dodged_toward_the_open_side(depths, steer):
+    """Middle blocks used to reverse, all of them, as "middle". The run had
+    one at about 380 mm, [...N.....], that reversed off something small the
+    car had a whole fan of room to go round. It now turns toward the side
+    with more open probes, and the reason says it was a dodge rather than a
+    graze so the journal keeps the two apart."""
+    verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(depths)))
+    assert verdict.action == dv.ACT_EVADE
+    assert verdict.steer == steer
+    assert verdict.reason.startswith("dodge")
+
+
+def test_a_centred_block_breaks_its_tie_on_room_and_an_exact_tie_reverses():
+    """A single probe on the centreline leaves four open probes either side,
+    so the count cannot pick. The measured room can; and when that is exactly
+    equal too there is no honest side, so it reverses as "middle" rather than
+    picking one by coin."""
+    roomier_left = [899.0] * 4 + [390.0] + [700.0] + [899.0] * 3
+    verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(roomier_left)))
+    assert verdict.action == dv.ACT_EVADE
+    assert verdict.steer == -1.0
+
+    roomier_right = [899.0] * 3 + [700.0] + [390.0] + [899.0] * 4
+    assert dv.read_the_gradient(
+        dv.free_by_column(probe_scene(roomier_right))).steer == 1.0
+
+    even = [899.0] * 4 + [390.0] + [899.0] * 4
+    verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(even)))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.steer == 0.0
+    assert verdict.reason == "middle"
+
+
+@pytest.mark.parametrize("depths, tight, clears", [
+    # pattern            reverses at     steers at   (sweep cut, R = 590)
+    ("N........",        250.0,          265.0),     # ~257
+    ("NN.......",        275.0,          295.0),     # ~284
+    ("...N.....",        340.0,          362.0),     # ~351
+])
+def test_the_turn_sweep_decides_how_close_is_too_close(depths, tight, clears):
+    """R7. The single 360 mm floor is gone; how close a block can be and still
+    be turned away from now depends on where it is in the fan, because the
+    car's swinging front corner reaches an edge probe last and a centred one
+    first. Literals either side of each cut, so moving TURN_RADIUS_MM or
+    CAMERA_AHEAD_MM fails here rather than quietly moving the scenes."""
+    def at(mm):
+        return probe_scene([mm if c == "N" else 899.0 for c in depths])
+
+    close = dv.read_the_gradient(dv.free_by_column(at(tight)))
+    assert close.action == dv.ACT_REVERSE
+    assert close.steer == 0.0
+    assert close.reason == f"tight {tight:.0f}"
+
+    assert dv.read_the_gradient(dv.free_by_column(at(clears))).action == dv.ACT_EVADE
+
+
+def test_the_sweep_is_asked_of_every_probe_not_just_the_blocked_one():
+    """A clear probe can still be in the way of the corner. An edge block at
+    300 mm clears on its own. Put the far probe -- the one the car is turning
+    toward, whose edge the swinging corner reaches first -- at 450 mm, past
+    the budget and so CLEAR, and the swing no longer fits: on that side the
+    cut is about 520 mm."""
+    alone = [300.0] + [899.0] * 8
+    assert dv.turn_sweep_clears(dv.free_by_column(probe_scene(alone)), 1.0)
+
+    crowded = [300.0] + [899.0] * 7 + [450.0]
+    scan = dv.free_by_column(probe_scene(crowded))
+    assert scan.reason[8] == dv.CLEAR
+    assert not dv.turn_sweep_clears(scan, 1.0)
+    verdict = dv.read_the_gradient(scan)
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.reason == "tight 300"
+
+
+def test_the_two_walls_marked_on_the_floor_land_on_the_side_he_marked():
+    """The /marks probe distances off the 2026-10-27 run, VERIFIED, both of
+    them oblique walls across the whole fan nearest at one edge. The first
+    reversed and was marked bad; the second reversed and was marked good. The
+    other two bad marks from that run, BAD3 and BAD5, are not here because
+    they still reverse: on the estimated radius their corners would clip."""
+    bad = [373.0, 390.0, 419.0, 455.0, 465.0, 514.0, 538.0, 617.0, 636.0]
+    verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(bad)))
+    assert verdict.action == dv.ACT_EVADE
+    assert verdict.steer == 1.0
+
+    good = [497.0, 481.0, 466.0, 446.0, 432.0, 420.0, 409.0, 395.0, 380.0]
+    verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(good)))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.reason.startswith("shallow")
 
 
 def test_a_doorway_straight_ahead_reverses_and_does_not_steer(d):
@@ -1549,9 +1662,13 @@ def test_too_much_of_the_car_in_it_reverses():
 def test_a_surface_too_steep_to_rotate_along_reverses():
     """R6, at the number. Without the ratio gate the car would steer away from
     a wall it is driving straight into, because one edge probe lighting up
-    first is exactly what a slightly-off-square approach looks like."""
+    first is exactly what a slightly-off-square approach looks like.
+
+    The open side was 700 here, a ratio of 1.79, when the threshold was 2.0.
+    That now steers -- it is steeper than the wall marked bad in the run -- so
+    the scene is 580, a ratio of 1.49, just under 1.5."""
     shallow = dv.read_the_gradient(
-        dv.free_by_column(probe_scene([390.0] + [700.0] * 8)))
+        dv.free_by_column(probe_scene([390.0] + [580.0] * 8)))
     assert shallow.action == dv.ACT_REVERSE
     assert shallow.reason.startswith("shallow")
     assert shallow.steer == 0.0
@@ -1630,7 +1747,7 @@ def test_open_floor_drives_straight_on_however_patchy_it_is(dropout):
 # --- the envelope: which wall angles are steered around --------------------
 
 
-@pytest.mark.parametrize("beta", [-70, -60, -50, 50, 60, 70])
+@pytest.mark.parametrize("beta", [-70, -60, -50, -40, 40, 50, 60, 70])
 def test_a_shallow_enough_wall_is_steered_away_from(beta):
     """Measured on the planar fixture at the trigger range, near edge at
     390 mm:
@@ -1638,22 +1755,25 @@ def test_a_shallow_enough_wall_is_steered_away_from(beta):
         beta   20     30     40     50     60     70
         ratio  1.28   1.47   1.76   2.26   2.31   2.31
 
-    The threshold sits between 40 and 50 degrees, which is where
-    OPEN_RATIO_MIN = 2.0 puts it: the fan's outer columns are at tan +/-0.383,
+    The threshold sits between 30 and 40 degrees, which is where
+    OPEN_RATIO_MIN = 1.5 puts it: the fan's outer columns are at tan +/-0.383,
     so a plane reads (1 + 0.383 tan beta) / (1 - 0.383 tan beta) across it and
-    2.0 is beta = 41 degrees. The table flattens at 2.31 because the open side
-    is the floor at 899 against a near edge at 390.
+    1.5 is beta = 28 degrees on the formula, a hair over 30 on the fixture.
+    It was 2.0 and 41 degrees, with 40 on the reverse side, until the run's
+    marks put it lower. The table flattens at 2.31 because the open side is
+    the floor at 899 against a near edge at 390.
     """
     verdict = dv.read_the_gradient(dv.free_by_column(wall(390.0, beta)))
     assert verdict.action == dv.ACT_EVADE
     assert verdict.steer == (1.0 if beta > 0 else -1.0), "steer away, not into"
 
 
-@pytest.mark.parametrize("beta", [-40, -30, -20, 20, 30, 40])
+@pytest.mark.parametrize("beta", [-30, -20, 20, 30])
 def test_a_wall_being_driven_into_is_backed_away_from(beta):
     """The other side of the same threshold, and the one that matters for
-    safety: a 40 degree approach still reverses. Steering along a wall the car
-    is driving into is how it ends up leaning on a servo."""
+    safety: a 30 degree approach still reverses. Steering along a wall the car
+    is driving into is how it ends up leaning on a servo. 40 degrees used to
+    be on this side; it steers now, see the table above."""
     verdict = dv.read_the_gradient(dv.free_by_column(wall(390.0, beta)))
     assert verdict.action == dv.ACT_REVERSE
     assert verdict.steer == 0.0
@@ -1670,7 +1790,7 @@ def test_a_head_on_wall_always_reverses(beta):
 
 
 @pytest.mark.parametrize("d_mm", [365.0, 380.0, 395.0])
-@pytest.mark.parametrize("beta", [-60, -50, 50, 60])
+@pytest.mark.parametrize("beta", [-60, -50, -40, 40, 50, 60])
 def test_the_envelope_holds_across_the_trigger_band(d_mm, beta):
     """The whole measurable band between REVERSE_FLOOR_MM and the trigger, so
     the verdict is not an accident of one standoff distance."""
@@ -1681,10 +1801,15 @@ def test_the_envelope_holds_across_the_trigger_band(d_mm, beta):
 
 def test_the_measured_journal_patterns_arm_about_two_in_five():
     """The sanity check on the real car's own record: 88 obstacle events read
-    out of the journal's bracketed probe strings, classified by shape. 37 of
+    out of the journal's bracketed probe strings, classified by shape. 47 of
     them are the evade shape. If a change to the rules moved this a long way
     in either direction, it changed what the car does on the floor rather than
-    what it does in a test."""
+    what it does in a test.
+
+    37 until middle blocks could be dodged. The ten that moved, at 390 mm, are
+    exactly the off-centre middle shapes: .......N. (5), ......N.. (2),
+    ...NN.... (1), .N....... (1) and ..N...... (1). The two ....N.... stay
+    reverses, an exact tie with nothing to choose a side by."""
     counts = {
         "........N": 15, "NNNNNNNNN": 13, "N........": 12, "....NNNNN": 7,
         "NN.......": 7, ".......N.": 5, "NNNNNN...": 3, "NNN......": 3,
@@ -1701,7 +1826,7 @@ def test_the_measured_journal_patterns_arm_about_two_in_five():
         assert marks(scan) == pattern, "the fixture has to reproduce the shape"
         if dv.read_the_gradient(scan).action == dv.ACT_EVADE:
             armed += seen
-    assert armed == 37, f"{armed} of {sum(counts.values())} events"
+    assert armed == 47, f"{armed} of {sum(counts.values())} events"
 
 
 # --- the commitment latch --------------------------------------------------
