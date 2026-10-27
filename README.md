@@ -172,7 +172,7 @@ fires, and is the only thing that runs the canned backup-and-turn. A model
 that will not load is auto unavailable, not a quiet fall back to the rules.
 
 Every tick it picks forward, reverse or stop, a throttle as a fraction of the
-speed cap (forward 0.4, reverse -0.296, so never faster than auto already
+speed cap (forward 0.4, reverse -1.0, so never faster than auto already
 drives) and a front steer in manual's units, a fraction of the pad's full
 lock (0.7). A reverse is the model's too, decided again every tick, so it can
 stop backing up the moment the picture says so. It writes into the same held

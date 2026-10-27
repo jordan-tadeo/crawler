@@ -13,9 +13,11 @@ holds it is `footprint.py` (the rows), `policy_input.py` (the picture) and
   (two buzzes) and the car opens the camera and starts a new MCAP of its own.
   It drives exactly like manual except the throttle is scaled: full RT is
   auto's forward speed (`Driver.forward_speed`, 0.4 today, 1745 us), full LT
-  is auto's reverse speed (`Driver.reverse_speed`, -0.296 today, 1405 us:
-  derived so reverse sits the same 170 us off neutral as forward). Every
-  recording up to the first record session was made at 0.2 / -0.6.
+  is auto's reverse speed (`Driver.reverse_speed`, -1.0 today, 1000 us:
+  full reverse, because the ESC needs a much bigger pulse to start backing
+  up than going forward). Every recording up to the first record session
+  was made at 0.2 / -0.6, and the sessions after it up to the reverse change
+  at 0.4 / -0.296.
   Steering is unchanged. Any
   fresh press of Y goes back to manual (one buzz); START ends the session and
   goes to auto; losing the pad ends it at neutral. A and B marks work as
@@ -107,7 +109,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `steer_by` | str | `"pad"` or `"driver"`: who had the steering when this row's command went out. Always `"pad"` in record |
 | `throttle_by` | str | `"pad"` or `"driver"`: same, for the throttle |
 | `pad_throttle` | float | record, or auto with `throttle_by` `"pad"`: the trigger before scaling, -1..1. Otherwise 0 |
-| `forward_limit`, `reverse_limit` | float | the scale used for `pad_throttle`, e.g. 0.4 / -0.296 (0.2 / -0.6 in the first sessions). -1 when no trigger was driving |
+| `forward_limit`, `reverse_limit` | float | the scale used for `pad_throttle`, e.g. 0.4 / -1.0 (0.2 / -0.6 in the first sessions, 0.4 / -0.296 after). -1 when no trigger was driving |
 | `imu_accel_x/y/z` | float | newest OAK-D IMU sample at the tick, linear acceleration, m/s^2 |
 | `imu_gyro_x/y/z` | float | same sample, rad/s |
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
@@ -178,9 +180,10 @@ for more than today's cap.
 The same pull is not the same decision at a different cap, though: at 0.2 I
 held RT flat because the car barely moved. So `tools/policy_dataset.py`
 leaves out, by default and with a `LEFT OUT` line, any session whose caps
-differ from `policy_adapters.RUNTIME_CAPS` (today 0.4 / -0.296), and
+differ from `policy_adapters.RUNTIME_CAPS` (today 0.4 / -1.0), and
 `--include-other-caps` keeps them with a `WARNING`. That includes every
-legacy file and the first record session, all at 0.2 / -0.6. A session that
+legacy file and the first record session, all at 0.2 / -0.6, and every
+session recorded at 0.4 / -0.296. A session that
 recorded no caps at all is kept with a warning; its throttle is the
 autopilot's and never a label. The `.npz` meta carries `throttle_unit`,
 `runtime_caps` and each session's `session_caps`.

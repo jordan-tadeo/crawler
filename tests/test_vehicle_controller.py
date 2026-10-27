@@ -222,18 +222,18 @@ def test_close_still_stops_the_esc_when_a_servo_raises(vecon):
 
 # --- the speed caps through the real mapping --------------------------------
 
-def test_reverse_cap_sits_as_far_off_neutral_as_forward(vecon):
-    """Reverse is as fast as forward, meaning the same pulse offset.
+def test_reverse_cap_is_full_reverse_through_the_real_mapping(vecon):
+    """Reverse is the end of the range: 1000 us, full reverse.
 
-    Through set_throttle's own arithmetic, not a copy of it: forward maps over
-    425 us and reverse over 575, so equal fractions would not be equal
-    offsets. int() truncation may cost one side a microsecond, never more.
+    Equal pulse offset with forward was measured too slow on the floor, so
+    reverse is not derived from forward any more. Through set_throttle's own
+    arithmetic, not a copy of it, and inside [-1, 0) so it is still a reverse
+    and the clamp never moves it.
     """
     import driver as dv
 
-    forward = vecon.set_throttle(dv.FORWARD_SPEED) - vc.ESC_NEUTRAL_PW
-    reverse = vc.ESC_NEUTRAL_PW - vecon.set_throttle(dv.REVERSE_SPEED)
-    assert forward > 0 and reverse > 0
-    assert abs(forward - reverse) <= 1
+    assert -1.0 <= dv.REVERSE_SPEED < 0
+    assert vecon.set_throttle(dv.REVERSE_SPEED) == vc.ESC_FULL_REVERSE_PW == 1000
+    assert vecon.set_throttle(dv.FORWARD_SPEED) > vc.ESC_NEUTRAL_PW
     d = dv.Driver(None, None)
     assert (d.forward_speed, d.reverse_speed) == (dv.FORWARD_SPEED, dv.REVERSE_SPEED)

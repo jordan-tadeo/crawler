@@ -39,11 +39,6 @@ from typing import NamedTuple
 
 import numpy as np
 
-# The ESC's calibration, read and never copied: the reverse cap below is
-# derived from it. Importing the module is free off the Pi -- the hardware
-# imports live inside VehicleController.__init__.
-import VehicleController as vc
-
 # Recover phases, in order.
 _PHASE_REVERSE = "reverse"
 _PHASE_SETTLE = "settle"
@@ -1090,23 +1085,16 @@ def floor_vetoes_forward(scan) -> bool:
 # pulse offset of what I drove that session.
 FORWARD_SPEED = 0.4
 
-# Reverse was -0.6, 1230 us: -345 us off neutral against forward's +85, so
-# backing up ran about four times the pulse offset of going forward and
-# drove much faster. Now reverse is as fast as forward, and "as fast" here
-# means the same pulse offset from neutral. set_throttle maps forward over
-# 425 us (neutral to full forward) and reverse over 575 us (neutral to full
-# reverse), so the same offset is a smaller fraction in reverse: -0.2957 at
-# forward 0.4, which is 1405 us, -170 us. Derived, so retuning FORWARD_SPEED
-# keeps them matched (int() truncation can leave them a microsecond apart at
-# other values, e.g. +127 / -128 at 0.3).
+# Reverse was -0.6, 1230 us, -345 us off neutral. Then it was derived to
+# sit the same pulse offset off neutral as forward: -0.2957 at forward 0.4,
+# 1405 us, -170 us. On the floor that was too slow. Reverse barely moved,
+# and with the wheels turned it did not move at all. This ESC needs a much
+# bigger pulse to start in reverse than in forward, so an equal offset is
+# not an equal speed here.
 #
-# Equal pulse offset is the first cut of "equal speed", not a measurement of
-# it. Nothing says this ESC answers the same offset with the same wheel
-# speed in both directions -- many ESCs do not -- so whether reverse is
-# actually as fast as forward is mine to judge on the floor.
-REVERSE_SPEED = -FORWARD_SPEED * (
-    (vc.ESC_FULL_FORWARD_PW - vc.ESC_NEUTRAL_PW)
-    / (vc.ESC_NEUTRAL_PW - vc.ESC_FULL_REVERSE_PW))
+# -1.0 is my call: the end of the range, 1000 us, -575 us off neutral, full
+# reverse. set_throttle clamps to [-1, 1], so there is nothing past it.
+REVERSE_SPEED = -1.0
 
 
 class Driver:

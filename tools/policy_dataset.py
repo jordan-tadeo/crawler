@@ -139,7 +139,7 @@ class IdleRules(NamedTuple):
       at rest > 10 s, manual (84614)       0.12 / 11.2        0.009 / 2.63
 
     Those are the old caps, 0.2 / -0.6; nothing here is measured at today's
-    0.4 / -0.296. Driving at the record caps shakes the car as hard as
+    0.4 / -1.0. Driving at the record caps shakes the car as hard as
     handling it does (reverse at -0.6 is the most violent thing in the
     files), which is why
     the rule only ever looks at ticks with no input. Half a second after
