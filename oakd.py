@@ -215,7 +215,31 @@ def build_pipeline(rectified: bool = True) -> dai.Pipeline:
     stereo.setSubpixel(False)
     stereo.setExtendedDisparity(True)
     stereo.setRectifyEdgeFillColor(0)
-    stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # Optional
+    # The align stays, and the argument for it is valid-pixel density -- not
+    # depth. It looks like a no-op and the device itself encourages that
+    # reading: there is no ColorCamera in this pipeline, and the log says
+    # "Align to RGB requested, but ColorCamera not configured. Can't determine
+    # output resolution automatically. Using MonoCamera resolution." It is not
+    # a no-op. The EEPROM carries RGB calibration whether or not that node
+    # exists, so the warp happens and the mono output size is kept.
+    #
+    # What it buys, measured on the car, 300 frames per config on one scene:
+    # 94.1% of the full frame valid with the align, 80.0% without. That 14
+    # point gap reproduces an earlier run on a different scene, 89.3% against
+    # 76.8%, so the density effect is the robust part of this. The depth shift
+    # that same earlier run reported did not reproduce -- against a tape
+    # measure the two configs read 1048.0 mm and 1051.0 mm on a 1041.4 mm
+    # target -- so treat the align as free of geometric cost and see FX_AT_640
+    # in driver.py for that whole measurement.
+    #
+    # Why density is worth buying: driver.py's MIN_VALID_FRACTION = 0.1 marks a
+    # footprint probe NO_RETURN when it cannot produce a tenth of its samples
+    # as valid-and-far, a NO_RETURN probe is blocked, and a blocked column is a
+    # reverse. Invalid pixels turn into reverses, so the align is buying
+    # forward motion. And it costs no frame rate at all: 16.00 fps measured
+    # either way. Anybody about to delete this as dead config is deleting 14
+    # points of density and paying for it in reverses.
+    stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
     stereo.setPostProcessingHardwareResources(
         POST_PROCESSING_SHAVES, POST_PROCESSING_SLICES)
 
@@ -258,10 +282,12 @@ def build_pipeline(rectified: bool = True) -> dai.Pipeline:
     # auto mode should not pay for a picture it does not look at. Measured,
     # 200 frames a config, same scene: depth plus disparity plus this one is
     # 12.25 fps, and unlinking both this and disparity -- half the transported
-    # bytes -- is 12.13. The stream is free on the wire. What it is not free
-    # of is the JPEG encode on the Pi's publisher thread, which is real, so
-    # the gate stays where it is and the hub still only asks for it when
-    # telemetry is going to carry it.
+    # bytes -- is 12.13. Both of those are the old 2-shave, uncapped pipeline
+    # and neither is the rate the car runs at now -- see CAPTURE_FPS above --
+    # but the comparison is the point and it survives: the stream is free on
+    # the wire. What it is not free of is the JPEG encode on the Pi's publisher
+    # thread, which is real, so the gate stays where it is and the hub still
+    # only asks for it when telemetry is going to carry it.
     if rectified:
         xout_rect = pipeline.create(dai.node.XLinkOut)
         xout_rect.setStreamName("rectified_left")
@@ -281,6 +307,25 @@ class OakD:
         # self.device.setLogLevel(dai.LogLevel.INFO)
         # self.device.setLogOutputLevel(dai.LogLevel.INFO)
 
+        # Every queue here is opened shallow and non-blocking -- the small
+        # maxSize and the False -- and that is load-bearing, not a style
+        # choice. depthai's default queue for a stream nobody asks for is deep
+        # AND blocking, so every XLinkOut stream in the pipeline has to be
+        # either drained or opened non-blocking. One stream left to fill will
+        # jam XLink and take every other stream down with it, depth included.
+        #
+        # It cost me an afternoon because it does not look like a host problem.
+        # I wrote a diagnostic straight against build_pipeline() and opened
+        # only the "depth" queue, leaving disparity and imu undrained. Depth
+        # delivered exactly 43 frames at an apparent 1.44 fps and then stopped
+        # dead -- and the 43 frames that did arrive carried a healthy 87 ms
+        # latency, which reads like the device dying rather than my own unread
+        # queues strangling it. Re-run with all three drained non-blocking:
+        # 300 frames at 16.08 fps, clean.
+        #
+        # So a stream that quits after a few dozen frames with good latency on
+        # the ones it did deliver is this, every time. Anyone writing a
+        # diagnostic against build_pipeline() has to open all of them.
         self.depth_queue = self.device.getOutputQueue("depth", 4, False)
         self.disparity_queue = self.device.getOutputQueue("disparity", 4, False)
         self.imu_queue = self.device.getOutputQueue("imu", 10, False)

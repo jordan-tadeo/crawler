@@ -275,40 +275,46 @@ CLEARANCE_MM = 400.0
 # They are scaled to whatever frame actually arrives, so a resolution change
 # needs no edit here.
 #
-# The complication, and it is unresolved: oakd.py calls
-# stereo.setDepthAlign(dai.CameraBoardSocket.RGB) while there is no
-# ColorCamera node in the pipeline. The EEPROM carries RGB calibration whether
-# or not that node exists, so the align can take effect, and if it does the
-# depth frame is in the IMX378's frame rather than the mono pair's -- 69
-# degree HFOV, and a 4:3 sensor squeezed into a 1.6 output. Worst case that is
-# fx = 466 (5.5% high) and fy = 388 (12% low). The margins below were picked
-# to survive it: at fy = 388 the bottom probe row still reads flat floor at
-# 792 mm against a 400 mm budget. Do not change the stereo config to find out
-# -- that is its own experiment. The cheap check is to park a measured 400 mm
-# off a flat wall and see whether the probe span lands on 267 mm of it.
+# There was one complication hanging over these two numbers, and it is closed.
+# oakd.py calls stereo.setDepthAlign(dai.CameraBoardSocket.RGB) while there is
+# no ColorCamera node in the pipeline. The EEPROM carries RGB calibration
+# whether or not that node exists, so the align does take effect, and the fear
+# was that depth therefore lands in the IMX378's frame rather than the mono
+# pair's -- 69 degree HFOV, and a 4:3 sensor squeezed into a 1.6 output. Worst
+# case that is fx = 466 (5.5% high) and fy = 388 (12% low), which would make
+# the two numbers below wrong by a few percent and every millimetre in this
+# file suspect with them.
 #
-# Half of that is no longer unresolved: the align IS taking effect. Measured
-# on a static bench scene, 200 frames each, nothing moved between runs, the
-# only difference being whether setDepthAlign is called:
+# They are not wrong. Measured on the car against a tape measure, flat box
+# target, 300 frames per config at a healthy 16.08 fps with every queue
+# drained:
 #
-#   with the align      median over a 100x100 centre ROI 521.3 mm,
-#                       89.3% of pixels valid
-#   without it          502.2 mm, 76.8% valid
+#   target at 203.2 mm (8 in)     depth read 207.0 mm
+#   target at 1041.4 mm (41 in)   depth read 1048.0 mm   align on, as deployed
+#                                 depth read 1051.0 mm   align off
 #
-# So the align shifts the reading by 19.1 mm, 3.7% of it, and it is worth
-# 12 percentage points of valid-pixel density -- which is also why removing it
-# is not a free win even though it costs no frame rate at all (16.00 fps
-# either way). The device says why in its own log: "Align to RGB requested,
-# but ColorCamera not configured. Can't determine output resolution
-# automatically. Using MonoCamera resolution."  It warps into the IMX378's
-# frame and keeps the mono output size.
+# Those two distances are 5x apart, which is what makes offset and scale
+# separable. Fit them jointly for a constant offset plus a scale factor and
+# they come out at +3.1 mm of offset and +0.33% of scale. The offset is the
+# optical centre sitting a few millimetres behind the housing face I held the
+# tape against, so it is me measuring from the wrong datum rather than an
+# error in the camera at all, and a third of a percent of scale is inside the
+# sensor's own spec and far below anything the thresholds in this file can
+# resolve.
 #
-# 3.7% is the right order for the 5.5% fx error the paragraph above feared, so
-# treat these two numbers as probably a few percent wrong in that direction.
-# What it is NOT is evidence of which way to jump: a tape measure against a
-# flat wall decides whether to fix the intrinsics or drop the align, and until
-# somebody does that, changing either of these is guessing. They stay as they
-# are.
+# So 441.25 is correct, the align does not meaningfully warp depth, and the
+# few-percent error feared above does not exist. Do not spend the afternoon
+# re-deriving it, and do not treat the millimetre figures anywhere in this
+# file as suspect on account of it. An earlier bench run had the align
+# shifting a centre-ROI median by 19.1 mm, 3.7% of it; that did not reproduce
+# against the tape and reads as an artifact of the one scene it was measured
+# on. What did reproduce is the valid-pixel density the align buys, which is
+# the actual reason it stays, and that is written up next to the call in
+# oakd.py.
+#
+# The probe margins below were originally sized to survive fy = 388. They keep
+# that slack, because slack there only ever costs me gaps I would have
+# squeezed through -- not because the error is still on the table.
 FX_AT_640 = 441.25
 FY_AT_400 = 441.25
 
