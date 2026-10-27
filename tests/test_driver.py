@@ -967,3 +967,117 @@ def test_a_frame_too_small_for_the_band_still_decides_and_fails_closed():
     # Narrower than the probe count cannot be laid out at all, and that too
     # has to come back as a stop rather than an exception.
     assert dv.free_by_column(np.full((4, 4), 3000, dtype=np.uint16)).blocked.any()
+
+
+# --- four-wheel steering ----------------------------------------------------
+#
+# The car has two steering servos and ordinary driving only ever used one.
+# tick() commanded set_steering(bias, 0), so the rear was hard-centred on
+# every forward tick while begin_recover() -- the one path that did use it --
+# commanded the full counter-phase pair. Tight indoor corners were the thing
+# that could not be taken. steering_pair() is now the single definition of
+# how this car steers and both auto call sites go through it.
+
+
+def test_counter_phase_puts_the_rear_opposite_the_front():
+    """Opposite, not the same. In-phase would crab the body sideways without
+    rotating it, which is not what a tight corner needs."""
+    front, rear = dv.steering_pair(0.4)
+    assert front == 0.4
+    assert rear == -0.4
+
+
+def test_the_ratio_is_full_counter_phase():
+    """1.0 is the tightest radius the linkage gives and it is what
+    begin_recover() has always commanded. Anything less is a looser turn than
+    the car can do."""
+    assert dv.REAR_STEER_RATIO == 1.0
+
+
+def test_centre_stays_centred_on_both_axles():
+    assert dv.steering_pair(0) == (0, 0)
+    assert dv.steering_pair(0.0)[1] == 0.0
+
+
+def test_forward_driving_steers_the_rear_too(d):
+    """The ask, at the call site that was wrong. A clear scene with the room
+    all on one side used to command a rear of exactly 0."""
+    depth = clear_depth()
+    depth[:, 320:] = 4000
+    d.camera.depth = depth
+    d.camera.imu = MOVING_IMU
+
+    d.tick(100.0)
+
+    front, rear = d.controller.steerings[-1]
+    assert front != 0, "the scene has to be lopsided enough to ask for a turn"
+    assert rear == -front
+
+
+def test_forward_driving_goes_through_the_one_steering_definition(d, monkeypatch):
+    """Not a second copy of the arithmetic. Turn the one constant and the
+    forward path has to follow it."""
+    monkeypatch.setattr(dv, "REAR_STEER_RATIO", 0.5)
+    depth = clear_depth()
+    depth[:, 320:] = 4000
+    d.camera.depth = depth
+    d.camera.imu = MOVING_IMU
+
+    d.tick(100.0)
+
+    front, rear = d.controller.steerings[-1]
+    assert rear == pytest.approx(-0.5 * front)
+
+
+def test_a_recover_goes_through_the_one_steering_definition(d, monkeypatch):
+    """begin_recover() predates the helper and its literal (turn_dir,
+    -turn_dir) happened to agree with it at ratio 1.0. It has to be reading
+    the ratio, or there are two definitions again and only one of them moves
+    when I turn the knob."""
+    monkeypatch.setattr(dv, "REAR_STEER_RATIO", 0.5)
+    d.begin_recover(100.0)
+
+    front, rear = d.controller.steerings[-1]
+    assert front == d._turn_dir
+    assert rear == pytest.approx(-0.5 * d._turn_dir)
+
+
+@pytest.mark.parametrize("ratio", [1.0, 1.5, 4.0, 100.0])
+@pytest.mark.parametrize("front", [-1.0, -0.6, -0.25, 0.0, 0.25, 0.6, 1.0])
+def test_the_rear_can_never_exceed_the_front(monkeypatch, ratio, front):
+    """max_turn = 0.6 is my limit on how hard a servo may be held against an
+    object, and it bounds the front. Capping the rear at the front's own
+    magnitude means the rear is under whatever bound the front is under, so a
+    ratio raised past 1.0 can never put the rear servo somewhere the front is
+    not allowed to go."""
+    monkeypatch.setattr(dv, "REAR_STEER_RATIO", ratio)
+    out_front, rear = dv.steering_pair(front)
+    assert out_front == front, "the front is clamped, never scaled down"
+    assert abs(rear) <= abs(front) + 1e-12
+
+
+@pytest.mark.parametrize("ratio", [1.0, 1.5, 100.0])
+def test_a_recover_never_commands_past_max_turn_on_either_axle(d, monkeypatch, ratio):
+    """The recover path is the one place the front is bounded by max_turn, so
+    it is the one place the bound can be checked end to end. The turn
+    direction is a random pick of four, so this asks for all of them."""
+    monkeypatch.setattr(dv, "REAR_STEER_RATIO", ratio)
+    for _ in range(50):
+        d.begin_recover(100.0)
+        front, rear = d.controller.steerings[-1]
+        assert abs(front) <= d.max_turn + 1e-12
+        assert abs(rear) <= d.max_turn + 1e-12
+
+
+def test_the_rear_keeps_the_front_sign_flipped_both_ways():
+    assert dv.steering_pair(-0.3)[1] == pytest.approx(0.3)
+    assert dv.steering_pair(0.3)[1] == pytest.approx(-0.3)
+
+
+def test_a_nan_angle_is_left_for_the_one_place_that_writes_hardware():
+    """steering_pair does not guard it and must not pretend to. _usable() in
+    VehicleController is the single gate and it commands neutral on both
+    channels, which is the behaviour a nan already had before the rear was
+    wired."""
+    front, rear = dv.steering_pair(float("nan"))
+    assert np.isnan(front) and np.isnan(rear)

@@ -34,6 +34,65 @@ _PHASE_SETTLE = "settle"
 REVERSE_SECONDS = 2.0
 SETTLE_SECONDS = 0.5
 
+# How this car steers, in one place.
+#
+# It is four-wheel steered -- FRONT_STEERING_CHANNEL 15 and
+# REAR_STEERING_CHANNEL 14, both of them real servos -- and until now only the
+# recover path used the second one. Ordinary forward driving commanded
+# set_steering(bias, 0) and hard-centred the rear on every tick, so the car
+# steered one way when it was driving and another way when it was backing out
+# of a corner. Indoors that showed up as corners it could not take: a tight
+# hallway turn needs a radius the front axle alone does not have.
+#
+# Counter-phase, which is what the negative sign is. The rear wheels turn
+# opposite the front ones, both axles contribute yaw, and the turning radius
+# comes down. In-phase (both axles the same way) is a crab -- it slides the
+# body sideways without rotating it -- which is a different and occasionally
+# useful thing, but nothing on this car senses a reason to pick it, so there
+# is no mode here to pick.
+#
+# 1.0 is full counter-phase, the tightest radius this linkage can give, and
+# it is the ratio begin_recover() has always commanded -- it sets
+# (turn_dir, -turn_dir). So this is not a new behaviour so much as the one
+# behaviour, now used everywhere a steering angle gets chosen instead of only
+# in recovery. Tightest is the ask; the feel is mine to judge on the floor and
+# this is the one number to turn.
+REAR_STEER_RATIO = 1.0
+
+
+def steering_pair(front):
+    """The (front, rear) pair to command for one chosen front angle.
+
+    Every steering decision in auto goes through here, so "how this car
+    steers" is defined once rather than re-decided at each call site. The
+    hand-back at the end of a recover does not: that commands a literal
+    (0, 0), because centre is centre and routing a zero through a ratio is
+    just a way to put a nonzero number on a servo by accident.
+
+    The rear magnitude can never exceed the front's. That is a clamp, not a
+    scale -- the front is handed back exactly as it came in. max_turn = 0.6 is
+    my limit on holding a servo at lock against an obstacle, and it is the
+    front that is bounded by it; capping the rear at the front means whatever
+    bound the front is under, the rear is under it too, and a ratio raised
+    above 1.0 can lean on the front but can never push the rear past it.
+
+    No numpy, no allocation beyond the tuple, five float operations. Measured
+    on the car's own interpreter: 1.43 us a call against 0.22 us for the
+    (front, 0) literal it replaced, so 1.2 us a tick. The footprint scan in
+    the same tick measures 1.88-2.34 ms, which is more than a thousand times
+    that, and the tick itself has about 13 ms. It is not a cost, but it is
+    measured rather than assumed, because the last estimate in this loop came
+    in 5-9x light.
+
+    A nan or an infinity in gets the same treatment it would have got
+    straight: it comes out the other side and set_steering() rejects it and
+    commands neutral on both channels. That check lives at the one place that
+    writes the hardware and it is not duplicated here.
+    """
+    rear = -REAR_STEER_RATIO * front
+    limit = abs(front)
+    return front, max(-limit, min(limit, rear))
+
 # What the IMU is allowed to say about motion. Three answers, not two: the old
 # is_moving() had only "moving" and "not moving" and it filed a missing sample
 # under the second one, so a tick with no IMU packet in it was indistinguishable
@@ -706,7 +765,7 @@ class Driver:
             self.max_turn / 4,
             self.max_turn,
         ])
-        self.controller.set_steering(self._turn_dir, -self._turn_dir)
+        self.controller.set_steering(*steering_pair(self._turn_dir))
         self.controller.set_throttle(self.reverse_speed)
 
         self._phase = _PHASE_REVERSE
@@ -852,7 +911,7 @@ class Driver:
             self.begin_recover(now)
             return
 
-        self.controller.set_steering(self.get_steering_bias(depth), 0)
+        self.controller.set_steering(*steering_pair(self.get_steering_bias(depth)))
         self.controller.set_throttle(self.forward_speed)
         if self._throttle_since is None:
             self._throttle_since = now
