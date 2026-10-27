@@ -251,8 +251,9 @@ class ThrottleLatch:
     """Throttle held at 0 after a handover, until both triggers let go.
 
     Leaving record with RT still held used to jump the car from auto's
-    forward speed (0.2) to full manual range on the very next tick: the same
-    finger, a 5x bigger throttle, and nothing to tell me. Out of auto it was
+    forward speed (0.2 then, 0.4 now) to full manual range on the very next
+    tick: the same finger, a 5x bigger throttle (2.5x now), and nothing to
+    tell me. Out of auto it was
     the same, from wherever the trigger happened to be resting. pigpio latches
     the last pulse width, so a jump like that is not a twitch, it is the car
     leaving at full speed.

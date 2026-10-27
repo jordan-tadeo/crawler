@@ -118,19 +118,46 @@ def rule_steer_units(fraction):
     """A verdict's steer (fraction of max_turn) in STEER_SCALE units."""
     return float(fraction) * RULE_MAX_TURN / STEER_SCALE
 
-# The speed caps a magnitude is a fraction of: Driver.forward_speed and
-# Driver.reverse_speed, which record mode scales the triggers to. Legacy rows
-# carry no caps, so these are what they are measured against.
-FORWARD_CAP = 0.2
-REVERSE_CAP = -0.6
+# The unit of a throttle label: a FRACTION OF THE CAP IN FORCE ON THAT ROW,
+# never an absolute throttle. Record mode scales the triggers to
+# Driver.forward_speed and Driver.reverse_speed, so throttle / cap is exactly
+# how far I pulled the trigger, and policy.py turns a magnitude back into a
+# throttle by multiplying it by the live caps. One unit on both sides, and a
+# model asked for "full" can never command more than today's cap whatever cap
+# it was trained under. An absolute label would do the opposite: a reverse
+# learned at -0.6 would ask for about twice today's reverse cap and lean on
+# a clamp to stay legal.
+#
+# What the unit does not fix is that a pull is not the same decision at a
+# different cap -- at forward 0.2 I held RT flat because the car barely
+# moved. So a session recorded at other caps is left out of a dataset by
+# default (policy_dataset.py --include-other-caps), and session_caps() is
+# how it is told.
+#
+# The caps every recording before the move to 0.4 was made at: forward 0.2,
+# reverse -0.6. A legacy file carries no caps and neither does a /footprint
+# row from before forward_limit existed; both are from then, so these are
+# what they are measured against.
+LEGACY_FORWARD_CAP = 0.2
+LEGACY_REVERSE_CAP = -0.6
+
+# What auto, record and the policy runtime drive at now. Read off driver.py,
+# never copied.
+RUNTIME_CAPS = (float(dv.FORWARD_SPEED), float(dv.REVERSE_SPEED))
+
+# Two caps closer than this are the same cap. footprint.py writes the float
+# as it was, so anything bigger is a real difference.
+CAP_TOLERANCE = 1e-4
 
 # Throttle to action, and it must not eat a creep. Joystick.read_throttle()
 # returns exactly 0.0 inside TRIGGER_DEADZONE = 0.05 and the trigger value
-# itself above it, so the smallest throttle record mode can command is
-# 0.05 x 0.2 = 0.010 forward and 0.05 x 0.6 = 0.030 reverse. Half the smaller
-# of those: anything the triggers can produce is motion, and only an
-# untouched pad is a stop.
-THROTTLE_DEADBAND = 0.5 * 0.05 * FORWARD_CAP
+# itself above it, so the smallest throttle record mode can command is 0.05
+# times the smallest cap: 0.05 x 0.2 = 0.010 at the old forward cap, 0.015 at
+# today's reverse. Half the smallest of those, across old and new caps:
+# anything the triggers can produce is motion, and only an untouched pad is
+# a stop. 0.005, as it always was.
+THROTTLE_DEADBAND = 0.5 * 0.05 * min(LEGACY_FORWARD_CAP, -LEGACY_REVERSE_CAP,
+                                     RUNTIME_CAPS[0], -RUNTIME_CAPS[1])
 
 SPLIT = "split"
 
@@ -166,8 +193,8 @@ class Command(NamedTuple):
     rule_action: str      # "" when the adapter cannot say
     rule_steer: float     # nan when the adapter cannot say
     seq: int              # -1 when there is none
-    forward_cap: float = FORWARD_CAP
-    reverse_cap: float = REVERSE_CAP
+    forward_cap: float = LEGACY_FORWARD_CAP
+    reverse_cap: float = LEGACY_REVERSE_CAP
     steer_by: str = BY_DRIVER
     throttle_by: str = BY_DRIVER
     accel: float = float("nan")   # |linear acceleration|, m/s^2; nan with no sample
@@ -224,22 +251,72 @@ def action_of(throttle):
     return pl.STOP
 
 
-def magnitude_of(throttle, forward_cap=FORWARD_CAP, reverse_cap=REVERSE_CAP):
+def magnitude_of(throttle, forward_cap=LEGACY_FORWARD_CAP,
+                 reverse_cap=LEGACY_REVERSE_CAP,
+                 fallback=(LEGACY_FORWARD_CAP, LEGACY_REVERSE_CAP)):
     """A signed throttle as a fraction of its direction's cap, in [0, 1].
 
-    A cap on the wrong side of zero is the row's "no limits" placeholder
-    (footprint.py writes -1 for both), and falls back to the bench caps.
+    A forward cap on the wrong side of zero is the row's "no limits"
+    placeholder (footprint.py writes -1 for both on an auto row no trigger
+    drove), and the PAIR falls back to `fallback`: the caps the rest of the
+    session recorded, when the caller knows them, and the legacy caps when it
+    does not. The pair, not each cap on its own: -1 is on the right side of
+    zero for a reverse cap, and read as one it turned a placeholder row's
+    reverse into its absolute throttle rather than a fraction of any cap.
     """
-    if not forward_cap > 0:
-        forward_cap = FORWARD_CAP
-    if not reverse_cap < 0:
-        reverse_cap = REVERSE_CAP
+    if not _valid_caps(forward_cap, reverse_cap):
+        forward_cap, reverse_cap = fallback
     action = action_of(throttle)
     if action == pl.FORWARD:
         return float(min(1.0, throttle / forward_cap))
     if action == pl.REVERSE:
         return float(min(1.0, throttle / reverse_cap))
     return 0.0
+
+
+def _valid_caps(forward_cap, reverse_cap):
+    return (math.isfinite(forward_cap) and math.isfinite(reverse_cap)
+            and forward_cap > 0 and reverse_cap < 0)
+
+
+def session_caps(session):
+    """Every (forward, reverse) cap pair a session's ticks recorded, sorted.
+
+    Only commands in the session's label modes count, and only real caps --
+    the -1 placeholder on an auto row is "nobody said", not a cap. A legacy
+    session is its commands' default, the legacy caps. Empty when nothing in
+    the file says: a record-mode file of nothing but untouched auto.
+    """
+    found = []
+    for cmd in session.commands:
+        if cmd.mode not in session.label_modes:
+            continue
+        if not _valid_caps(cmd.forward_cap, cmd.reverse_cap):
+            continue
+        pair = (float(cmd.forward_cap), float(cmd.reverse_cap))
+        if not any(caps_match(pair, seen) for seen in found):
+            found.append(pair)
+    return sorted(found)
+
+
+def caps_match(a, b=RUNTIME_CAPS, tol=CAP_TOLERANCE):
+    """Are two (forward, reverse) cap pairs the same caps?"""
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def fallback_caps(session):
+    """What a placeholder row in `session` is measured against.
+
+    The session's own caps when it recorded exactly one pair, which is every
+    session there can be today (the caps are constants for a process). Else
+    the legacy caps, which is what an auto-only file from before this change
+    was driven at -- and NOT necessarily what one from after was. That case
+    is the one session_caps() returns empty for, and policy_dataset says so.
+    """
+    caps = session_caps(session)
+    if len(caps) == 1:
+        return caps[0]
+    return (LEGACY_FORWARD_CAP, LEGACY_REVERSE_CAP)
 
 
 def rule_action_of(verdict_action):
@@ -396,8 +473,8 @@ class FootprintAdapter:
                 rule_action_of(payload.get(r["rule_action"])),
                 rule_steer_units(_f(payload.get(r["rule_steer"]))),
                 int(payload.get(r["seq"], -1)),
-                _f(payload.get(r["forward_cap"]), FORWARD_CAP),
-                _f(payload.get(r["reverse_cap"]), REVERSE_CAP),
+                _f(payload.get(r["forward_cap"]), LEGACY_FORWARD_CAP),
+                _f(payload.get(r["reverse_cap"]), LEGACY_REVERSE_CAP),
                 *control_sources(str(payload.get(r["mode"], "")),
                                  payload.get(r["steer_by"]),
                                  payload.get(r["throttle_by"])),

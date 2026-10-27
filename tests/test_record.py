@@ -507,15 +507,15 @@ def test_with_telemetry_off_record_refuses_and_stays_manual(monkeypatch):
 
 def test_full_rt_is_auto_forward_and_full_lt_is_auto_reverse():
     limits = mn.auto_speed_limits()
-    assert mn.scale_throttle(1.0, limits) == pytest.approx(0.2)
-    assert mn.scale_throttle(-1.0, limits) == pytest.approx(-0.6)
+    assert mn.scale_throttle(1.0, limits) == pytest.approx(dv.FORWARD_SPEED)
+    assert mn.scale_throttle(-1.0, limits) == pytest.approx(dv.REVERSE_SPEED)
     assert mn.scale_throttle(0.0, limits) == 0.0
 
 
 def test_the_trigger_is_scaled_not_clipped():
     limits = mn.auto_speed_limits()
-    assert mn.scale_throttle(0.5, limits) == pytest.approx(0.1)
-    assert mn.scale_throttle(-0.5, limits) == pytest.approx(-0.3)
+    assert mn.scale_throttle(0.5, limits) == pytest.approx(0.5 * dv.FORWARD_SPEED)
+    assert mn.scale_throttle(-0.5, limits) == pytest.approx(0.5 * dv.REVERSE_SPEED)
 
 
 def test_the_limits_come_from_the_driver_not_a_literal():
@@ -562,12 +562,12 @@ def test_record_drives_the_esc_at_the_scaled_throttle(monkeypatch):
     pad.throttle = 1.0
     out = run(pad, hold_y(1.0) + [()] * 3, monkeypatch=monkeypatch)
     assert out["vecon"].throttles[0] == pytest.approx(1.0)   # still manual
-    assert out["vecon"].throttles[-1] == pytest.approx(0.2)  # record
+    assert out["vecon"].throttles[-1] == pytest.approx(dv.FORWARD_SPEED)  # record
 
     pad = FakePad()
     pad.throttle = -1.0
     out = run(pad, hold_y(1.0) + [()] * 3, monkeypatch=monkeypatch)
-    assert out["vecon"].throttles[-1] == pytest.approx(-0.6)
+    assert out["vecon"].throttles[-1] == pytest.approx(dv.REVERSE_SPEED)
 
 
 def test_steering_in_record_is_manual_steering(monkeypatch):
@@ -640,7 +640,7 @@ def test_an_exception_in_the_tap_costs_a_row_and_not_a_tick(monkeypatch):
     out = run(pad, hold_y(1.0) + [()] * 30, tele=tele, tap=tap,
               monkeypatch=monkeypatch)
     assert out["modes"].mode == mn.RECORD
-    assert out["vecon"].throttles[-1] == pytest.approx(0.2)
+    assert out["vecon"].throttles[-1] == pytest.approx(dv.FORWARD_SPEED)
     assert tele.of("footprint") == []
 
 
@@ -688,9 +688,9 @@ def test_the_row_carries_the_command_from_its_own_tick(monkeypatch):
     rows = [row for row, _ in tele.of("footprint")]
     assert len(rows) >= 4
     for row in rows:
-        assert row["throttle"] == pytest.approx(row["pad_throttle"] * 0.2)
-        assert row["forward_limit"] == pytest.approx(0.2)
-        assert row["reverse_limit"] == pytest.approx(-0.6)
+        assert row["throttle"] == pytest.approx(row["pad_throttle"] * dv.FORWARD_SPEED)
+        assert row["forward_limit"] == pytest.approx(dv.FORWARD_SPEED)
+        assert row["reverse_limit"] == pytest.approx(dv.REVERSE_SPEED)
     # And the last row's throttle is one the ESC was actually sent.
     sent = [round(t, 9) for t in out["vecon"].throttles]
     assert all(round(row["throttle"], 9) in sent for row in rows)
@@ -1021,7 +1021,7 @@ def after_handover(throttles, index):
 
 def test_leaving_record_with_rt_held_holds_the_throttle_until_it_is_let_go(
         monkeypatch):
-    """The 0.2 to full-range jump, gone: Y tap out with RT still at full."""
+    """The forward-cap to full-range jump, gone: Y tap out with RT still at full."""
     head = hold_y(1.0) + [()] * 5 + [(mn.RECORD_BUTTON,), ()]
     script = head + [()] * (HELD + LET_GO + AGAIN)
     plan = [1.0] * (len(head) + HELD) + [0.0] * LET_GO + [1.0] * AGAIN
@@ -1030,7 +1030,7 @@ def test_leaving_record_with_rt_held_holds_the_throttle_until_it_is_let_go(
     assert out["modes"].mode == mn.MANUAL
 
     throttles = out["vecon"].throttles
-    last_record = max(i for i, t in enumerate(throttles) if t == pytest.approx(0.2))
+    last_record = max(i for i, t in enumerate(throttles) if t == pytest.approx(dv.FORWARD_SPEED))
     held, live = after_handover(throttles, last_record + 1)
     assert len(held) >= HELD + LET_GO
     assert live == [1.0] * AGAIN
@@ -1063,7 +1063,7 @@ def test_a_pad_that_comes_back_after_record_is_held_too(monkeypatch):
     out = run(pad, script, monkeypatch=monkeypatch)
     assert out["modes"].mode == mn.MANUAL
     throttles = out["vecon"].throttles
-    last_record = max(i for i, t in enumerate(throttles) if t == pytest.approx(0.2))
+    last_record = max(i for i, t in enumerate(throttles) if t == pytest.approx(dv.FORWARD_SPEED))
     held, live = after_handover(throttles, last_record + 1)
     assert len(held) >= HELD
     assert live == [1.0] * AGAIN

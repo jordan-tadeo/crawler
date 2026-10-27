@@ -172,7 +172,7 @@ fires, and is the only thing that runs the canned backup-and-turn. A model
 that will not load is auto unavailable, not a quiet fall back to the rules.
 
 Every tick it picks forward, reverse or stop, a throttle as a fraction of the
-speed cap (forward 0.2, reverse -0.6, so never faster than auto already
+speed cap (forward 0.4, reverse -0.296, so never faster than auto already
 drives) and a front steer in manual's units, a fraction of the pad's full
 lock (0.7). A reverse is the model's too, decided again every tick, so it can
 stop backing up the moment the picture says so. It writes into the same held
@@ -390,7 +390,7 @@ camera back; START ends the session and goes to auto; losing the pad ends it
 at neutral, and a pad that just goes quiet counts as lost after 5 s (see
 "The pad's link timeout"). Y does nothing in auto. Coming back to manual from record or
 from auto, the throttle stays at 0 until both triggers have been let go once,
-so leaving record with RT still held is not a jump from 0.2 to full; the
+so leaving record with RT still held is not a jump from 0.4 to full; the
 steering is live the whole time. No flag, so nothing in the unit file
 changes. With `--no-telemetry --no-record` there is no publisher thread to
 write with, so record refuses and says so.

@@ -390,7 +390,7 @@ def test_a_recover_hands_back_centred_steering(d):
 # --- the gyro as a rear bumper ---------------------------------------------
 #
 # Nothing on this car points backwards, so a reverse is blind. The gyro is
-# the contact sensor: commanded in reverse at -0.6 and not shaking means the
+# the contact sensor: commanded in reverse at reverse_speed and not shaking means the
 # wheels are against something, and the remaining seconds of the reverse are
 # seconds of pushing.
 #

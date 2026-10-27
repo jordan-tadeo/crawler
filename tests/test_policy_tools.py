@@ -5,6 +5,7 @@ the contract the dataset tool keeps with what record mode writes
 (TRAINING_DATA.md) and with what the trainer and the eval read back.
 """
 
+import json
 import math
 import os
 import sys
@@ -16,6 +17,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "tools"))
 
+import driver as dv  # noqa: E402
 import policy as pl  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 import policy_dataset as pd  # noqa: E402
@@ -474,3 +476,72 @@ def test_the_timeline_is_a_character_a_second():
     timeline += [(T0 + 6 * S, "exit reach")]
     (line,) = pd.format_timeline(timeline)
     assert line.split() == ["0s", "##pp..x"]
+
+
+# --- speed caps across sessions ------------------------------------------------
+
+OLD = (0.2, -0.6)
+
+
+def capped(caps, n=20, throttle=None, mode="record"):
+    throttle = caps[0] if throttle is None else throttle
+    return footprint_session(driving(n, mode, throttle, forward_limit=caps[0],
+                                     reverse_limit=caps[1]))
+
+
+def test_a_label_is_a_fraction_of_its_own_rows_cap_and_the_runtime_agrees():
+    """Full RT is magnitude 1.0 at either cap, and the runtime's caps are
+    driver.py's, so 1.0 always replays as today's cap."""
+    for caps in (OLD, pa.RUNTIME_CAPS):
+        ticks, _, _ = align(capped(caps))
+        assert ticks and all(t.magnitude == pytest.approx(1.0) for t in ticks)
+        rev, _, _ = align(capped(caps, throttle=caps[1]))
+        assert rev and all(t.magnitude == pytest.approx(1.0) for t in rev)
+    assert pa.RUNTIME_CAPS == (pytest.approx(dv.FORWARD_SPEED),
+                               pytest.approx(dv.REVERSE_SPEED))
+
+
+def test_a_placeholder_row_is_measured_against_its_sessions_own_caps():
+    f, r = pa.RUNTIME_CAPS
+    rows = driving(5, "record", f, forward_limit=f, reverse_limit=r)
+    rows += [(1.0 + i * 0.1, row(10 + i, "auto", r, forward_limit=-1, reverse_limit=-1))
+             for i in range(3)]
+    session = footprint_session(rows)
+    assert pa.session_caps(session) == [pytest.approx((f, r))]
+    ticks, _, _ = align(session)
+    autos = [t for t in ticks if t.mode == "auto"]
+    assert autos and all(t.magnitude == pytest.approx(1.0) for t in autos)
+
+
+def test_a_session_at_other_caps_is_left_out_unless_asked_for():
+    old = capped(OLD)
+    assert pa.session_caps(old) == [OLD]
+    line, _ = pd.caps_verdict(old)
+    assert line.startswith(pd.CAPS_EXCLUDED)
+    line, _ = pd.caps_verdict(old, include_other=True)
+    assert line.startswith(pd.CAPS_WARNING)
+    assert pd.caps_verdict(capped(pa.RUNTIME_CAPS))[0] == ""
+    nothing = footprint_session(driving(5, "auto", 0.3, forward_limit=-1, reverse_limit=-1))
+    assert pa.session_caps(nothing) == []
+    assert pd.caps_verdict(nothing)[0].startswith(pd.CAPS_WARNING)
+
+
+def test_the_dataset_tool_drops_the_old_caps_by_default(tmp_path, monkeypatch, capsys):
+    sessions = {"old.mcap": capped(OLD)._replace(name="old"),
+                "new.mcap": capped(pa.RUNTIME_CAPS)._replace(name="new")}
+    monkeypatch.setattr(pd, "read_session",
+                        lambda path, adapter=None: (sessions[os.path.basename(path)], False))
+    paths = [str(tmp_path / n) for n in sessions]
+
+    out = tmp_path / "default.npz"
+    assert pd.main([str(out), *paths, "--no-idle-rules"]) == 0
+    meta = json.loads(str(np.load(out)["meta"]))
+    assert meta["sessions"] == ["new"]
+    assert meta["throttle_unit"] == "fraction_of_row_cap"
+    assert "LEFT OUT old" in capsys.readouterr().out
+
+    out = tmp_path / "all.npz"
+    assert pd.main([str(out), *paths, "--no-idle-rules", "--include-other-caps"]) == 0
+    meta = json.loads(str(np.load(out)["meta"]))
+    assert meta["sessions"] == ["old", "new"]
+    assert meta["session_caps"]["old"] == [list(OLD)]

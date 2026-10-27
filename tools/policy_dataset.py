@@ -69,6 +69,16 @@ on the log clock through the row's mono_s, never a hardcoded 4 s / 1 s. On a
 tick the autopilot was driving the mark judges the autopilot, not a label, so
 it stays a flag for policy_eval's marks section and nothing else.
 
+Left out by default, and said so: a session recorded at speed caps other than
+the ones the car drives at now (policy_adapters.RUNTIME_CAPS). A throttle
+label is a fraction of its own row's cap -- how hard I pulled -- and the
+runtime multiplies it by today's cap, so the unit carries across; the
+decision does not. At forward 0.2 I held RT flat because the car barely
+moved, and that is not what I would do at 0.4. --include-other-caps keeps
+them. A session that recorded no caps at all (auto with nobody on the
+triggers) is kept with a warning: its throttle is the autopilot's, never a
+label, and its magnitudes are measured against the legacy caps.
+
 Needs `mcap` and `mcap-protobuf-support`, which are tools for the laptop and
 not dependencies of the car. The alignment below needs neither and is what
 the tests exercise.
@@ -128,8 +138,10 @@ class IdleRules(NamedTuple):
       at rest 0.5-1.0 s, manual (385)      1.35 / 3.33        0.15 / 0.23
       at rest > 10 s, manual (84614)       0.12 / 11.2        0.009 / 2.63
 
-    Driving at the record caps shakes the car as hard as handling it does
-    (reverse at -0.6 is the most violent thing in the files), which is why
+    Those are the old caps, 0.2 / -0.6; nothing here is measured at today's
+    0.4 / -0.296. Driving at the record caps shakes the car as hard as
+    handling it does (reverse at -0.6 is the most violent thing in the
+    files), which is why
     the rule only ever looks at ticks with no input. Half a second after
     the sticks are let go the coast is over -- nothing past it in 385
     manual samples reached 0.23 rad/s or 3.4 m/s^2 -- so the thresholds sit
@@ -320,6 +332,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     seq_index = {f.seq: i for i, f in enumerate(session.frames)} if session.by_seq else {}
 
     commands = session.commands if session.by_seq else sample_ticks(session.commands)
+    fallback = pa.fallback_caps(session)
     last_reverse = None
     prev_was_reverse = False
     prev_t = None
@@ -371,7 +384,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         rule_steer = cmd.rule_steer if math.isfinite(cmd.rule_steer) else frame.rule_steer
         ticks.append(Tick(
             cmd.t_ns, fi, age, action,
-            pa.magnitude_of(cmd.throttle, cmd.forward_cap, cmd.reverse_cap),
+            pa.magnitude_of(cmd.throttle, cmd.forward_cap, cmd.reverse_cap, fallback),
             float(np.clip(cmd.front / pa.STEER_SCALE, -1.0, 1.0)),
             rule_action, float(rule_steer), decision, cmd.mode,
             cmd.steer_by == pa.BY_PAD, cmd.throttle_by == pa.BY_PAD,
@@ -577,6 +590,37 @@ def read_session(path, adapter_name=None):
     return adapter.finish(), truncated
 
 
+CAPS_EXCLUDED = "LEFT OUT"
+CAPS_WARNING = "WARNING"
+
+
+def _caps_text(caps):
+    return ", ".join(f"{f:+.3f}/{r:+.3f}" for f, r in caps)
+
+
+def caps_verdict(session, include_other=False, runtime=pa.RUNTIME_CAPS):
+    """(line, caps): what to say about a session's speed caps, and the caps.
+
+    The line is "" when every cap it recorded is the runtime's, starts with
+    CAPS_EXCLUDED when they differ and include_other is False, and with
+    CAPS_WARNING when they differ but are kept, or when it recorded none.
+    """
+    caps = pa.session_caps(session)
+    want = _caps_text([runtime])
+    if not caps:
+        return (f"{CAPS_WARNING} {session.name}: no speed caps recorded; kept, "
+                f"measured against the legacy caps "
+                f"{_caps_text([(pa.LEGACY_FORWARD_CAP, pa.LEGACY_REVERSE_CAP)])}"), caps
+    if all(pa.caps_match(c, runtime) for c in caps):
+        return "", caps
+    got = _caps_text(caps)
+    if include_other:
+        return (f"{CAPS_WARNING} {session.name}: recorded at caps {got}, the "
+                f"runtime drives at {want}; kept (--include-other-caps)"), caps
+    return (f"{CAPS_EXCLUDED} {session.name}: recorded at caps {got}, the runtime "
+            f"drives at {want}; --include-other-caps keeps it"), caps
+
+
 def _pct(values, q):
     return float(np.percentile(values, q)) if len(values) else float("nan")
 
@@ -602,6 +646,9 @@ def main(argv=None):
                     help="comma list of recorded modes to label from "
                          "(default: auto for legacy files, record for new ones)")
     ap.add_argument("--max-age-ms", type=float, default=None)
+    ap.add_argument("--include-other-caps", action="store_true",
+                    help="keep sessions recorded at speed caps other than the "
+                         "runtime's (%+.3f/%+.3f)" % pa.RUNTIME_CAPS)
     d = IdleRules()
     idle = ap.add_argument_group("not-driving rules (IdleRules; record and manual ticks only)")
     idle.add_argument("--no-idle-rules", action="store_true", help="keep every tick")
@@ -632,10 +679,18 @@ def main(argv=None):
 
     kept, contracts, report = [], set(), []
     all_errors = []
+    caps_by_session = {}
     for path in args.mcaps:
         session, truncated = read_session(path, args.adapter)
         if args.modes:
             session = session._replace(label_modes=tuple(args.modes.split(",")))
+        verdict, caps = caps_verdict(session, args.include_other_caps)
+        if verdict:
+            print(verdict)
+            report.append(verdict)
+        if verdict.startswith(CAPS_EXCLUDED):
+            continue
+        caps_by_session[session.name] = [list(c) for c in caps]
         timeline = []
         ticks, drops, errors = align(session, args.max_age_ms, rules, timeline)
         splits = sum(1 for c in session.commands if _is_split(c))
@@ -685,6 +740,12 @@ def main(argv=None):
         "actions": list(pl.ACTIONS),
         "sessions": [s.name for s, _ in kept],
         "steer_scale": pa.STEER_SCALE,
+        # A throttle magnitude is a fraction of its row's own cap. These say
+        # which caps those were, and which caps the car drove at when this
+        # file was built.
+        "throttle_unit": "fraction_of_row_cap",
+        "runtime_caps": list(pa.RUNTIME_CAPS),
+        "session_caps": {s.name: caps_by_session.get(s.name, []) for s, _ in kept},
         "marks": {s.name: [m for m in s.marks] for s, _ in kept},
         "alignment_ms_histogram": {"edges": hist_edges[:-1], "counts": hist},
         "report": report,

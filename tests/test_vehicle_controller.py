@@ -218,3 +218,22 @@ def test_close_still_stops_the_esc_when_a_servo_raises(vecon):
     vecon.front_steering_servo = Raising()
     vecon.close()
     assert vecon.pi.pulses[vc.ESC_GPIO_PIN] == 0
+
+
+# --- the speed caps through the real mapping --------------------------------
+
+def test_reverse_cap_sits_as_far_off_neutral_as_forward(vecon):
+    """Reverse is as fast as forward, meaning the same pulse offset.
+
+    Through set_throttle's own arithmetic, not a copy of it: forward maps over
+    425 us and reverse over 575, so equal fractions would not be equal
+    offsets. int() truncation may cost one side a microsecond, never more.
+    """
+    import driver as dv
+
+    forward = vecon.set_throttle(dv.FORWARD_SPEED) - vc.ESC_NEUTRAL_PW
+    reverse = vc.ESC_NEUTRAL_PW - vecon.set_throttle(dv.REVERSE_SPEED)
+    assert forward > 0 and reverse > 0
+    assert abs(forward - reverse) <= 1
+    d = dv.Driver(None, None)
+    assert (d.forward_speed, d.reverse_speed) == (dv.FORWARD_SPEED, dv.REVERSE_SPEED)

@@ -12,8 +12,11 @@ holds it is `footprint.py` (the rows), `policy_input.py` (the picture) and
 - **Record mode** is the training drive: in manual, hold **Y for one second**
   (two buzzes) and the car opens the camera and starts a new MCAP of its own.
   It drives exactly like manual except the throttle is scaled: full RT is
-  auto's forward speed (`Driver.forward_speed`, 0.2 today), full LT is auto's
-  reverse speed (`Driver.reverse_speed`, -0.6). Steering is unchanged. Any
+  auto's forward speed (`Driver.forward_speed`, 0.4 today, 1745 us), full LT
+  is auto's reverse speed (`Driver.reverse_speed`, -0.296 today, 1405 us:
+  derived so reverse sits the same 170 us off neutral as forward). Every
+  recording up to the first record session was made at 0.2 / -0.6.
+  Steering is unchanged. Any
   fresh press of Y goes back to manual (one buzz); START ends the session and
   goes to auto; losing the pad ends it at neutral. A and B marks work as
   always. Back in manual, from record or from auto, the throttle stays 0
@@ -104,7 +107,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `steer_by` | str | `"pad"` or `"driver"`: who had the steering when this row's command went out. Always `"pad"` in record |
 | `throttle_by` | str | `"pad"` or `"driver"`: same, for the throttle |
 | `pad_throttle` | float | record, or auto with `throttle_by` `"pad"`: the trigger before scaling, -1..1. Otherwise 0 |
-| `forward_limit`, `reverse_limit` | float | the scale used for `pad_throttle`, e.g. 0.2 / -0.6. -1 when no trigger was driving |
+| `forward_limit`, `reverse_limit` | float | the scale used for `pad_throttle`, e.g. 0.4 / -0.296 (0.2 / -0.6 in the first sessions). -1 when no trigger was driving |
 | `imu_accel_x/y/z` | float | newest OAK-D IMU sample at the tick, linear acceleration, m/s^2 |
 | `imu_gyro_x/y/z` | float | same sample, rad/s |
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
@@ -162,6 +165,25 @@ Rows that do not exist: manual mode, and auto's 2.5 s recover manoeuvre (no
 scan, no decision) -- unless my hand has a group during it. Then the rows come
 at 10 Hz off the car's own view, `source` `"tap"`, `mode` `"auto"`, with a
 `/policy/depth_small` picture and no raw frame.
+
+## Throttle labels across speed caps
+
+A throttle label is a **fraction of its own row's cap**: `throttle /
+forward_limit` going forward, `throttle / reverse_limit` in reverse, which is
+how far the trigger was pulled. The policy runtime multiplies a magnitude by
+the caps the car drives at now, so a label and a model output are the same
+unit whatever caps the session was recorded at, and a model can never ask
+for more than today's cap.
+
+The same pull is not the same decision at a different cap, though: at 0.2 I
+held RT flat because the car barely moved. So `tools/policy_dataset.py`
+leaves out, by default and with a `LEFT OUT` line, any session whose caps
+differ from `policy_adapters.RUNTIME_CAPS` (today 0.4 / -0.296), and
+`--include-other-caps` keeps them with a `WARNING`. That includes every
+legacy file and the first record session, all at 0.2 / -0.6. A session that
+recorded no caps at all is kept with a warning; its throttle is the
+autopilot's and never a label. The `.npz` meta carries `throttle_unit`,
+`runtime_caps` and each session's `session_caps`.
 
 ## Getting it out
 

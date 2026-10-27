@@ -39,6 +39,11 @@ from typing import NamedTuple
 
 import numpy as np
 
+# The ESC's calibration, read and never copied: the reverse cap below is
+# derived from it. Importing the module is free off the Pi -- the hardware
+# imports live inside VehicleController.__init__.
+import VehicleController as vc
+
 # Recover phases, in order.
 _PHASE_REVERSE = "reverse"
 _PHASE_SETTLE = "settle"
@@ -161,6 +166,14 @@ UNKNOWN = "unknown"
 # is a genuinely stalled car -- wheels against something, ESC pushing at 0.2 --
 # so whether a stall reads under 0.010 or buzzes above it is NOT measured.
 # That is a test to do with a hand on the car.
+#
+# Every number above was measured at forward_speed 0.2. Forward is 0.4 now
+# (FORWARD_SPEED), twice the throttle and four times the pulse offset off
+# neutral, so these 0.2-era numbers say very little about it and 0.010 has
+# not been checked against it. A faster car should shake the chassis more
+# while rolling, which moves the rolling p1 up and away from this threshold
+# rather than toward it, but that is a guess -- and a stall at 0.4 pushes a
+# lot harder and may buzz above it. UNVERIFIED at 0.4.
 GYRO_MOVING_MIN = 0.010  # rad/s
 
 # How much evidence before the car is allowed to call itself stuck. At the 10 Hz
@@ -649,6 +662,20 @@ def free_by_column(depth, threshold_mm=CLEARANCE_MM) -> FootprintScan:
 # Of the run's eight "floor" reversals, the ones at 160, 226 and 247 mm still
 # reverse (the first on this floor, the other two on the sweep check). This
 # number is not the knob for those; TURN_RADIUS_MM is.
+#
+# At forward 0.4 the margin is thinner, and I have NOT changed the number.
+# Ground speed at 0.4 is ESTIMATED at 330-420 mm/s, twice what 0.2 measured.
+# The band this floor can see -- from 200 down to the sensor's ~165 mm near
+# edge -- is 35 mm, which was about 1.7 ticks of travel at 0.2 and is about
+# one tick (33-42 mm) at 0.4, so a forward decision on one tick can carry an
+# obstacle straight past it. A picture is 88 ms old when it is decided on, and
+# takeover's forward trigger accepts one up to FLOOR_SCAN_MAX_AGE 0.3 s old:
+# 0.19-0.39 s between the picture and the next chance to stop, 60-80 mm at the
+# common end and 130-165 mm at the worst, so something read at 201 mm can be
+# inside 165 before anything looks again. The rules autopilot is still safe
+# there because R1 reverses on any NO_RETURN, and too close reads NO_RETURN.
+# floor_vetoes_forward() -- takeover's forward trigger and the policy runtime
+# -- counts NEAR probes only, so inside 165 mm it stops vetoing.
 REVERSE_FLOOR_MM = 200.0
 
 # The full-lock turn, as one circle. ESTIMATED, off the 2026-10-27 recording,
@@ -667,6 +694,11 @@ REVERSE_FLOOR_MM = 200.0
 # disagree by 20% -- so read it as 450-750 mm. Counter-phase rear steer is
 # roughly half the radius front-only steering would give, so this is the
 # radius of a car that would turn in about 1.2 m on its front axle alone.
+#
+# All of that was at forward_speed 0.2. Forward is 0.4 now; a turning circle
+# is geometry and should not move much with speed, so this number stays, but
+# the faster the car the more a slipping tyre widens it, and at twice the
+# throttle that is no longer a small effect. The tape settles it, at 0.4.
 TURN_RADIUS_MM = 590.0
 
 # How far the camera sits ahead of the point the car pivots about, which on a
@@ -682,6 +714,17 @@ CAMERA_AHEAD_MM = 160.0
 # EVADE_SECONDS) and the servos take about 0.15 s to reach lock (yaw rises
 # from nothing to the turn rate in two or three 20 Hz samples in the run),
 # so about 0.24 s at 210 mm/s, which is 50 mm.
+#
+# 210 mm/s was ground speed at forward_speed 0.2 in an auto run (and the
+# first record session closed on a wall at only 164 mm/s at the same cap).
+# Ground speed at 0.4 is NOT measured, and at twice the throttle the 0.2-era
+# speed is no basis for guessing it. The allowance is time times speed, so it
+# grows with the car: at an ESTIMATED 330-420 mm/s (2x the 164-210 measured
+# at 0.2) the same 0.24 s is 80-100 mm, so 50 is an UNDERestimate at 0.4 and
+# the sweep check is less conservative than it reads. I have left it at 50
+# until the speed at 0.4 is measured off a recording rather than guessed;
+# 50 is also the number REVERSE_FLOOR_MM's "four times the allowance" was
+# written against, and at 0.4 that ratio is about two.
 TURN_LAG_MM = 50.0
 
 # How much of the car is allowed to be in the thing being steered around.
@@ -1034,6 +1077,38 @@ def floor_vetoes_forward(scan) -> bool:
     return bool(near) and min(near) < REVERSE_FLOOR_MM
 
 
+# The speed caps. Auto drives at exactly these, record scales full RT and
+# full LT to them (main.auto_speed_limits), takeover's trigger is scaled to
+# them, and the policy runtime multiplies its magnitude by them.
+#
+# Forward was 0.2, 1660 us against neutral 1575. The first record session
+# (2026-10-27 22:18) says that sits on the motor's start threshold: RT was
+# at full for 638 of 645 forward ticks, the one clean straight approach
+# closed at 164 mm/s, and two other straight full-RT stretches closed at 4
+# and 19 mm/s -- a car with my whole finger on the trigger, barely moving.
+# 0.4 is 1745 us, +170 us off neutral: twice the throttle and twice the
+# pulse offset of what I drove that session.
+FORWARD_SPEED = 0.4
+
+# Reverse was -0.6, 1230 us: -345 us off neutral against forward's +85, so
+# backing up ran about four times the pulse offset of going forward and
+# drove much faster. Now reverse is as fast as forward, and "as fast" here
+# means the same pulse offset from neutral. set_throttle maps forward over
+# 425 us (neutral to full forward) and reverse over 575 us (neutral to full
+# reverse), so the same offset is a smaller fraction in reverse: -0.2957 at
+# forward 0.4, which is 1405 us, -170 us. Derived, so retuning FORWARD_SPEED
+# keeps them matched (int() truncation can leave them a microsecond apart at
+# other values, e.g. +127 / -128 at 0.3).
+#
+# Equal pulse offset is the first cut of "equal speed", not a measurement of
+# it. Nothing says this ESC answers the same offset with the same wheel
+# speed in both directions -- many ESCs do not -- so whether reverse is
+# actually as fast as forward is mine to judge on the floor.
+REVERSE_SPEED = -FORWARD_SPEED * (
+    (vc.ESC_FULL_FORWARD_PW - vc.ESC_NEUTRAL_PW)
+    / (vc.ESC_NEUTRAL_PW - vc.ESC_FULL_REVERSE_PW))
+
+
 class Driver:
     def __init__(self, controller, oakd):
         self.controller = controller
@@ -1060,10 +1135,12 @@ class Driver:
         # throttle and nothing in here writes it.
         self._reverse_still_samples = 0
 
-        # Tunable parameters. I set all four of these by feel on the bench and
-        # they are not to be nudged from a desk.
-        self.forward_speed = 0.2    # very slow forward motion
-        self.reverse_speed = -0.6   # very slow backup
+        # Tunable parameters. The two speeds are the module's FORWARD_SPEED
+        # and REVERSE_SPEED -- see there for why they are what they are. The
+        # other two I set by feel on the bench and they are not to be nudged
+        # from a desk.
+        self.forward_speed = FORWARD_SPEED
+        self.reverse_speed = REVERSE_SPEED
         # Limit to avoid servo damage when steering against an object -- and
         # it now bounds every steering angle auto commands, which is what that
         # sentence always claimed and did not do. It used to be read only by
@@ -1079,7 +1156,10 @@ class Driver:
         # the only test. It is one of two OR'd terms now and the gyro is the one
         # carrying the weight. Measured parked, the accel magnitude tops out at
         # 0.058, so 0.2 never fired on a parked car -- the threshold was never
-        # the problem and I have not touched it.
+        # the problem and I have not touched it. This 0.2 is m/s^2 and has
+        # nothing to do with forward_speed's old 0.2. The rolling accel it
+        # was weighed against (p50 0.188) was measured with forward at 0.2;
+        # at 0.4 the rolling accel is not measured, and the number stays.
         self.stuck_threshold = 0.2
 
         # Recover phase machine. _phase is None whenever recover does not own
@@ -1142,20 +1222,22 @@ class Driver:
         The signal is the gyro first and the accelerometer second. The camera's
         IMU node is enabled for LINEAR_ACCELERATION, which is gravity
         compensated: near zero at rest AND near zero at a constant velocity.
-        forward_speed = 0.2 is a creep that reaches steady state in well under
-        a second, so on the accel magnitude alone a car rolling along perfectly
-        happily reads the same as a car that is not moving at all. Measured,
-        that floor is p50 0.017 / max 0.058 m/s^2, nowhere near
-        stuck_threshold, which is why the accel term is now a second opinion
-        for a knock or a wheel breaking loose rather than the primary test.
+        forward_speed is a creep (0.2 when this was written, 0.4 now) that
+        reaches steady state in well under a second, so on the accel
+        magnitude alone a car rolling along perfectly happily reads the same
+        as a car that is not moving at all. Measured, that floor is p50
+        0.017 / max 0.058 m/s^2, nowhere near stuck_threshold, which is why
+        the accel term is now a second opinion for a knock or a wheel
+        breaking loose rather than the primary test.
 
         The gyro survives constant velocity. It reads the chassis shaking, and
         a crawler on real ground always shakes while it rolls.
 
         What I could not measure from a desk: how much gyro a creep at 0.2
         actually produces. That one is measured now -- see GYRO_MOVING_MIN, and
-        the old 0.035 was its median. What follows was written when it was
-        anchored off the parked end of the range only, which erred toward
+        the old 0.035 was its median. At 0.4 it is not measured yet. What
+        follows was written when it was anchored off the parked end of the
+        range only, which erred toward
         calling the car moving -- that is, toward never recovering for no
         reason, which is the failure being fixed. The number still wants a pass
         on the bench with the wheels up before I treat it as a feel number.
@@ -1338,7 +1420,8 @@ class Driver:
 
         There is no camera pointed backwards, so a reverse is blind -- but
         there is a contact sensor bolted to the car already and it is the
-        gyro. The car has been commanded in reverse at -0.6 and the chassis is
+        gyro. The car has been commanded in reverse at reverse_speed and the
+        chassis is
         not shaking, so either the wheels are against something or it is up on
         a ledge. Either way the reverse has stopped being useful and the two
         remaining seconds of it are two seconds of pushing.

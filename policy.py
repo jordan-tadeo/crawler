@@ -51,7 +51,10 @@ The throttle is a magnitude, never a signed number. Forward and reverse are
 both right answers in the same scene often enough that one regressed signed
 throttle averages them into a stop, so the direction is a classification and
 the magnitude a sigmoid in [0, 1] that only ever multiplies a bench cap --
-forward_speed for forward, reverse_speed for reverse. Every continuous output
+forward_speed for forward, reverse_speed for reverse. That is the label's
+unit too: policy_adapters measures each recorded throttle against the caps
+in force on its own row, so "how hard I pulled" is what is learned and what
+is replayed, at whatever caps the car drives at now. Every continuous output
 is checked with isfinite() and against its range before it is scaled, and
 never clamped into range first: min(1.0, nan) is 1.0, and 1.0 times
 forward_speed is the most throttle this file can command, but a broken model

@@ -254,10 +254,10 @@ def test_the_throttle_goes_back_to_the_autopilot_and_not_to_a_stop(
     out = run_auto(monkeypatch, 30 + HALF + 10, Camera(far_frame()),
                    plan=chain(at(10, throttle=-1.0), at(30, throttle=0.0)))
     s = out["snaps"]
-    assert s[29]["throttle"] == pytest.approx(-0.6)
+    assert s[29]["throttle"] == pytest.approx(dv.REVERSE_SPEED)
     assert s[30 + HALF - 1]["throttle_by"] == mn.PAD
     assert s[30 + HALF]["throttle_by"] == mn.DRIVER
-    assert s[30 + HALF]["throttle"] == pytest.approx(0.2)
+    assert s[30 + HALF]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
 
 
 def test_rest_noise_never_takes_over_and_the_band_between_never_releases(
@@ -326,7 +326,7 @@ def test_a_recover_under_my_steering_keeps_my_steering(monkeypatch):
     for i in range(let_go, let_go + HALF):
         assert s[i]["steer_by"] == mn.PAD, i
         assert s[i]["steering"] == pytest.approx((0.0, 0.0)), i
-    assert any(s[i]["throttle"] == pytest.approx(-0.6) for i in reversing)
+    assert any(s[i]["throttle"] == pytest.approx(dv.REVERSE_SPEED) for i in reversing)
 
     handback = s[let_go + HALF]
     assert handback["steer_by"] == mn.DRIVER
@@ -349,7 +349,7 @@ def test_stuck_cannot_fire_under_my_throttle(monkeypatch):
         return plan
 
     alone = run_auto(monkeypatch, 450, Camera(far_frame()), plan=scene(False))
-    assert any(t == pytest.approx(-0.6) for t in alone["vecon"].throttles)
+    assert any(t == pytest.approx(dv.REVERSE_SPEED) for t in alone["vecon"].throttles)
 
     mine = run_auto(monkeypatch, 450, Camera(far_frame()), plan=scene(True))
     assert all(snap["phase"] is None for snap in mine["snaps"])
@@ -444,12 +444,12 @@ def test_the_floor_holds_my_forward_and_never_my_reverse(monkeypatch):
         pad.throttle = -1.0
 
     out = run_auto(monkeypatch, 60, Camera(wall_frame(190)), plan=back)
-    assert all(snap["throttle"] == pytest.approx(-0.6)
+    assert all(snap["throttle"] == pytest.approx(dv.REVERSE_SPEED)
                for snap in out["snaps"][1:])
 
     # And the floor is the only thing holding it: open floor, full RT.
     out = run_auto(monkeypatch, 30, Camera(far_frame()), plan=forward)
-    assert out["snaps"][-1]["throttle"] == pytest.approx(0.2)
+    assert out["snaps"][-1]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
 
 
 def test_a_scan_too_old_to_say_holds_my_forward(monkeypatch):
@@ -465,7 +465,7 @@ def test_a_scan_too_old_to_say_holds_my_forward(monkeypatch):
     assert stale
     assert all(snap["throttle"] == 0.0 for snap in stale)
     # Before it went stale, the same scene let the trigger through.
-    assert out["snaps"][1]["throttle"] == pytest.approx(0.2)
+    assert out["snaps"][1]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
 
 
 def test_floor_veto_agrees_with_the_rules_floor():
@@ -595,8 +595,8 @@ def test_every_auto_row_says_whose_each_group_was(monkeypatch):
         if row["throttle_by"] == mn.PAD:
             # 0.5 while held, 0 for the half second after letting go.
             assert row["pad_throttle"] in (0.5, 0.0)
-            assert row["throttle"] == pytest.approx(row["pad_throttle"] * 0.2)
-            assert row["forward_limit"] == pytest.approx(0.2)
+            assert row["throttle"] == pytest.approx(row["pad_throttle"] * dv.FORWARD_SPEED)
+            assert row["forward_limit"] == pytest.approx(dv.FORWARD_SPEED)
     assert seen == {(mn.DRIVER, mn.DRIVER), (mn.PAD, mn.DRIVER),
                     (mn.DRIVER, mn.PAD)}
 
