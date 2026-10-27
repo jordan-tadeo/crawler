@@ -505,6 +505,15 @@ def test_bad_buzzes_twice_without_anybody_sleeping(markpad, pad):
     assert len(pad.joystick.calls) == 2
 
 
+@pytest.mark.parametrize("pulses", [1, 2])
+def test_a_record_buzz_plays_on_the_mark_scheduler(markpad, pad, pulses):
+    """Record mode's enter (2) and exit (1) buzzes, on the poll's own clock."""
+    markpad.buzz(pulses, 1.0)
+    for tick in range(100):
+        markpad.poll(pad, 1.0 + tick * 0.01, "manual")
+    assert len(pad.joystick.calls) == pulses
+
+
 def test_a_rumble_that_raises_costs_only_the_buzz(tmp_path):
     log = FakeLogger()
     pad = FakePad(handle=FakeHandle(raises=RuntimeError("no haptics")))

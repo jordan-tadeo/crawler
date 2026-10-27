@@ -74,6 +74,9 @@ STARTING = "starting"
 READY = "ready"
 FAILED = "failed"
 CLOSED = "closed"
+# Being given back by release(), on a thread of its own, after which it is
+# OFF again and start() can open it. CLOSED is close(), the end of the process.
+RELEASING = "releasing"
 
 
 class StreamView:
@@ -97,6 +100,11 @@ class StreamView:
         self._disparity = None
         self._rectified_left = None
         self._imu = None
+        # The last depth frame this view handed out, kept after the take. The
+        # driver's view is the only one that uses it: the footprint tap reads
+        # it to shrink exactly the frame the driver just scanned, without a
+        # second take that would steal the driver's next one.
+        self.last_depth = None
 
         # Per-view, because it is per-view state: the dashboard's smoothing
         # should not depend on how often telemetry asked for a frame.
@@ -124,7 +132,10 @@ class StreamView:
         return frame
 
     def get_depth_frame(self):
-        return self._take("_depth")
+        frame = self._take("_depth")
+        if frame is not None:
+            self.last_depth = frame
+        return frame
 
     def get_disparity_frame(self):
         return self._take("_disparity")
@@ -196,6 +207,14 @@ class CameraHub:
         self._reader = None
         self._ready = threading.Event()
 
+        # How long the last open took, start() to READY, in seconds. 0.0 until
+        # one has finished. A record session waits on this and I want to know
+        # what it costs me.
+        self.open_seconds = 0.0
+        self._start_requested = 0.0
+        # close() rather than release(): nothing reopens after this.
+        self._final = False
+
     # ---- lifecycle -------------------------------------------------------
 
     def start(self) -> bool:
@@ -205,9 +224,12 @@ class CameraHub:
         """
         if self.state in (STARTING, READY):
             return True
-        if self.state == CLOSED:
+        if self.state in (CLOSED, RELEASING):
+            # RELEASING is not a refusal for good: the caller asks again once
+            # the release thread has put it back to OFF.
             return False
 
+        self._start_requested = time.monotonic()
         self.state = STARTING
         self.error = ""
         self._stop.clear()
@@ -254,23 +276,60 @@ class CameraHub:
             return
 
         self.oakd = oakd
-        self.state = READY
-        self._ready.set()
-        self._log("info", "Camera", "OAK-D up"
-                  + (" with the rectified stream" if self.rectified else ""))
+        self.open_seconds = time.monotonic() - self._start_requested
 
+        # The reader is started BEFORE the hub says READY. The other order
+        # left a window where a release() racing the open found a reader
+        # Thread that existed and had not been started, and join() raises on
+        # that.
         self._reader = threading.Thread(
             target=self._read_loop, name="camera-read", daemon=True)
         self._reader.start()
 
+        self.state = READY
+        self._ready.set()
+        self._log("info", "Camera", f"OAK-D up in {self.open_seconds:.1f} s"
+                  + (" with the rectified stream" if self.rectified else ""))
+
     def close(self):
         """Release the device. Safe to call twice, never raises."""
+        self._final = True
+        self._shut(timeout=3.0)
+        self.state = CLOSED
+
+    def release(self) -> bool:
+        """Give the device back without waiting, so it can be opened again.
+
+        For a record session ending: the camera is shut at idle in manual by
+        design, so a session that opened it closes it. dai.Device's close and
+        the thread joins take real time, so they happen on a thread of their
+        own and the caller -- the control loop -- returns at once. State is
+        RELEASING until that is done and OFF after, and start() refuses in
+        between rather than racing it.
+        """
+        if self.state not in (STARTING, READY):
+            return False
+        self.state = RELEASING
+        threading.Thread(target=self._release, name="camera-release",
+                         daemon=True).start()
+        return True
+
+    def _release(self):
+        # No timeout on the joins. This thread is nobody's wait, and an opener
+        # still inside dai.Device() has to finish and see the stop before the
+        # hub may claim to be OFF -- otherwise it lands READY on a hub that
+        # thinks it has no device.
+        self._shut(timeout=None)
+        if not self._final:
+            self.state = OFF
+
+    def _shut(self, timeout):
         self._stop.set()
         self._ready.set()
 
         for thread in (self._reader, self._opener):
-            if thread is not None:
-                thread.join(timeout=3.0)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=timeout)
         self._reader = None
         self._opener = None
 
@@ -280,7 +339,6 @@ class CameraHub:
                 oakd.close()
             except Exception as e:
                 print(f"[camera] close failed: {e}")
-        self.state = CLOSED
 
     # ---- consumers -------------------------------------------------------
 
