@@ -574,30 +574,6 @@ def test_a_bumped_reverse_does_not_leave_the_car_one_tick_from_stuck(d):
         f"{full_price:.2f} s from cold -- evidence survived the recover")
 
 
-# --- steering bias ----------------------------------------------------------
-
-def test_an_even_scene_steers_straight(d):
-    assert d.get_steering_bias(clear_depth()) == 0
-
-
-def test_steering_bias_turns_toward_the_open_side(d):
-    """Positive is steer right, so more room on the right has to come out
-    positive."""
-    depth = np.full((400, 640), 500, dtype=np.uint16)
-    depth[:, 320:] = 4000
-    assert d.get_steering_bias(depth) > 0
-
-
-def test_steering_bias_stays_in_the_unit_range(d):
-    depth = np.full((400, 640), 1, dtype=np.uint16)
-    depth[:, 320:] = 65000
-    assert -1.0 <= d.get_steering_bias(depth) <= 1.0
-
-
-def test_no_valid_depth_either_side_steers_straight_rather_than_dividing(d):
-    assert d.get_steering_bias(np.zeros((400, 640), dtype=np.uint16)) == 0
-
-
 # --- the footprint check ----------------------------------------------------
 #
 # The bug this half of the file is about: obstacle_in_front() sampled a 50x50
@@ -676,6 +652,90 @@ def speckled_depth(near_samples, probe=4):
     for r, c in sampled_cells(geo, probe)[::3][:near_samples]:
         frame[r, c] = 120
     return frame
+
+
+
+# The stereo pair's minimum range, which is the floor every near reading sits
+# above: fx * baseline / disparity_levels = 441.25 * 75 / 95. Inside it
+# nothing comes back at all, which is what makes a closing obstacle flip to
+# NO_RETURN instead of reading nearer and nearer.
+MIN_Z_MM = dv.FX_AT_640 * 75.0 / 95.0
+
+
+def sampled_columns(geo):
+    """Every column the probes actually read, after COL_STRIDE."""
+    cols = []
+    for i in range(dv.PROBE_COLUMNS):
+        cols.extend(range(geo.col_edges[i], geo.col_edges[i + 1], dv.COL_STRIDE))
+    return np.array(cols)
+
+
+def wall(d_mm=390.0, beta_deg=30.0, invalid=0.0):
+    """A flat vertical wall at beta degrees to the image plane, over level floor.
+
+    beta = 0 is head-on. Positive beta recedes to the right, so the wall is
+    nearest on the left and the car should steer right away from it; negative
+    is the mirror of that.
+
+    The plane is z = d + x tan beta, and a pixel at horizontal tangent u sees
+    it at z = d / (1 - u tan beta) -- one divide per column, no ray casting.
+    It is then scaled so the nearest column the probes actually sample reads
+    exactly d_mm, because that is the number the car decides on: anchoring on
+    the near edge is what keeps the whole wall measurable as beta steepens,
+    instead of sliding the near end into the blind zone and turning every
+    oblique scene into a NO_RETURN.
+
+    Anything closer than MIN_Z_MM is written as 0, which is how an
+    unmeasurable pixel arrives off the device.
+    """
+    frame = ground_depth(invalid=invalid)
+    h, w = frame.shape
+    geo = dv.footprint_geometry(frame.shape)
+    u = (np.arange(w) - w / 2.0) / geo.fx
+    t = np.tan(np.radians(beta_deg))
+    denom = 1.0 - u * t
+    behind = denom <= 1e-6
+    z = np.where(behind, np.inf, 1.0 / np.where(behind, 1.0, denom))
+    z = z * (d_mm / z[sampled_columns(geo)].min())
+
+    out = np.minimum(frame.astype(np.float64), z[None, :])
+    out[out < MIN_Z_MM] = 0.0
+    return np.minimum(out, 65535).astype(np.uint16)
+
+
+def probe_scene(depths):
+    """A frame where probe i reads exactly depths[i] mm.
+
+    Not a photograph of anything. It writes the scan's own axis directly, so
+    the arithmetic in cruise_bias() and read_the_gradient() can be checked
+    against exact numbers rather than approximate ones, and a mirrored scene
+    is exactly mirrored.
+
+    That last part is the reason this exists alongside wall(). The probe fan
+    is not symmetric about the frame centre to the pixel -- col_edges run
+    151..489 on a 640 wide frame, so the outermost sampled columns are 169 px
+    left of centre and 167 px right of it -- which means a flipped IMAGE is
+    not a flipped SCAN and nothing built out of pixels can state an exact
+    negation.
+    """
+    frame = ground_depth()
+    geo = dv.footprint_geometry(frame.shape)
+    for i, mm in enumerate(depths):
+        frame[geo.row_top:geo.row_bottom,
+              geo.col_edges[i]:geo.col_edges[i + 1]] = mm
+    return frame
+
+
+def blind_probe(frame, probe):
+    """Zero one probe's columns outright, the way a dead column arrives."""
+    frame = frame.copy()
+    geo = dv.footprint_geometry(frame.shape)
+    frame[:, geo.col_edges[probe]:geo.col_edges[probe + 1]] = 0
+    return frame
+
+
+EVADE_LEFT = [390.0] + [899.0] * 8      # blocked on the left edge, steer right
+EVADE_RIGHT = [899.0] * 8 + [390.0]     # blocked on the right edge, steer left
 
 
 # --- the geometry, against the two numbers measured off the car -------------
@@ -943,21 +1003,6 @@ def test_the_scan_is_left_on_the_driver_for_telemetry_to_publish(d):
     assert d.last_scan_ms > 0.0
 
 
-def test_the_check_fits_inside_the_tick_budget():
-    """The control loop targets 100 Hz, measures 75, and has a 190 ms stall in
-    its history, so the budget for this is sub-millisecond. Measured p50 is
-    about 0.07 ms on a laptop; the bar here is loose on purpose so it catches
-    a tenfold regression and never a slow machine."""
-    frame = ground_depth(invalid=0.25)
-    dv.free_by_column(frame)
-    times = []
-    for _ in range(200):
-        started = time.perf_counter()
-        dv.free_by_column(frame)
-        times.append((time.perf_counter() - started) * 1000.0)
-    assert float(np.median(times)) < 2.0, f"median {np.median(times):.3f} ms"
-
-
 def test_a_frame_too_small_for_the_band_still_decides_and_fails_closed():
     """Degenerate shapes must not raise on the one thread that commands the
     ESC. Nothing on the car produces these; the guards are there because an
@@ -1000,11 +1045,9 @@ def test_centre_stays_centred_on_both_axles():
 
 
 def test_forward_driving_steers_the_rear_too(d):
-    """The ask, at the call site that was wrong. A clear scene with the room
-    all on one side used to command a rear of exactly 0."""
-    depth = clear_depth()
-    depth[:, 320:] = 4000
-    d.camera.depth = depth
+    """The ask, at the call site that was wrong. A scene asking for a turn
+    used to command a rear of exactly 0."""
+    d.camera.depth = probe_scene(EVADE_LEFT)
     d.camera.imu = MOVING_IMU
 
     d.tick(100.0)
@@ -1018,9 +1061,7 @@ def test_forward_driving_goes_through_the_one_steering_definition(d, monkeypatch
     """Not a second copy of the arithmetic. Turn the one constant and the
     forward path has to follow it."""
     monkeypatch.setattr(dv, "REAR_STEER_RATIO", 0.5)
-    depth = clear_depth()
-    depth[:, 320:] = 4000
-    d.camera.depth = depth
+    d.camera.depth = probe_scene(EVADE_LEFT)
     d.camera.imu = MOVING_IMU
 
     d.tick(100.0)
@@ -1084,48 +1125,44 @@ def test_a_nan_angle_is_left_for_the_one_place_that_writes_hardware():
     assert np.isnan(front) and np.isnan(rear)
 
 
-# --- max_turn bounds the forward path too -----------------------------------
+# --- max_turn bounds every steering command --------------------------------
 #
 # self.max_turn = 0.6 carries the comment "limit to avoid servo damage when
-# steering against an object", and until now that sentence was not true of the
-# path it describes. The constant was referenced in exactly one place,
-# begin_recover(), and tick() fed get_steering_bias() straight into
-# steering_pair(). Measured on a frame with one side at 1500 mm and the other
-# at 4000: the bias saturates at exactly 1.0000, so the car commanded full
-# lock on the front while it leaned against the wall. The four-wheel change
-# put a second servo under the same load, which is what turned a note into a
-# fix. The number 0.6 has not moved; what changed is that it now governs.
+# steering against an object", and for a long time that sentence was not true
+# of the path it describes: the constant was referenced in exactly one place,
+# begin_recover(), and tick() fed the old get_steering_bias() straight into
+# steering_pair(). That function saturated at exactly 1.0000 on a frame with
+# one side at 1500 mm and the other at 4000, so the car commanded full lock on
+# the front while it leaned against the wall, and the four-wheel change put a
+# second servo under the same load.
+#
+# Every steering decision is now a FRACTION of max_turn -- cruise, evade and
+# recover alike -- so the bound is one multiplication at one call site and
+# there is nothing left for a decision to saturate past. The number 0.6 has
+# not moved; what changed is that it governs.
 
 
-def wall_on_one_side(near_mm=1500, far_mm=4000, left=True):
-    """A clear footprint with a wall down one side.
-
-    Both sides are well past CLEARANCE_MM, so obstacle_in_front() is False and
-    the forward path is the one that runs -- which is the point. This is the
-    exact scene the max_turn comment describes and the one that used to
-    saturate.
-    """
-    depth = np.full((400, 640), far_mm, dtype=np.uint16)
-    if left:
-        depth[:, :320] = near_mm
-    else:
-        depth[:, 320:] = near_mm
-    return depth
+def test_an_evade_asks_for_the_full_fraction(d):
+    """The premise, asserted rather than assumed. An evade is the one
+    decision that asks for everything it is allowed, so if this ever stops
+    coming out at exactly 1.0 the clamp below is being tested against
+    nothing. This is the test that used to pin get_steering_bias() saturating
+    at 1.0; the saturation is deliberate and bounded now instead of
+    accidental and unbounded."""
+    verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(EVADE_LEFT)))
+    assert verdict.action == dv.ACT_EVADE
+    assert verdict.steer == 1.0
+    assert dv.read_the_gradient(
+        dv.free_by_column(probe_scene(EVADE_RIGHT))).steer == -1.0
 
 
-def test_a_wall_down_one_side_saturates_the_bias(d):
-    """The premise, asserted rather than assumed. If this scene ever stops
-    saturating, the clamp below is being tested against nothing."""
-    depth = wall_on_one_side()
-    assert d.obstacle_in_front(depth) is False
-    assert d.get_steering_bias(depth) == pytest.approx(1.0)
-
-
-@pytest.mark.parametrize("left,expected_front", [(True, 0.6), (False, -0.6)])
-def test_the_forward_path_never_commands_past_max_turn(d, left, expected_front):
-    """The fix. Saturated both ways, and the sign has to survive the clamp --
-    a bound that forgot which way to turn would steer into the wall."""
-    d.camera.depth = wall_on_one_side(left=left)
+@pytest.mark.parametrize("depths,expected_front",
+                         [(EVADE_LEFT, 0.6), (EVADE_RIGHT, -0.6)])
+def test_the_forward_path_never_commands_past_max_turn(d, depths, expected_front):
+    """The fix. Asked for everything both ways, and the sign has to survive
+    the bound -- a limit that forgot which way to turn would steer into the
+    thing it was avoiding."""
+    d.camera.depth = probe_scene(depths)
     d.camera.imu = MOVING_IMU
 
     d.tick(100.0)
@@ -1137,27 +1174,30 @@ def test_the_forward_path_never_commands_past_max_turn(d, left, expected_front):
     assert abs(rear) <= d.max_turn + 1e-12
 
 
-def test_a_bias_inside_max_turn_is_passed_through_untouched(d):
-    """A bound, not a gain. Scaling every angle by max_turn would make the car
-    lazier at every bias instead of capping only the hard ones."""
-    depth = clear_depth()
-    depth[:, :320] = 2800
-    d.camera.depth = depth
-    d.camera.imu = MOVING_IMU
-    bias = d.get_steering_bias(depth)
-    assert 0 < bias < d.max_turn, "the scene has to ask for less than the cap"
+def test_a_cruise_correction_is_passed_through_as_its_own_fraction(d):
+    """A bound, not a gain, and the fraction is not quantised on the way
+    through. Cruise asks for a fraction well inside the limit and the command
+    has to be exactly that fraction of it."""
+    depths = [880.0] * 5 + [500.0] * 4          # room on the left
+    scan = dv.free_by_column(probe_scene(depths))
+    bias = dv.cruise_bias(scan)
+    assert -1.0 < bias < 0.0, "the scene has to ask for a left correction"
+    assert abs(bias) < 1.0
 
+    d.camera.depth = probe_scene(depths)
+    d.camera.imu = MOVING_IMU
     d.tick(100.0)
 
-    front, _ = d.controller.steerings[-1]
-    assert front == pytest.approx(bias)
+    front, rear = d.controller.steerings[-1]
+    assert front == pytest.approx(bias * d.max_turn)
+    assert rear == pytest.approx(-bias * d.max_turn)
 
 
 def test_the_bound_is_the_constant_and_not_a_literal(d):
     """max_turn is the knob. Turning it has to move the forward path, or 0.6
     has been copied into tick() and there are two limits again."""
     d.max_turn = 0.25
-    d.camera.depth = wall_on_one_side()
+    d.camera.depth = probe_scene(EVADE_LEFT)
     d.camera.imu = MOVING_IMU
 
     d.tick(100.0)
@@ -1169,14 +1209,13 @@ def test_the_bound_is_the_constant_and_not_a_literal(d):
 
 def test_the_clamp_does_not_turn_a_nan_into_a_hard_turn(d, monkeypatch):
     """The trap worth a test of its own. min(0.6, nan) is 0.6, so a plain
-    max/min clamp converts an unmeasurable bias into a commanded full
+    max/min clamp converts an unmeasurable steer into a commanded full
     deflection -- the exact opposite of a safety limit, and the same shape as
     the bug that once made a nan throttle read as full forward. A nan has to
     reach set_steering(), which is the one place that writes hardware and the
     one place that rejects it into neutral on both channels."""
-    monkeypatch.setattr(dv.Driver, "get_steering_bias",
-                        lambda self, depth: float("nan"))
-    d.camera.depth = clear_depth()
+    monkeypatch.setattr(dv, "cruise_bias", lambda scan: float("nan"))
+    d.camera.depth = ground_depth()
     d.camera.imu = MOVING_IMU
 
     d.tick(100.0)
@@ -1187,13 +1226,15 @@ def test_the_clamp_does_not_turn_a_nan_into_a_hard_turn(d, monkeypatch):
 
 
 def test_max_turn_bounds_every_auto_steering_command(d):
-    """Both auto paths, end to end, which is the claim the comment on the
-    constant now makes. Forward through tick(), recovery through
-    begin_recover()'s max_turn-derived magnitudes -- which were already
-    bounded, and are asserted here so that "already" is on the record."""
-    d.camera.depth = wall_on_one_side()
+    """All three paths, end to end, which is the claim the comment on the
+    constant now makes: cruise and evade through tick(), recovery through
+    begin_recover()'s max_turn-derived magnitudes."""
     d.camera.imu = MOVING_IMU
-    d.tick(100.0)
+    for depths in (EVADE_LEFT, EVADE_RIGHT, [880.0] * 5 + [500.0] * 4,
+                   [500.0] * 4 + [880.0] * 5):
+        d.camera.depth = probe_scene(depths)
+        d._clear_evade()
+        d.tick(100.0)
 
     for _ in range(50):
         d.begin_recover(100.0)
@@ -1202,3 +1243,696 @@ def test_max_turn_bounds_every_auto_steering_command(d):
     for front, rear in d.controller.steerings:
         assert abs(front) <= d.max_turn + 1e-12
         assert abs(rear) <= d.max_turn + 1e-12
+
+
+# --- cruise steering, which replaced get_steering_bias ---------------------
+#
+# The old function took two 100x80 patches at the quarter columns, averaged
+# every valid pixel in each and divided the difference by a 1200 mm literal.
+# Three things were wrong with it: it read a band the footprint check now
+# covers properly, it saturated at exactly 1.0 with a wall down one side, and
+# the normaliser made its answer depend on how far away the scene was rather
+# than on its shape.
+#
+# cruise_bias() reads the scan that already ran, is scale free by
+# construction, and is deliberately silent on anything past FLOOR_CLEAR_MM.
+
+
+def test_an_even_scene_steers_straight(d):
+    """Level floor reads 899 on every probe, so this has to be exactly zero
+    and the command exactly zero -- not a small number that still rounds up
+    to a servo degree."""
+    assert dv.cruise_bias(dv.free_by_column(ground_depth())) == 0.0
+
+    d.camera.depth = ground_depth()
+    d.camera.imu = MOVING_IMU
+    d.tick(100.0)
+
+    front, rear = d.controller.steerings[-1]
+    assert front == 0.0
+    assert rear == 0.0
+
+
+def test_cruise_turns_toward_the_open_side_and_mirrors_exactly(d):
+    """Positive is nose right, so a scene nearer on the right has to come out
+    negative, and the mirror of it has to come out as the exact negation --
+    not approximately, or the two sides of the car are not the same car.
+
+    (Was test_steering_bias_turns_toward_the_open_side.)
+    """
+    nearer_right = dv.cruise_bias(
+        dv.free_by_column(probe_scene([880.0] * 5 + [500.0] * 4)))
+    nearer_left = dv.cruise_bias(
+        dv.free_by_column(probe_scene([500.0] * 4 + [880.0] * 5)))
+
+    assert nearer_right < 0.0
+    assert nearer_left == -nearer_right
+
+
+def test_an_evade_turns_toward_the_open_side_and_mirrors_exactly():
+    """The same claim on the other decision. A wall nearer on the right is
+    steered away from to the left, and the mirrored wall gives the exact
+    negation because the magnitude is a constant and not a measurement."""
+    right = dv.read_the_gradient(dv.free_by_column(wall(390.0, -60.0)))
+    left = dv.read_the_gradient(dv.free_by_column(wall(390.0, 60.0)))
+
+    assert right.action == dv.ACT_EVADE and right.steer < 0.0
+    assert left.action == dv.ACT_EVADE
+    assert left.steer == -right.steer
+
+
+def test_cruise_is_silent_on_anything_past_the_floor_clip(d):
+    """Documented behaviour, pinned so nobody later reads it as dead code and
+    "fixes" it. Every probe terminates on the floor inside FLOOR_CLEAR_MM, so
+    a scene whose walls are all further away than that reads as open floor and
+    gets no correction at all. A wall at 1500 mm down one side used to command
+    full lock through the old normaliser."""
+    far_wall = np.full((400, 640), 4000, dtype=np.uint16)
+    far_wall[:, :320] = 1500
+    assert dv.cruise_bias(dv.free_by_column(far_wall)) == 0.0
+
+    # Bring the same asymmetry inside the clip and it does ask for a turn.
+    assert dv.cruise_bias(
+        dv.free_by_column(probe_scene([500.0] * 4 + [880.0] * 5))) > 0.0
+
+
+def test_a_correction_smaller_than_the_deadband_is_not_commanded():
+    """The deadband, at the number. A 4% difference in room is servo noise and
+    has to come out as an exact zero rather than a twitch."""
+    inside = probe_scene([880.0] * 5 + [880.0 * (1 - 2 * 0.04)] * 4)
+    outside = probe_scene([880.0] * 5 + [880.0 * (1 - 2 * 0.07)] * 4)
+
+    raw_in = dv.free_by_column(inside)
+    left = float(np.minimum(raw_in.distance_mm, dv.FLOOR_CLEAR_MM)[:4].mean())
+    right = float(np.minimum(raw_in.distance_mm, dv.FLOOR_CLEAR_MM)[5:].mean())
+    assert abs((right - left) / (right + left)) < dv.CRUISE_DEADBAND
+
+    assert dv.cruise_bias(raw_in) == 0.0
+    assert dv.cruise_bias(dv.free_by_column(outside)) != 0.0
+
+
+def test_cruise_is_a_correction_and_not_a_turn():
+    """CRUISE_TURN_FRACTION, at the number. The hardest cruise command the
+    899 clip can produce has to stay well inside the evade magnitude, or
+    leaning away from a wall and steering around an obstacle stop being
+    distinguishable on the servos."""
+    hardest = dv.cruise_bias(
+        dv.free_by_column(probe_scene([899.0] * 5 + [400.0] * 4)))
+    ceiling = ((dv.FLOOR_CLEAR_MM - 1 - dv.CLEARANCE_MM)
+               / (dv.FLOOR_CLEAR_MM - 1 + dv.CLEARANCE_MM)
+               * dv.CRUISE_TURN_FRACTION)
+    assert abs(hardest) == pytest.approx(abs(ceiling), abs=1e-3)
+    assert abs(hardest) < 0.2
+
+
+def test_probe_four_is_left_out_of_both_sides():
+    """It straddles the centreline and contributes to both sides equally, so
+    including it could only dilute the difference. Moving it has to not move
+    the answer."""
+    depths = [880.0] * 5 + [500.0] * 4
+    with_centre = dv.cruise_bias(dv.free_by_column(probe_scene(depths)))
+    depths[4] = 400.0
+    assert dv.cruise_bias(dv.free_by_column(probe_scene(depths))) == with_centre
+
+
+def test_the_bias_is_scale_free(d):
+    """The actual fix for the 1200 mm normaliser, and the reason it is not
+    simply a smaller normaliser. The same wall angle at two different standoff
+    distances has to ask for the same correction, because what is being
+    measured is the angle."""
+    close = dv.cruise_bias(dv.free_by_column(probe_scene([600.0] * 5 + [450.0] * 4)))
+    far = dv.cruise_bias(dv.free_by_column(probe_scene([800.0] * 5 + [600.0] * 4)))
+    assert close == pytest.approx(far, abs=1e-9)
+
+
+# --- the gradient rules, R1 to R6 ------------------------------------------
+#
+# Six gates in order, every one of them a reason to reverse, and the evade is
+# only what falls out of the bottom. One test per gate, so the narrowing of
+# begin_recover()'s domain can be audited one condition at a time.
+
+
+def test_an_all_zeros_frame_reverses_rather_than_dividing(d):
+    """INVERTED on purpose, and the inversion is the point.
+
+    This was test_no_valid_depth_either_side_steers_straight_rather_than_
+    dividing: get_steering_bias() returned a neutral 0 when neither patch had
+    a valid pixel, tick() clamped that to 0 and drove on at forward_speed. A
+    frame with nothing measurable in it is a frame the stereo pair cannot see
+    -- too close, too dark or too featureless -- and driving straight ahead
+    was the fail-open bug. R1 vetoes the whole feature on a single NO_RETURN
+    probe, so the test that pinned the bug is now the test that pins the fix.
+    """
+    blind = np.zeros((400, 640), dtype=np.uint16)
+    verdict = dv.read_the_gradient(dv.free_by_column(blind))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.steer == 0.0
+    assert verdict.reason == "no_return"
+
+    d.camera.depth = blind
+    d.camera.imu = MOVING_IMU
+    d.tick(100.0)
+    assert d.controller.throttles[-1] == d.reverse_speed
+
+
+@pytest.mark.parametrize("probe", range(dv.PROBE_COLUMNS))
+def test_a_no_return_probe_can_never_be_the_direction_turned_toward(probe):
+    """R1, at every position in the fan, and the hardest constraint in the
+    whole feature.
+
+    The base scene is a clean evade: one blocked probe on the left edge with
+    open floor beside it, which steers right. Put one unmeasurable column
+    anywhere in that fan -- including the one being steered toward -- and the
+    answer has to become a reverse. An unmeasurable column is usually
+    something too close to measure, and steering at it is the worst available
+    move.
+    """
+    frame = blind_probe(probe_scene(EVADE_LEFT), probe)
+    verdict = dv.read_the_gradient(dv.free_by_column(frame))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.steer == 0.0
+
+
+def test_an_obstacle_closing_in_stops_being_an_evade():
+    """The other half of R1 and R2 together, and the reason no separate
+    progress monitor is needed. A wall being grazed that keeps closing runs
+    out of room: first it drops under REVERSE_FLOOR_MM, and then it stops
+    being measurable at all and the R1 veto takes it. Either way the episode
+    ends on the scan itself rather than on a timer."""
+    for d_mm in (390.0, 370.0):
+        assert dv.read_the_gradient(
+            dv.free_by_column(wall(d_mm, 60.0))).action == dv.ACT_EVADE
+
+    closed = dv.read_the_gradient(dv.free_by_column(wall(MIN_Z_MM - 5.0, 60.0)))
+    assert closed.action == dv.ACT_REVERSE
+    assert closed.steer == 0.0
+    assert closed.reason.split()[0] in ("floor", "no_return"), closed.reason
+
+    # And a column that has gone entirely unmeasurable -- which is what an
+    # obstacle filling the blind zone looks like -- is the R1 veto itself.
+    gone = blind_probe(probe_scene(EVADE_LEFT), 0)
+    assert dv.read_the_gradient(dv.free_by_column(gone)).reason == "no_return"
+
+
+def test_something_as_close_as_the_sensor_can_see_reverses():
+    """R2, at the number. Inside REVERSE_FLOOR_MM there is no room left to
+    rotate along a surface and the next few millimetres are the blind zone.
+    355 and 365 mm bracket the shipped 360, written as literals so that moving
+    the constant does not quietly move the scene with it."""
+    verdict = dv.read_the_gradient(
+        dv.free_by_column(probe_scene([355.0] + [899.0] * 8)))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.reason.startswith("floor")
+    assert verdict.steer == 0.0
+
+    just_clear = dv.read_the_gradient(
+        dv.free_by_column(probe_scene([365.0] + [899.0] * 8)))
+    assert just_clear.action == dv.ACT_EVADE
+
+
+def test_the_reverse_floor_sits_between_the_blind_zone_and_the_trigger():
+    """Where R2's number has to live. Below the stereo minimum it could never
+    fire -- nothing is measurable down there -- and at or above the trigger it
+    would swallow the whole feature."""
+    assert MIN_Z_MM < dv.REVERSE_FLOOR_MM < dv.CLEARANCE_MM
+
+
+def test_two_separate_obstacles_are_not_a_surface():
+    """R3. A blocked probe at each end is two things, and there is no single
+    direction that goes around both."""
+    verdict = dv.read_the_gradient(
+        dv.free_by_column(probe_scene([390.0] + [899.0] * 7 + [390.0])))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.steer == 0.0
+    assert verdict.reason == "split"
+
+
+def test_a_gap_to_thread_is_not_a_surface_to_graze():
+    """R4. Steering away from something that touches neither edge means
+    steering into whatever is beside it, and at 400 mm the whole fan is only
+    306 mm of real width on a car 267 mm wide, so a threadable gap barely
+    exists. Deliberate: these are the events to re-read after a session if he
+    wants more forward motion out of it."""
+    for depths in ([899.0] * 4 + [390.0] + [899.0] * 4,          # ....N....
+                   [899.0] * 7 + [390.0] + [899.0],              # .......N.
+                   [390.0] + [899.0] * 7 + [899.0]):             # N........ (control)
+        verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(depths)))
+        if depths[0] == 390.0:
+            assert verdict.action == dv.ACT_EVADE
+        else:
+            assert verdict.action == dv.ACT_REVERSE
+            assert verdict.steer == 0.0
+            assert verdict.reason == "middle"
+
+
+def test_a_doorway_straight_ahead_reverses_and_does_not_steer(d):
+    """The scene R4 exists for, asserted on the steer as well as the action.
+    A steer of anything but exactly zero on a reverse would be a servo angle
+    held against whatever is in front of the car for the length of a
+    recover."""
+    verdict = dv.read_the_gradient(
+        dv.free_by_column(probe_scene([899.0] * 3 + [390.0] * 3 + [899.0] * 3)))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.steer == 0.0
+
+
+def test_a_block_spanning_the_whole_fan_reverses():
+    """R4's other half. Touching both edges is a wall, and the open side the
+    ratio would need does not exist."""
+    verdict = dv.read_the_gradient(dv.free_by_column(probe_scene([390.0] * 9)))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.reason == "spans"
+
+
+def test_too_much_of_the_car_in_it_reverses():
+    """R5, at the number. The probe boundaries put one blocked edge probe
+    14.5 mm inside the tyre line, two at 48.2 mm -- about one tyre face -- and
+    three at 82 mm, which is most of the wheel."""
+    for width in (1, 2):
+        depths = [390.0] * width + [899.0] * (9 - width)
+        assert dv.read_the_gradient(
+            dv.free_by_column(probe_scene(depths))).action == dv.ACT_EVADE
+
+    for width in (3, 4):
+        depths = [390.0] * width + [899.0] * (9 - width)
+        verdict = dv.read_the_gradient(dv.free_by_column(probe_scene(depths)))
+        assert verdict.action == dv.ACT_REVERSE
+        assert verdict.reason == f"wide {width}"
+        assert verdict.steer == 0.0
+
+
+def test_a_surface_too_steep_to_rotate_along_reverses():
+    """R6, at the number. Without the ratio gate the car would steer away from
+    a wall it is driving straight into, because one edge probe lighting up
+    first is exactly what a slightly-off-square approach looks like."""
+    shallow = dv.read_the_gradient(
+        dv.free_by_column(probe_scene([390.0] + [700.0] * 8)))
+    assert shallow.action == dv.ACT_REVERSE
+    assert shallow.reason.startswith("shallow")
+    assert shallow.steer == 0.0
+
+    assert dv.read_the_gradient(
+        dv.free_by_column(probe_scene([390.0] + [899.0] * 8))).action == dv.ACT_EVADE
+
+
+def test_the_open_side_cannot_be_inflated_past_the_floor_clip():
+    """R6's ceiling. Every probe terminates on the floor inside
+    FLOOR_CLEAR_MM, so a column that happened to see past it -- a dropout
+    straight down the band, say -- must not be allowed to manufacture a ratio
+    the geometry cannot support."""
+    depths = [390.0] + [899.0] * 7 + [40000.0]
+    ratio_source = dv.free_by_column(probe_scene(depths))
+    assert ratio_source.distance_mm[8] > dv.FLOOR_CLEAR_MM
+    verdict = dv.read_the_gradient(ratio_source)
+    assert verdict.action == dv.ACT_EVADE
+    assert float(verdict.reason.split()[1]) == pytest.approx(
+        dv.FLOOR_CLEAR_MM / 390.0, abs=0.01)
+
+
+def test_the_ratio_threshold_is_reachable_against_its_own_ceiling():
+    """OPEN_RATIO_MIN has to leave headroom under the ceiling the 899 clip
+    imposes, or the feature is unreachable in principle. The ceiling is the
+    clip over the closest reading that is still allowed to steer."""
+    ceiling = dv.FLOOR_CLEAR_MM / dv.REVERSE_FLOOR_MM
+    assert dv.OPEN_RATIO_MIN < ceiling
+    assert dv.OPEN_RATIO_MIN <= 2.2, "past 2.2 there is no headroom left"
+
+
+def test_clear_always_means_a_finite_distance():
+    """The invariant that makes the old fail-open bug unreachable.
+
+    get_steering_bias() divided by a count it had not checked and handed back
+    a neutral zero when the count was nothing. Every consumer of this scan --
+    cruise_bias(), R6's open side -- reads distance_mm on probes marked CLEAR,
+    so CLEAR has to imply a real number and not an infinity.
+
+    It holds because the far-evidence rule is stricter than the near-sample
+    rule: a CLEAR probe needs MIN_VALID_FRACTION of its samples valid AND
+    beyond the budget, which on any probe with at least
+    NEAR_SAMPLES_FLOOR / MIN_VALID_FRACTION samples in it is more than the k
+    the distance statistic needs.
+    """
+    assert dv.MIN_VALID_FRACTION >= dv.NEAR_SAMPLE_FRACTION
+
+    frames = [ground_depth(), ground_depth(invalid=0.3), ground_depth(invalid=0.5),
+              ground_depth(invalid=0.7), ground_depth(invalid=0.85),
+              clear_depth(), blocked_depth(), np.zeros((400, 640), np.uint16),
+              probe_scene(EVADE_LEFT), probe_scene(EVADE_RIGHT),
+              probe_scene([390.0] * 9), speckled_depth(3), speckled_depth(40)]
+    frames += [wall(390.0, beta) for beta in range(-80, 81, 10)]
+    frames += [blind_probe(probe_scene(EVADE_LEFT), i)
+               for i in range(dv.PROBE_COLUMNS)]
+
+    for frame in frames:
+        scan = dv.free_by_column(frame)
+        for i in range(dv.PROBE_COLUMNS):
+            if scan.reason[i] == dv.CLEAR:
+                assert np.isfinite(scan.distance_mm[i]), (
+                    f"clear probe {i} with no distance: {marks(scan)}")
+
+
+@pytest.mark.parametrize("dropout", [0.0, 0.3, 0.5, 0.7, 0.85])
+def test_open_floor_drives_straight_on_however_patchy_it_is(dropout):
+    """The risk this change carries, on the steering as well as the stop. A
+    scene that is plainly open floor has to come out as forward with an exact
+    zero -- if heavy dropout can shift the per-probe distances enough to ask
+    for a turn, the car wanders down an empty room."""
+    verdict = dv.read_the_gradient(dv.free_by_column(ground_depth(invalid=dropout)))
+    assert verdict.action == dv.ACT_FORWARD
+    assert verdict.steer == 0.0
+
+
+# --- the envelope: which wall angles are steered around --------------------
+
+
+@pytest.mark.parametrize("beta", [-70, -60, -50, 50, 60, 70])
+def test_a_shallow_enough_wall_is_steered_away_from(beta):
+    """Measured on the planar fixture at the trigger range, near edge at
+    390 mm:
+
+        beta   20     30     40     50     60     70
+        ratio  1.28   1.47   1.76   2.26   2.31   2.31
+
+    The threshold sits between 40 and 50 degrees, which is where
+    OPEN_RATIO_MIN = 2.0 puts it: the fan's outer columns are at tan +/-0.383,
+    so a plane reads (1 + 0.383 tan beta) / (1 - 0.383 tan beta) across it and
+    2.0 is beta = 41 degrees. The table flattens at 2.31 because the open side
+    is the floor at 899 against a near edge at 390.
+    """
+    verdict = dv.read_the_gradient(dv.free_by_column(wall(390.0, beta)))
+    assert verdict.action == dv.ACT_EVADE
+    assert verdict.steer == (1.0 if beta > 0 else -1.0), "steer away, not into"
+
+
+@pytest.mark.parametrize("beta", [-40, -30, -20, 20, 30, 40])
+def test_a_wall_being_driven_into_is_backed_away_from(beta):
+    """The other side of the same threshold, and the one that matters for
+    safety: a 40 degree approach still reverses. Steering along a wall the car
+    is driving into is how it ends up leaning on a servo."""
+    verdict = dv.read_the_gradient(dv.free_by_column(wall(390.0, beta)))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.steer == 0.0
+
+
+@pytest.mark.parametrize("beta", [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5])
+def test_a_head_on_wall_always_reverses(beta):
+    """The scene the whole feature must never get wrong. Square on to a wall,
+    plus or minus five degrees of approach, is a reverse every time -- and the
+    reasons vary (spans, wide, shallow) which is fine, the action does not."""
+    verdict = dv.read_the_gradient(dv.free_by_column(wall(390.0, beta)))
+    assert verdict.action == dv.ACT_REVERSE
+    assert verdict.steer == 0.0
+
+
+@pytest.mark.parametrize("d_mm", [365.0, 380.0, 395.0])
+@pytest.mark.parametrize("beta", [-60, -50, 50, 60])
+def test_the_envelope_holds_across_the_trigger_band(d_mm, beta):
+    """The whole measurable band between REVERSE_FLOOR_MM and the trigger, so
+    the verdict is not an accident of one standoff distance."""
+    verdict = dv.read_the_gradient(dv.free_by_column(wall(d_mm, beta)))
+    assert verdict.action == dv.ACT_EVADE
+    assert verdict.steer == (1.0 if beta > 0 else -1.0)
+
+
+def test_the_measured_journal_patterns_arm_about_two_in_five():
+    """The sanity check on the real car's own record: 88 obstacle events read
+    out of the journal's bracketed probe strings, classified by shape. 37 of
+    them are the evade shape. If a change to the rules moved this a long way
+    in either direction, it changed what the car does on the floor rather than
+    what it does in a test."""
+    counts = {
+        "........N": 15, "NNNNNNNNN": 13, "N........": 12, "....NNNNN": 7,
+        "NN.......": 7, ".......N.": 5, "NNNNNN...": 3, "NNN......": 3,
+        "......NNN": 3, ".......NN": 3, "....N....": 2, "......N..": 2,
+        "NN.NNNNNN": 1, "..NNNNNN.": 1, "...NNNNNN": 1, "NNNNN....": 1,
+        "NNN....NN": 1, "..NNNNN..": 1, "NNNN.....": 1, "....NNNN.": 1,
+        ".....NNNN": 1, ".....NNN.": 1, "...NN....": 1, ".N.......": 1,
+        "..N......": 1,
+    }
+    armed = 0
+    for pattern, seen in counts.items():
+        frame = probe_scene([390.0 if c == "N" else 899.0 for c in pattern])
+        scan = dv.free_by_column(frame)
+        assert marks(scan) == pattern, "the fixture has to reproduce the shape"
+        if dv.read_the_gradient(scan).action == dv.ACT_EVADE:
+            armed += seen
+    assert armed == 37, f"{armed} of {sum(counts.values())} events"
+
+
+# --- the commitment latch --------------------------------------------------
+#
+# The latch lives on the Driver. read_the_gradient() is pure and sees none of
+# it, so what gets commanded is a function of one scan plus one latched
+# direction and nothing else.
+
+
+def test_an_evade_holds_its_side_through_clear_frames_and_then_lets_go(d):
+    """EVADE_SECONDS. The obstacle rotates out of the fan about one tick into
+    the turn, so a car that un-steers the moment the fan reads clear has not
+    gone anywhere. It has to keep the turn in and then hand it back."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+    d.tick(100.0)
+    assert d.controller.steerings[-1][0] == pytest.approx(d.max_turn)
+
+    d.camera.depth = ground_depth()
+    for k in range(1, 5):                     # 100.1 .. 100.4
+        d.tick(100.0 + 0.1 * k)
+        assert d.controller.steerings[-1][0] == pytest.approx(d.max_turn), (
+            f"let go after {0.1 * k:.1f} s, inside EVADE_SECONDS")
+
+    d.tick(100.0 + dv.EVADE_SECONDS)
+    assert d.controller.steerings[-1][0] == 0.0
+    assert d._evade_dir == 0.0
+
+
+def test_an_evade_that_never_ends_reverses_instead(d):
+    """EVADE_LIMIT_SECONDS. A surface that is still blocked after thirty
+    decisions of steering the same way is a wall being followed into a
+    corner, and none of R1, R2, R5 or R6 will have fired. This is the
+    backstop."""
+    assert dv.EVADE_LIMIT_SECONDS <= 10.0, (
+        "a backstop longer than ten seconds is not a backstop")
+
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+
+    for k in range(int(dv.EVADE_LIMIT_SECONDS / 0.1)):
+        d.tick(100.0 + 0.1 * k)
+        assert d.controller.throttles[-1] == d.forward_speed, (
+            f"gave up after {0.1 * k:.1f} s, inside EVADE_LIMIT_SECONDS")
+
+    d.tick(100.0 + dv.EVADE_LIMIT_SECONDS)
+    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d._evade_dir == 0.0
+
+
+def test_an_evade_asking_for_the_other_side_becomes_a_reverse(d):
+    """The anti-dither mechanism, at the source. A sign reversal mid-episode
+    is never obeyed: it is a scene the car cannot read, not a turn to make,
+    and a reverse is both the safe answer and an assertable one. A low-pass
+    filter would only have damped it, and would have added lag to the floor
+    check as well."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+    d.tick(100.0)
+    assert d.controller.throttles[-1] == d.forward_speed
+
+    d.camera.depth = probe_scene(EVADE_RIGHT)
+    d.tick(100.1)
+    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d._evade_dir == 0.0
+
+
+def test_a_reverse_verdict_drops_the_latch_at_the_decision_too(d):
+    """Belt and braces with begin_recover()'s own clear, and asked of _commit()
+    directly because that is where it has to live. _commit() is the only thing
+    in this file with a memory in it, so it drops the latch itself rather than
+    trusting every caller to recover afterwards."""
+    d._evade_dir = 1.0
+    d._evade_until = 1e9
+
+    out = d._commit(dv.SteerVerdict(dv.ACT_REVERSE, 0.0, "spans"), 100.0)
+
+    assert out.action == dv.ACT_REVERSE
+    assert d._evade_dir == 0.0
+
+
+def test_the_decision_is_left_on_the_driver_beside_the_scan(d):
+    """Same read-only bookkeeping as last_scan, for the same reason: whoever
+    publishes telemetry should not have to re-run the decision to report it."""
+    assert d.last_verdict is None
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+
+    d.tick(100.0)
+
+    assert d.last_verdict.action == dv.ACT_EVADE
+    assert d.last_verdict.steer == 1.0
+    assert d.last_verdict.reason.startswith("graze")
+
+
+def test_the_probe_string_tells_the_two_block_reasons_apart():
+    """N and ? are two different events -- something measurably inside the
+    budget, and a stereo pair that cannot see at all -- and the journal line is
+    where I read which one it was. One character wrong and a week of logs says
+    the wrong thing; the 88 events behind these constants were read out of
+    exactly this string."""
+    near_left_blind_right = blind_probe(probe_scene(EVADE_LEFT), 8)
+    assert dv.probe_marks(dv.free_by_column(near_left_blind_right)) == "N.......?"
+    assert dv.probe_marks(dv.free_by_column(ground_depth())) == "." * 9
+
+
+def test_a_reverse_beats_the_commitment_every_time(d):
+    """Safety beats commitment. Mid-evade, a scene that reverses reverses --
+    the latch does not get to hold the turn in for another half second."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+    d.tick(100.0)
+
+    d.camera.depth = probe_scene([390.0] * 9)
+    d.tick(100.1)
+    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d._evade_dir == 0.0
+
+
+def test_a_recover_clears_the_latch(d):
+    """Whatever the car was steering around is behind the decision once a
+    recover has taken the wheels, and a latch that survived it would steer the
+    old way on the first tick back."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+    d.tick(100.0)
+    assert d._evade_dir == 1.0
+
+    d.begin_recover(200.0)
+    assert d._evade_dir == 0.0
+    assert d._evade_until == 0.0
+
+    d.camera.depth = ground_depth()
+    d.tick(203.0)        # ends the reverse phase
+    d.tick(204.0)        # settle is up, wheels come back, decides afresh
+    assert d.controller.steerings[-1] == (0.0, 0.0)
+
+
+def test_abort_clears_the_latch(d):
+    """Same claim for the other way out. abort() is what a START press, a
+    controller dropout and a systemctl stop all land on."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+    d.tick(100.0)
+    assert d._evade_dir == 1.0
+
+    d.abort()
+    assert d._evade_dir == 0.0
+
+
+def test_the_servos_never_see_a_sign_flip_on_consecutive_decisions(d):
+    """Anti-dither on the hardware record rather than on the decision.
+
+    The scene alternates left-blocked and right-blocked every tick, which is
+    the worst input this feature can be handed -- a scene balanced on
+    OPEN_RATIO_MIN at a 10 Hz decision rate. What must never appear is two
+    consecutive decisions commanding opposite front angles, which on four
+    wheels is both steering servos slamming across at 10 Hz.
+    """
+    d.camera.imu = MOVING_IMU
+    commanded = {}
+    for k in range(100):
+        d.camera.depth = probe_scene(EVADE_LEFT if k % 2 == 0 else EVADE_RIGHT)
+        before = len(d.controller.steerings)
+        d.tick(100.0 + 0.1 * k)
+        if (len(d.controller.steerings) > before
+                and d.controller.throttles[-1] == d.forward_speed):
+            commanded[k] = d.controller.steerings[-1][0]
+
+    assert commanded, "the alternation has to command forward steering at all"
+    for k, front in commanded.items():
+        previous = commanded.get(k - 1)
+        if previous:
+            assert front * previous > 0, (
+                f"tick {k - 1} commanded {previous:+.2f} and tick {k} "
+                f"commanded {front:+.2f}")
+
+
+# --- what every tick does, whatever it decides -----------------------------
+
+
+def tick_scenarios():
+    """Every shape of decision tick() can take, by the frame that causes it."""
+    return {
+        "open floor": ground_depth(),
+        "patchy floor": ground_depth(invalid=0.7),
+        "cruise correction": probe_scene([880.0] * 5 + [500.0] * 4),
+        "evade left": probe_scene(EVADE_LEFT),
+        "evade right": probe_scene(EVADE_RIGHT),
+        "grazeable wall": wall(390.0, 60.0),
+        "head-on wall": wall(390.0, 0.0),
+        "doorway": probe_scene([899.0] * 3 + [390.0] * 3 + [899.0] * 3),
+        "split": probe_scene([390.0] + [899.0] * 7 + [390.0]),
+        "blind frame": np.zeros((400, 640), dtype=np.uint16),
+        "no depth at all": None,
+    }
+
+
+@pytest.mark.parametrize("name", list(tick_scenarios()))
+def test_every_tick_commands_something(d, name):
+    """pigpio latches the last servo pulse width forever and there is no
+    hardware failsafe on this car, so a tick that decides and commands
+    nothing is a tick that keeps doing whatever it was doing. Exactly one
+    throttle command per tick, and never a tick that writes neither the ESC
+    nor the servos."""
+    d.camera.depth = tick_scenarios()[name]
+    d.camera.imu = MOVING_IMU
+
+    d.tick(100.0)
+
+    assert len(d.controller.throttles) == 1, d.controller.throttles
+    assert d.controller.throttles or d.controller.steerings
+
+
+@pytest.mark.parametrize("name", list(tick_scenarios()))
+def test_a_tick_decides_before_it_commands(d, name):
+    """The old order commanded forward speed and only then looked for an
+    obstacle, so every tick facing a wall lurched into it for a tick first.
+    Whatever the scene, the first throttle of the tick is the only one."""
+    d.camera.depth = tick_scenarios()[name]
+    d.camera.imu = MOVING_IMU
+
+    d.tick(100.0)
+
+    assert len(set(d.controller.throttles)) == 1
+
+
+def test_the_decision_prints_on_transitions_and_not_on_every_tick(d, capsys):
+    """The decision rate is 10 Hz and journald rate-limits, so a line a tick
+    costs me the lines I actually want. The bracketed probe string is what
+    makes the journal readable after the fact -- the 88 events behind
+    MAX_BLOCKED_PROBES and OPEN_RATIO_MIN were read straight out of it."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+    for k in range(10):
+        d.tick(100.0 + 0.1 * k)
+
+    printed = [line for line in capsys.readouterr().out.splitlines()
+               if "[" in line]
+    assert len(printed) == 1, printed
+    assert "[N........]" in printed[0]
+    assert "steering right" in printed[0]
+
+
+def test_the_scan_and_the_verdict_fit_inside_the_tick_budget():
+    """The control loop targets 100 Hz, measures 75, and has a 190 ms stall in
+    its history, so the budget for this is sub-millisecond. Timed as the tick
+    pays for it: one scan plus the verdict read off it. The verdict measures a
+    few microseconds against a scan of about 70 us on a laptop, so the bar
+    here is loose on purpose -- it catches a tenfold regression and never a
+    slow machine."""
+    frame = ground_depth(invalid=0.25)
+    dv.read_the_gradient(dv.free_by_column(frame))
+    times = []
+    for _ in range(200):
+        started = time.perf_counter()
+        dv.read_the_gradient(dv.free_by_column(frame))
+        times.append((time.perf_counter() - started) * 1000.0)
+    assert float(np.median(times)) < 2.0, f"median {np.median(times):.3f} ms"

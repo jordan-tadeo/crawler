@@ -1,4 +1,17 @@
-"""Depth-driven roomba mode: crawl forward, back out of whatever it hits.
+"""Depth-driven roomba mode: crawl forward, steer around an edge, back out of
+the rest.
+
+One decision per tick, taken before anything is commanded, off one read of
+the depth frame. read_the_gradient() turns a footprint scan into one of three
+answers -- drive on, steer around it, or back out -- and it is pure, so the
+whole decision is testable on a laptop with no car attached. Everything with
+a memory in it is on the Driver: the recover phase machine, the stuck
+evidence, and one latched evade direction.
+
+The steering half of that is new and deliberately narrow. Every probe inside
+the 400 mm budget used to mean a reverse; now one shape instead steers away
+and keeps driving, and the six gates that define that shape are in the block
+above the class. Everything else reverses exactly as it did.
 
 Everything here is synchronous and non-blocking. The control loop owns the
 ESC and the servos on one thread and calls tick() about ten times a second,
@@ -367,6 +380,16 @@ NO_RETURN = "no_return" # nothing measurable, which on a stereo pair means too
 CLEAR = ""
 
 
+def probe_marks(scan) -> str:
+    """One scan as a readable string: N near, ? no-return, . clear.
+
+    The format the journal has carried since the footprint check
+    shipped, defined once now that two places want to print it.
+    """
+    return "".join("N" if r == NEAR else "?" if r == NO_RETURN else "."
+                   for r in scan.reason)
+
+
 class FootprintGeometry(NamedTuple):
     """Where the probes land on one particular frame shape, in pixels."""
 
@@ -505,6 +528,236 @@ def free_by_column(depth, threshold_mm=CLEARANCE_MM) -> FootprintScan:
     return FootprintScan(distance, valid_fraction, blocked, tuple(reason), geo)
 
 
+# ---------------------------------------------------------------------------
+# Reading the gradient: the one near obstacle that gets steered around
+# ---------------------------------------------------------------------------
+#
+# Until now every probe inside the clearance budget meant the same thing:
+# stop, reverse for two seconds, turn a random way, try again. That is the
+# right answer to a wall and the wrong answer to the thing this car actually
+# meets indoors, which is a door jamb or a skirting board catching one edge of
+# the fan while the other eight probes read open floor. 88 obstacle events
+# read out of a week of the journal, and 37 of them are a single edge probe or
+# a pair of them -- [........N] 15 times, [N........] 12, [NN.......] 7,
+# [.......NN] 3.
+#
+# So exactly one pattern now steers instead of reversing: a block that is
+# entirely measured, contiguous, at most MAX_BLOCKED_PROBES wide, touching
+# exactly one edge of the fan, with OPEN_RATIO_MIN times as much room on the
+# open side and nothing closer than REVERSE_FLOOR_MM. Everything else reverses
+# exactly as it did before.
+#
+# That is deliberately written as a narrowing of begin_recover()'s domain and
+# not as a new behaviour alongside it. Six gates in order, every one of them a
+# reason to reverse, and the evade is only what falls out of the bottom -- so
+# the safety argument reads one condition at a time, which is why the rules
+# are numbered in the code as well as here.
+
+# How close is too close to steer. The stereo pair's minimum range is
+# fx * baseline / disparity_levels = 441.25 * 75 / 95 = 348.4 mm, so a
+# measured near reading always lies in [348.4, 400). Inside this floor there
+# is no room left to rotate along a surface and the next few millimetres are
+# the blind zone, so it reverses.
+#
+# 11.6 mm of margin above minZ, which is not as thin as it looks: at 360 mm
+# one full disparity pixel is Z^2 / (fx * baseline) = 360^2 / 33094 = 3.9 mm
+# and subpixel is on, so 11.6 mm is about 24 depth steps rather than a
+# rounding error.
+REVERSE_FLOOR_MM = 360.0
+
+# How much of the car is allowed to be in the thing being steered around.
+# The probe boundaries land at these lateral offsets at the 400 mm budget,
+# in mm: -153.2 -118.8 -85.2 -50.8 -17.2 +17.2 +50.8 +85.2 +118.8 +153.2.
+# The outer face of a tyre is at +/-133.35, so one blocked edge probe reaches
+# at most 14.5 mm inside the tyre line, two reach 48.2 mm -- about one tyre
+# face -- and three reach 82 mm, which is most of the wheel. Two is the last
+# width where steering away is still a graze rather than a hope.
+MAX_BLOCKED_PROBES = 2
+
+# How much more room the open side needs before the surface counts as shallow
+# enough to rotate along rather than back away from.
+#
+# For a flat surface the ratio is a statement about its angle and nothing
+# else: the fan's outer columns sit at tan = +/-0.383, so a plane at beta to
+# the image plane reads (1 + 0.383 tan beta) / (1 - 0.383 tan beta) across it,
+# and 2.0 is beta = 41 degrees. Below that the car is driving into it, not
+# along it.
+#
+# The ceiling is the reason this cannot simply be raised to taste.
+# distance_mm is the near statistic of a probe whose lower rows terminate on
+# the floor inside FLOOR_CLEAR_MM, so an open probe reads about 899 whatever
+# is out there, and against a 400 mm trigger the ratio can never exceed about
+# 2.5. 2.0 leaves 20% of headroom. Past 2.2 the feature stops being reachable.
+OPEN_RATIO_MIN = 2.0
+
+# Cruise steering: how much of max_turn a gradient with no obstacle in it is
+# allowed to ask for, and how much asymmetry it takes before it asks at all.
+#
+# Cruise is a correction and not a turn -- the turns are evades and recovers
+# -- so it gets half the bench limit. With the 899 clip the raw bias tops out
+# at (899 - 400) / (899 + 400) = 0.384, which puts the hardest cruise command
+# at 0.384 * 0.5 * 0.6 = 0.115, or 10 servo degrees.
+#
+# The deadband is on the raw bias, so 0.05 is a 5% left/right difference in
+# room and commands 0.05 * 0.5 * 0.6 = 0.015, which is 1.3 servo degrees. That
+# is the floor below which a correction is servo noise rather than a steer.
+CRUISE_TURN_FRACTION = 0.5
+CRUISE_DEADBAND = 0.05
+
+# How long an evade is committed to once it starts, and the longest one
+# allowed. The autopilot decides at 10 Hz -- AUTO_TICK_INTERVAL in main.py,
+# not the camera's 30 fps and not the control loop's 100 Hz -- so 0.5 s is
+# five decisions.
+#
+# EVADE_SECONDS is there to hold the turn after the obstacle has left the fan.
+# The fan is 338 px wide at the budget range and the thing being steered
+# around is at its edge, so the moment the nose starts rotating the obstacle
+# stops being measured, and a car that un-steers then has not gone anywhere.
+# Five decisions is coarse; it is not lower for that reason.
+#
+# EVADE_LIMIT_SECONDS is the backstop for a surface that never ends: 30
+# decisions of steering the same way and still being blocked is a wall being
+# followed into a corner, and it reverses. ESTIMATED -- it wants a ground
+# speed measurement off the car to pin properly.
+EVADE_SECONDS = 0.5
+EVADE_LIMIT_SECONDS = 3.0
+
+# What tick() does about one scan.
+ACT_FORWARD = "forward"
+ACT_EVADE = "evade"
+ACT_REVERSE = "reverse"
+
+
+class SteerVerdict(NamedTuple):
+    """One decision about one scan, taken before anything is commanded.
+
+    action  ACT_FORWARD, ACT_EVADE or ACT_REVERSE.
+    steer   the front angle as a FRACTION of max_turn, in [-1, 1], positive
+            noses the car right. A fraction and not an angle on purpose: the
+            one bench constant that bounds every auto steering command is
+            then applied at the one place that commands it, and nothing
+            decided in here can get around it.
+    reason  a short phrase for the journal, and the thing _announce() keys
+            its transitions off.
+    """
+
+    action: str
+    steer: float
+    reason: str
+
+
+def cruise_bias(scan) -> float:
+    """Which way to lean with nothing inside the clearance budget.
+
+    The old get_steering_bias() took two 100x80 patches at the quarter
+    columns, averaged every valid pixel in each, and divided the difference by
+    a 1200 mm literal. Three things were wrong with it: it read a band this
+    file now covers properly, it saturated at exactly 1.0 against a wall down
+    one side, and the normaliser made the answer depend on how far away the
+    scene was rather than on its shape.
+
+    This is scale free by construction. For a plane the standoff distance is a
+    common factor of both sides and cancels, so what comes out is the wall's
+    ANGLE and not its distance -- which is the actual fix for the 1200 mm
+    normaliser, rather than a smaller number in the same place.
+
+    It reads the footprint scan that the obstacle check already ran, so it
+    costs no second look at the frame, and it inherits the scan's fail-closed
+    validity rules for free.
+
+    Probe 4 is left out. It straddles the centreline, contributes to both
+    sides equally and can only dilute the difference.
+
+    Deliberately silent until something is inside FLOOR_CLEAR_MM. Every probe
+    terminates on the floor inside 899 mm, so open floor reads 899 across the
+    fan and the bias is exactly zero -- this says nothing at all about an
+    empty room, which is correct and is not a bug to be fixed later. What it
+    does is lean away from a wall that is already in sight but not yet inside
+    the trigger, and that mild pre-turn raises the angle the wall is read at,
+    which is what moves a scene from the reverse band into the evade band.
+    """
+    room = np.minimum(scan.distance_mm, FLOOR_CLEAR_MM)
+    left = float(room[:4].mean())
+    right = float(room[5:].mean())
+    total = left + right
+    if not total > 0.0:
+        # Unreachable from tick(): cruise only runs on a scan with nothing
+        # blocked, and a clear probe has a finite distance of at least the
+        # trigger range. It is here so the function is total, because the
+        # caller is the one thread that commands the ESC.
+        return 0.0
+    bias = (right - left) / total
+    return 0.0 if abs(bias) < CRUISE_DEADBAND else bias * CRUISE_TURN_FRACTION
+
+
+def read_the_gradient(scan) -> SteerVerdict:
+    """What to do about one footprint scan. Pure: a scan in, a verdict out.
+
+    Six gates, in order, and every one of them reverses. The evade is what
+    comes out of the bottom when all six are satisfied, so this reads as the
+    old "anything inside 400 mm reverses" with its domain narrowed rather than
+    as a second behaviour competing with it.
+
+    R1 is first and has to stay first. A NO_RETURN probe is a column the
+    stereo pair cannot measure -- too close, too dark or too featureless --
+    and such a column can never be a direction to turn toward, can never
+    contribute to the open side of the ratio and can never be counted in the
+    width. One anywhere in the fan vetoes the whole feature.
+
+    That also supplies the abort signal for free. An obstacle being grazed
+    that closes to under 348 mm stops being measurable at all, flips to
+    NO_RETURN, and the very next scan reverses: the thing disappearing into
+    the blind zone is itself the reason to stop.
+    """
+    blocked = [i for i in range(PROBE_COLUMNS) if scan.blocked[i]]
+
+    # R1. Anything unmeasurable anywhere vetoes the whole feature.
+    if any(r == NO_RETURN for r in scan.reason):
+        return SteerVerdict(ACT_REVERSE, 0.0, "no_return")
+
+    if not blocked:
+        return SteerVerdict(ACT_FORWARD, cruise_bias(scan), "clear")
+
+    near = min(float(scan.distance_mm[i]) for i in blocked)
+
+    # R2. Already as close as the sensor can see.
+    if near < REVERSE_FLOOR_MM:
+        return SteerVerdict(ACT_REVERSE, 0.0, f"floor {near:.0f}")
+
+    # R3. Two separate obstacles is not a surface.
+    if blocked != list(range(blocked[0], blocked[-1] + 1)):
+        return SteerVerdict(ACT_REVERSE, 0.0, "split")
+
+    # R4. A gap to thread, not a surface to graze. Steering away from
+    # something that does not touch an edge means steering into whatever is
+    # beside it, and at 400 mm a gap wide enough to thread barely exists --
+    # the whole fan is 306 mm of real width on a car 267 mm wide.
+    at_left = blocked[0] == 0
+    at_right = blocked[-1] == PROBE_COLUMNS - 1
+    if at_left == at_right:              # neither edge, or both of them
+        return SteerVerdict(ACT_REVERSE, 0.0, "middle" if not at_left else "spans")
+
+    # R5. How much of the car may be in it.
+    if len(blocked) > MAX_BLOCKED_PROBES:
+        return SteerVerdict(ACT_REVERSE, 0.0, f"wide {len(blocked)}")
+
+    # R6. Shallow enough to rotate along? The open side is capped at the same
+    # FLOOR_CLEAR_MM the probes themselves terminate at, so the ratio cannot
+    # be inflated by a column that happened to see past the floor, and an
+    # infinity cannot reach the division.
+    open_mm = min(FLOOR_CLEAR_MM,
+                  max(float(scan.distance_mm[i]) for i in range(PROBE_COLUMNS)
+                      if scan.reason[i] == CLEAR))
+    ratio = open_mm / near
+    if ratio < OPEN_RATIO_MIN:
+        return SteerVerdict(ACT_REVERSE, 0.0, f"shallow {ratio:.2f}")
+
+    # Away from the blocked edge, at the full fraction. Nothing in between:
+    # the magnitude is not a function of the ratio, so it cannot dither, and
+    # the one number that bounds it is max_turn at the call site.
+    return SteerVerdict(ACT_EVADE, 1.0 if at_left else -1.0, f"graze {ratio:.2f}")
+
+
 class Driver:
     def __init__(self, controller, oakd):
         self.controller = controller
@@ -538,10 +791,12 @@ class Driver:
         # Limit to avoid servo damage when steering against an object -- and
         # it now bounds every steering angle auto commands, which is what that
         # sentence always claimed and did not do. It used to be read only by
-        # begin_recover(); tick() drove the forward path straight off
-        # get_steering_bias(), which saturates at 1.0 with a wall down one
-        # side. Same 0.6 as it has always been, still a bench number, still
-        # not to be nudged from a desk.
+        # begin_recover(); tick() drove the forward path straight off the old
+        # get_steering_bias(), which saturated at 1.0 with a wall down one
+        # side. Every steering decision is a fraction of this now -- cruise,
+        # evade and recover alike -- so the bound is one multiplication at one
+        # call site. Same 0.6 as it has always been, still a bench number,
+        # still not to be nudged from a desk.
         self.max_turn = 0.6
         # Still my bench number, and still the same quantity: the smoothed
         # linear accel magnitude in m/s^2. What changed is that it is no longer
@@ -567,6 +822,24 @@ class Driver:
         self.last_scan = None
         self.last_scan_ms = 0.0
         self.last_block_reason = CLEAR
+        # The decision taken off that scan, same deal: read-only bookkeeping,
+        # one assignment, nothing in here decides on it. Publishing it on
+        # /marks is a one-line change in marks.py and is not made here.
+        self.last_verdict = None
+
+        # The evade latch. _evade_dir is the side the current episode is
+        # committed to, 0.0 whenever there is no episode, and it is the only
+        # thing carried from one decision to the next -- read_the_gradient()
+        # is pure and sees none of this. _evade_since dates the episode for
+        # EVADE_LIMIT_SECONDS and _evade_until is how long a clear frame
+        # keeps steering the way it was.
+        self._evade_dir = 0.0
+        self._evade_since = 0.0
+        self._evade_until = 0.0
+
+        # What _announce() last printed, so it prints on transitions rather
+        # than ten times a second.
+        self._last_announced = None
 
     def motion_evidence(self, imu) -> str:
         """What the IMU can say about motion: MOVING, STILL or UNKNOWN.
@@ -684,55 +957,23 @@ class Driver:
         self._still_samples = 0
         return True
 
-    def get_steering_bias(self, depth, region_width=100, region_height=80, threshold_mm=1200):
-        """
-        Compare average depth in left vs right side.
-        Return a steering value from -1 (steer left) to 1 (steer right).
-        """
-        h, w = depth.shape
-        top = h // 2 - region_height // 2
-        bottom = h // 2 + region_height // 2
+    def scan_footprint(self, depth_frame, threshold_mm=CLEARANCE_MM) -> FootprintScan:
+        """Scan the footprint once, time it, and leave the result behind.
 
-        # Regions left and right of center
-        left_region = depth[top:bottom, w//4 - region_width//2:w//4 + region_width//2]
-        right_region = depth[top:bottom, 3*w//4 - region_width//2:3*w//4 + region_width//2]
+        One read of the frame per tick, and this is it. tick() calls this and
+        then decides off the scan it is handed; obstacle_in_front() is the
+        same scan asked a single boolean question. Nothing in auto looks at a
+        frame twice.
 
-        left_valid = left_region[left_region > 0]
-        right_valid = right_region[right_region > 0]
+        The timing and the three read-only attributes telemetry publishes --
+        last_scan, last_scan_ms and last_block_reason -- are set here, which
+        is where they were always set, so /marks keeps reporting the same
+        fields off the same assignments.
 
-        # Avoid divide-by-zero
-        if len(left_valid) == 0 or len(right_valid) == 0:
-            return 0  # neutral
-
-        left_avg = np.mean(left_valid)
-        right_avg = np.mean(right_valid)
-
-        # Normalize difference to [-1, 1]
-        delta = right_avg - left_avg
-        max_range = threshold_mm
-        steering = np.clip(delta / max_range, -1.0, 1.0)
-        return steering
-
-    def obstacle_in_front(self, depth_frame, threshold_mm=CLEARANCE_MM):
-        """Is any part of the footprint inside its clearance budget?
-
-        Fails closed, same as it always did, and for the same reason: on a
-        stereo pair a no-return usually means too close, too dark or too
-        featureless, and all three are reasons to stop. Dropping the zero
-        pixels and then taking a mean used to hand np.mean() an empty array,
-        which is nan, and nan > 0.5 is False -- a patch with nothing
-        measurable in it read as "clear" and the car drove straight at it.
-
-        What changed is what gets asked. It used to be one 50x50 patch at the
-        dead centre, 0.98% of the frame and 45 mm square out in the world on a
-        267 mm wide car. It is now PROBE_COLUMNS probes tiling the real
-        footprint, each reaching from a little above the lens down toward the
-        near ground, each with its own budget and its own fail-closed test.
-        See the block above the class for the derivation.
-
-        The scan is kept on the Driver rather than printed or published from
-        here, so telemetry can report the column distances, the validity and
-        the reason without a second read of the frame.
+        last_block_reason is NEAR, NO_RETURN, both joined by a "+", or the
+        empty string when the footprint is clear. Both are reported when both
+        fired: they are two different behaviours and a log that calls them the
+        same thing is a log that cannot tell me which one I am looking at.
         """
         started = time.perf_counter()
         scan = free_by_column(depth_frame, threshold_mm)
@@ -744,9 +985,6 @@ class Driver:
         no_return = bool(np.any(scan.blocked & np.array(
             [r == NO_RETURN for r in scan.reason])))
 
-        # Both reasons reported when both fired. They are two different
-        # behaviours and a log that calls them the same thing is a log that
-        # cannot tell me which one I am looking at.
         if near and no_return:
             self.last_block_reason = NEAR + "+" + NO_RETURN
         elif near:
@@ -756,7 +994,30 @@ class Driver:
         else:
             self.last_block_reason = CLEAR
 
-        return bool(scan.blocked.any())
+        return scan
+
+    def obstacle_in_front(self, depth_frame, threshold_mm=CLEARANCE_MM):
+        """Is any part of the footprint inside its clearance budget?
+
+        One question asked of scan_footprint(), kept because it is the honest
+        name for that question even though tick() now wants the whole scan
+        rather than the boolean.
+
+        Fails closed, same as it always did, and for the same reason: on a
+        stereo pair a no-return usually means too close, too dark or too
+        featureless, and all three are reasons to stop. Dropping the zero
+        pixels and then taking a mean used to hand np.mean() an empty array,
+        which is nan, and nan > 0.5 is False -- a patch with nothing
+        measurable in it read as "clear" and the car drove straight at it.
+
+        What changed before this was what gets asked. It used to be one 50x50
+        patch at the dead centre, 0.98% of the frame and 45 mm square out in
+        the world on a 267 mm wide car. It is now PROBE_COLUMNS probes tiling
+        the real footprint, each reaching from a little above the lens down
+        toward the near ground, each with its own budget and its own
+        fail-closed test. See the block above the class for the derivation.
+        """
+        return bool(self.scan_footprint(depth_frame, threshold_mm).blocked.any())
 
     def begin_recover(self, now):
         """Start a backup-and-turn. Commands the first phase and returns."""
@@ -778,6 +1039,8 @@ class Driver:
         self._phase = _PHASE_REVERSE
         self._phase_until = now + REVERSE_SECONDS
         self._clear_motion_evidence()
+        # Whatever the car was steering around, it is behind the decision now.
+        self._clear_evade()
 
     def _rear_bumper_hit(self) -> bool:
         """Has the car reversed into something?
@@ -874,6 +1137,102 @@ class Driver:
         self._phase_until = 0.0
         self.controller.set_throttle(0)
         self._clear_motion_evidence()
+        self._clear_evade()
+
+    def _commit(self, verdict, now):
+        """Hold an evade to the side it started on, and time-limit it.
+
+        The latch lives on the Driver and not in read_the_gradient(), so the
+        decision function stays pure and this stays the only place with a
+        memory in it.
+
+        Three jobs, in the order they are allowed to win:
+
+          a reverse clears the latch and is obeyed immediately -- safety beats
+          commitment, always;
+
+          an evade that asks for the opposite side of an evade already running
+          is never obeyed. It becomes a reverse. Dither is the failure this
+          feature could plausibly have -- the decision rate is 10 Hz and a
+          scene balanced on OPEN_RATIO_MIN could flip the verdict tick to tick
+          -- and a sign flip at 10 Hz on two steering servos is the one
+          outcome worth making unreachable rather than merely damped. Turning
+          it into a reverse is both safe and assertable on the recorded
+          commands, which is what a low-pass filter would not be;
+
+          and a clear frame inside EVADE_SECONDS of the last evade keeps
+          steering the way it was. Without that the car un-steers the instant
+          the obstacle rotates out of the fan, which is about one tick in, and
+          it has not gone anywhere yet.
+
+        No separate progress monitor. R1, R2, R5 and R6 re-run on every
+        decision and already are one: the obstacle closing, widening, going
+        unmeasurable or flattening out all end the episode by themselves.
+        EVADE_LIMIT_SECONDS is only the backstop for the case where none of
+        them ever fire.
+        """
+        if verdict.action == ACT_REVERSE:
+            self._evade_dir = 0.0
+            return verdict
+
+        if verdict.action == ACT_EVADE:
+            side = 1.0 if verdict.steer > 0 else -1.0
+            if self._evade_dir and side != self._evade_dir:
+                self._evade_dir = 0.0
+                return SteerVerdict(ACT_REVERSE, 0.0, "evade flipped")
+            if not self._evade_dir:
+                self._evade_since = now
+            elif now - self._evade_since >= EVADE_LIMIT_SECONDS:
+                self._evade_dir = 0.0
+                return SteerVerdict(ACT_REVERSE, 0.0, "evade timeout")
+            self._evade_dir = side
+            self._evade_until = now + EVADE_SECONDS
+            return verdict
+
+        if self._evade_dir and now < self._evade_until:
+            return SteerVerdict(ACT_EVADE, self._evade_dir, "holding out")
+
+        self._evade_dir = 0.0
+        return verdict
+
+    def _clear_evade(self):
+        """Forget an evade episode. Called wherever recover takes the wheels."""
+        self._evade_dir = 0.0
+        self._evade_since = 0.0
+        self._evade_until = 0.0
+        self._last_announced = None
+
+    def _announce(self, verdict, scan):
+        """Print the decision, on transitions only.
+
+        Keyed on (action, reason), so a car driving down a corridor prints one
+        line when it starts leaning away from the wall and one when it stops,
+        rather than ten a second. The decision rate is 10 Hz and journald
+        rate-limits, so a per-tick line would cost me the lines I actually
+        want.
+
+        The bracketed probe string stays exactly as it was. It is what makes
+        the journal readable after the fact and I have been mining it -- the
+        88 obstacle events behind MAX_BLOCKED_PROBES and OPEN_RATIO_MIN were
+        read straight out of these lines.
+        """
+        key = (verdict.action, verdict.reason)
+        if key == self._last_announced:
+            return
+        self._last_announced = key
+
+        where = probe_marks(scan)
+        if verdict.action == ACT_REVERSE:
+            print(f"Obstacle detected ({self.last_block_reason}) "
+                  f"[{where}] {verdict.reason} - backing up.")
+        elif verdict.action == ACT_EVADE:
+            side = "right" if verdict.steer > 0 else "left"
+            print(f"Obstacle detected ({self.last_block_reason}) "
+                  f"[{where}] {verdict.reason} - steering {side}.")
+        elif where.strip("."):
+            # Cruising, but with something in sight. Worth one line; an empty
+            # fan is not.
+            print(f"Clear [{where}] - driving on.")
 
     def tick(self, now=None):
         """One pass of autonomy. Never blocks, never sleeps."""
@@ -900,15 +1259,17 @@ class Driver:
         # Decide first, command second. The old order commanded forward speed
         # and only then checked for an obstacle, so every tick facing a wall
         # lurched into it for a tick before reversing.
-        if self.obstacle_in_front(depth):
-            # Which probes and why. "near" and "no_return" are two different
-            # events -- a measured obstacle and a stereo pair that cannot see
-            # -- and the old single line could not tell me which I was reading.
-            where = "".join(
-                "N" if r == NEAR else "?" if r == NO_RETURN else "."
-                for r in self.last_scan.reason)
-            print(f"Obstacle detected ({self.last_block_reason}) "
-                  f"[{where}] - backing up.")
+        #
+        # One scan, three consumers: the verdict, the journal line and the
+        # telemetry attributes. read_the_gradient() is pure and _commit() is
+        # the only thing here with a memory, so what gets commanded below is
+        # a function of this scan plus one latched direction and nothing else.
+        scan = self.scan_footprint(depth)
+        verdict = self._commit(read_the_gradient(scan), now)
+        self.last_verdict = verdict
+        self._announce(verdict, scan)
+
+        if verdict.action == ACT_REVERSE:
             self.begin_recover(now)
             return
 
@@ -920,28 +1281,22 @@ class Driver:
 
         # max_turn, applied where it was always meant to be. Its comment says
         # "limit to avoid servo damage when steering against an object" and
-        # until now that was a lie: the constant was referenced only by
+        # for a long time that was a lie: the constant was referenced only by
         # begin_recover(), so the forward path -- the one path that actually
-        # drives at a wall -- was unbounded. A wall down one side makes
-        # get_steering_bias() saturate at exactly 1.0000 (measured, on a frame
-        # with one side at 1500 mm and the other at 4000), and that commanded
-        # full lock while the car leaned on it. It did that to one servo
-        # before; it does it to two now, which is what made this worth fixing
-        # rather than noting.
+        # drives at a wall -- was unbounded, and the old get_steering_bias()
+        # saturated at exactly 1.0000 with a wall down one side.
         #
-        # So: nothing new, no new number, my own bench constant finally
-        # governing every auto steering command -- forward through here,
-        # recovery through begin_recover()'s max_turn-derived magnitudes, which
-        # it already did. The rear is covered for free, because steering_pair()
-        # clamps the rear to the front's magnitude.
+        # The verdict hands over a FRACTION of max_turn rather than an angle,
+        # so the multiplication here is the whole of the bound and there is
+        # nothing for a decision to saturate past. The clip is belt and
+        # braces on a fraction that is already constructed inside [-1, 1].
         #
-        # np.clip and not max(-m, min(m, v)), which is not a style choice.
-        # min(0.6, nan) is 0.6, so the plain clamp turns a nan bias into a
-        # commanded hard turn -- and a nan is meant to reach set_steering() and
-        # be rejected into neutral there. np.clip propagates it. It is also the
-        # same idiom get_steering_bias() already ends on, which is untouched.
-        front = float(np.clip(self.get_steering_bias(depth),
-                              -self.max_turn, self.max_turn))
+        # np.clip and not max(-1, min(1, v)), which is not a style choice.
+        # min(1.0, nan) is 1.0, so the plain clamp turns a nan into a
+        # commanded hard turn -- and a nan is meant to reach set_steering()
+        # and be rejected into neutral on both channels there. np.clip
+        # propagates it.
+        front = float(np.clip(verdict.steer, -1.0, 1.0) * self.max_turn)
         self.controller.set_steering(*steering_pair(front))
         self.controller.set_throttle(self.forward_speed)
         if self._throttle_since is None:
