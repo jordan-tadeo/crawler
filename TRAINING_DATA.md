@@ -38,7 +38,10 @@ both, into `~/crawler-data/mcap/` by default.
 
 A record session ends on a Y tap, on START, on losing the pad, or when the pad
 has not proved it is there for 5 s; the last two buzz one long pulse instead
-of one short one. Either way the session's last `/diagnostics` row says
+of one short one. A pad that dies quietly is lost about 5.8 s later: the
+Bluetooth link times out at 5 s on every connection
+(`deploy/install-pad-lst.sh`; the default is 20 s), and the loop sees the
+device go within about 0.8 s. Either way the session's last `/diagnostics` row says
 `controller_connected: false`. With no pad connected the camera channels
 (`/camera/*`, `/imu`, `/policy/depth_small`) are not written at all, in any
 file, until it is back.

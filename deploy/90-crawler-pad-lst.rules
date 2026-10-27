@@ -1,0 +1,5 @@
+# Every time xpadneo binds a Bluetooth pad (bus 0005), shorten that link's
+# supervision timeout to 5 s. HID_UNIQ is the pad's address. Only xpadneo
+# devices match, so a keyboard or headset keeps the default. See
+# deploy/pad-lst.sh for why, and deploy/install-pad-lst.sh for the install.
+ACTION=="bind", SUBSYSTEM=="hid", KERNEL=="0005:*", DRIVER=="xpadneo", ENV{HID_UNIQ}=="?*", RUN+="/bin/systemctl --no-block start crawler-pad-lst@$env{HID_UNIQ}.service"

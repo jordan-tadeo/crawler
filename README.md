@@ -136,6 +136,29 @@ touching `/etc`, which is how I check it before it goes anywhere.
 Auto mode also needs a udev rule for the OAK-D, which the installer does not
 write -- see the comment at the top of it.
 
+### The pad's link timeout
+
+```sh
+sudo ./deploy/install-pad-lst.sh                # once, on the car
+journalctl -u 'crawler-pad-lst@*'               # one line per pad connection
+```
+
+A pad sitting still sends nothing, so the only thing that notices one that
+died quietly (flat battery, out of range) is the Bluetooth link supervision
+timeout, and its default is 20 s. That is 20 s of the car holding whatever it
+was last told. On every connection the pad's link is cut to **5 s** (8000
+slots): a udev rule sees xpadneo bind the pad and starts
+`crawler-pad-lst@<mac>.service`, which runs `deploy/pad-lst.sh` as root and
+logs the value it reads back, `link supervision timeout 8000 slots (5000 ms)`.
+It is per connection, so it has to run on every one, and it does not depend on
+`crawler.service` at all. Only xpadneo devices match. The kernel drops the
+input device when the 5 s run out, and the car's lost-pad path sees that
+within about 0.8 s, so a silent pad is at neutral after about 5.8 s.
+
+It uses `hcitool lst` because nothing else on the car sends that HCI command:
+`btmgmt` has none, and `LinkSupervisionTimeout` in `/etc/bluetooth/main.conf`
+only sets a kernel default the 6.6 kernel never sends to the controller.
+
 ## A learned autopilot
 
 Off unless I ask for it. `main.py --policy models/policy.onnx` makes START
@@ -364,7 +387,8 @@ than clipped: full RT is auto's forward speed and full LT auto's reverse speed,
 read off `driver.Driver`, so whatever auto drives at, I drive at. Steering is
 unchanged. Any fresh press of Y is back to manual (one buzz) and gives the
 camera back; START ends the session and goes to auto; losing the pad ends it
-at neutral. Y does nothing in auto. Coming back to manual from record or
+at neutral, and a pad that just goes quiet counts as lost after 5 s (see
+"The pad's link timeout"). Y does nothing in auto. Coming back to manual from record or
 from auto, the throttle stays at 0 until both triggers have been let go once,
 so leaving record with RT still held is not a jump from 0.2 to full; the
 steering is live the whole time. No flag, so nothing in the unit file

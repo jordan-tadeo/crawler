@@ -1,0 +1,12 @@
+# One run of crawler-pad-lst for one pad, by address: crawler-pad-lst@<mac>.
+# Started by 90-crawler-pad-lst.rules on every xpadneo bind, never enabled.
+# Its own unit, rather than a udev RUN, so udev is not held while it retries,
+# and so the read-back lands in the journal under a name I can grep:
+#   journalctl -u 'crawler-pad-lst@*'
+[Unit]
+Description=Short Bluetooth link supervision timeout for game pad %I
+After=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/crawler-pad-lst %I
