@@ -286,6 +286,29 @@ CLEARANCE_MM = 400.0
 # 792 mm against a 400 mm budget. Do not change the stereo config to find out
 # -- that is its own experiment. The cheap check is to park a measured 400 mm
 # off a flat wall and see whether the probe span lands on 267 mm of it.
+#
+# Half of that is no longer unresolved: the align IS taking effect. Measured
+# on a static bench scene, 200 frames each, nothing moved between runs, the
+# only difference being whether setDepthAlign is called:
+#
+#   with the align      median over a 100x100 centre ROI 521.3 mm,
+#                       89.3% of pixels valid
+#   without it          502.2 mm, 76.8% valid
+#
+# So the align shifts the reading by 19.1 mm, 3.7% of it, and it is worth
+# 12 percentage points of valid-pixel density -- which is also why removing it
+# is not a free win even though it costs no frame rate at all (16.00 fps
+# either way). The device says why in its own log: "Align to RGB requested,
+# but ColorCamera not configured. Can't determine output resolution
+# automatically. Using MonoCamera resolution."  It warps into the IMX378's
+# frame and keeps the mono output size.
+#
+# 3.7% is the right order for the 5.5% fx error the paragraph above feared, so
+# treat these two numbers as probably a few percent wrong in that direction.
+# What it is NOT is evidence of which way to jump: a tape measure against a
+# flat wall decides whether to fix the intrinsics or drop the align, and until
+# somebody does that, changing either of these is guessing. They stay as they
+# are.
 FX_AT_640 = 441.25
 FY_AT_400 = 441.25
 
@@ -637,8 +660,18 @@ CRUISE_DEADBAND = 0.05
 
 # How long an evade is committed to once it starts, and the longest one
 # allowed. The autopilot decides at 10 Hz -- AUTO_TICK_INTERVAL in main.py,
-# not the camera's 30 fps and not the control loop's 100 Hz -- so 0.5 s is
+# not the camera's 16 fps and not the control loop's 100 Hz -- so 0.5 s is
 # five decisions.
+#
+# 30 fps is what that used to say, and the camera has never delivered it. 30
+# is the mono sensors' default shutter rate; what reaches this file is the
+# stereo node's output rate, which was 12.25 fps measured and is now 16.0 --
+# oakd.CAPTURE_FPS, which is a cap set deliberately under what the node can
+# finish so that frames stop queueing inside the device. Either way the
+# decision rate is the slower of the two and this constant is counted in
+# decisions, so nothing below moved. What did change is how old the frame
+# behind a decision is: 642 ms, now 88 ms, which is most of one decision
+# interval returned.
 #
 # EVADE_SECONDS is there to hold the turn after the obstacle has left the fan.
 # The fan is 338 px wide at the budget range and the thing being steered

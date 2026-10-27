@@ -58,6 +58,70 @@ def test_a_two_byte_payload_is_still_read_as_sixteen_bit():
     assert np.array_equal(frame, expected)
 
 
+def _nodes(pipeline, kind):
+    return [n for n in pipeline.getAllNodes() if n.getName() == kind]
+
+
+def test_both_monos_are_capped_at_the_rate_the_stereo_node_can_finish():
+    """The latency fix, and it only works as a pair with the shave count.
+
+    Uncapped, the sensors shutter at 30 fps while the stereo node finishes
+    far fewer, the surplus queues inside the device, and depth arrives 642 ms
+    old -- measured on the car. The cap has to be on BOTH monos: stereo waits
+    for a matched pair, so one camera left at 30 goes on filling its own pool.
+    """
+    pipeline = oakd.build_pipeline()
+    monos = _nodes(pipeline, "MonoCamera")
+    assert len(monos) == 2
+    assert [m.getFps() for m in monos] == [float(oakd.CAPTURE_FPS)] * 2
+
+
+def test_the_cap_sits_under_what_the_shave_count_can_deliver():
+    """The one invariant that makes the cap work rather than make it worse.
+
+    Measured capability, uncapped, 200 frames a config: 12.25 fps at 2
+    post-processing shaves, 15.17 at 3, 17.29 at 4, 18.69 at 5, 19.50 at 6. A
+    cap ABOVE capability is not a smaller version of the fix, it is no fix at
+    all -- 15 fps at 2 shaves measured 622 ms against the 642 it started at.
+    So the two settings have to stay a pair, with room to spare for a scene
+    harder than the one on the bench.
+    """
+    assert oakd.POST_PROCESSING_SHAVES >= 3, (
+        "the device's own log asks for more than 2, recommended 3")
+    capability_fps = {2: 12.25, 3: 15.17, 4: 17.29, 5: 18.69, 6: 19.50}
+    measured = capability_fps[oakd.POST_PROCESSING_SHAVES]
+    assert oakd.CAPTURE_FPS < measured, (
+        f"{oakd.CAPTURE_FPS} fps asked of a pipeline measured at {measured}")
+
+
+def test_the_pipeline_asks_for_the_shaves_it_says_it_does():
+    """setPostProcessingHardwareResources is the lever that mattered: 12.25
+    fps to 18.69 on its own. Worth asserting it reaches the node, because it
+    is the sort of call that is easy to drop in a refactor and costs nothing
+    visible until somebody measures the frame rate again."""
+    stereo = _nodes(oakd.build_pipeline(), "StereoDepth")
+    assert len(stereo) == 1
+    assert (stereo[0].properties.numPostProcessingShaves
+            == oakd.POST_PROCESSING_SHAVES)
+    assert (stereo[0].properties.numPostProcessingMemorySlices
+            == oakd.POST_PROCESSING_SLICES)
+
+
+def test_the_rectified_stream_is_the_only_thing_the_flag_changes():
+    """build_pipeline's one argument. Off, the rectified XLinkOut is not
+    created; depth, disparity and the IMU are there either way, because the
+    driver needs depth and Foxglove needs disparity, and a linked queue
+    nobody drains stalls the stream behind it."""
+    with_rect = oakd.build_pipeline(rectified=True)
+    without = oakd.build_pipeline(rectified=False)
+    assert len(_nodes(with_rect, "XLinkOut")) == 4
+    assert len(_nodes(without, "XLinkOut")) == 3
+    for pipeline in (with_rect, without):
+        assert len(_nodes(pipeline, "MonoCamera")) == 2
+        assert len(_nodes(pipeline, "StereoDepth")) == 1
+        assert len(_nodes(pipeline, "IMU")) == 1
+
+
 @pytest.mark.parametrize("data_size, width, height", [
     (256001, 640, 400),   # not a whole number of bytes per pixel
     (0, 640, 400),        # metadata-only transfer

@@ -45,9 +45,23 @@ import time
 import telemetry as tm
 
 # How often the reader thread asks the device for new packets. The depth
-# stream is 30 fps at best, so 5 ms is five times faster than it can produce
-# and nothing waits on a frame that has already arrived. Each pass is four
-# tryGet() calls, every one of which returns immediately.
+# stream delivers 16.0 fps -- oakd.CAPTURE_FPS, measured over 600 frames on
+# the car -- so 5 ms is twelve times faster than it can produce and nothing
+# waits on a frame that has already arrived. Each pass is four tryGet() calls,
+# every one of which returns immediately.
+#
+# 30 is what this said for a long time and it was never true. 30 fps is what
+# the mono sensors shutter at by default, not what arrives: the depth stream
+# is whatever the stereo node can finish, and with the post-processing filters
+# this pipeline runs that was 12.25 fps measured. The gap was not harmless --
+# the surplus queued inside the device and depth frames arrived 642 ms old.
+# oakd.py now caps capture under what the node can finish, which is why the
+# number here is both lower than 30 and higher than what the car was actually
+# getting. The real constraint is the stereo node's throughput, and the
+# reasoning is all written down next to CAPTURE_FPS in oakd.py.
+#
+# Nothing here has to change if that cap moves. This interval only has to stay
+# well under one frame interval, and at 5 ms it has a factor of twelve.
 READ_INTERVAL = 0.005
 
 # Longest the opener thread will sit in dai.Device() before giving up on it.

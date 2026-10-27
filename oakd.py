@@ -72,116 +72,208 @@ def frame_from_payload(packet, label=""):
     return None
 
 
+# How fast the mono pair is allowed to shutter, and how much of the Myriad X
+# the depth post-processing gets. These two are one setting, because each one
+# is useless without the other, and together they are the whole of why the
+# depth frame the driver reads is 88 ms old instead of 642.
+#
+# What was happening. The monos defaulted to 30 fps and nothing capped them.
+# The stereo node with 2 post-processing shaves can only finish 12.25 frames a
+# second, so for every frame it completed, the sensors handed it two and a half
+# more. The surplus does not get dropped at the front -- it sits in the
+# device's frame pools -- so a steady-state queue formed and every depth frame
+# arrived having waited behind about eight others. Measured on the car, 600
+# frames, static scene: 12.25 fps delivered and a mean age of 641 ms between
+# the packet's own timestamp and dai.Clock.now() at receipt. 641 ms is 7.9
+# frame intervals, and that is what those eight queued frames cost.
+#
+# It is not the USB link and never was. The whole config was measured with
+# depth, disparity, the rectified mono and the IMU all streaming, and again
+# with disparity and the rectified stream unlinked -- half the transported
+# bytes gone, 12.13 fps against 12.25. Transport is free here: the device
+# re-enumerates as 03e7:f63b on the Pi's 5 Gbps bus once the pipeline is
+# uploaded, and getUsbSpeed() says SUPER. The 480 Mbps that lsusb shows at
+# idle is the Myriad bootloader ROM, which is USB-2 only. Do not go looking
+# for bandwidth; this node is compute-bound.
+#
+# So the fix is both halves:
+#
+# The shaves raise what the pipeline can finish. Measured capability, uncapped:
+# 12.25 fps at 2 shaves, 15.17 at 3, 17.29 at 4, 18.69 at 5, 19.50 at 6. The
+# device asks for 3 in its own log -- "It's recommended to assign more than 2
+# post-processing shaves using 'setPostProcessingHardwareResources' due to
+# performance reasons. Recommended: 3" -- and 3 is genuinely where the big
+# step is. 5 is past the recommendation on purpose, for the headroom reason
+# below. There is nothing else on this device to starve: the pipeline is two
+# MonoCameras, a StereoDepth, an IMU and some XLinkOuts, no NeuralNetwork, and
+# the IMU measured 104.7 Hz at 2 shaves and 104.7 Hz at 5. A blob would change
+# that calculation and the shaves would have to come back.
+#
+# The fps cap stops the surplus being produced at all, and this is the half
+# that actually collapses the latency. Capping alone does nothing -- 15 fps at
+# 2 shaves is 12.28 fps and 622 ms, because 15 still over-produces against a
+# 12.25 capability. Capping below capability empties the queue: 5 shaves and
+# 16 fps is 16.00 fps delivered at a mean age of 87.5 ms, min 84.3, max 90.8
+# over 600 frames. One and a bit frame intervals, which is as fresh as a frame
+# can be.
+#
+# Which is why 16 and not 19. The cap has to sit under capability with room to
+# spare, because going over is not a graceful degradation -- it is the whole
+# backlog back. Measured: 3 shaves capped at 20 gives 511 ms, 5 shaves capped
+# at 18 gives 88 ms but has only 3.7% of margin left. 16 against a measured
+# 18.69 leaves 14%, which is what a scene harder than the one I measured on
+# gets to eat. And 16 fps is already 1.6 frames per autopilot decision at
+# AUTO_TICK_INTERVAL = 0.1, so there is nothing upstairs asking for more.
+#
+# None of this moves depth. Same static scene, 600 frames each: median over a
+# 100x100 centre ROI 519.4 mm at baseline and 519.6 mm here, valid-pixel
+# density 0.890 and 0.892, first-percentile depth 323 mm and 325 mm. Depth is
+# still real millimetres and every threshold in driver.py still means what it
+# said.
+#
+# One thing I have not measured and should: a 16 fps cap lets auto-exposure
+# reach a 62 ms exposure where 30 fps bounded it at 33, so a fast pan could
+# blur more than it used to. Static bench scene cannot show that. It wants a
+# driving run.
+CAPTURE_FPS = 16
+POST_PROCESSING_SHAVES = 5
+POST_PROCESSING_SLICES = 3
+
+
+def build_pipeline(rectified: bool = True) -> dai.Pipeline:
+    """The whole device config, with no device attached.
+
+    Split out of OakD.__init__ so the settings above can be asserted without
+    an OAK-D plugged in -- dai.Pipeline() is pure host-side bookkeeping and
+    dai.Device() is the only line that needs hardware. Everything OakD used to
+    build inline is built here and nothing else changed.
+    """
+    pipeline = dai.Pipeline()
+
+    # Mono cameras
+    cam_left = pipeline.create(dai.node.MonoCamera)
+    cam_right = pipeline.create(dai.node.MonoCamera)
+    cam_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+    cam_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+    cam_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+    cam_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+    cam_left.setFps(CAPTURE_FPS)
+    cam_right.setFps(CAPTURE_FPS)
+
+    # Stereo depth node
+    stereo = pipeline.create(dai.node.StereoDepth)
+
+    # Create IMU node
+    imu = pipeline.create(dai.node.IMU)
+    imu.enableIMUSensor([dai.IMUSensor.LINEAR_ACCELERATION, dai.IMUSensor.GYROSCOPE_RAW], 100)
+    imu.setBatchReportThreshold(1)
+    imu.setMaxBatchReports(10)
+
+    # IMU output
+    imu_out = pipeline.create(dai.node.XLinkOut)
+    imu_out.setStreamName("imu")
+    imu.out.link(imu_out.input)
+
+    # === GUI-EQUIVALENT SETTINGS ===
+    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+    stereo.setConfidenceThreshold(245)
+    stereo.setLeftRightCheck(True)
+    # Extended disparity rather than subpixel. These two are mutually
+    # exclusive on RVC2, so it is a trade and not an addition: extended
+    # runs the stereo engine twice, once at half resolution, and
+    # concatenates the result into a 190 level disparity search instead of
+    # 95. That halves the minimum measurable depth --
+    # fx * baseline / levels = 441.25 * 75 / 190 = 174 mm against 348 --
+    # which is what I actually want, because the obstacle trigger is at
+    # 400 mm and with subpixel on there were only 52 mm of measurable
+    # warning above the blind zone. Now there are 226 mm.
+    #
+    # What I give up is subpixel interpolation, so depth comes back
+    # quantised to whole disparity levels. One level is Z^2 / (fx*baseline)
+    # = 4.8 mm at the 400 mm trigger and 24.5 mm at the 900 mm floor clip,
+    # where subpixel's eighth-of-a-level gave 0.6 mm and 3.1 mm. Neither
+    # matters here: 4.8 mm of jitter on a 400 mm threshold is 1.2%, and the
+    # floor clip at 899 is a band edge with 12 degrees of pitch margin
+    # behind it, not a measurement anybody reads. 174 mm of range is worth
+    # more than a millimetre of precision I never look at.
+    #
+    # Measured, 300 frames a side, same scene, camera not moved: nearest
+    # valid depth went from 319 mm on subpixel to 165 mm on extended, and
+    # readings in the 200-250 mm band exist only on extended -- 25130 pixel
+    # samples against zero. 12.1 fps and 0.64 s of frame latency either
+    # way, so the second stereo pass costs nothing measurable here. Those
+    # two figures are the old 2-shave, uncapped pipeline and are no longer
+    # what the car runs -- see CAPTURE_FPS above -- but the point survives,
+    # which was that extended and subpixel cost the same.
+    #
+    # One surprise worth writing down: 348 was never the hard floor the
+    # arithmetic says. Subpixel returned depth down to 319 mm, roughly 4%
+    # of valid pixels sitting under 348, because the spatial and temporal
+    # filters below interpolate across the edge of the search range. So
+    # the gain is real but it is a floor dropping from ~320 to ~165, not
+    # from 348 to 174.
+    stereo.setSubpixel(False)
+    stereo.setExtendedDisparity(True)
+    stereo.setRectifyEdgeFillColor(0)
+    stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # Optional
+    stereo.setPostProcessingHardwareResources(
+        POST_PROCESSING_SHAVES, POST_PROCESSING_SLICES)
+
+    # stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
+
+    config = stereo.initialConfig.get()
+    config.postProcessing.spatialFilter.enable = True
+    config.postProcessing.spatialFilter.holeFillingRadius = 2
+    config.postProcessing.spatialFilter.numIterations = 1
+
+    config.postProcessing.temporalFilter.enable = True
+
+    config.postProcessing.speckleFilter.enable = True
+    config.postProcessing.speckleFilter.speckleRange = 28
+
+    stereo.initialConfig.set(config)
+    # === END SETTINGS ===
+
+    # Link stereo to cameras
+    cam_left.out.link(stereo.left)
+    cam_right.out.link(stereo.right)
+
+    # Depth output
+    xout_depth = pipeline.create(dai.node.XLinkOut)
+    xout_depth.setStreamName("depth")
+    stereo.depth.link(xout_depth.input)
+
+    # Disparity output (optional)
+    xout_disp = pipeline.create(dai.node.XLinkOut)
+    xout_disp.setStreamName("disparity")
+    stereo.disparity.link(xout_disp.input)
+
+    # The rectified left mono image: the actual camera picture, which
+    # neither depth nor disparity shows me. Worth having in Foxglove for
+    # checking where the thing is pointed and whether a lens is dirty --
+    # a depth map looks much the same either way.
+    #
+    # Still opt-in, but no longer for the reason I wrote down. I had it that
+    # an XLink stream costs USB bandwidth from the moment it is linked, so
+    # auto mode should not pay for a picture it does not look at. Measured,
+    # 200 frames a config, same scene: depth plus disparity plus this one is
+    # 12.25 fps, and unlinking both this and disparity -- half the transported
+    # bytes -- is 12.13. The stream is free on the wire. What it is not free
+    # of is the JPEG encode on the Pi's publisher thread, which is real, so
+    # the gate stays where it is and the hub still only asks for it when
+    # telemetry is going to carry it.
+    if rectified:
+        xout_rect = pipeline.create(dai.node.XLinkOut)
+        xout_rect.setStreamName("rectified_left")
+        stereo.rectifiedLeft.link(xout_rect.input)
+
+    return pipeline
+
+
 class OakD:
     def __init__(self, rectified: bool = True):
-        self.pipeline = dai.Pipeline()
-
-        # Mono cameras
-        cam_left = self.pipeline.create(dai.node.MonoCamera)
-        cam_right = self.pipeline.create(dai.node.MonoCamera)
-        cam_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
-        cam_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
-        cam_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-        cam_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-
-        # Stereo depth node
-        stereo = self.pipeline.create(dai.node.StereoDepth)
-
-        # Create IMU node
-        imu = self.pipeline.create(dai.node.IMU)
-        imu.enableIMUSensor([dai.IMUSensor.LINEAR_ACCELERATION, dai.IMUSensor.GYROSCOPE_RAW], 100)
-        imu.setBatchReportThreshold(1)
-        imu.setMaxBatchReports(10)
-
-        # IMU output
-        imu_out = self.pipeline.create(dai.node.XLinkOut)
-        imu_out.setStreamName("imu")
-        imu.out.link(imu_out.input)
-
-        # === GUI-EQUIVALENT SETTINGS ===
-        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
-        stereo.setConfidenceThreshold(245)
-        stereo.setLeftRightCheck(True)
-        # Extended disparity rather than subpixel. These two are mutually
-        # exclusive on RVC2, so it is a trade and not an addition: extended
-        # runs the stereo engine twice, once at half resolution, and
-        # concatenates the result into a 190 level disparity search instead of
-        # 95. That halves the minimum measurable depth --
-        # fx * baseline / levels = 441.25 * 75 / 190 = 174 mm against 348 --
-        # which is what I actually want, because the obstacle trigger is at
-        # 400 mm and with subpixel on there were only 52 mm of measurable
-        # warning above the blind zone. Now there are 226 mm.
-        #
-        # What I give up is subpixel interpolation, so depth comes back
-        # quantised to whole disparity levels. One level is Z^2 / (fx*baseline)
-        # = 4.8 mm at the 400 mm trigger and 24.5 mm at the 900 mm floor clip,
-        # where subpixel's eighth-of-a-level gave 0.6 mm and 3.1 mm. Neither
-        # matters here: 4.8 mm of jitter on a 400 mm threshold is 1.2%, and the
-        # floor clip at 899 is a band edge with 12 degrees of pitch margin
-        # behind it, not a measurement anybody reads. 174 mm of range is worth
-        # more than a millimetre of precision I never look at.
-        #
-        # Measured, 300 frames a side, same scene, camera not moved: nearest
-        # valid depth went from 319 mm on subpixel to 165 mm on extended, and
-        # readings in the 200-250 mm band exist only on extended -- 25130 pixel
-        # samples against zero. 12.1 fps and 0.64 s of frame latency either
-        # way, so the second stereo pass costs nothing measurable here.
-        #
-        # One surprise worth writing down: 348 was never the hard floor the
-        # arithmetic says. Subpixel returned depth down to 319 mm, roughly 4%
-        # of valid pixels sitting under 348, because the spatial and temporal
-        # filters below interpolate across the edge of the search range. So
-        # the gain is real but it is a floor dropping from ~320 to ~165, not
-        # from 348 to 174.
-        stereo.setSubpixel(False)
-        stereo.setExtendedDisparity(True)
-        stereo.setRectifyEdgeFillColor(0)
-        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # Optional
-        stereo.setPostProcessingHardwareResources(2, 3)
-
-        # stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
-
-        config = stereo.initialConfig.get()
-        config.postProcessing.spatialFilter.enable = True
-        config.postProcessing.spatialFilter.holeFillingRadius = 2
-        config.postProcessing.spatialFilter.numIterations = 1
-
-        config.postProcessing.temporalFilter.enable = True
-
-        config.postProcessing.speckleFilter.enable = True
-        config.postProcessing.speckleFilter.speckleRange = 28
-
-        stereo.initialConfig.set(config)
-        # === END SETTINGS ===
-
-        # Link stereo to cameras
-        cam_left.out.link(stereo.left)
-        cam_right.out.link(stereo.right)
-
-        # Depth output
-        xout_depth = self.pipeline.create(dai.node.XLinkOut)
-        xout_depth.setStreamName("depth")
-        stereo.depth.link(xout_depth.input)
-
-        # Disparity output (optional)
-        xout_disp = self.pipeline.create(dai.node.XLinkOut)
-        xout_disp.setStreamName("disparity")
-        stereo.disparity.link(xout_disp.input)
-
-        # The rectified left mono image: the actual camera picture, which
-        # neither depth nor disparity shows me. Worth having in Foxglove for
-        # checking where the thing is pointed and whether a lens is dirty --
-        # a depth map looks much the same either way.
-        #
-        # Opt-in, because an XLink stream costs USB bandwidth from the moment
-        # it is linked whether or not anybody drains it, and auto mode does
-        # not want to pay for a picture it does not look at. The hub only asks
-        # for it when telemetry is going to carry it.
+        self.pipeline = build_pipeline(rectified)
         self.rectified = rectified
-        if rectified:
-            xout_rect = self.pipeline.create(dai.node.XLinkOut)
-            xout_rect.setStreamName("rectified_left")
-            stereo.rectifiedLeft.link(xout_rect.input)
 
         # Start device
         self.device = dai.Device(self.pipeline)
