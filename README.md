@@ -208,13 +208,25 @@ Foxglove is open. That is the whole point -- the run worth looking at is
 always the one that just ended badly, and by then the laptop is shut.
 
 ```sh
-./pull-recordings.sh                 # newest 5 onto the laptop, checked
-./pull-recordings.sh --list          # what the car is holding, copy nothing
-./pull-recordings.sh --all
+./pull-recordings.sh                 # everything new into ~/crawler-data/mcap, verified
+./pull-recordings.sh --list          # what the car is holding and which file is live
 ./pull-recordings.sh -n 20 -o ~/Desktop/crawl
+./pull-recordings.sh --prune         # which car copies have a matching copy here
+./pull-recordings.sh --prune --yes   # and delete those off the car
 ```
 
-Then `open -a Foxglove` and drag a file from `recordings/` onto the window.
+They land outside the repo on purpose, and a destination inside any git work
+tree is refused: this repo is public and a recording is video of the house.
+Each copy is checked by size and sha256 on both ends, the segment the service
+still has open is skipped, and nothing is deleted off the car without
+`--prune --yes`. Whether a drive is worth training on:
+
+```sh
+uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
+    python tools/session_report.py ~/crawler-data/mcap/crawler-record-*.mcap
+```
+
+Then `open -a Foxglove` and drag a file from `~/crawler-data/mcap` onto the window.
 **Open connection** is for live; a file is a drag, or **File -> Open local
 file**. The same panels work on a file as on the socket.
 
@@ -244,8 +256,8 @@ runs and which I can `cat` on the car.
 
 ```sh
 # on the laptop, after ./pull-recordings.sh
-uv run --with mcap python deploy/mcap_check.py --marks recordings
-uv run --with mcap python deploy/mcap_check.py --window 2 recordings/<file>.mcap
+uv run --with mcap python deploy/mcap_check.py --marks ~/crawler-data/mcap
+uv run --with mcap python deploy/mcap_check.py --window 2 ~/crawler-data/mcap/<file>.mcap
 ```
 
 `--marks` lists every mark with its wall-clock time, its offset into the run
