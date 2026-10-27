@@ -67,6 +67,11 @@ RAW_DEPTH_EVERY = 5
 RECORD = "record"
 AUTO = "auto"
 
+# Who had each group on a row's tick: "pad" is my hand, "driver" the
+# autopilot. main.DRIVER and main.PAD are the same strings.
+DRIVER = "driver"
+PAD = "pad"
+
 IMU_FIELDS = ("imu_accel_x", "imu_accel_y", "imu_accel_z",
               "imu_gyro_x", "imu_gyro_y", "imu_gyro_z")
 
@@ -89,7 +94,7 @@ def _sweep_clears(scan, side) -> bool:
 
 def feature_row(scan, verdict, command, mode, source, shape, scan_ms=0.0,
                 committed=None, pad_throttle=None, limits=None,
-                steering_mode=""):
+                steering_mode="", steer_by=PAD, throttle_by=PAD):
     """One /footprint message. Pure: values in, a dict out."""
     throttle, front, rear = command
     forward, reverse = limits if limits is not None else (-1.0, -1.0)
@@ -119,6 +124,10 @@ def feature_row(scan, verdict, command, mode, source, shape, scan_ms=0.0,
         "steering_front": _num(front, 0.0),
         "steering_rear": _num(rear, 0.0),
         "steering_mode": str(steering_mode),
+        # Who had each group when `command` went out. A "pad" group is a
+        # label; a "driver" group is the autopilot, not a demonstration.
+        "steer_by": str(steer_by),
+        "throttle_by": str(throttle_by),
         "pad_throttle": _num(pad_throttle, 0.0),
         "forward_limit": _num(forward),
         "reverse_limit": _num(reverse),
@@ -177,21 +186,29 @@ class FootprintTap:
         self._imu_at = 0.0
 
     def after_drive(self, now, mode, command, driver=None, pad_throttle=None,
-                    limits=None, steering_mode=""):
+                    limits=None, steering_mode="", steer_by=None,
+                    throttle_by=None, takeover=False):
         """Called by the control loop once a pass, after the drive call.
 
         `command` is (throttle, front, rear) as the controller holds it after
-        this pass's command. Returns the row offered, or None. Never raises:
-        a recording is never worth a tick, and this runs after the wheels have
-        already been told what to do.
+        this pass's command -- in auto, the mix of the autopilot and whatever
+        my hand has taken over, because that is what reached the hardware.
+        `steer_by` and `throttle_by` say whose each group was; left out they
+        are the pad in record and the driver in auto. `takeover` is True while
+        either group is mine in auto. Returns the row offered, or None. Never
+        raises: a recording is never worth a tick, and this runs after the
+        wheels have already been told what to do.
         """
         try:
             self._poll_imu(now)
             if mode == AUTO:
-                return self._auto(now, command, driver, steering_mode)
+                return self._auto(now, command, driver, steering_mode,
+                                  steer_by or DRIVER, throttle_by or DRIVER,
+                                  takeover, pad_throttle, limits)
             if mode == RECORD:
                 return self._record(now, command, pad_throttle, limits,
-                                    steering_mode)
+                                    steering_mode, steer_by or PAD,
+                                    throttle_by or PAD)
             return None
         except Exception as e:
             if not self._failed:
@@ -210,19 +227,29 @@ class FootprintTap:
 
     # ---- auto: the driver's own decision ---------------------------------
 
-    def _auto(self, now, command, driver, steering_mode):
+    def _auto(self, now, command, driver, steering_mode, steer_by,
+              throttle_by, takeover, pad_throttle, limits):
         """A row on every pass where the driver made a new scan.
 
         The driver's tick is already gated at 10 Hz, so this is too. A recover
-        makes no scan and so makes no row: those 2.5 seconds are a fixed
-        manoeuvre, not a decision.
+        makes no scan and so makes no row of the driver's: those 2.5 seconds
+        are a fixed manoeuvre, not a decision. Unless my hand has a group --
+        then what it does during the manoeuvre is a correction, which is the
+        most useful label there is, so the row comes off our own view at the
+        decision rate, exactly as in record, marked source "tap".
         """
         if driver is None or self.tele is None:
             return None
         scan = getattr(driver, "last_scan", None)
         if scan is None or scan is self._last_driver_scan:
+            if takeover and getattr(driver, "_phase", None) is not None:
+                return self._own_row(now, command, AUTO, pad_throttle, limits,
+                                     steering_mode, steer_by, throttle_by)
             return None
         self._last_driver_scan = scan
+        # One rate for both kinds of row, so the tap's first row in a recover
+        # comes a decision after the driver's last one and not a pass after.
+        self._next_at = now + self.interval
         if not self.tele.wants("footprint", now):
             return None
 
@@ -232,12 +259,22 @@ class FootprintTap:
             depth.shape if depth is not None else None,
             getattr(driver, "last_scan_ms", 0.0),
             committed=getattr(driver, "last_verdict", None),
-            steering_mode=steering_mode)
+            steering_mode=steering_mode, steer_by=steer_by,
+            throttle_by=throttle_by, pad_throttle=pad_throttle,
+            limits=limits)
         return self._offer(row, now, depth)
 
     # ---- record: our own scan, my hands' command -------------------------
 
-    def _record(self, now, command, pad_throttle, limits, steering_mode):
+    def _record(self, now, command, pad_throttle, limits, steering_mode,
+                steer_by, throttle_by):
+        return self._own_row(now, command, RECORD, pad_throttle, limits,
+                             steering_mode, steer_by, throttle_by)
+
+    def _own_row(self, now, command, mode, pad_throttle, limits,
+                 steering_mode, steer_by, throttle_by):
+        """A row off our own view and our own scan, at the decision rate.
+        The raw frame rides along on every raw_every-th one in record only."""
         if self.view is None or self.tele is None:
             return None
         if now < self._next_at:
@@ -257,9 +294,12 @@ class FootprintTap:
         scan_ms = (time.perf_counter() - started) * 1000.0
         verdict = dv.read_the_gradient(scan)
 
-        row = feature_row(scan, verdict, command, RECORD, "tap", depth.shape,
+        row = feature_row(scan, verdict, command, mode, "tap", depth.shape,
                           scan_ms, pad_throttle=pad_throttle, limits=limits,
-                          steering_mode=steering_mode)
+                          steering_mode=steering_mode, steer_by=steer_by,
+                          throttle_by=throttle_by)
+        if mode != RECORD:
+            return self._offer(row, now, depth)
 
         # The frame first, at the same `now`, so its log time is the row's.
         if (self._record_rows % self.raw_every == 0

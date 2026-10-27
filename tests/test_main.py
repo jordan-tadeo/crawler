@@ -183,7 +183,7 @@ class FakeAutopilot:
     def pause(self):
         self.pauses += 1
 
-    def step(self, now):
+    def step(self, now, takeover=None):
         self.steps += 1
         return True
 

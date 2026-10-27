@@ -338,7 +338,12 @@ JSON_SCHEMAS = {
         "steering_front": _NUM,
         "steering_rear": _NUM,
         "steering_mode": _STR,
-        # Record only: the trigger before scaling, and the scale.
+        # Whose each group was on this tick: "pad" (my hand, a label) or
+        # "driver" (the autopilot). Always "pad" in record.
+        "steer_by": _STR,
+        "throttle_by": _STR,
+        # Record, and auto while the throttle is mine: the trigger before
+        # scaling, and the scale.
         "pad_throttle": _NUM,
         "forward_limit": _NUM,
         "reverse_limit": _NUM,

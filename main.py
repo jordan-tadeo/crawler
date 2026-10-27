@@ -15,6 +15,11 @@ Three drive modes:
 Press START on the controller to switch between manual and auto without
 restarting. START in record ends the recording and goes to auto.
 
+In auto either control group can be taken off the autopilot by moving it:
+the steering stick(s) or the triggers. The autopilot keeps the other, and gets
+a group back after it has sat in its deadzone for half a second. That is how I
+correct it, and the corrections are labelled in the recording. See Takeover.
+
 In manual the left stick steers both axles counter-phase, through the same
 driver.steering_pair() every auto steering decision goes through -- one
 definition of how this car steers, not one per mode. Click the left stick (L3)
@@ -478,6 +483,265 @@ class SteerMode:
         return True
 
 
+# ---- takeover: correcting auto one control at a time ----------------------
+#
+# In auto the pad's controls fall into two groups. Steering is LEFT_X, plus
+# RIGHT_X while split is on; throttle is the two triggers. Moving a group past
+# its deadzone hands that group, and only that group, to my hand. The
+# autopilot keeps driving the other one. LEFT_Y does nothing. A group goes back
+# once everything in it has sat inside its deadzone for
+# TAKEOVER_RELEASE_SECONDS, and letting go never commands straight or stop by
+# itself: what goes back to the wheels at the handback is whatever the
+# autopilot is asking for right then. The price of that is that I cannot take
+# over just to hold the wheel centred -- a centred stick is a let-go stick.
+#
+# Every /footprint row says which hand had each group (steer_by, throttle_by),
+# and a group that was mine is a correction: the label the policy should learn
+# from. See TRAINING_DATA.md.
+
+DRIVER = "driver"
+PAD = "pad"
+
+# The sticks have no deadzone anywhere else in this file -- manual passes the
+# axis straight through -- so these two are new, and they are off a recording
+# rather than a guess. Measured on 2026-10-27 over every /controller sample in
+# nine of the car's MCAPs (103,517 samples, the pad under xpadneo), taking the
+# stretches where a stick sat within 0.01 of itself for a second or more (44
+# on LEFT_X, 60 on RIGHT_X):
+#
+#   LEFT_X  where it comes to rest   p50 0.052   p95 0.072   p99 0.094   max 0.106
+#   RIGHT_X where it comes to rest   p50 0.023   p95 0.057   p99 0.061   max 0.064
+#   jitter inside one rest           up to 0.017 on either stick
+#
+# Those are raw axis readings, before STEERING_LIMIT_PERC. The left stick does
+# not come back to 0: it comes back to wherever it lands, anywhere from 0.02 to
+# 0.07, and stays there. So "inside" is under 0.12, clear of every rest I have
+# recorded including its jitter, and "taken over" is past 0.20. The gap between
+# them is the hysteresis: a stick dithering at the edge of 0.12 cannot flap
+# ownership, because getting it back means a deliberate push past 0.20.
+STICK_RELEASE = 0.12
+STICK_TAKEOVER = 0.20
+
+# How long a group has to sit inside its deadzone before the autopilot gets it
+# back.
+TAKEOVER_RELEASE_SECONDS = 0.5
+
+# How old the driver's last scan may be and still clear my forward throttle
+# past the floor veto. Three decision ticks. A recover makes no scans, so for
+# most of one my forward trigger is held at 0 -- the camera has not been
+# asked, and no picture is not a clear picture. Reverse is never held.
+FLOOR_SCAN_MAX_AGE = 0.3
+
+TAKEN = "taken"
+RELEASED = "released"
+STEERING = "steering"
+THROTTLE = "throttle"
+
+
+def _finite(*values) -> bool:
+    try:
+        return all(math.isfinite(float(v)) for v in values)
+    except Exception:
+        return False
+
+
+class DriverCommand:
+    """The autopilot's command, held instead of written. Its controller.
+
+    driver.Driver commands whatever it is handed as `controller`, and it used
+    to be handed the VehicleController. Now it is handed one of these, so
+    nothing the driver does reaches pigpio directly: AutoPilot.step() reads
+    what it asked for, lets my hand replace the groups I own, and writes the
+    result in at most one set_steering and one set_throttle a pass. Never a
+    write from the driver followed by a second one from the pad, which on a
+    latching pulse would leave the driver's command on the wheels for however
+    long the gap between the two happened to be.
+
+    Two things per channel: the value the driver last asked for, which is its
+    standing intent (the driver commands nothing while a reverse runs and
+    relies on the latch), and whether it asked for anything new since the last
+    read. Last write wins inside one tick.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """The wheels went to neutral underneath it. Start from there."""
+        self.throttle = 0.0
+        self.front = 0.0
+        self.rear = 0.0
+        self.throttle_new = False
+        self.steering_new = False
+
+    def set_throttle(self, value):
+        self.throttle = value
+        self.throttle_new = True
+
+    def set_steering(self, front, rear):
+        self.front = front
+        self.rear = rear
+        self.steering_new = True
+
+    def take(self):
+        """(steering_new, throttle_new), and forget both."""
+        new = (self.steering_new, self.throttle_new)
+        self.steering_new = self.throttle_new = False
+        return new
+
+
+class _Group:
+    """One group's ownership. Taken past its outer edge, given back after
+    release_seconds inside its inner one."""
+
+    def __init__(self):
+        self.owned = False
+        self._quiet_since = None
+
+    def update(self, beyond, inside, now, release_seconds):
+        """TAKEN, RELEASED or None."""
+        if not self.owned:
+            if beyond:
+                self.owned = True
+                self._quiet_since = None
+                return TAKEN
+            return None
+        if not inside:
+            self._quiet_since = None
+            return None
+        if self._quiet_since is None:
+            self._quiet_since = now
+        if now - self._quiet_since >= release_seconds:
+            self.drop()
+            return RELEASED
+        return None
+
+    def drop(self):
+        self.owned = False
+        self._quiet_since = None
+
+
+class Takeover:
+    """Which of the two groups my hand owns in auto, off one pad read a pass.
+
+    poll() reads the pad once, through read_pad_intent() -- the same three
+    readings manual drives on, so a taken-over steering is exactly manual's
+    steering (steering_pair, or split) and a taken-over throttle is the
+    trigger record drives on, scaled to auto's own caps by AutoPilot.step().
+
+    A pad read that raises, or hands back a nan or an infinity, is a pad
+    fault: both groups go back at once, poll() says False, and the control
+    loop parks auto on the same neutral the lost-pad path uses. Nothing in
+    here commands anything.
+
+    Takeover and handback each get one buzz, through the mark buttons' rumble
+    scheduler (the one record's enter and exit go through), and a log line.
+    """
+
+    def __init__(self, logger=None, markpad=None,
+                 release_seconds=TAKEOVER_RELEASE_SECONDS):
+        self.logger = logger
+        self.markpad = markpad
+        self.release_seconds = release_seconds
+        self._steering = _Group()
+        self._throttle = _Group()
+        self.intent = (0.0, 0.0, 0.0)
+        # Groups handed back on the last poll, for AutoPilot.step() to put the
+        # autopilot's standing command back on in the same pass.
+        self.released = ()
+
+    @property
+    def steering(self) -> bool:
+        return self._steering.owned
+
+    @property
+    def throttle(self) -> bool:
+        return self._throttle.owned
+
+    @property
+    def steer_by(self) -> str:
+        return PAD if self._steering.owned else DRIVER
+
+    @property
+    def throttle_by(self) -> str:
+        return PAD if self._throttle.owned else DRIVER
+
+    def poll(self, joystick, now, split=False) -> bool:
+        """Read the pad and update both groups. False on a pad fault."""
+        self.released = ()
+        try:
+            intent = tuple(float(v) for v in read_pad_intent(joystick, split))
+        except Exception as e:
+            self.drop(f"pad read failed: {e}")
+            return False
+        if not _finite(*intent):
+            self.drop("the pad read a nan")
+            return False
+        self.intent = intent
+
+        # In raw axis units, so the thresholds above are the recording's own
+        # numbers. Unified reads LEFT_X alone; intent[2] is then the rear the
+        # pair derived from it, not a stick, and is not looked at.
+        scale = STEERING_LIMIT_PERC / 100
+        sticks = intent[1:] if split else intent[1:2]
+        deflection = max(abs(v) for v in sticks) / scale
+
+        # read_throttle() already applies TRIGGER_DEADZONE and reads 0.0
+        # inside it. The triggers rest at exactly -1.0 (98.5% of every
+        # recorded sample is that value; the rest are presses), so there is
+        # no rest noise for a hysteresis to absorb and the one deadzone serves
+        # both edges.
+        pulled = intent[0] != 0.0
+
+        changes = []
+        for name, group, beyond, inside in (
+                (STEERING, self._steering, deflection > STICK_TAKEOVER,
+                 deflection < STICK_RELEASE),
+                (THROTTLE, self._throttle, pulled, not pulled)):
+            change = group.update(beyond, inside, now, self.release_seconds)
+            if change is not None:
+                changes.append((name, change))
+
+        self.released = tuple(name for name, change in changes
+                              if change == RELEASED)
+        for name, change in changes:
+            self._say(("Took the " if change == TAKEN else "Gave back the ")
+                      + name)
+            self._buzz(now)
+        return True
+
+    def pad_steering(self):
+        """(front, rear) off this pass's read. Centre if it is not a number."""
+        _, front, rear = self.intent
+        return (front, rear) if _finite(front, rear) else (0.0, 0.0)
+
+    def drop(self, why=""):
+        """Both groups back to the autopilot, now. No buzz: the usual reason
+        is a pad that is not there to feel it."""
+        had = self._steering.owned or self._throttle.owned
+        self._steering.drop()
+        self._throttle.drop()
+        self.released = ()
+        self.intent = (0.0, 0.0, 0.0)
+        if had:
+            self._say("Gave back both" + (f": {why}" if why else ""))
+
+    def _say(self, message):
+        print(f"[takeover] {message}")
+        if self.logger is not None:
+            try:
+                self.logger.log("info", "Takeover", message)
+            except Exception:
+                pass
+
+    def _buzz(self, now):
+        if self.markpad is not None:
+            try:
+                self.markpad.buzz(1, now)
+            except Exception:
+                pass
+
+
 class AutoPilot:
     """Auto mode, driven off the shared camera.
 
@@ -511,6 +775,13 @@ class AutoPilot:
         self._next_tick = 0.0
         # The shared camera, or None if this process was started without one.
         self.hub = hub
+        # What the driver is handed as its controller. See DriverCommand: the
+        # driver asks, step() writes.
+        self.command = DriverCommand()
+        # When the driver's last_scan last changed, for the floor veto on my
+        # forward throttle.
+        self._scan = None
+        self._scan_at = None
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -567,7 +838,7 @@ class AutoPilot:
 
             try:
                 from driver import Driver
-                self.driver = Driver(self.vecon, hub.view(AUTO_VIEW))
+                self.driver = Driver(self.command, hub.view(AUTO_VIEW))
             except Exception as e:
                 self.unavailable = True
                 self.logger.log("error", "Auto mode unavailable", str(e))
@@ -575,19 +846,46 @@ class AutoPilot:
                 return False
 
         self._next_tick = 0.0  # tick on the next step
+        # Every way into auto has just put the wheels at neutral. A scan left
+        # over from an earlier lap is of no known age, so it clears nothing.
+        self.command.reset()
+        self._scan = getattr(self.driver, "last_scan", None)
+        self._scan_at = None
         return True
 
-    def step(self, now):
-        """One pass of auto mode. False means hand the wheels back to manual."""
+    def step(self, now, takeover=None):
+        """One pass of auto mode. False means hand the wheels back to manual.
+
+        The driver still decides at AUTO_TICK_INTERVAL. What changed is that it
+        no longer writes the hardware: it asks, into self.command, and this
+        writes. On a pass where I own nothing that is exactly the driver's own
+        writes, in the driver's own order (steering, then throttle), and on
+        passes between its ticks it is nothing at all -- the same calls the
+        driver used to make on the VehicleController itself, except that two
+        steering asks inside one tick, which the end of a recover makes, now
+        reach the servos as the last of the two.
+
+        `takeover` is a Takeover already polled this pass, or None. A group it
+        owns replaces that field of the driver's command, every pass rather
+        than every tick, because my hand at 10 Hz would be a hand with 100 ms
+        of lag in it. A group it handed back this pass gets the driver's
+        standing command written straight away, so letting go puts the
+        autopilot's own command on the wheels and never a straight or a stop
+        of its own.
+        """
         if self.unavailable or self.driver is None:
             return False
 
-        if now < self._next_tick:
-            return True
-        self._next_tick = now + AUTO_TICK_INTERVAL
-
         try:
-            self.driver.tick(now)
+            if now >= self._next_tick:
+                self._next_tick = now + AUTO_TICK_INTERVAL
+                self.driver.human_throttle = bool(
+                    takeover is not None and takeover.throttle)
+                self.driver.tick(now)
+                scan = self.driver.last_scan
+                if scan is not self._scan:
+                    self._scan, self._scan_at = scan, now
+            self._write(now, takeover)
         except Exception as e:
             # Stop the car BEFORE writing anything down. Logging opens, writes
             # and flushes a file on this same thread, and the throttle does
@@ -603,11 +901,54 @@ class AutoPilot:
 
         return True
 
+    def _write(self, now, takeover):
+        """The mixed command, in at most one set_steering and one
+        set_throttle. Steering first, as the driver always ordered them."""
+        cmd = self.command
+        steering_new, throttle_new = cmd.take()
+        released = takeover.released if takeover is not None else ()
+
+        if takeover is not None and takeover.steering:
+            self.vecon.set_steering(*takeover.pad_steering())
+        elif steering_new or STEERING in released:
+            self.vecon.set_steering(cmd.front, cmd.rear)
+
+        if takeover is not None and takeover.throttle:
+            self.vecon.set_throttle(self._pad_throttle(now, takeover))
+        elif throttle_new or THROTTLE in released:
+            self.vecon.set_throttle(cmd.throttle)
+
+    def _pad_throttle(self, now, takeover):
+        """My trigger at record's scaling, under the floor veto. Never nan.
+
+        Full RT is the driver's forward_speed and full LT its reverse_speed,
+        read off the live driver. Forward is held at 0 while the driver's last
+        scan has something measured inside REVERSE_FLOOR_MM, or when there is
+        no scan young enough to say; reverse is mine whatever the scan says.
+        scale_throttle() turns a nan into 0.0 before any clamp sees it.
+        """
+        throttle = scale_throttle(takeover.intent[0],
+                                  auto_speed_limits(self.driver))
+        if throttle > 0.0 and self._floor_vetoes(now):
+            return 0.0
+        return throttle
+
+    def _floor_vetoes(self, now):
+        if (self._scan is None or self._scan_at is None
+                or now - self._scan_at > FLOOR_SCAN_MAX_AGE):
+            return True
+        return dv.floor_vetoes_forward(self._scan)
+
     def pause(self):
         """Hand the wheels back. Drops a recover in progress on the floor."""
         if self.driver is not None:
             self.driver.abort()
+            self.driver.human_throttle = False
+            # abort() asks for a stop; it goes out ahead of the neutral, as
+            # it did when the driver wrote the controller itself.
+            self._write(0.0, None)
         self.vecon.return_neutral()
+        self.command.reset()
 
     def stop(self):
         """Give up the driver. The camera is not mine to close.
@@ -715,7 +1056,7 @@ def drive_pad(joystick, vecon, log, split=False, limits=None, latch=None):
 
 def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                  markpad=None, steer=None, session=None, tap=None,
-                 record_button=None, clock=time.monotonic):
+                 record_button=None, clock=time.monotonic, takeover=None):
     """Poll the controller and drive whichever mode is current.
 
     Only one mode ever has the wheels: auto runs as a step() on this thread
@@ -757,6 +1098,11 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     if record_button is None:
         record_button = RecordButton()
 
+    # Which pad groups my hand has taken off the autopilot. Only auto reads
+    # it, and it is dropped on every way out of auto.
+    if takeover is None:
+        takeover = Takeover(log, markpad)
+
     # Which mode drove the previous pass, so a handover into manual from
     # record or auto -- by any path, the disconnect wait included -- arms the
     # throttle latch on the first manual pass after it.
@@ -788,6 +1134,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     log.log("warning", "Controller", "Lost the controller, holding neutral")
                     # Losing the pad means losing the only way to stop the
                     # car, so auto does not get to keep driving without it.
+                    takeover.drop("lost the controller")
                     if modes.mode == AUTO:
                         autopilot.pause()
                         modes.mode = MANUAL
@@ -881,11 +1228,24 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     session.end(now, why="pad read failed")
                     modes.mode = MANUAL
                     last_error = "record ended on a pad fault"
-            elif not autopilot.step(now):
+            elif not takeover.poll(joystick, now, steer.split):
+                # The pad cannot be read, so the only way to stop the car is
+                # not there either: the lost-pad answer, without the wait.
+                autopilot.pause()
+                modes.mode = MANUAL
+                vecon.return_neutral()
+                last_error = "auto parked on a pad fault"
+                log.log("warning", "Mode", "Pad fault in auto, parked to manual")
+            elif not autopilot.step(now, takeover):
+                takeover.drop("auto gave up")
                 modes.mode = MANUAL
                 vecon.return_neutral()
                 last_error = "auto gave up"
                 log.log("warning", "Mode", "Auto gave up, dropping to manual")
+            if modes.mode != AUTO:
+                takeover.drop()
+            elif takeover.throttle:
+                pad_throttle = takeover.intent[0]
 
             # After driving, not before: the snapshot a mark carries is meant
             # to say what the car was being commanded at the moment I pressed
@@ -907,8 +1267,14 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                  float(vecon.last_steering_rear or 0.0)),
                 driver=autopilot.driver if modes.mode == AUTO else None,
                 pad_throttle=pad_throttle,
-                limits=session.limits if modes.mode == RECORD else None,
-                steering_mode=steer.name)
+                limits=(session.limits if modes.mode == RECORD
+                        else auto_speed_limits(autopilot.driver)
+                        if pad_throttle is not None else None),
+                steering_mode=steer.name,
+                steer_by=takeover.steer_by if modes.mode == AUTO else PAD,
+                throttle_by=takeover.throttle_by if modes.mode == AUTO else PAD,
+                takeover=modes.mode == AUTO and (takeover.steering
+                                                 or takeover.throttle))
 
             # Telemetry. Every one of these is the same shape: ask whether
             # anybody is watching the channel and whether its rate gate has

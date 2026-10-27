@@ -1016,6 +1016,24 @@ def read_the_gradient(scan) -> SteerVerdict:
     return SteerVerdict(ACT_EVADE, side, f"{kind} {ratio:.2f}")
 
 
+def floor_vetoes_forward(scan) -> bool:
+    """R2 on its own: is anything measured inside REVERSE_FLOOR_MM?
+
+    What main.Takeover asks before it lets my trigger drive the car forward
+    in auto. The same blocked probes and the same floor read_the_gradient()
+    reverses on, and nothing else: R1's NO_RETURN veto and the sweep check are
+    the autopilot's reasons not to TURN, and my hand on the stick is not the
+    autopilot. A missing scan is a veto, because no picture is not a clear
+    picture. Reverse is never asked about here -- the camera cannot see
+    behind the car, so this has nothing to say about it.
+    """
+    if scan is None:
+        return True
+    near = [float(scan.distance_mm[i]) for i in range(len(scan.blocked))
+            if scan.blocked[i] and scan.reason[i] == NEAR]
+    return bool(near) and min(near) < REVERSE_FLOOR_MM
+
+
 class Driver:
     def __init__(self, controller, oakd):
         self.controller = controller
@@ -1098,6 +1116,20 @@ class Driver:
         # What _announce() last printed, so it prints on transitions rather
         # than ten times a second.
         self._last_announced = None
+
+        # True while my hand has the throttle in auto (main.Takeover). Set by
+        # the control loop before each tick and read in one place: it disarms
+        # the STUCK detector. stuck() asks whether a car the driver is telling
+        # to go is not going, and while I hold the triggers the driver is not
+        # telling it anything -- I might be holding it still on purpose, and
+        # half a second of stop is exactly what letting go of a trigger
+        # commands before the throttle goes back. A STUCK then would start a
+        # recover and swing the steering, which may still be the driver's, at
+        # a random lock under a car I am driving. So under my throttle the arm
+        # is dropped on every tick, and after I let go it has to be earned
+        # again: STUCK_ARM_SECONDS of the driver's own forward command, then
+        # STUCK_CONFIRM_SAMPLES of stillness.
+        self.human_throttle = False
 
     def motion_evidence(self, imu) -> str:
         """What the IMU can say about motion: MOVING, STILL or UNKNOWN.
@@ -1532,7 +1564,10 @@ class Driver:
             self.begin_recover(now)
             return
 
-        if self.stuck(imu, now):
+        if self.human_throttle:
+            self._throttle_since = None
+            self._still_samples = 0
+        elif self.stuck(imu, now):
             self.last_recovery_time = now
             print("STUCK - backing up to recover.")
             self.begin_recover(now)

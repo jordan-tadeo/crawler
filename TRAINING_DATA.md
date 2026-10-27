@@ -20,7 +20,14 @@ holds it is `footprint.py` (the rows), `policy_input.py` (the picture) and
   until both triggers have been let go once (`main.ThrottleLatch`). Manual
   writes no rows, so this never shows up in the data.
 - **Auto** writes the same rows for the autopilot's own decisions, into the
-  rolling recording, from the frame the driver actually scanned.
+  rolling recording, from the frame the driver actually scanned. Whenever the
+  recorder is on (`--record`, the default) these go to disk with their
+  `/policy/depth_small` pictures; nothing has to be watching in Foxglove.
+- **Takeover, in auto:** moving the left stick (plus the right in split) takes
+  the steering off the autopilot, and pulling a trigger takes the throttle, one
+  group at a time; the autopilot keeps driving the other. A group goes back
+  after 0.5 s inside its deadzone. A taken throttle is scaled exactly like
+  record's. The rows' `steer_by` / `throttle_by` say which hand had each group.
 - **Manual** writes no rows.
 
 Files: a record session is `recordings/crawler-record-<UTC>Z-p<pid>-001.mcap`
@@ -78,13 +85,15 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 |---|---|---|
 | `seq` | int | per process, from 1 |
 | `mode` | str | `"record"` or `"auto"` |
-| `source` | str | `"tap"` (record: our own scan) or `"driver"` (auto: the driver's scan) |
+| `source` | str | `"tap"` (our own scan: record, or auto during a recover I have a hand in) or `"driver"` (auto: the driver's scan) |
 | `frame_width`, `frame_height` | int | depth frame size, 640x400 (0 if unknown) |
 | `throttle` | float | **the label.** Throttle that reached the ESC this tick, -1..1 (record: already scaled) |
 | `steering_front`, `steering_rear` | float | **the label.** Steering sent to each servo, -0.7..0.7 (the pad's LEFT_X x 70%); `rear` = -`front` in unified mode |
 | `steering_mode` | str | `"unified"` or `"split"` (L3 toggles) |
-| `pad_throttle` | float | record: the trigger before scaling, -1..1. 0 in auto |
-| `forward_limit`, `reverse_limit` | float | record: the scale used, e.g. 0.2 / -0.6. -1 in auto |
+| `steer_by` | str | `"pad"` or `"driver"`: who had the steering when this row's command went out. Always `"pad"` in record |
+| `throttle_by` | str | `"pad"` or `"driver"`: same, for the throttle |
+| `pad_throttle` | float | record, or auto with `throttle_by` `"pad"`: the trigger before scaling, -1..1. Otherwise 0 |
+| `forward_limit`, `reverse_limit` | float | the scale used for `pad_throttle`, e.g. 0.2 / -0.6. -1 when no trigger was driving |
 | `imu_accel_x/y/z` | float | newest OAK-D IMU sample at the tick, linear acceleration, m/s^2 |
 | `imu_gyro_x/y/z` | float | same sample, rad/s |
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
@@ -118,8 +127,23 @@ The probe and verdict fields are the rule-based driver's opinion, recorded as
 a baseline to beat. In record **nothing acts on them**; the wheels get only
 the pad (a test holds this).
 
+**Which half of a row is a label.** `throttle`, `steering_front` and
+`steering_rear` are always what reached the hardware, and in auto that is a
+mix: each group is either my hand or the autopilot. A group marked `"pad"` is a
+human label -- in auto it is a correction, the most useful kind. A group marked
+`"driver"` is NOT a demonstration: it is the rule-based autopilot's own output
+and a policy trained on it learns the rules, not me. Mask it out of that
+group's loss, or down-weight it hard; never mix it in as if it were mine. A
+row can be `"pad"` on one group and `"driver"` on the other, so mask per group,
+not per row. For the 0.5 s after I let go a group is still `"pad"` and reads my
+stick's resting value (near centre, or a throttle of 0); that is a real thing
+my hand did, but it is also where I stopped meaning anything, so it is worth
+trimming.
+
 Rows that do not exist: manual mode, and auto's 2.5 s recover manoeuvre (no
-scan, no decision).
+scan, no decision) -- unless my hand has a group during it. Then the rows come
+at 10 Hz off the car's own view, `source` `"tap"`, `mode` `"auto"`, with a
+`/policy/depth_small` picture and no raw frame.
 
 ## Getting it out
 
