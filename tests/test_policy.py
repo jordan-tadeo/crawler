@@ -151,12 +151,68 @@ def chair_leg():
 def test_the_floor_takes_the_throttle_off_a_forward_and_lets_it_steer():
     d = policy_driver(StubModel(FORWARD, throttle=1.0, steer=0.4), chair_leg())
     d.tick(T0)
-    assert dv.floor_vetoes_forward(d.last_scan)
+    assert d.floor_veto.vetoes()
     assert d._phase is None
     assert d.controller.throttles[-1] == 0.0
     assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(0.4 * pl.STEER_SCALE))
     assert d.last_decision.reason == "model floor"
     assert d.last_decision.throttle == 0.0
+
+
+def centre_band(mm):
+    """Probes 3-5 at `mm` (0 reads nothing), open floor either side -- so
+    never the all-blind frame, which is neutral before the model is asked."""
+    depth = clear()
+    edges = dv.footprint_geometry(depth.shape).col_edges
+    depth[:, edges[3]:edges[6]] = mm
+    return depth
+
+
+def drive_through(d, frames, start=T0):
+    """One tick per frame, a decision apart. The reasons, in order."""
+    reasons = []
+    for k, frame in enumerate(frames):
+        d.camera.depth = frame
+        d.tick(start + k * 0.1)
+        reasons.append(d.last_decision.reason)
+    return reasons
+
+
+def test_a_model_forward_stays_held_when_the_probe_goes_blind_on_the_way_in():
+    d = policy_driver(StubModel(FORWARD), centre_band(390))
+    reasons = drive_through(d, [centre_band(mm) for mm in (390, 300, 190, 0, 0)])
+    assert reasons == ["model", "model floor", "model floor", "model floor",
+                       "model floor"]
+    assert d.controller.throttles[-1] == 0.0
+    assert d.floor_veto.latch.latched[4]
+
+
+def test_a_model_forward_through_a_dark_patch_is_not_held():
+    d = policy_driver(StubModel(FORWARD), clear())
+    reasons = drive_through(d, [clear(), clear(), centre_band(0), centre_band(0)])
+    assert reasons == ["model"] * 4
+    assert d.controller.throttles[-1] == pytest.approx(d.forward_speed)
+
+
+def test_a_model_floor_lets_go_on_open_floor_and_on_backing_off():
+    d = policy_driver(StubModel(FORWARD), centre_band(190))
+    drive_through(d, [centre_band(190), centre_band(0)])
+    assert d.floor_veto.vetoes()
+    drive_through(d, [clear()], start=T0 + 0.2)
+    assert d.last_decision.reason == "model"
+
+    # Latched again, then the model backs up at the cap while the probe stays
+    # blind: about 1.22 s of it lets go, and forward is the model's again.
+    d = policy_driver(StubModel(REVERSE), centre_band(190))
+    drive_through(d, [centre_band(190), centre_band(0)])
+    drive_through(d, [centre_band(0) for _ in range(10)], start=T0 + 0.2)
+    assert d.floor_veto.vetoes()  # 1.1 s of reverse: 180 mm, not yet
+    drive_through(d, [centre_band(0) for _ in range(3)], start=T0 + 1.2)
+    assert not d.floor_veto.vetoes()  # 1.4 s: 230 mm
+    d.model.out["logits"] = np.array([FORWARD], dtype=np.float32)
+    drive_through(d, [centre_band(0)], start=T0 + 1.5)
+    assert d.last_decision.reason == "model"
+    assert d.controller.throttles[-1] == pytest.approx(d.forward_speed)
 
 
 def test_the_floor_never_holds_a_model_reverse():

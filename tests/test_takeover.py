@@ -458,7 +458,11 @@ def test_a_scan_too_old_to_say_holds_my_forward(monkeypatch):
     def plan(n, pad, cam):
         pad.throttle = 1.0
 
-    out = run_auto(monkeypatch, 100, Camera(wall_frame()), plan=plan)
+    # A wall the rules reverse from ("spans") that is still outside the
+    # forward floor, so only the age of the scan can hold the trigger.
+    mm = 380
+    assert dv.FORWARD_FLOOR_MM < mm < dv.CLEARANCE_MM
+    out = run_auto(monkeypatch, 100, Camera(wall_frame(mm)), plan=plan)
     stale = [snap for snap in out["snaps"]
              if snap["phase"] is not None
              and snap["now"] > mn.FLOOR_SCAN_MAX_AGE + mn.AUTO_TICK_INTERVAL]
@@ -468,13 +472,70 @@ def test_a_scan_too_old_to_say_holds_my_forward(monkeypatch):
     assert out["snaps"][1]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
 
 
-def test_floor_veto_agrees_with_the_rules_floor():
-    for mm in (150, 190, 199, 200, 230, 380):
+def test_the_forward_floor_covers_the_rules_floor_and_more():
+    """Wherever the rules reverse on R2 my forward is held, and it is held
+    further out too: everything under FORWARD_FLOOR_MM."""
+    for mm in (150, 190, 199, 200, 230, 300, 360, 370, 380):
         scan = dv.free_by_column(wall_frame(mm))
-        verdict = dv.read_the_gradient(scan)
-        assert dv.floor_vetoes_forward(scan) == verdict.reason.startswith(
-            "floor"), mm
-    assert dv.floor_vetoes_forward(None)
+        held = dv.forward_floor_vetoes(dv.EMPTY_FLOOR_LATCH, scan)
+        if dv.read_the_gradient(scan).reason.startswith("floor"):
+            assert held, mm
+        assert held == (mm < dv.FORWARD_FLOOR_MM), mm
+    assert dv.forward_floor_vetoes(dv.EMPTY_FLOOR_LATCH, None)
+
+
+def centre_frame(mm):
+    """Probes 3-5 at `mm` (0 is blind), the rest open floor."""
+    frame = far_frame()
+    edges = dv.footprint_geometry(frame.shape).col_edges
+    frame[:, edges[3]:edges[6]] = mm
+    return frame
+
+
+def standing_policy(command, cam):
+    """A policy that only ever says stop: it scans every tick and never
+    starts a recover, so the takeover's veto sees every scan of an approach
+    the rules would have backed away from half way in."""
+    from test_policy import STOP, StubModel
+    import policy as pl
+    return pl.PolicyDriver(command, cam, StubModel(STOP))
+
+
+def test_my_forward_stays_held_when_the_probe_goes_blind_on_the_way_in(monkeypatch):
+    """390, 300, 190, then the centre reads nothing because it is too close.
+    The old veto only counted NEAR probes, so on the blind scans it let full
+    RT through -- exactly when the car was closest."""
+    approach = [390, 300, 190, 0]
+    tick = int(round(mn.AUTO_TICK_INTERVAL / STEP)) + 1
+
+    def plan(n, pad, cam):
+        pad.throttle = 1.0
+        cam.frame = centre_frame(approach[min(n // tick, len(approach) - 1)])
+
+    out = run_auto(monkeypatch, 6 * tick, Camera(centre_frame(390)),
+                   plan=plan, make_driver=standing_policy)
+    floor = out["pilot"]._floor
+    assert floor.scan.reason[4] == dv.NO_RETURN
+    assert floor.latch.latched[4]
+    # Every pass from the 300 mm scan on, the blind ones included.
+    held = out["snaps"][tick + 2:]
+    assert held and all(snap["throttle"] == 0.0 for snap in held)
+    # 390 is outside the floor, so the trigger went through there.
+    assert out["snaps"][2]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
+
+
+def test_a_blind_probe_out_of_open_floor_does_not_hold_my_forward(monkeypatch):
+    """A dark patch is not a wall: nothing near before it, nothing held."""
+    tick = int(round(mn.AUTO_TICK_INTERVAL / STEP)) + 1
+
+    def plan(n, pad, cam):
+        pad.throttle = 1.0
+        cam.frame = far_frame() if n < 2 * tick else centre_frame(0)
+
+    out = run_auto(monkeypatch, 2 * tick + 4, Camera(far_frame()), plan=plan)
+    assert out["pilot"]._floor.scan.reason[4] == dv.NO_RETURN
+    assert not any(out["pilot"]._floor.latch.latched)
+    assert out["snaps"][-1]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
 
 
 # --- the safe paths ---------------------------------------------------------
@@ -596,7 +657,9 @@ def test_every_auto_row_says_whose_each_group_was(monkeypatch):
             # 0.5 while held, 0 for the half second after letting go.
             assert row["pad_throttle"] in (0.5, 0.0)
             assert row["throttle"] == pytest.approx(row["pad_throttle"] * dv.FORWARD_SPEED)
-            assert row["forward_limit"] == pytest.approx(dv.FORWARD_SPEED)
+        # Every row carries auto's caps, the ones no trigger drove included.
+        assert row["forward_limit"] == pytest.approx(dv.FORWARD_SPEED)
+        assert row["reverse_limit"] == pytest.approx(dv.REVERSE_SPEED)
     assert seen == {(mn.DRIVER, mn.DRIVER), (mn.PAD, mn.DRIVER),
                     (mn.DRIVER, mn.PAD)}
 

@@ -33,6 +33,7 @@ commanded in reverse that has stopped shaking has hit something, and the
 reverse can end there instead of pushing for the rest of its two seconds.
 """
 
+import math
 import random
 import time
 from typing import NamedTuple
@@ -669,8 +670,11 @@ def free_by_column(depth, threshold_mm=CLEARANCE_MM) -> FootprintScan:
 # common end and 130-165 mm at the worst, so something read at 201 mm can be
 # inside 165 before anything looks again. The rules autopilot is still safe
 # there because R1 reverses on any NO_RETURN, and too close reads NO_RETURN.
-# floor_vetoes_forward() -- takeover's forward trigger and the policy runtime
-# -- counts NEAR probes only, so inside 165 mm it stops vetoing.
+# Takeover's forward trigger and the policy runtime used to ask this floor
+# about NEAR probes only, so inside 165 mm they stopped vetoing. They ask
+# ForwardFloorVeto now, which holds them further out (FORWARD_FLOOR_MM) and
+# keeps holding when a probe goes blind on the way in. This number is still
+# the rules autopilot's R2, and the base the forward floor is built on.
 REVERSE_FLOOR_MM = 200.0
 
 # The full-lock turn, as one circle. ESTIMATED, off the 2026-10-27 recording,
@@ -1054,24 +1058,6 @@ def read_the_gradient(scan) -> SteerVerdict:
     return SteerVerdict(ACT_EVADE, side, f"{kind} {ratio:.2f}")
 
 
-def floor_vetoes_forward(scan) -> bool:
-    """R2 on its own: is anything measured inside REVERSE_FLOOR_MM?
-
-    What main.Takeover asks before it lets my trigger drive the car forward
-    in auto. The same blocked probes and the same floor read_the_gradient()
-    reverses on, and nothing else: R1's NO_RETURN veto and the sweep check are
-    the autopilot's reasons not to TURN, and my hand on the stick is not the
-    autopilot. A missing scan is a veto, because no picture is not a clear
-    picture. Reverse is never asked about here -- the camera cannot see
-    behind the car, so this has nothing to say about it.
-    """
-    if scan is None:
-        return True
-    near = [float(scan.distance_mm[i]) for i in range(len(scan.blocked))
-            if scan.blocked[i] and scan.reason[i] == NEAR]
-    return bool(near) and min(near) < REVERSE_FLOOR_MM
-
-
 # The speed caps. Auto drives at exactly these, record scales full RT and
 # full LT to them (main.auto_speed_limits), takeover's trigger is scaled to
 # them, and the policy runtime multiplies its magnitude by them.
@@ -1095,6 +1081,302 @@ FORWARD_SPEED = 0.4
 # -1.0 is my call: the end of the range, 1000 us, -575 us off neutral, full
 # reverse. set_throttle clamps to [-1, 1], so there is nothing past it.
 REVERSE_SPEED = -1.0
+
+
+# ---------------------------------------------------------------------------
+# The forward floor: the veto on a forward the rules autopilot did not choose
+# ---------------------------------------------------------------------------
+#
+# Two things drive this car forward in auto without going through
+# read_the_gradient(): my trigger under takeover (main.AutoPilot) and the
+# policy runtime (policy.PolicyDriver). Both used to ask one scan whether a
+# NEAR probe was under REVERSE_FLOOR_MM, and at forward 0.4 that had two holes.
+# Inside about 165 mm the stereo pair measures nothing, so a probe read
+# NO_RETURN and the veto let go exactly when the car was closest. And the
+# 200-165 band is about one tick of travel at 0.4, against a picture that can
+# be 0.39 s old by the time anything looks again. ForwardFloorVeto closes
+# both: the floor is pushed out by the travel during the worst-case picture
+# age, and a probe that goes blind on the way in stays a veto. The rules
+# autopilot never asks it; its R1 and R2 are what they were.
+
+# Ground speed per unit of forward throttle. ESTIMATED, a fit through zero
+# off the only two measurements there are, both at forward_speed 0.2: 210
+# mm/s off three straight wall approaches in an auto run (VERIFIED, see
+# TURN_LAG_MM) and 164 mm/s off the one clean approach in the first record
+# session. The fast one, because a car that is faster than assumed is the one
+# that overruns the floor. At 0.4 that is 420 mm/s, the top of the 330-420
+# guessed for it. Nothing has measured 0.4. A motor with a start threshold --
+# and 0.2 sat on this one's -- rises faster than a line through zero above
+# it, so 420 may be low; drive a recorded straight approach at 0.4 and
+# replace this. Forward only: reverse is not this line (see REVERSE_SPEED).
+MM_S_PER_THROTTLE = 210.0 / 0.2
+
+# How old a picture is when the next chance to stop comes round, at worst.
+# The frame behind a decision is 88 ms old (measured, see EVADE_SECONDS), and
+# takeover lets my trigger through on a scan up to FLOOR_SCAN_MAX_AGE old.
+# The policy decides on a fresh frame every tick and so sees at most 0.19 s
+# of this; one number covers both callers, and it is the takeover's.
+FRAME_AGE_S = 0.088
+
+# How old the last scan may be and still clear my forward throttle past the
+# floor veto. Three decision ticks. A recover makes no scans, so for most of
+# one my forward trigger is held at 0 -- the camera has not been asked, and
+# no picture is not a clear picture. Reverse is never held. (main.py reads it
+# from here: the floor is built on it.)
+FLOOR_SCAN_MAX_AGE = 0.3
+WORST_PICTURE_AGE_S = FRAME_AGE_S + FLOOR_SCAN_MAX_AGE
+
+# How far back a blind probe looks for the approach that would explain it.
+# One second is ten scans and 420 mm of travel at 0.4, which is the whole
+# NEAR band (under CLEARANCE_MM) with room to spare: past a second, nothing
+# the probe measured says anything about where it is now.
+FLOOR_LATCH_SECONDS = 1.0
+
+# A latch also lets go once the car has backed off this far. A latched probe
+# was at worst touching something; backed off REVERSE_FLOOR_MM, which is 35 mm
+# past the ~165 mm near edge of the sensor, the thing is inside the band the
+# camera measures, so a probe still reading NO_RETURN there is a dark or
+# featureless surface and not a near one. The usual release is sooner and
+# needs no estimate -- the probe reads a distance again as soon as the car
+# backs out of the blind zone. This one is for the probe that stays blind.
+FLOOR_RELEASE_REVERSE_MM = REVERSE_FLOOR_MM
+
+# How a reverse is counted toward that, and it is deliberately crude, because
+# reverse ground speed has never been measured at any pulse. What is known:
+# at -0.296 (170 us) reverse barely moved, and with the wheels turned not at
+# all, so this ESC's reverse starts much later than its forward and no
+# forward fit says anything about it. So a reverse counts only at or past
+# REVERSE_CREDIT_MIN, -0.5 (287 us, 1.7 times the pulse that barely moved),
+# and then only at REVERSE_CREDIT_MM_S, 164 mm/s, the slowest clean ground
+# speed this car has been measured at in either direction. At the -1.0 cap
+# that is ESTIMATED 1.22 s of backing up, about twelve ticks -- inside the
+# recover's own reverse. Both numbers err toward holding the latch longer.
+REVERSE_CREDIT_MIN = -0.5
+REVERSE_CREDIT_MM_S = 164.0
+
+
+def ground_speed_mm_s(throttle) -> float:
+    """ESTIMATED forward ground speed for a forward throttle, mm/s. Anything
+    that is not a finite forward is 0: reverse is floor_travel_mm's."""
+    try:
+        t = float(throttle)
+    except Exception:
+        return 0.0
+    if not math.isfinite(t) or t <= 0.0:
+        return 0.0
+    return MM_S_PER_THROTTLE * min(t, 1.0)
+
+
+def forward_floor_mm(forward_speed=None) -> float:
+    """Where a forward the rules did not choose is held, for this cap.
+
+    REVERSE_FLOOR_MM plus how far the car goes at `forward_speed` while the
+    picture ages WORST_PICTURE_AGE_S, so something read just outside it is
+    still outside REVERSE_FLOOR_MM when the veto next looks. None is the
+    module's FORWARD_SPEED, read when called.
+    """
+    if forward_speed is None:
+        forward_speed = FORWARD_SPEED
+    speed = ground_speed_mm_s(max(0.0, float(forward_speed)))
+    return REVERSE_FLOOR_MM + speed * WORST_PICTURE_AGE_S
+
+
+# 200 + 420 x 0.388 = 363 mm at forward 0.4. Under CLEARANCE_MM, as it has to
+# be: a NEAR reading only exists inside the clearance budget, so a floor past
+# 400 would be a floor nothing can trip.
+FORWARD_FLOOR_MM = forward_floor_mm(FORWARD_SPEED)
+
+
+class FloorLatch(NamedTuple):
+    """What the forward veto remembers. Immutable; the functions below make
+    the next one.
+
+    history      ((time, near_mm per probe), ...) for the last
+                 FLOOR_LATCH_SECONDS of scans, inf where a probe was not NEAR
+    latched      per probe: blind, and blind because it got too close
+    reversed_mm  ESTIMATED backing-off since a probe latched
+    """
+
+    history: tuple
+    latched: tuple
+    reversed_mm: float
+
+
+EMPTY_FLOOR_LATCH = FloorLatch((), (), 0.0)
+
+
+def _blind_from_approach(history, i, now, speed) -> bool:
+    """Could probe i, or a probe beside it, have closed into the blind zone?
+
+    A NEAR reading at d mm, `age` seconds before this scan, explains a probe
+    going blind now if the car could have covered d - REVERSE_FLOOR_MM since:
+    d under REVERSE_FLOOR_MM + speed x age. Never less than the forward floor
+    itself, so a probe that was holding the veto keeps holding it when it goes
+    blind. The neighbours count because an approach at an angle walks the
+    near edge across the fan.
+    """
+    for t, near in history:
+        reach = REVERSE_FLOOR_MM + speed * max(WORST_PICTURE_AGE_S, now - t)
+        for j in (i - 1, i, i + 1):
+            if 0 <= j < len(near) and near[j] < reach:
+                return True
+    return False
+
+
+def advance_floor_latch(latch, scan, now, forward_speed=None) -> FloorLatch:
+    """The latch after one more scan. Pure: a latch and a scan in, a latch out.
+
+    Per probe:
+      NO_RETURN out of an approach (see _blind_from_approach)   latches
+      NO_RETURN while already latched                            stays
+      NO_RETURN out of a clear or far scene                      never latches
+      NEAR under the forward floor                               stays as it was
+      a measured distance at or past the forward floor           lets go, and
+                                                                 forgets what
+                                                                 it read on
+                                                                 the way in
+    The last line is the "reads a valid distance above the floor again". A
+    NO_RETURN out of nothing is the dark or featureless surface the old veto
+    ignored on purpose, and this still ignores it.
+    """
+    if scan is None:
+        return latch
+    if forward_speed is None:
+        forward_speed = FORWARD_SPEED
+    floor = forward_floor_mm(forward_speed)
+    speed = ground_speed_mm_s(max(0.0, float(forward_speed)))
+    n = len(scan.reason)
+    history = tuple(h for h in latch.history
+                    if 0.0 <= now - h[0] <= FLOOR_LATCH_SECONDS)
+    was = latch.latched if len(latch.latched) == n else (False,) * n
+
+    latched = []
+    for i in range(n):
+        reason = scan.reason[i]
+        if reason == NO_RETURN:
+            hold = was[i] or _blind_from_approach(history, i, now, speed)
+        elif reason == NEAR and float(scan.distance_mm[i]) < floor:
+            hold = was[i]
+        else:
+            hold = False
+        latched.append(bool(hold))
+
+    # A probe measured at or past the floor has said where it is now, and
+    # that supersedes anything it read on the way in: its old NEAR readings
+    # are forgotten, so a dark patch right after it is not an approach.
+    measured_far = [scan.reason[i] != NO_RETURN
+                    and float(scan.distance_mm[i]) >= floor for i in range(n)]
+    if any(measured_far):
+        history = tuple(
+            (t, tuple(math.inf if i < n and measured_far[i] else d
+                      for i, d in enumerate(near)))
+            for t, near in history)
+
+    near = tuple(float(scan.distance_mm[i]) if scan.reason[i] == NEAR
+                 else math.inf for i in range(n))
+    return FloorLatch(history + ((float(now), near),), tuple(latched),
+                      latch.reversed_mm if any(latched) else 0.0)
+
+
+def floor_latch_moved(latch, travelled_mm) -> FloorLatch:
+    """The latch after the car moved `travelled_mm`, negative backwards. Pure.
+
+    Backed off FLOOR_RELEASE_REVERSE_MM in all, it lets go of everything and
+    forgets the approach too, or the next blind scan would latch again off
+    the same readings.
+    """
+    if not any(latch.latched):
+        return latch._replace(reversed_mm=0.0)
+    back = max(0.0, latch.reversed_mm - float(travelled_mm))
+    if back >= FLOOR_RELEASE_REVERSE_MM:
+        return EMPTY_FLOOR_LATCH
+    return latch._replace(reversed_mm=back)
+
+
+def floor_travel_mm(throttle, seconds) -> float:
+    """ESTIMATED travel at `throttle` for `seconds`, as the latch counts it.
+
+    Backwards at REVERSE_CREDIT_MM_S, and only at or past REVERSE_CREDIT_MIN;
+    forwards on the fast fit. Both choices keep a latch on longer, never
+    shorter.
+    """
+    if seconds <= 0.0:
+        return 0.0
+    try:
+        t = float(throttle)
+    except Exception:
+        return 0.0
+    if math.isfinite(t) and t <= REVERSE_CREDIT_MIN:
+        return -REVERSE_CREDIT_MM_S * seconds
+    return ground_speed_mm_s(t) * seconds
+
+
+def forward_floor_vetoes(latch, scan, forward_speed=None) -> bool:
+    """Hold a forward? Pure. Anything NEAR under the forward floor, or any
+    probe latched blind. A missing scan is a veto: no picture is not a clear
+    picture. Reverse is never asked about -- the camera cannot see behind.
+
+    R1's NO_RETURN veto and the sweep check are the autopilot's reasons not
+    to TURN, and neither my hand nor a model is the autopilot, so a blind
+    probe on its own vetoes nothing here.
+    """
+    if scan is None:
+        return True
+    floor = forward_floor_mm(forward_speed)
+    for i in range(len(scan.reason)):
+        if scan.reason[i] == NEAR and float(scan.distance_mm[i]) < floor:
+            return True
+    return any(latch.latched)
+
+
+class ForwardFloorVeto:
+    """The forward floor with its memory. One per caller, owned by it.
+
+    The caller shows it every new scan (observe) and every throttle that went
+    out (note_throttle), and asks vetoes() before a forward. All the deciding
+    is in the pure functions above; this only holds the latch between scans.
+    The same scan shown twice counts once, so a caller asking at 100 Hz off a
+    10 Hz scan cannot age its own history.
+
+    `forward_speed` is the cap the forward is scaled to; None reads the
+    module's FORWARD_SPEED when asked.
+    """
+
+    def __init__(self, forward_speed=None):
+        self.forward_speed = forward_speed
+        self.reset()
+
+    def reset(self):
+        """Nothing seen and the wheels at neutral."""
+        self.latch = EMPTY_FLOOR_LATCH
+        self.scan = None
+        self._throttle = 0.0
+        self._throttle_at = None
+
+    def observe(self, scan, now):
+        if scan is None or scan is self.scan:
+            return
+        self.scan = scan
+        self.latch = advance_floor_latch(self.latch, scan, now,
+                                         self.forward_speed)
+
+    def note_throttle(self, throttle, now):
+        """`throttle` is on the wheels from `now`. The one before it is
+        credited for the time it was on them -- pigpio holds a pulse until
+        it is told otherwise, so that is how long it drove."""
+        if self._throttle_at is not None:
+            self.latch = floor_latch_moved(
+                self.latch, floor_travel_mm(self._throttle,
+                                            now - self._throttle_at))
+        try:
+            t = float(throttle)
+        except Exception:
+            t = 0.0
+        self._throttle = t if math.isfinite(t) else 0.0
+        self._throttle_at = now
+
+    def vetoes(self) -> bool:
+        return forward_floor_vetoes(self.latch, self.scan, self.forward_speed)
 
 
 class Driver:

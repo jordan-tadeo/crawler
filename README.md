@@ -164,9 +164,10 @@ only sets a kernel default the 6.6 kernel never sends to the controller.
 Off unless I ask for it. `main.py --policy models/policy.onnx` makes START
 hand the wheels to a small network instead of the hand-written rules, behind
 vetoes of its own: no frame, a stale frame or a blind frame is neutral, a
-forward with anything under `REVERSE_FLOOR_MM` becomes throttle 0 with its
-steering still going out (the same `floor_vetoes_forward` my trigger is held
-by), and an output that is not finite or not in range is neutral, never
+forward with anything under `FORWARD_FLOOR_MM` (363 mm at forward 0.4), or
+with a probe that went blind on the way in, becomes throttle 0 with its
+steering still going out (`driver.ForwardFloorVeto`, the same veto my trigger
+is held by), and an output that is not finite or not in range is neutral, never
 clamped (a nan through `min(1, v)` is full forward). The stuck detector still
 fires, and is the only thing that runs the canned backup-and-turn. A model
 that will not load is auto unavailable, not a quiet fall back to the rules.

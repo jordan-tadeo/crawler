@@ -63,8 +63,10 @@ FOOTPRINT_ROW = {
     "steering_mode": "steering_mode",
     "rule_action": "verdict_action",
     "rule_steer": "verdict_steer",
-    # Record mode's speed caps, so a magnitude is measured against the caps
-    # that were actually in force rather than assumed. -1 in auto.
+    # The speed caps, so a magnitude is measured against the caps that were
+    # actually in force rather than assumed. Record rows always carry them;
+    # auto rows carry auto's caps on every row now, and -1 only in older
+    # recordings, on rows no trigger drove.
     "forward_cap": "forward_limit",
     "reverse_cap": "reverse_limit",
     # TAKEOVER: who had each group of controls on this tick, "driver" (the

@@ -34,12 +34,14 @@ failure commands neutral. In the order they are checked:
   wrong shape, throttle past [0, 1]
   or steering past +-1              neutral
   a forward with anything measured
-  inside REVERSE_FLOOR_MM           throttle 0, the model's steering still
-                                    goes out (driver.floor_vetoes_forward,
-                                    the takeover's own veto). A model
-                                    reverse is never vetoed: the camera
-                                    cannot see behind, so the floor has
-                                    nothing to say about it
+  inside FORWARD_FLOOR_MM, or a
+  probe gone blind on the way in    throttle 0, the model's steering still
+                                    goes out (driver.ForwardFloorVeto, the
+                                    same veto the takeover holds my
+                                    trigger with, its own instance). A
+                                    model reverse is never vetoed: the
+                                    camera cannot see behind, so the floor
+                                    has nothing to say about it
   anything raises                   neutral, then the exception goes on up
                                     to AutoPilot.step(), which parks auto
 
@@ -359,6 +361,11 @@ class PolicyDriver(dv.Driver):
         self.model = model
         self.downsample = downsample or downsample_for(model.contract)
         self._prev = (STOP, 0.0, 0.0)
+        # The forward floor and its memory of the last second of scans. This
+        # driver's own: it is shown every scan this driver makes and every
+        # throttle it commands.
+        self.floor_veto = dv.ForwardFloorVeto(self.forward_speed)
+        self._now = None  # the tick in progress, for the neutral path
         # Read-only bookkeeping, like last_scan and last_verdict.
         self.last_decision = None
         self.last_infer_ms = 0.0
@@ -388,6 +395,7 @@ class PolicyDriver(dv.Driver):
             self.controller.set_steering(0, 0)
         except Exception:
             pass
+        self._commanded(0.0, self._now)
         self._clear_motion_evidence()
         self._prev = (STOP, 0.0, 0.0)
         self._note(Decision(STOP, 0.0, 0.0, None, reason))
@@ -430,9 +438,24 @@ class PolicyDriver(dv.Driver):
         self._note(Decision(REVERSE, 1.0, 0.0, None, reason, self.reverse_speed, 0.0))
         self._prev = (REVERSE, 1.0, 0.0)
         self.begin_recover(now)
+        self._commanded(self.reverse_speed, now)
+
+    def _commanded(self, throttle, now):
+        """Tell the floor veto what this driver just put on the throttle.
+        Never raises: it runs on the neutral path too."""
+        try:
+            if now is not None:
+                self.floor_veto.note_throttle(throttle, now)
+        except Exception:
+            pass
 
     def _tick(self, now):
+        self._now = now
         if self.recovering(now):
+            # The recover's reverse, then its settle at 0, as the veto's
+            # record of what the wheels were told.
+            self._commanded(self.reverse_speed
+                            if self._phase == dv._PHASE_REVERSE else 0.0, now)
             return
 
         depth = self.camera.get_depth_frame()
@@ -442,6 +465,10 @@ class PolicyDriver(dv.Driver):
 
         imu = self.camera.get_imu_sample()
         scan = self.scan_footprint(depth)
+        # Every scan, blind ones too: a blind scan is exactly the one the
+        # latch is for. The cap is read each tick, as the throttle is.
+        self.floor_veto.forward_speed = self.forward_speed
+        self.floor_veto.observe(scan, now)
 
         if all(r == dv.NO_RETURN for r in scan.reason):
             self._neutral("blind")
@@ -472,7 +499,7 @@ class PolicyDriver(dv.Driver):
         action, magnitude, steer, rear = decided
 
         reason = "model"
-        if action == FORWARD and dv.floor_vetoes_forward(scan):
+        if action == FORWARD and self.floor_veto.vetoes():
             # Blocks the forward, not the decision: the steering still goes
             # out, and next tick the model can choose to reverse.
             throttle, reason = 0.0, "model floor"
@@ -494,6 +521,7 @@ class PolicyDriver(dv.Driver):
         # holds both and AutoPilot.step() writes them once.
         self.controller.set_steering(*pair)
         self.controller.set_throttle(throttle)
+        self._commanded(throttle, now)
         if throttle > 0.0:
             if self._throttle_since is None:
                 self._throttle_since = now

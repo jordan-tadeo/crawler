@@ -2086,3 +2086,168 @@ def test_the_scan_and_the_verdict_fit_inside_the_tick_budget():
         dv.read_the_gradient(dv.free_by_column(frame))
         times.append((time.perf_counter() - started) * 1000.0)
     assert float(np.median(times)) < 2.0, f"median {np.median(times):.3f} ms"
+
+
+# --- the forward floor: takeover's and the policy's veto ---------------------
+#
+# Fake scan sequences, ten a second like the driver's tick. "N<mm>" is a
+# probe NEAR at that distance, "?" NO_RETURN, "." clear.
+
+TICK = 0.1
+
+
+def fake_scan(*probes):
+    """Nine probes, each "N<mm>", "?" or "." -- the rest of the fan clear."""
+    probes = list(probes) + ["."] * (dv.PROBE_COLUMNS - len(probes))
+    dist, reason = [], []
+    for p in probes:
+        if p.startswith("N"):
+            dist.append(float(p[1:]))
+            reason.append(dv.NEAR)
+        else:
+            dist.append(np.inf)
+            reason.append(dv.NO_RETURN if p == "?" else dv.CLEAR)
+    blocked = np.array([r != dv.CLEAR for r in reason])
+    return dv.FootprintScan(np.array(dist), np.zeros(len(dist)), blocked,
+                            tuple(reason), None)
+
+
+def centre(p):
+    """One reading on probe 4, dead ahead, and open floor either side."""
+    return fake_scan(".", ".", ".", ".", p)
+
+
+def replay(scans, veto=None):
+    """Each scan a tick apart into one veto; what it said after each."""
+    veto = veto or dv.ForwardFloorVeto()
+    said = []
+    for k, scan in enumerate(scans):
+        veto.observe(scan, k * TICK)
+        said.append(veto.vetoes())
+    return said, veto
+
+
+def test_the_forward_floor_is_built_on_forward_speed():
+    """REVERSE_FLOOR_MM plus the travel at the cap while a picture ages its
+    worst: 200 + 1050 x 0.4 x 0.388 = 363 mm today, and under the clearance
+    budget, past which nothing can read NEAR to trip it."""
+    assert dv.FORWARD_FLOOR_MM == pytest.approx(
+        dv.REVERSE_FLOOR_MM
+        + dv.MM_S_PER_THROTTLE * dv.FORWARD_SPEED * dv.WORST_PICTURE_AGE_S)
+    assert dv.FORWARD_FLOOR_MM == pytest.approx(362.96, abs=0.01)
+    assert dv.REVERSE_FLOOR_MM < dv.FORWARD_FLOOR_MM < dv.CLEARANCE_MM
+    assert dv.WORST_PICTURE_AGE_S == pytest.approx(
+        dv.FRAME_AGE_S + dv.FLOOR_SCAN_MAX_AGE)
+
+
+def test_the_forward_floor_moves_with_the_speed(monkeypatch):
+    """Read off FORWARD_SPEED when asked, never a literal: a slower cap is a
+    nearer floor, and a NEAR 300 that holds the car at 0.4 does not at 0.2."""
+    at_04 = dv.forward_floor_mm()
+    assert replay([centre("N300")])[0] == [True]
+    monkeypatch.setattr(dv, "FORWARD_SPEED", 0.2)
+    at_02 = dv.forward_floor_mm()
+    assert at_02 == pytest.approx(200.0 + 210.0 * dv.WORST_PICTURE_AGE_S)
+    assert at_02 < 300.0 < at_04
+    assert replay([centre("N300")])[0] == [False]
+    assert dv.forward_floor_mm(0.0) == dv.REVERSE_FLOOR_MM
+    assert dv.ForwardFloorVeto().vetoes()  # no scan yet is held
+
+
+def test_an_approach_stays_held_through_the_blind_tick():
+    said, veto = replay([centre("N400"), centre("N300"), centre("N190"),
+                         centre("?"), centre("?")])
+    assert said == [False, True, True, True, True]
+    assert veto.latch.latched[4]
+
+
+def test_a_blind_probe_out_of_a_clear_or_far_scene_holds_nothing():
+    """The dark or featureless surface: out of open floor, out of a reading
+    well outside the floor on the tick before, and with no history at all."""
+    assert replay([centre("."), centre("."), centre("?"), centre("?")])[0] == [
+        False, False, False, False]
+    assert replay([centre("N390"), centre("?")])[0] == [False, False]
+    assert replay([centre("?")])[0] == [False]
+    # Something near on the far side of the fan says nothing about probe 4.
+    assert replay([fake_scan("N250"), centre("?")])[0] == [True, False]
+
+
+def test_a_neighbour_going_blind_counts_as_the_approach():
+    """An angled approach walks the near edge across the fan."""
+    said, veto = replay([fake_scan(".", ".", ".", "N250", "."), centre("?")])
+    assert said == [True, True]
+    assert veto.latch.latched[4]
+
+
+def test_an_old_reading_counts_once_the_car_could_have_closed_it():
+    """NEAR 390 then blind: not an approach on the next tick (42 mm of travel
+    at 0.4 cannot cover 190), but it is once the car could have."""
+    said, _ = replay([centre("N390")] + [centre("?") for _ in range(6)])
+    # 200 + 420 x age passes 390 at age 0.45 s.
+    assert said == [False, False, False, False, False, True, True]
+
+
+def test_the_latch_lets_go_on_a_valid_reading_past_the_floor():
+    # 330 is measured but still under the floor, so the latch holds through
+    # it; open floor lets go, and forgets the approach, so a blind scan right
+    # after is a dark patch.
+    said, veto = replay([centre("N300"), centre("?"), centre("N330"),
+                         centre("?"), centre("."), centre("?")])
+    assert said == [True, True, True, True, False, False]
+    said, veto = replay([centre("N300"), centre("?"), centre("N370"),
+                         centre("N370")])
+    assert said == [True, True, False, False]
+    assert not any(veto.latch.latched)
+
+
+def test_the_latch_lets_go_after_backing_off_and_forgets_the_approach():
+    """FLOOR_RELEASE_REVERSE_MM of ESTIMATED reverse, and a reverse short of
+    REVERSE_CREDIT_MIN counts for nothing however long it runs."""
+    _, veto = replay([centre("N190"), centre("?")])
+    assert veto.vetoes()
+    # -0.45: past the -0.296 that barely moved, short of the credit line.
+    veto.note_throttle(-0.45, 1.0)
+    veto.note_throttle(0.0, 6.0)
+    assert veto.vetoes() and veto.latch.reversed_mm == 0.0
+    # At the cap, 164 mm/s: 1.22 s is the release.
+    assert dv.REVERSE_SPEED <= dv.REVERSE_CREDIT_MIN
+    need = dv.FLOOR_RELEASE_REVERSE_MM / dv.REVERSE_CREDIT_MM_S
+    assert need == pytest.approx(1.22, abs=0.005)
+    veto.note_throttle(dv.REVERSE_SPEED, 10.0)
+    veto.note_throttle(dv.REVERSE_SPEED, 10.0 + need - 0.02)
+    assert veto.vetoes()
+    veto.note_throttle(0.0, 10.0 + need + 0.01)
+    assert not veto.vetoes()
+    assert veto.latch == dv.EMPTY_FLOOR_LATCH
+    # Still blind where it stopped: a dark surface now, not a near one.
+    veto.observe(centre("?"), 11.0)
+    assert not veto.vetoes()
+
+
+def test_driving_forward_while_latched_takes_back_the_reverse_credit():
+    _, veto = replay([centre("N190"), centre("?")])
+    veto.note_throttle(dv.REVERSE_SPEED, 1.0)
+    veto.note_throttle(dv.FORWARD_SPEED, 2.0)
+    veto.note_throttle(0.0, 2.2)
+    assert veto.vetoes()
+    assert veto.latch.reversed_mm == pytest.approx(
+        1.0 * 164.0 - 0.2 * 420.0, abs=0.5)
+
+
+def test_the_same_scan_shown_twice_counts_once():
+    scan = centre("N190")
+    veto = dv.ForwardFloorVeto()
+    for k in range(5):
+        veto.observe(scan, k * 0.01)
+    assert len(veto.latch.history) == 1
+
+
+def test_the_floor_veto_is_pure():
+    empty = dv.EMPTY_FLOOR_LATCH
+    a = dv.advance_floor_latch(empty, centre("N190"), 0.0)
+    b = dv.advance_floor_latch(a, centre("?"), 0.1)
+    assert empty == dv.EMPTY_FLOOR_LATCH and not any(a.latched)
+    assert b.latched[4]
+    assert dv.advance_floor_latch(a, centre("?"), 0.1) == b
+    assert dv.forward_floor_vetoes(b, centre("?"))
+    assert not dv.forward_floor_vetoes(empty, centre("?"))

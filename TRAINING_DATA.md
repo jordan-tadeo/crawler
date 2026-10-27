@@ -109,7 +109,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `steer_by` | str | `"pad"` or `"driver"`: who had the steering when this row's command went out. Always `"pad"` in record |
 | `throttle_by` | str | `"pad"` or `"driver"`: same, for the throttle |
 | `pad_throttle` | float | record, or auto with `throttle_by` `"pad"`: the trigger before scaling, -1..1. Otherwise 0 |
-| `forward_limit`, `reverse_limit` | float | the scale used for `pad_throttle`, e.g. 0.4 / -1.0 (0.2 / -0.6 in the first sessions, 0.4 / -0.296 after). -1 when no trigger was driving |
+| `forward_limit`, `reverse_limit` | float | the speed caps in force on this row, e.g. 0.4 / -1.0 (0.2 / -0.6 in the first sessions, 0.4 / -0.296 after): the scale for `pad_throttle` in record and under takeover, and auto's own caps on every auto row. Older recordings carry -1 on auto rows no trigger drove; read those against the session's other caps |
 | `imu_accel_x/y/z` | float | newest OAK-D IMU sample at the tick, linear acceleration, m/s^2 |
 | `imu_gyro_x/y/z` | float | same sample, rad/s |
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
@@ -118,7 +118,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
 | `policy_throttle` | float | the model's throttle after its floor veto; what it would have driven even while my trigger has the group |
 | `policy_steering_front` | float | the model's front steering, in manual's units (full lock 0.7) |
-| `policy_reason` | string | why it did that: `model`, `model floor`, `blind`, `stuck`, ... |
+| `policy_reason` | string | why it did that: `model`, `model floor` (a forward held by `driver.ForwardFloorVeto`: something under `FORWARD_FLOOR_MM`, or a probe that went blind on the way in), `blind`, `stuck`, ... |
 | `policy_infer_ms` | float | the model's inference time that tick |
 | `depth_small` | bool | a `/policy/depth_small` picture carries this row's log time |
 | `depth_raw` | bool | a `/camera/depth_raw` frame carries this row's log time |

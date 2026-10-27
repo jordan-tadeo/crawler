@@ -557,10 +557,9 @@ STICK_TAKEOVER = 0.20
 TAKEOVER_RELEASE_SECONDS = 0.5
 
 # How old the driver's last scan may be and still clear my forward throttle
-# past the floor veto. Three decision ticks. A recover makes no scans, so for
-# most of one my forward trigger is held at 0 -- the camera has not been
-# asked, and no picture is not a clear picture. Reverse is never held.
-FLOOR_SCAN_MAX_AGE = 0.3
+# past the floor veto. Defined in driver.py now, because the forward floor is
+# built on it -- see FLOOR_SCAN_MAX_AGE and FORWARD_FLOOR_MM there.
+FLOOR_SCAN_MAX_AGE = dv.FLOOR_SCAN_MAX_AGE
 
 TAKEN = "taken"
 RELEASED = "released"
@@ -811,9 +810,12 @@ class AutoPilot:
         # driver asks, step() writes.
         self.command = DriverCommand()
         # When the driver's last_scan last changed, for the floor veto on my
-        # forward throttle.
+        # forward throttle, and the veto itself. Its own, not the policy's:
+        # it is shown every scan and every throttle that reaches the wheels,
+        # whoever commanded it.
         self._scan = None
         self._scan_at = None
+        self._floor = dv.ForwardFloorVeto()
         # --policy: a learned model's .onnx. None is the hand-written
         # autopilot, which is the default and stays the default.
         self.policy_path = policy_path
@@ -885,6 +887,9 @@ class AutoPilot:
         self.command.reset()
         self._scan = getattr(self.driver, "last_scan", None)
         self._scan_at = None
+        # Nothing the veto saw on an earlier lap is of a known age either, and
+        # the cap it is built on is the live driver's.
+        self._floor = dv.ForwardFloorVeto(auto_speed_limits(self.driver)[0])
         return True
 
     def _build_driver(self, view):
@@ -937,6 +942,7 @@ class AutoPilot:
                 scan = self.driver.last_scan
                 if scan is not self._scan:
                     self._scan, self._scan_at = scan, now
+                    self._floor.observe(scan, now)
             self._write(now, takeover)
         except Exception as e:
             # Stop the car BEFORE writing anything down. Logging opens, writes
@@ -966,17 +972,25 @@ class AutoPilot:
             self.vecon.set_steering(cmd.front, cmd.rear)
 
         if takeover is not None and takeover.throttle:
-            self.vecon.set_throttle(self._pad_throttle(now, takeover))
+            throttle = self._pad_throttle(now, takeover)
         elif throttle_new or THROTTLE in released:
-            self.vecon.set_throttle(cmd.throttle)
+            throttle = cmd.throttle
+        else:
+            return
+        self.vecon.set_throttle(throttle)
+        # What is on the wheels from now, so a latched floor knows when the
+        # car has backed off it.
+        self._floor.note_throttle(throttle, now)
 
     def _pad_throttle(self, now, takeover):
         """My trigger at record's scaling, under the floor veto. Never nan.
 
         Full RT is the driver's forward_speed and full LT its reverse_speed,
-        read off the live driver. Forward is held at 0 while the driver's last
-        scan has something measured inside REVERSE_FLOOR_MM, or when there is
-        no scan young enough to say; reverse is mine whatever the scan says.
+        read off the live driver. Forward is held at 0 while the forward
+        floor vetoes (driver.ForwardFloorVeto: something measured inside
+        FORWARD_FLOOR_MM, or a probe that went blind on the way in), or when
+        there is no scan young enough to say; reverse is mine whatever the
+        scan says. Held, never ramped: the trigger passes through or is 0.
         scale_throttle() turns a nan into 0.0 before any clamp sees it.
         """
         throttle = scale_throttle(takeover.intent[0],
@@ -989,7 +1003,12 @@ class AutoPilot:
         if (self._scan is None or self._scan_at is None
                 or now - self._scan_at > FLOOR_SCAN_MAX_AGE):
             return True
-        return dv.floor_vetoes_forward(self._scan)
+        # step() has already shown it this scan; asking again is a no-op, and
+        # makes sure the veto is about the scan the age check just passed.
+        # The floor follows the cap my trigger is scaled to right now.
+        self._floor.forward_speed = auto_speed_limits(self.driver)[0]
+        self._floor.observe(self._scan, self._scan_at)
+        return self._floor.vetoes()
 
     def pause(self):
         """Hand the wheels back. Drops a recover in progress on the floor."""
@@ -1001,6 +1020,7 @@ class AutoPilot:
             self._write(0.0, None)
         self.vecon.return_neutral()
         self.command.reset()
+        self._floor.reset()
 
     def stop(self):
         """Give up the driver. The camera is not mine to close.
@@ -1387,9 +1407,13 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                  float(vecon.last_steering_rear or 0.0)),
                 driver=autopilot.driver if modes.mode == AUTO else None,
                 pad_throttle=pad_throttle,
+                # Every auto row carries the caps auto is driving at, whoever
+                # had the throttle: a row the autopilot drove is measured
+                # against them as much as one my trigger did. -1 is left for
+                # manual, which writes no rows.
                 limits=(session.limits if modes.mode == RECORD
                         else auto_speed_limits(autopilot.driver)
-                        if pad_throttle is not None else None),
+                        if modes.mode == AUTO else None),
                 steering_mode=steer.name,
                 steer_by=takeover.steer_by if modes.mode == AUTO else PAD,
                 throttle_by=takeover.throttle_by if modes.mode == AUTO else PAD,
