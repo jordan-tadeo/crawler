@@ -4,6 +4,7 @@
     python3 tools/pull_mcaps.py                    # everything new, into ~/crawler-data/mcap
     python3 tools/pull_mcaps.py --list             # what is on the car, and what is live
     python3 tools/pull_mcaps.py -n 3               # the newest three only
+    python3 tools/pull_mcaps.py --records-only     # only the RECORD-mode sessions
     python3 tools/pull_mcaps.py --prune            # say what would go off the car
     python3 tools/pull_mcaps.py --prune --yes      # and do it
 
@@ -33,6 +34,13 @@ Verification is size plus sha256 on both ends, every file this run copied.
 only deleted if a local copy (the file, or the .orig mcap_check keeps beside a
 repaired one) has the same sha256 right now. It never touches a live file, it
 prints what it would delete, and without --yes it deletes nothing.
+
+--records-only narrows everything after the listing to the crawler-record-*
+files, the training sessions, and leaves the rolling drive logs where they
+are. -n counts within what it kept, --list shows what it kept, and --prune
+only looks at what it kept, so a drive log is never even a candidate. Prune
+was never deciding off the filter anyway: nothing goes without a local copy
+that hashes the same.
 
 On the car this only ever reads, except for the rm that --prune --yes sends.
 """
@@ -213,6 +221,24 @@ def mark_live(files, state, main_pid, open_paths):
     return files
 
 
+RECORD_PREFIX = "crawler-record-"
+
+
+def is_record_session(f):
+    """A RECORD-mode training session, by its name."""
+    return f.name.startswith(RECORD_PREFIX)
+
+
+def select(files, records_only=False, count=0):
+    """What this run works on: the filter first, then the newest count of
+    what is left. files is already newest first."""
+    if records_only:
+        files = [f for f in files if is_record_session(f)]
+    if count > 0:
+        files = files[:count]
+    return files
+
+
 def newest_first(files):
     return sorted(files, key=lambda f: (f.mtime, f.name), reverse=True)
 
@@ -315,12 +341,12 @@ def survey(car, dirs):
     return newest_first(files), state, pid, open_paths, df
 
 
-def show(files, state, pid, open_paths):
+def show(files, state, pid, open_paths, what="recordings"):
     print(f"On {CAR}: service {state}, MainPID {pid}"
           + ("" if open_paths is not None else
              " (its fd table is not readable; live = no footer + its pid)"))
     total = sum(f.size for f in files)
-    print(f"  {len(files)} recordings, {mib(total)}")
+    print(f"  {len(files)} {what}, {mib(total)}")
     for f in files:
         flag = "LIVE " if f.live else ("     " if f.closed else "nofoot")
         print(f"  {flag:<6} {mib(f.size):>11}  {f.name}"
@@ -426,6 +452,9 @@ def parse_args(argv):
                         "a git work tree")
     p.add_argument("-n", "--count", type=int, default=0,
                    help="only the newest N recordings (default: all)")
+    p.add_argument("--records-only", action="store_true",
+                   help="only the crawler-record-* training sessions, not "
+                        "the rolling drive logs")
     p.add_argument("--list", action="store_true",
                    help="say what is on the car and stop")
     p.add_argument("--prune", action="store_true",
@@ -449,12 +478,17 @@ def main(argv):
         return 2
 
     files, state, pid, open_paths, df = survey(CAR, REMOTE_DIRS)
-    show(files, state, pid, open_paths)
+    if args.records_only:
+        others = len(files)
+        files = select(files, records_only=True)
+        show(files, state, pid, open_paths, "record sessions")
+        print(f"  ({others - len(files)} drive logs left on the car)")
+    else:
+        show(files, state, pid, open_paths)
     print_df(df[:1], "before")
     if args.list:
         return 0
-    if args.count > 0:
-        files = files[:args.count]
+    files = select(files, count=args.count)
 
     copied, failed = pull(CAR, files, dest, args.pulled_list)
     if args.prune:

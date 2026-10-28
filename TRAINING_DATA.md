@@ -39,7 +39,8 @@ Files: a record session is `log/mcap/crawler-record-<UTC>Z-p<pid>-001.mcap`
 (`/home/jt/Documents/py/crawler/log/mcap/` on the car, or `--record-dir`), one
 per session, never pruned by the ring; the rolling recording is
 `crawler-<UTC>Z-...mcap` in the same directory. `./pull-recordings.sh` pulls
-both, into `~/crawler-data/mcap/` by default.
+both, into `~/crawler-data/mcap/` by default; `--records-only` pulls just the
+record sessions and leaves the drive logs on the car.
 
 A record session ends on a Y tap, on START, on losing the pad, or when the pad
 has not proved it is there for 5 s; the last two buzz one long pulse instead

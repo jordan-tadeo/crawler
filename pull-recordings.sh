@@ -8,6 +8,7 @@
 #
 #   ./pull-recordings.sh              # everything new into ~/crawler-data/mcap
 #   ./pull-recordings.sh -n 20        # only the newest 20
+#   ./pull-recordings.sh --records-only   # only the Y-button training sessions, not the drive logs
 #   ./pull-recordings.sh --list       # just say what is on the car, and what is live
 #   ./pull-recordings.sh -o ~/Desktop/crawl
 #   ./pull-recordings.sh --prune      # say which car copies are safe to delete
@@ -53,11 +54,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--count) ARGS+=(--count "$2"); shift 2 ;;
     --all)      shift ;;  # the default now; kept so old muscle memory works
+    --records-only) ARGS+=(--records-only); shift ;;
     --list)     LIST_ONLY=1; ARGS+=(--list); shift ;;
     -o|--out)   OUT="$2"; shift 2 ;;
     --prune)    ARGS+=(--prune); shift ;;
     --yes)      ARGS+=(--yes); shift ;;
-    -h|--help)  sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done

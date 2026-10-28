@@ -221,6 +221,92 @@ def test_a_copy_at_the_same_size_is_already_here(tmp_path):
     assert not pm.already_have(f, str(tmp_path))
 
 
+
+# ---------------------------------------------------------------------------
+# --records-only
+# ---------------------------------------------------------------------------
+
+REC = ["crawler-record-20261027T1900Z-p900-001.mcap",
+       "crawler-record-20261027T1800Z-p800-001.mcap",
+       "crawler-record-20261027T1700Z-p700-001.mcap"]
+LOG = ["crawler-20261027T1930Z-p2002-004.mcap",
+       "crawler-20261027T1830Z-p2002-003.mcap"]
+
+
+def mixed():
+    """Newest first, the drive logs interleaved with the sessions."""
+    return [rf(n) for n in (LOG[0], REC[0], LOG[1], REC[1], REC[2])]
+
+
+def test_records_only_keeps_just_the_record_sessions():
+    assert [f.name for f in pm.select(mixed(), records_only=True)] == REC
+    assert [f.name for f in pm.select(mixed())] == [
+        f.name for f in mixed()]
+
+
+def test_count_is_taken_after_the_filter():
+    """-n 2 with the filter is the newest two sessions, not whatever sessions
+    happen to be among the newest two files."""
+    assert [f.name for f in pm.select(mixed(), records_only=True,
+                                      count=2)] == REC[:2]
+
+
+def _main_against(monkeypatch, tmp_path, argv):
+    """main() with the car faked: what got listed, pulled and pruned."""
+    seen = {}
+    monkeypatch.setattr(pm, "survey", lambda car, dirs: (
+        mixed(), "active", 2002, set(), []))
+    monkeypatch.setattr(pm, "show", lambda files, *a, **k: seen.setdefault(
+        "shown", [f.name for f in files]))
+
+    def pull(car, files, dest, pulled_list=None):
+        seen["pulled"] = [f.name for f in files]
+        return files, []
+    monkeypatch.setattr(pm, "pull", pull)
+
+    def prune(car, files, dest, yes):
+        seen["pruned"] = [f.name for f in files]
+    monkeypatch.setattr(pm, "prune", prune)
+    assert pm.main(["--dest", str(tmp_path)] + argv) == 0
+    return seen
+
+
+def test_list_shows_what_the_filter_selects(monkeypatch, tmp_path):
+    seen = _main_against(monkeypatch, tmp_path, ["--records-only", "--list"])
+    assert seen["shown"] == REC
+    assert "pulled" not in seen
+
+
+def test_records_only_pulls_and_prunes_no_drive_log(monkeypatch, tmp_path):
+    seen = _main_against(monkeypatch, tmp_path,
+                         ["--records-only", "-n", "2", "--prune"])
+    assert seen["pulled"] == REC[:2]
+    assert seen["pruned"] == REC[:2]
+
+
+def test_without_the_flag_everything_is_pulled(monkeypatch, tmp_path):
+    seen = _main_against(monkeypatch, tmp_path, [])
+    assert seen["pulled"] == [f.name for f in mixed()]
+
+
+def test_a_filtered_out_drive_log_is_never_hashed_or_removed(monkeypatch,
+                                                             tmp_path):
+    """The real prune, given what --records-only kept, with a drive log on
+    the Mac that hashes the same as the car's: it still never comes up."""
+    contents = {n: n.encode() for n in REC + LOG}
+    sent = _fake_car(monkeypatch, tmp_path, contents)
+    hashed = []
+    real = pm.sha256_remote
+    monkeypatch.setattr(pm, "sha256_remote", lambda car, paths: (
+        hashed.extend(paths), real(car, paths))[1])
+    pm.prune("car", pm.select(mixed(), records_only=True), str(tmp_path),
+             yes=True)
+    assert not any(os.path.basename(p) in LOG for p in hashed)
+    rms = [c for c in sent if c.startswith("rm ")]
+    assert len(rms) == 1
+    assert not any(n in rms[0] for n in LOG)
+    assert all(n in rms[0] for n in REC)
+
 # ---------------------------------------------------------------------------
 # Counting reversals
 # ---------------------------------------------------------------------------
