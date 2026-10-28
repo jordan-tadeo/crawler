@@ -44,6 +44,21 @@ failure commands neutral. In the order they are checked:
                                     has nothing to say about it
   anything raises                   neutral, then the exception goes on up
                                     to AutoPilot.step(), which parks auto
+  the goal is reached               neutral, whatever the model said
+
+The goal
+--------
+The model's own "stop" is never committed on its own say. goal.Goal is the
+one source of whether the car has arrived, asked every decision; while it
+says no (always, for now) a stop answer is driven as the better of forward
+and reverse by the model's own logits, at the magnitude and steering the
+model gave -- the magnitude head is only ever trained on moving ticks, so
+it is a moving answer even on a stop. Only the model's choice is masked:
+every row above that commands neutral, the recover, and the floor's hold on
+a forward are all where they were, and a masked forward goes through the
+floor like any other. When the goal says yes, the tick is neutral with
+reason "goal reached". /footprint keeps the model's raw choice in
+policy_action and says goal_reached and policy_stop_masked beside it.
 
 It is handed main.DriverCommand as its controller, exactly as Driver is, so
 it never writes the hardware: AutoPilot.step() mixes in whatever groups my
@@ -150,6 +165,7 @@ import numpy as np
 
 import column_profile as cp
 import driver as dv
+import goal as gl
 import policy_imu as pimu
 
 # ---- the frame the model sees ----------------------------------------------
@@ -481,6 +497,10 @@ class Decision(NamedTuple):
     reason: str
     throttle: float = 0.0
     front: float = 0.0
+    # The model's own answer, when it is not `action`: a stop that was
+    # masked, or any answer on a tick the goal was reached. "" otherwise.
+    model_action: str = ""
+    stop_masked: bool = False
 
 
 def _in(value, low, high):
@@ -517,6 +537,17 @@ def read_output(outputs):
     return (ACTIONS[int(np.argmax(logits))], float(np.clip(mag[0], 0.0, 1.0)),
             float(np.clip(steer[0], -1.0, 1.0)),
             None if rear is None else float(np.clip(rear[0], -1.0, 1.0))), ""
+
+
+def moving_action(outputs):
+    """The better of forward and reverse by the model's action logits.
+
+    Only called on outputs read_output() has already checked, so the logits
+    are three finite numbers. A tie is forward, as argmax over all three is.
+    """
+    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
+    f, r = logits[ACTIONS.index(FORWARD)], logits[ACTIONS.index(REVERSE)]
+    return FORWARD if f >= r else REVERSE
 
 
 def model_label(meta, path):
@@ -614,9 +645,13 @@ class PolicyDriver(dv.Driver):
     and human_steering, whether my hand has the steering group.
     """
 
-    def __init__(self, controller, oakd, model, downsample=None):
+    def __init__(self, controller, oakd, model, downsample=None, goal=None):
         super().__init__(controller, oakd)
         self.model = model
+        # Whether the car has arrived: the only thing that lets a model stop
+        # be committed (goal.py). Asked every tick.
+        self.goal = goal if goal is not None else gl.Goal()
+        self.goal_reached = False
         self.downsample = downsample or downsample_for(model.contract)
         self._prev = (STOP, 0.0, 0.0)
         # The forward floor and its memory of the last second of scans. This
@@ -731,10 +766,13 @@ class PolicyDriver(dv.Driver):
             "policy_model": str(getattr(self.model, "label", "")
                                 or getattr(self.model, "sha256", "")),
             "policy_model_sha256": str(getattr(self.model, "sha256", "")),
-            "policy_action": d.action if d is not None else "",
+            # The model's own choice; committed_action is what was done.
+            "policy_action": (d.model_action or d.action) if d is not None else "",
             "policy_throttle": float(d.throttle) if d is not None else 0.0,
             "policy_steering_front": float(d.front) if d is not None else 0.0,
             "policy_reason": d.reason if d is not None else "",
+            "goal_reached": bool(self.goal_reached),
+            "policy_stop_masked": bool(d.stop_masked) if d is not None else False,
             "policy_infer_ms": float(self.last_infer_ms),
             # The mode the policy drove with, and the head's probability of
             # that mode on its last answer: low while it wants to switch. -1
@@ -764,6 +802,13 @@ class PolicyDriver(dv.Driver):
 
     def _tick(self, now):
         self._now = now
+        # First, so every row says it, whichever path the tick takes. A goal
+        # that raises is the exception path: neutral, and auto parks.
+        was = self.goal_reached
+        self.goal_reached = bool(self.goal.reached())
+        if self.goal_reached != was:
+            print("Goal reached - stopping." if self.goal_reached
+                  else "Goal no longer reached - driving on.")
         if self.recovering(now):
             # The recover's reverse, then its settle at 0, as the veto's
             # record of what the wheels were told.
@@ -834,6 +879,17 @@ class PolicyDriver(dv.Driver):
             if not self.human_steering:
                 self.mode.update(p_split, now)
 
+        if self.goal_reached:
+            self._neutral("goal reached")
+            self._note(self.last_decision._replace(model_action=action))
+            return
+        model_action = action
+        stop_masked = action == STOP
+        if stop_masked:
+            # Not arrived, so not a stop. Only the direction changes; the
+            # floor below still holds a forward, as it holds any other.
+            action = moving_action(outputs)
+
         reason = "model"
         if action == FORWARD and self.floor_veto.vetoes():
             # Blocks the forward, not the decision: the steering still goes
@@ -869,4 +925,5 @@ class PolicyDriver(dv.Driver):
             # Only a forward the driver itself commanded arms STUCK.
             self._clear_motion_evidence()
         self._prev = (action, magnitude, steer)
-        self._note(Decision(action, magnitude, steer, rear, reason, throttle, front))
+        self._note(Decision(action, magnitude, steer, rear, reason, throttle, front,
+                            model_action if stop_masked else "", stop_masked))

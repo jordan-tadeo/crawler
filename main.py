@@ -62,6 +62,7 @@ import time
 
 import camera
 import driver as dv
+import goal
 import Logger as lg
 
 MANUAL = "manual"
@@ -819,6 +820,9 @@ class AutoPilot:
         # --policy: a learned model's .onnx. None is the hand-written
         # autopilot, which is the default and stays the default.
         self.policy_path = policy_path
+        # Whether the car has arrived, for a learned driver's stop (goal.py).
+        # Never set yet; a person follower sets it on this object.
+        self.goal = goal.Goal()
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -910,7 +914,7 @@ class AutoPilot:
                         f"({model.representation}, {model.contract}, "
                         f"sha256 {model.sha256[:12]})")
         print(f"[auto] policy {model.label} sha256 {model.sha256}", file=sys.stderr)
-        return policy.PolicyDriver(self.command, view, model)
+        return policy.PolicyDriver(self.command, view, model, goal=self.goal)
 
     def step(self, now, takeover=None, split=False):
         """One pass of auto mode. False means hand the wheels back to manual.

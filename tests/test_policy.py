@@ -82,11 +82,88 @@ def test_forward_is_a_fraction_of_forward_speed_never_more():
     assert d.last_decision.action == pl.FORWARD
 
 
-def test_stop_takes_the_throttle_off_and_still_steers():
-    d = policy_driver(StubModel(STOP, throttle=0.9, steer=-0.25), clear())
+# --- the goal: the model's stop is only committed once the car has arrived ---
+
+def test_the_goal_is_never_reached_unless_something_says_so():
+    import goal as gl
+    assert gl.Goal().reached() is False
+    d = policy_driver(StubModel(FORWARD), clear())
+    assert d.goal.reached() is False
+    pilot = mn.AutoPilot(None, None)
+    assert pilot.goal.reached() is False
+
+
+@pytest.mark.parametrize("logits,want,speed", [
+    ((0.0, 1.0, 5.0), pl.REVERSE, "reverse_speed"),
+    ((1.0, 0.0, 5.0), pl.FORWARD, "forward_speed"),
+])
+def test_a_model_stop_short_of_the_goal_drives_the_better_of_forward_and_reverse(
+        logits, want, speed):
+    d = policy_driver(StubModel(logits, throttle=0.5, steer=-0.25), clear())
     d.tick(T0)
-    assert d.controller.throttles == [0]
+    assert d.controller.throttles[-1] == pytest.approx(0.5 * getattr(d, speed))
     assert d.controller.steerings[-1] == dv.steering_pair(-0.25 * pl.STEER_SCALE)
+    assert d.last_decision.action == want
+    assert d.last_decision.model_action == pl.STOP
+    assert d.last_decision.stop_masked
+    assert d.last_verdict.action == {pl.FORWARD: dv.ACT_FORWARD,
+                                     pl.REVERSE: dv.ACT_REVERSE}[want]
+    fields = d.policy_fields()
+    assert fields["policy_action"] == pl.STOP
+    assert fields["policy_stop_masked"] is True
+    assert fields["goal_reached"] is False
+
+
+def test_a_model_that_does_not_say_stop_is_not_masked():
+    d = policy_driver(StubModel(REVERSE, throttle=0.5), clear())
+    d.tick(T0)
+    assert not d.last_decision.stop_masked
+    assert d.policy_fields()["policy_action"] == pl.REVERSE
+
+
+def test_the_goal_reached_is_neutral_whatever_the_model_says():
+    import goal as gl
+    goal = gl.Goal()
+    d = pl.PolicyDriver(FakeController(), FakeCamera(depth=clear()),
+                        StubModel(FORWARD, throttle=1.0, steer=0.5), goal=goal)
+    d.tick(T0)
+    assert d.controller.throttles[-1] > 0
+    goal.set_reached(True)
+    d.tick(T0 + 0.1)
+    assert neutral(d)
+    assert d.last_decision.action == pl.STOP
+    assert d.last_decision.reason == "goal reached"
+    assert d.last_verdict.action == pl.STOP
+    fields = d.policy_fields()
+    assert fields["goal_reached"] is True
+    assert fields["policy_action"] == pl.FORWARD
+    assert fields["policy_stop_masked"] is False
+    # And a model stop with the goal reached is committed as a stop.
+    d.model.out["logits"] = np.array([STOP], dtype=np.float32)
+    d.tick(T0 + 0.2)
+    assert neutral(d) and d.last_decision.reason == "goal reached"
+    assert d.policy_fields()["policy_action"] == pl.STOP
+
+
+def test_the_floor_still_holds_a_masked_stop_that_comes_out_forward():
+    d = policy_driver(StubModel((1.0, 0.0, 5.0), throttle=1.0, steer=0.4), chair_leg())
+    d.tick(T0)
+    assert d.floor_veto.vetoes()
+    assert d.controller.throttles[-1] == 0.0
+    assert d.last_decision.reason == "model floor"
+    assert d.last_decision.stop_masked
+
+
+def test_every_safety_stop_still_stops_while_the_goal_is_not_reached():
+    # No frame, a blind frame, a bad output: neutral, and nothing masked.
+    for depth, out in ((None, None), (np.zeros((400, 640), dtype=np.uint16), None),
+                       (clear(), float("nan"))):
+        model = StubModel(STOP, throttle=1.0 if out is None else out)
+        d = policy_driver(model, depth)
+        d.tick(T0)
+        assert neutral(d), depth
+        assert not d.goal_reached
+        assert not d.policy_fields()["policy_stop_masked"]
 
 
 def test_full_steer_is_manuals_full_lock():
@@ -534,6 +611,29 @@ def test_footprint_rows_carry_the_models_own_command_under_my_hand(monkeypatch):
                if row["steer_by"] == mn.DRIVER)
 
 
+def test_footprint_rows_say_the_goal_and_the_masked_stop(monkeypatch):
+    import footprint as fp
+    import telemetry as tm
+    from test_record import SessionTele
+
+    tele = SessionTele()
+    out = run_policy(monkeypatch, StubModel((0.0, 1.0, 5.0), throttle=0.5), 30,
+                     lambda n, pad, cam: None, tele=tele, tap=fp.FootprintTap(tele=tele))
+    rows = [row for row, _ in tele.of("footprint")]
+    assert rows
+    props = tm.JSON_SCHEMAS["footprint"]["schema"]["properties"]
+    assert props["goal_reached"]["type"] == "boolean"
+    assert props["policy_stop_masked"]["type"] == "boolean"
+    for row in rows:
+        assert row["goal_reached"] is False
+        assert row["policy_stop_masked"] is True
+        assert row["policy_action"] == pl.STOP
+        assert row["committed_action"] == dv.ACT_REVERSE
+    assert fp.AUTOPILOT_FIELDS["goal_reached"] is False
+    assert fp.AUTOPILOT_FIELDS["policy_stop_masked"] is False
+    assert out["driver"].goal_reached is False
+
+
 def test_rows_under_the_rules_say_rules_and_record_rows_say_nobody():
     import footprint as fp
 
@@ -610,7 +710,10 @@ class ModeStub(StubModel):
     mode_switch = SWITCH
 
     def __init__(self, p_split=0.5, **kw):
-        kw.setdefault("logits", STOP)   # STOP still steers, and never arms STUCK
+        # A stop with no magnitude: driven on as a forward at 0, so it still
+        # steers and never arms STUCK.
+        kw.setdefault("logits", STOP)
+        kw.setdefault("throttle", 0.0)
         kw.setdefault("steer", 0.5)
         super().__init__(**kw)
         self.set_p(p_split)

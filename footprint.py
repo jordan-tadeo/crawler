@@ -88,6 +88,8 @@ AUTOPILOT_FIELDS = {
     "policy_throttle": 0.0,
     "policy_steering_front": 0.0,
     "policy_reason": "",
+    "goal_reached": False,       # goal.Goal said the car has arrived
+    "policy_stop_masked": False, # the model said stop and was driven on
     "policy_infer_ms": 0.0,
     "policy_steer_mode": "",     # unified / split: the mode the model drove with
     "policy_steer_mode_p": 0.0,  # the mode head's p of that mode; -1 with no head
@@ -106,8 +108,12 @@ def autopilot_fields(driver):
     try:
         for key, value in fields().items():
             if key in out:
-                out[key] = (str(value) if isinstance(out[key], str)
-                            else _num(value, 0.0))
+                if isinstance(out[key], bool):
+                    out[key] = bool(value)
+                elif isinstance(out[key], str):
+                    out[key] = str(value)
+                else:
+                    out[key] = _num(value, 0.0)
     except Exception:
         out["autopilot"] = "policy"
     return out

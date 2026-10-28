@@ -378,6 +378,12 @@ JSON_SCHEMAS = {
         "policy_throttle": _NUM,
         "policy_steering_front": _NUM,
         "policy_reason": _STR,
+        # Whether goal.Goal said the car had arrived (the only thing that
+        # lets a model stop be committed), and whether the model said stop
+        # on this tick and was driven on instead. policy_action is still the
+        # model's own choice; committed_action is what was done.
+        "goal_reached": _BOOL,
+        "policy_stop_masked": _BOOL,
         "policy_infer_ms": _NUM,
         # The steering mode the policy drove with, and its mode head's
         # probability of that mode (-1 for a model with no head).

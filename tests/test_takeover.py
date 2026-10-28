@@ -498,7 +498,8 @@ def standing_policy(command, cam):
     the rules would have backed away from half way in."""
     from test_policy import STOP, StubModel
     import policy as pl
-    return pl.PolicyDriver(command, cam, StubModel(STOP))
+    # Short of the goal its stop is driven on, at the magnitude it gave: 0.
+    return pl.PolicyDriver(command, cam, StubModel(STOP, throttle=0.0))
 
 
 def test_my_forward_stays_held_when_the_probe_goes_blind_on_the_way_in(monkeypatch):
