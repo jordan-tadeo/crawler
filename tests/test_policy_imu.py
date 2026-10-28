@@ -21,18 +21,15 @@ import depthai as dai
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "tools"))
-
-import footprint as fp  # noqa: E402
-import oakd  # noqa: E402
-import policy as pl  # noqa: E402
+from crawler.autopilot import footprint as fp  # noqa: E402
+from crawler.hardware import oakd  # noqa: E402
+from crawler.autopilot import policy as pl  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 import policy_dataset as pd  # noqa: E402
 import policy_eval as pe  # noqa: E402
-import policy_imu as pimu  # noqa: E402
+from crawler.autopilot import policy_imu as pimu  # noqa: E402
 import policy_train as pt  # noqa: E402
-import telemetry as tm  # noqa: E402
+from crawler.telemetry import telemetry as tm  # noqa: E402
 
 from conftest import FakeCamera, FakeController  # noqa: E402
 from test_policy_tools import footprint_session, row  # noqa: E402

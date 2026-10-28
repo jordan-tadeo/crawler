@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR"
 
 # Same precedence as deploy/install-service.sh, and the same reason: `env` is
@@ -34,4 +34,4 @@ else
   echo "Make one with: uv venv --python /usr/bin/python3 --system-site-packages && uv sync" >&2
 fi
 
-exec "$PYTHON" main.py --mode manual "$@"
+exec "$PYTHON" -m crawler --mode manual "$@"

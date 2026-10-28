@@ -15,7 +15,7 @@ import pytest
 
 pytest.importorskip("depthai", reason="depthai is not installed here")
 
-import oakd  # noqa: E402
+from crawler.hardware import oakd  # noqa: E402
 
 
 class FakePacket:

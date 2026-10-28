@@ -790,7 +790,7 @@ CRUISE_TURN_FRACTION = 0.5
 CRUISE_DEADBAND = 0.05
 
 # How long an evade is committed to once it starts, and the longest one
-# allowed. The autopilot decides at 10 Hz -- AUTO_TICK_INTERVAL in main.py,
+# allowed. The autopilot decides at 10 Hz -- AUTO_TICK_INTERVAL in crawler/__main__.py,
 # not the camera's 16 fps and not the control loop's 100 Hz -- so 0.5 s is
 # five decisions.
 #
@@ -1121,7 +1121,7 @@ FRAME_AGE_S = 0.088
 # How old the last scan may be and still clear my forward throttle past the
 # floor veto. Three decision ticks. A recover makes no scans, so for most of
 # one my forward trigger is held at 0 -- the camera has not been asked, and
-# no picture is not a clear picture. Reverse is never held. (main.py reads it
+# no picture is not a clear picture. Reverse is never held. (crawler/__main__.py reads it
 # from here: the floor is built on it.)
 FLOOR_SCAN_MAX_AGE = 0.3
 WORST_PICTURE_AGE_S = FRAME_AGE_S + FLOOR_SCAN_MAX_AGE

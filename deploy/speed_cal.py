@@ -50,12 +50,14 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 
+# Run by path on the car, possibly out of the old env/ venv that never
+# installed this project, so the checkout root goes on the path for `crawler`.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import driver as dv  # noqa: E402
-import main as car_main  # noqa: E402  (light: pygame, pigpio and depthai are all deferred)
+from crawler.autopilot import driver as dv  # noqa: E402
+import crawler.__main__ as car_main  # noqa: E402  (light: pygame, pigpio and depthai are all deferred)
 
 # ---------------------------------------------------------------------------
 # The protocol's numbers
@@ -246,7 +248,7 @@ class Recommendation(NamedTuple):
 
 def esc_pulse(throttle) -> int:
     """The pulse VehicleController.set_throttle sends for this value."""
-    import VehicleController as vc
+    from crawler.hardware import vehicle_controller as vc
     if throttle > 0:
         return int(vc.ESC_NEUTRAL_PW + throttle * (vc.ESC_FULL_FORWARD_PW - vc.ESC_NEUTRAL_PW))
     if throttle < 0:
@@ -802,8 +804,8 @@ class CarVehicle:
     """VehicleController, with the tool's own finite check on top of its own."""
 
     def __init__(self):
-        import Logger as lg
-        import VehicleController as vc
+        from crawler.telemetry import logger as lg
+        from crawler.hardware import vehicle_controller as vc
         self.vc = vc.VehicleController(logger=lg.Logger())
         self.vc.return_neutral()
 
@@ -824,7 +826,7 @@ class CarPad:
 
     def __init__(self, stop_event):
         import pygame
-        import Joystick as js
+        from crawler.hardware import joystick as js
         self.pygame = pygame
         self.js = js.Joystick(stop_event=stop_event)
 
@@ -870,7 +872,7 @@ class CarCamera:
 
     def __init__(self):
         import depthai as dai
-        from oakd import OakD
+        from crawler.hardware.oakd import OakD
         self.dai = dai
         self.oak = OakD(rectified=False)
 

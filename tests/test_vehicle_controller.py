@@ -14,7 +14,7 @@ import math
 
 import pytest
 
-import VehicleController as vc
+from crawler.hardware import vehicle_controller as vc
 
 
 # --- throttle endpoints -----------------------------------------------------
@@ -230,7 +230,7 @@ def test_reverse_cap_is_full_reverse_through_the_real_mapping(vecon):
     arithmetic, not a copy of it, and inside [-1, 0) so it is still a reverse
     and the clamp never moves it.
     """
-    import driver as dv
+    from crawler.autopilot import driver as dv
 
     assert -1.0 <= dv.REVERSE_SPEED < 0
     assert vecon.set_throttle(dv.REVERSE_SPEED) == vc.ESC_FULL_REVERSE_PW == 1000

@@ -15,11 +15,8 @@ import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "tools"))
-
-import models as md  # noqa: E402
-import policy_train as pt  # noqa: E402
+import models as md
+import policy_train as pt
 
 
 def sidecar(**over):

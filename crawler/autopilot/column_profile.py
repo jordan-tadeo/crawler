@@ -20,7 +20,7 @@ turn away is -- which is the half read_the_gradient() goes looking in.
 
 import numpy as np
 
-import driver as dv
+from crawler.autopilot import driver as dv
 
 PROFILE_COLUMNS = 32
 # nearest, median, valid fraction -- in that order, one row each.

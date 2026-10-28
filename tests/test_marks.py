@@ -26,7 +26,7 @@ import types
 
 import pytest
 
-import marks as mk
+from crawler.autopilot import marks as mk
 
 
 class FakeLogger:
@@ -195,7 +195,7 @@ def test_a_mark_is_a_window_not_an_instant(markpad, pad):
 
 def test_the_lookback_covers_a_whole_recovery_cycle():
     """reverse 2.0 + settle 0.5, and then the approach that caused it."""
-    import driver as dv
+    from crawler.autopilot import driver as dv
 
     assert (mk.MARK_LOOKBACK_SECONDS
             > dv.REVERSE_SECONDS + dv.SETTLE_SECONDS)
@@ -266,7 +266,7 @@ def test_a_mark_during_a_recover_says_which_phase(markpad, pad):
 
 def test_motion_evidence_does_not_feed_the_stuck_detector(markpad, pad):
     """The whole reason this does not call driver.motion_evidence()."""
-    import driver as dv
+    from crawler.autopilot import driver as dv
 
     driver = FakeDriver()
     driver.gyro_history = [0.5, 0.5]
@@ -283,7 +283,7 @@ def test_motion_evidence_does_not_feed_the_stuck_detector(markpad, pad):
 
 
 def test_a_still_car_reads_still(markpad, pad):
-    import driver as dv
+    from crawler.autopilot import driver as dv
 
     driver = FakeDriver()
     driver.gyro_history = [0.001]
@@ -593,7 +593,7 @@ def test_the_mark_is_offered_on_the_marks_channel(markpad, pad):
 
 def test_marks_is_a_real_telemetry_channel():
     """A channel the recorder picks up needs to be in the registry."""
-    import telemetry as tm
+    from crawler.telemetry import telemetry as tm
 
     assert tm.JSON_TOPICS["marks"] == "/marks"
     assert "marks" in tm.ALL_KEYS
@@ -606,7 +606,7 @@ def test_marks_is_a_real_telemetry_channel():
 
 
 def test_the_counts_are_in_the_diagnostics_schema():
-    import telemetry as tm
+    from crawler.telemetry import telemetry as tm
 
     properties = tm.JSON_SCHEMAS["diagnostics"]["schema"]["properties"]
     assert set(mk.MarkPad().counts()) <= set(properties)
@@ -614,15 +614,15 @@ def test_the_counts_are_in_the_diagnostics_schema():
 
 def test_marks_has_no_rate_gate():
     """A rate gate on an event channel is a lost press."""
-    import telemetry as tm
+    from crawler.telemetry import telemetry as tm
 
     assert tm.INTERVALS["marks"] == 0.0
 
 
 def test_the_control_loop_polls_the_mark_buttons():
-    """main.py has to actually call it, on every tick, in both modes."""
+    """crawler/__main__.py has to actually call it, on every tick, in both modes."""
     source = open(os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "main.py")).read()
+        os.path.abspath(__file__))), "crawler", "__main__.py")).read()
     loop = source.split("def control_loop", 1)[1].split("\ndef ", 1)[0]
     assert "markpad.poll(" in loop
     assert "markpad.counts()" in loop

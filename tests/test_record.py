@@ -25,13 +25,13 @@ import pathlib
 import numpy as np
 import pytest
 
-import camera
-import driver as dv
-import footprint as fp
-import main as mn
-import policy_input
-import recording
-import telemetry as tm
+from crawler.hardware import camera
+from crawler.autopilot import driver as dv
+from crawler.autopilot import footprint as fp
+import crawler.__main__ as mn
+from crawler.autopilot import policy_input
+from crawler.telemetry import recording
+from crawler.telemetry import telemetry as tm
 
 from test_main import FakeLogger, FakeMarkPad, FakePad, FakeVecon, TickLimit
 
@@ -301,12 +301,12 @@ class YPad:
 
 
 def test_y_is_the_record_button_and_nothing_else_reads_it():
-    import Joystick as js
+    from crawler.hardware import joystick as js
 
     assert mn.RECORD_BUTTON == "Y"
     assert js.XBOX_BUTTONS["Y"] == 3
     others = {mn.MODE_TOGGLE_BUTTON, mn.STEER_SPLIT_BUTTON}
-    import marks as mk
+    from crawler.autopilot import marks as mk
     others |= set(mk.BUTTON_KINDS)
     assert "Y" not in others
 
@@ -955,7 +955,8 @@ def test_release_returns_at_once_and_the_hub_can_open_again(monkeypatch):
         get_disparity_frame = get_rectified_left_frame = get_depth_frame
         get_imu_sample = get_depth_frame
 
-    monkeypatch.setitem(sys.modules, "oakd", types.SimpleNamespace(OakD=SlowOakD))
+    monkeypatch.setitem(sys.modules, "crawler.hardware.oakd",
+                        types.SimpleNamespace(OakD=SlowOakD))
     hub = camera.CameraHub()
     hub.start()
     assert hub.wait_ready(5)
@@ -1087,7 +1088,7 @@ def test_a_stale_read_never_counts_as_let_go():
 
 
 def test_triggers_at_rest_reads_both_triggers_against_their_rest():
-    import Joystick as js
+    from crawler.hardware import joystick as js
 
     class Handle:
         def __init__(self):

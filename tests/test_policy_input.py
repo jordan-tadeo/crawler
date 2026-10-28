@@ -5,7 +5,7 @@ import pathlib
 import numpy as np
 import pytest
 
-import policy_input as pi
+from crawler.autopilot import policy_input as pi
 
 
 def test_640x400_comes_out_80x50_uint16_millimetres():
@@ -93,6 +93,7 @@ def test_another_size_is_cut_into_its_own_blocks_and_still_80x50():
 
 def test_nothing_else_in_the_repo_shrinks_a_frame_for_the_policy():
     """The function must not drift: the tap and the dump both call this one."""
-    root = pathlib.Path(pi.__file__).parent
-    for path in (root / "footprint.py", root / "deploy" / "footprint_dump.py"):
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for path in (root / "crawler" / "autopilot" / "footprint.py",
+                 root / "deploy" / "footprint_dump.py"):
         assert "policy_input.depth_small(" in path.read_text(), path

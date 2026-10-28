@@ -30,7 +30,7 @@ byte: the check that training and the car shrink a frame the same way.
 --small DIR writes the policy pictures, one DIR/<recording>.npz per file:
 `depth` (N, 50, 80) uint16 mm, `seq` and `log_time_ns` (N,), in row order,
 so `depth[i]` pairs with the row whose seq is `seq[i]`. Schema of both
-topics: TRAINING_DATA.md.
+topics: docs/TRAINING_DATA.md.
 
 Reads in streaming order, so a file that never reached close() -- the battery
 out mid-session -- dumps the same as one that did.
@@ -175,9 +175,9 @@ def verify(row, frame, small=None):
     be policy_input.depth_small(frame) exactly.
     """
     _repo()
-    import driver as dv
+    from crawler.autopilot import driver as dv
     import numpy as np
-    import policy_input
+    from crawler.autopilot import policy_input
 
     scan = dv.free_by_column(frame)
     verdict = dv.read_the_gradient(scan)

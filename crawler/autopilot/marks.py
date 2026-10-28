@@ -39,8 +39,8 @@ import queue
 import threading
 import time
 
-import Logger as lg
-import telemetry as tm
+from crawler.telemetry import logger as lg
+from crawler.telemetry import telemetry as tm
 
 # Which button means what.
 #
@@ -437,7 +437,7 @@ class MarkPad:
         same question without touching them.
         """
         try:
-            import driver as dv
+            from crawler.autopilot import driver as dv
 
             gyro = list(getattr(driver, "gyro_history", []) or [])
             accel = list(getattr(driver, "imu_history", []) or [])

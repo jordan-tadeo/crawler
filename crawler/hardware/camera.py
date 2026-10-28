@@ -42,7 +42,7 @@ anything on it that can raise.
 import threading
 import time
 
-import telemetry as tm
+from crawler.telemetry import telemetry as tm
 
 # How often the reader thread asks the device for new packets. The depth
 # stream delivers 16.0 fps -- oakd.CAPTURE_FPS, measured over 600 frames on
@@ -253,7 +253,7 @@ class CameraHub:
     def _open(self):
         """The multi-second blocking construct, on a thread nobody waits on."""
         try:
-            from oakd import OakD
+            from crawler.hardware.oakd import OakD
             oakd = OakD(rectified=self.rectified)
         except BaseException as e:
             # BaseException on purpose. depthai is a native extension and a

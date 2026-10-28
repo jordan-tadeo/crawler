@@ -1,6 +1,6 @@
 from typing import Tuple
 import math
-import Logger
+from crawler.telemetry import logger as Logger
 
 # pigpio, board, busio, adafruit_pca9685 and adafruit_motor are imported
 # inside __init__, not here. None of them exist off the Pi, and at module

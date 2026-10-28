@@ -69,6 +69,13 @@ requirements.txt
 # pytest's cache.
 .pytest_cache/
 
+# What `uv sync` leaves behind when it installs crawler/ as editable.
+*.egg-info/
+build/
+
+# Where I send a test run's output to read it back.
+out.txt
+
 # Where pull-recordings.sh used to drop what it fetched off the car. It puts
 # them in ~/crawler-data/mcap now, outside any repo, and refuses a
 # destination inside one; this stays for the copies already sitting here.

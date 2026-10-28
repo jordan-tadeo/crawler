@@ -20,12 +20,12 @@ import pathlib
 import numpy as np
 import pytest
 
-import camera
-import column_profile as cp
-import driver as dv
-import footprint as fp
-import main as mn
-import policy as pl
+from crawler.hardware import camera
+from crawler.autopilot import column_profile as cp
+from crawler.autopilot import driver as dv
+from crawler.autopilot import footprint as fp
+import crawler.__main__ as mn
+from crawler.autopilot import policy as pl
 
 from conftest import FakeCamera, FakeController
 
@@ -85,7 +85,7 @@ def test_forward_is_a_fraction_of_forward_speed_never_more():
 # --- the goal: the model's stop is only committed once the car has arrived ---
 
 def test_the_goal_is_never_reached_unless_something_says_so():
-    import goal as gl
+    from crawler.autopilot import goal as gl
     assert gl.Goal().reached() is False
     d = policy_driver(StubModel(FORWARD), clear())
     assert d.goal.reached() is False
@@ -122,7 +122,7 @@ def test_a_model_that_does_not_say_stop_is_not_masked():
 
 
 def test_the_goal_reached_is_neutral_whatever_the_model_says():
-    import goal as gl
+    from crawler.autopilot import goal as gl
     goal = gl.Goal()
     d = pl.PolicyDriver(FakeController(), FakeCamera(depth=clear()),
                         StubModel(FORWARD, throttle=1.0, steer=0.5), goal=goal)
@@ -406,7 +406,7 @@ def test_a_rear_head_is_read_and_checked_when_there_is_one():
 # --- the inputs -----------------------------------------------------------------
 
 def test_the_depth_small_contract_is_the_recordings_own_function():
-    import policy_input
+    from crawler.autopilot import policy_input
 
     assert pl.downsample_for(pl.CONTRACT_DEPTH_SMALL) is policy_input.depth_small
 
@@ -586,8 +586,8 @@ def test_my_throttle_takes_over_from_the_model_and_leaves_it_the_steering(monkey
 
 
 def test_footprint_rows_carry_the_models_own_command_under_my_hand(monkeypatch):
-    import footprint as fp
-    import telemetry as tm
+    from crawler.autopilot import footprint as fp
+    from crawler.telemetry import telemetry as tm
     import test_takeover as tk
     from test_record import SessionTele
 
@@ -612,8 +612,8 @@ def test_footprint_rows_carry_the_models_own_command_under_my_hand(monkeypatch):
 
 
 def test_footprint_rows_say_the_goal_and_the_masked_stop(monkeypatch):
-    import footprint as fp
-    import telemetry as tm
+    from crawler.autopilot import footprint as fp
+    from crawler.telemetry import telemetry as tm
     from test_record import SessionTele
 
     tele = SessionTele()
@@ -635,7 +635,7 @@ def test_footprint_rows_say_the_goal_and_the_masked_stop(monkeypatch):
 
 
 def test_rows_under_the_rules_say_rules_and_record_rows_say_nobody():
-    import footprint as fp
+    from crawler.autopilot import footprint as fp
 
     assert fp.autopilot_fields(None) == fp.AUTOPILOT_FIELDS
     assert fp.AUTOPILOT_FIELDS["autopilot"] == ""
@@ -649,7 +649,7 @@ def test_rows_under_the_rules_say_rules_and_record_rows_say_nobody():
     assert fields["policy_throttle"] == pytest.approx(0.5 * d.reverse_speed)
 
 
-# --- main.py: opt-in, and loud when it fails ----------------------------------
+# --- crawler/__main__.py: opt-in, and loud when it fails ----------------------------------
 
 class ReadyHub:
     state = camera.READY
@@ -887,7 +887,7 @@ def test_l3_in_policy_auto_reaches_the_model_and_the_footprint_rows(monkeypatch)
     """Through the real control loop: L3 at 1 s switches the policy to split,
     the rear goes straight, and the rows say so; my left stick after that
     takes the steering in my mode."""
-    import footprint as fp
+    from crawler.autopilot import footprint as fp
     import test_takeover as tk
     from test_record import SessionTele
 

@@ -373,7 +373,7 @@ def tick_holes(tick_times, span_end, gap=PAD_HOLE_S):
     """Stretches with no /vehicle tick longer than gap, as [(start, s)],
     including one running off the end of the file.
 
-    This is how a lost pad shows up in a recording. main.py parks the loop
+    This is how a lost pad shows up in a recording. crawler/__main__.py parks the loop
     while the pad is gone, so /vehicle and /controller just stop; the one
     /diagnostics row meant to say "disconnected" is behind the 4 Hz rate gate
     and, in every file checked, never made it in.

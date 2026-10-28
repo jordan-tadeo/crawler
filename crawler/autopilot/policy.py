@@ -13,7 +13,7 @@ and it is a Driver: the recover phase machine, the stuck detector, the rear
 bumper and the footprint scan are all inherited, not copied. The only thing
 the model replaces is the verdict.
 
-It is opt-in. main.py builds one only when --policy names a model file, and
+It is opt-in. crawler/__main__.py builds one only when --policy names a model file, and
 with no flag the car runs exactly the autopilot it runs today.
 
 What the model can never do
@@ -163,10 +163,10 @@ from typing import NamedTuple
 
 import numpy as np
 
-import column_profile as cp
-import driver as dv
-import goal as gl
-import policy_imu as pimu
+from crawler.autopilot import column_profile as cp
+from crawler.autopilot import driver as dv
+from crawler.autopilot import goal as gl
+from crawler.autopilot import policy_imu as pimu
 
 # ---- the frame the model sees ----------------------------------------------
 
@@ -180,7 +180,7 @@ DEPTH_SCALE_MM = 3000.0
 # Where the recording's downsample lives. The ONE place the name is written:
 # the dataset tool and the runtime both resolve it through
 # depth_small_function(), so if the module is renamed this is the edit.
-DEPTH_SMALL_MODULE = "policy_input"
+DEPTH_SMALL_MODULE = "crawler.autopilot.policy_input"
 DEPTH_SMALL_FUNCTION = "depth_small"
 
 CONTRACT_DEPTH_SMALL = "depth_small"

@@ -11,7 +11,7 @@ on the wheels, and the IMU. In auto it writes the same three for the
 autopilot's own decisions, off the frame the driver scanned. The nine-probe
 footprint scan and the gradient rules' verdict ride along in the same row:
 they are what the hand-written driver would have done, which is the baseline
-a learned one has to beat. The schema is in TRAINING_DATA.md.
+a learned one has to beat. The schema is in docs/TRAINING_DATA.md.
 
 Nothing in here is a second copy of the rules. The scan is
 driver.free_by_column() and the verdict is driver.read_the_gradient(), called,
@@ -50,9 +50,9 @@ PNG encode is on the publisher thread.
 import math
 import time
 
-import driver as dv
-import policy_imu
-import policy_input
+from crawler.autopilot import driver as dv
+from crawler.autopilot import policy_imu
+from crawler.autopilot import policy_input
 
 # The decision rate. main.AUTO_TICK_INTERVAL is the same number; it is not
 # imported from there because main imports this file.
@@ -76,7 +76,7 @@ PAD = "pad"
 # Who was driving auto's "driver" groups, and what a learned one asked for.
 # Every row carries all of these, empty when they do not apply, so the
 # columns are the same in every row: autopilot is "" in record, "rules" for
-# the hand-written driver and "policy" for main.py --policy. The policy_*
+# the hand-written driver and "policy" for python -m crawler --policy. The policy_*
 # fields are the model's own command after its floor veto -- what it would
 # have put on the wheels, which the row's throttle / steering_* are not
 # while my hand has a group.

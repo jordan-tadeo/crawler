@@ -20,15 +20,15 @@ CAR_NAME = "jtpi.local"
 
 # Where an address would be written if it were written anywhere.
 SEARCHED = (
-    "pull-recordings.sh",
-    "run.sh",
-    "telemetry.py",
-    "main.py",
+    "scripts/pull-recordings.sh",
+    "scripts/run.sh",
+    "crawler/telemetry/telemetry.py",
+    "crawler/__main__.py",
     "README.md",
     "deploy/mcap_check.py",
     "deploy/install-service.sh",
     "deploy/crawler.service.template",
-    "models.sh",
+    "scripts/models.sh",
     "tools/models.py",
 )
 
@@ -46,18 +46,18 @@ def read(name):
 
 
 def test_pull_recordings_reaches_the_car_by_name():
-    source = read("pull-recordings.sh")
+    source = read("scripts/pull-recordings.sh")
     assert f'CAR="${{CRAWLER_HOST:-jt@{CAR_NAME}}}"' in source
 
 
 def test_the_host_override_is_still_there():
     """A network with no mDNS still needs a way in."""
-    assert "CRAWLER_HOST" in read("pull-recordings.sh")
+    assert "CRAWLER_HOST" in read("scripts/pull-recordings.sh")
 
 
 def test_the_foxglove_url_is_the_name_too():
     assert f"ws://{CAR_NAME}:8765" in read("README.md")
-    assert f"ws://{CAR_NAME}:8765" in read("telemetry.py")
+    assert f"ws://{CAR_NAME}:8765" in read("crawler/telemetry/telemetry.py")
 
 
 def test_no_file_is_pinned_to_an_address():

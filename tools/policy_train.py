@@ -80,12 +80,14 @@ import sys
 
 import numpy as np
 
+# The training venv (~/crawler-train) does not install this project, so the
+# checkout root goes on the path for `import crawler`. Under `uv run` it is
+# installed already and this is a no-op.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import column_profile as cp  # noqa: E402
-import policy as pl  # noqa: E402
-import policy_imu as pimu  # noqa: E402
+from crawler.autopilot import column_profile as cp  # noqa: E402
+from crawler.autopilot import policy as pl  # noqa: E402
+from crawler.autopilot import policy_imu as pimu  # noqa: E402
 import policy_eval as pe  # noqa: E402
 
 GOOD_WEIGHT = 2.0

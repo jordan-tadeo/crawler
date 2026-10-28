@@ -16,7 +16,7 @@
     python3 tools/models.py attach 1.2 --evidence ab.json --gate-note "won held-out A/B"
     python3 tools/models.py demote 2.0 --tag imu-1028 --reason "..."
 
-models.sh runs this. Standard library only, so plain python3 on the Mac runs
+scripts/models.sh runs this. Standard library only, so plain python3 on the Mac runs
 it; nothing in here imports pigpio or commands a wheel.
 
 Names. A version number means "better than the version before it", the way a
@@ -73,7 +73,7 @@ model_name / model_version ("1.3", or "candidate <tag>") so the car can say
 which model drove (policy.model_label, the /footprint policy_model field).
 Nothing is overwritten.
 
-Deploy. The service runs `main.py --policy models/policy.onnx`, and
+Deploy. The service runs `python -m crawler --policy models/policy.onnx`, and
 models/policy.onnx and models/policy.json are symlinks on the car. deploy
 copies the model's files into the car's models/ if they are not there, checks
 their sha256 on the car, and then -- in one ssh, behind a fresh parked check --
@@ -103,9 +103,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import pull_mcaps as pm  # noqa: E402
+import pull_mcaps as pm
 
 FAMILY = "kblock"
 MODELS_DIR = os.path.expanduser(os.environ.get("CRAWLER_MODELS", "~/crawler-data/models"))
@@ -126,7 +124,7 @@ EVIDENCE_METRICS = ("reverse_recall", "reverse_precision", "steer_mae",
 
 CAR_REPO = "/home/jt/Documents/py/crawler"
 CAR_MODELS = CAR_REPO + "/models"
-# What the service is started with: main.py --policy models/policy.onnx, and
+# What the service is started with: python -m crawler --policy models/policy.onnx, and
 # PolicyModel reads the .json beside whatever path it is given.
 LINK_ONNX = "policy.onnx"
 LINK_JSON = "policy.json"
@@ -688,7 +686,7 @@ def promote(tag, models_dir=MODELS_DIR, evidence=None, approved_on_car=False,
 
     if not approved_on_car:
         raise SystemExit(f"Refusing: {cand['label']} needs --approved-on-car. Deploy it "
-                         f"(./models.sh deploy {cand['onnx'][:-5]}), drive it, and "
+                         f"(./scripts/models.sh deploy {cand['onnx'][:-5]}), drive it, and "
                          f"promote it once it drove well.")
     ev = None
     if evidence is not None:
@@ -1106,7 +1104,7 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
         out("UNHEALTHY after the restart:")
         for p in problems:
             out(f"  {p}")
-        out("Roll back with: ./models.sh rollback")
+        out("Roll back with: ./scripts/models.sh rollback")
         return 1
     out(f"healthy: active, NRestarts {h.get('nrestarts')}, listening on {PORT}, "
         f"throttle {h.get('pulse')}, no Traceback. {entry['label']} drives.")
@@ -1239,7 +1237,7 @@ def cmd_register(args):
         print(f"  evidence {entry['evidence']['file']} vs {entry['evidence']['baseline']}:")
         for line in describe_checks(entry["evidence"]["summary"]):
             print(f"    {line}")
-    print(f"  test drive: ./models.sh deploy {entry['onnx'][:-5]}")
+    print(f"  test drive: ./scripts/models.sh deploy {entry['onnx'][:-5]}")
     return 0
 
 

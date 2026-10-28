@@ -8,7 +8,7 @@ the car has two steering servos and a corner wants both of them, counter-phase.
 The left stick now drives both, and it does it by calling
 driver.steering_pair(), the same function every auto steering decision goes
 through. That shared call is the point and there is a test below whose whole
-job is to fail if somebody copies the arithmetic into main.py instead: turn
+job is to fail if somebody copies the arithmetic into crawler/__main__.py instead: turn
 REAR_STEER_RATIO and manual has to follow it. Nobody has yet put the wheels off
 the ground and confirmed that (f, -f) is counter-phase rather than a crab on
 this linkage, so the one-definition property is what makes that answer a
@@ -33,8 +33,8 @@ import threading
 
 import pytest
 
-import driver as dv
-import main as mn
+from crawler.autopilot import driver as dv
+import crawler.__main__ as mn
 
 
 def limited(value):
@@ -92,7 +92,7 @@ class FakePad:
         self.script = list(script or [])
         self.frames = 0
 
-    # ---- what main.py reads ---------------------------------------------
+    # ---- what crawler/__main__.py reads ---------------------------------------------
     def read_throttle(self):
         if self.raises:
             raise RuntimeError("stale handle")
@@ -411,7 +411,7 @@ def test_the_journal_says_which_way_the_toggle_went(pad, log):
 def test_l3_is_a_button_nothing_else_reads(log):
     """LS was measured at 9 and left unread. If the mode toggle or a mark ever
     lands on the same index, one press would do two things."""
-    import Joystick as js
+    from crawler.hardware import joystick as js
 
     assert mn.STEER_SPLIT_BUTTON == "LS"
     assert mn.STEER_SPLIT_BUTTON != mn.MODE_TOGGLE_BUTTON
@@ -552,7 +552,7 @@ def test_the_loop_publishes_which_mapping_is_in_force(pad, log, monkeypatch):
 
 def test_the_published_field_is_in_the_vehicle_schema():
     """A field Studio has no schema for is a field Studio will not plot."""
-    import telemetry as tm
+    from crawler.telemetry import telemetry as tm
 
     properties = tm.JSON_SCHEMAS["vehicle"]["schema"]["properties"]
     assert properties["steering_mode"] == {"type": "string"}

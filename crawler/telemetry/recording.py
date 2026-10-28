@@ -44,7 +44,7 @@ measured below, or years of hand driving with the camera shut.
 
 What it costs, measured on the car
 ----------------------------------
-A 100 Hz replica of main.py's telemetry block, 120 s a condition, camera up,
+A 100 Hz replica of crawler/__main__.py's telemetry block, 120 s a condition, camera up,
 nothing connected to the socket:
 
                               block on the control thread        process
@@ -219,7 +219,9 @@ def _repo_path(path: str) -> str:
     """
     if os.path.isabs(path):
         return path
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    # crawler/telemetry/recording.py, so the checkout root is three levels up.
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), path)
 
 
 def segment_name(when=None, pid=None, index=0, prefix=PREFIX) -> str:

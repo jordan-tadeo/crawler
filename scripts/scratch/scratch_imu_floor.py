@@ -11,11 +11,11 @@ Run it twice, same duration both times:
 
     # 1. the floor. Car parked, powered, ESC armed, hands off.
     sudo systemctl stop crawler
-    .venv/bin/python scratch_imu_floor.py 60
+    .venv/bin/python scripts/scratch/scratch_imu_floor.py 60
 
     # 2. the signal. Wheels up on the stand, or rock the car by hand the
     #    whole time -- anything that is genuinely chassis movement.
-    .venv/bin/python scratch_imu_floor.py 60
+    .venv/bin/python scripts/scratch/scratch_imu_floor.py 60
     sudo systemctl start crawler
 
 GYRO_MOVING_MIN wants to sit between the parked max and the moving p05. If
@@ -32,7 +32,7 @@ import statistics
 import sys
 import time
 
-import camera
+from crawler.hardware import camera
 
 TICK = 0.1  # the driver's own tick rate, so this sees what the driver sees
 

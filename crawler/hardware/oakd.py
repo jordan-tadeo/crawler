@@ -34,7 +34,7 @@ the same packets. Everything in here now is a raw frame off one queue.
 import depthai as dai
 import numpy as np
 
-import policy_imu
+from crawler.autopilot import policy_imu
 
 
 def frame_from_payload(packet, label=""):

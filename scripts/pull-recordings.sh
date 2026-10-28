@@ -6,13 +6,13 @@
 # is something Foxglove Studio will actually accept, and repairs the ones that
 # are not.
 #
-#   ./pull-recordings.sh              # everything new into ~/crawler-data/mcap
-#   ./pull-recordings.sh -n 20        # only the newest 20
-#   ./pull-recordings.sh --records-only   # only the Y-button training sessions, not the drive logs
-#   ./pull-recordings.sh --list       # just say what is on the car, and what is live
-#   ./pull-recordings.sh -o ~/Desktop/crawl
-#   ./pull-recordings.sh --prune      # say which car copies are safe to delete
-#   ./pull-recordings.sh --prune --yes
+#   ./scripts/pull-recordings.sh              # everything new into ~/crawler-data/mcap
+#   ./scripts/pull-recordings.sh -n 20        # only the newest 20
+#   ./scripts/pull-recordings.sh --records-only   # only the Y-button training sessions, not the drive logs
+#   ./scripts/pull-recordings.sh --list       # just say what is on the car, and what is live
+#   ./scripts/pull-recordings.sh -o ~/Desktop/crawl
+#   ./scripts/pull-recordings.sh --prune      # say which car copies are safe to delete
+#   ./scripts/pull-recordings.sh --prune --yes
 #
 # Then: open -a Foxglove, and drag the file in. Open connection is for live;
 # a file is File -> Open local file, or just a drag onto the window.
@@ -45,7 +45,7 @@ set -euo pipefail
 # CRAWLER_HOST=jt@<address> still overrides it for a network with no mDNS.
 CAR="${CRAWLER_HOST:-jt@jtpi.local}"
 export CRAWLER_HOST="$CAR"
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${CRAWLER_DATA:-$HOME/crawler-data/mcap}"
 ARGS=()
 LIST_ONLY=0

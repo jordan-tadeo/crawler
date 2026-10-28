@@ -58,7 +58,9 @@ ExecStartPre=/bin/sh -c 'until "@PIGS@" t >/dev/null 2>&1; do sleep 0.25; done'
 #   --telemetry-port N   if 8765 is ever taken.
 # Whatever the flag says, the interpreter above has to have foxglove-sdk in
 # it. Without it the car drives exactly as before and the log says so.
-ExecStart="@PYTHON@" "@REPO_DIR@/main.py" --mode manual
+# -m, with WorkingDirectory above at the checkout: python finds the crawler
+# package there, so this works out of env/ too, which never installed it.
+ExecStart="@PYTHON@" -m crawler --mode manual
 # The last line of defence. If the process was SIGKILLed, or crashed hard, or
 # TimeoutStopSec ran out, nothing in Python got to disarm anything -- and
 # pigpio keeps emitting the last pulse width it was handed, so the car is still
@@ -69,7 +71,7 @@ ExecStart="@PYTHON@" "@REPO_DIR@/main.py" --mode manual
 ExecStopPost=-@PIGS@ servo 18 0
 Restart=on-failure
 RestartSec=5
-# Give main.py time to unwind through vecon.close() so the ESC is left at
+# Give the app time to unwind through vecon.close() so the ESC is left at
 # neutral instead of holding its last pulse width.
 KillSignal=SIGTERM
 TimeoutStopSec=15

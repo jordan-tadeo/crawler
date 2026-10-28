@@ -119,13 +119,15 @@ from typing import NamedTuple
 
 import numpy as np
 
+# The training venv (~/crawler-train) does not install this project, so the
+# checkout root goes on the path for `import crawler`. Under `uv run` it is
+# installed already and this is a no-op.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import driver as dv  # noqa: E402
-import policy as pl  # noqa: E402
+from crawler.autopilot import driver as dv  # noqa: E402
+from crawler.autopilot import policy as pl  # noqa: E402
 import policy_adapters as pa  # noqa: E402
-import policy_imu as pimu  # noqa: E402
+from crawler.autopilot import policy_imu as pimu  # noqa: E402
 
 TICK_S = 0.1
 # Slack on the 10 Hz sampling of a 20 Hz channel, so jitter in /vehicle does

@@ -21,7 +21,7 @@ import types
 
 import pytest
 
-import recording
+from crawler.telemetry import recording
 
 
 class FakeLogger:
@@ -443,5 +443,7 @@ def test_a_relative_directory_is_anchored_to_the_checkout():
     recorder = recording.Recorder(directory="log/mcap")
     assert os.path.isabs(recorder.directory)
     assert recorder.directory.endswith(os.path.join("log", "mcap"))
-    assert recorder.directory.startswith(
-        os.path.dirname(os.path.abspath(recording.__file__)))
+    # The checkout root, three levels up from crawler/telemetry/recording.py.
+    assert recorder.directory == os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(recording.__file__)))), "log", "mcap")

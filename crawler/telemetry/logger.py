@@ -4,8 +4,9 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
 # This checkout, worked out from where this file sits rather than from where
-# the process happens to be standing.
-REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+# the process happens to be standing: crawler/telemetry/logger.py, so three
+# levels up. log/ and app.log land at the checkout root, as they always have.
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _prepare(path):
@@ -24,7 +25,7 @@ def _prepare(path):
 
     The checkout: the unit does set WorkingDirectory to this directory, so
     relative paths resolve correctly there today. But that is the unit's
-    promise, not a property of the code -- run main.py from anywhere else, or
+    promise, not a property of the code -- start the car from anywhere else, or
     change that line, and the logs quietly land somewhere else. Anchoring here
     means `log/vehicle_state_log.csv` is the same file whoever starts the car.
     An absolute path handed in is left exactly as it was given.

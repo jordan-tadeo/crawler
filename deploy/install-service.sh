@@ -76,8 +76,8 @@ if [[ ! -f "$TEMPLATE" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$REPO_DIR/main.py" ]]; then
-  echo "No main.py in $REPO_DIR -- is this the checkout?" >&2
+if [[ ! -f "$REPO_DIR/crawler/__main__.py" ]]; then
+  echo "No crawler/__main__.py in $REPO_DIR -- is this the checkout?" >&2
   exit 1
 fi
 

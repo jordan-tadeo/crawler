@@ -9,8 +9,8 @@ with no pad the camera's channels are not written at all.
 
 import pytest
 
-import main as mn
-import telemetry as tm
+import crawler.__main__ as mn
+from crawler.telemetry import telemetry as tm
 
 from test_main import FakePad
 from test_record import ENTRY, STEP, FakeRecorder, hold_y, run
@@ -150,7 +150,7 @@ def test_a_heard_that_raises_is_a_dead_handle():
 
 def test_joystick_heard_is_the_handle_answering(monkeypatch):
     import pygame
-    import Joystick as js
+    from crawler.hardware import joystick as js
 
     class Handle:
         raises = False

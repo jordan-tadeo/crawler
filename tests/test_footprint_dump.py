@@ -14,10 +14,10 @@ import os
 import numpy as np
 import pytest
 
-import driver as dv
-import footprint as fp
-import policy_input
-import telemetry as tm
+from crawler.autopilot import driver as dv
+from crawler.autopilot import footprint as fp
+from crawler.autopilot import policy_input
+from crawler.telemetry import telemetry as tm
 
 _PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "deploy", "footprint_dump.py")

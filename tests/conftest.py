@@ -14,7 +14,7 @@ arithmetic had never run anywhere but on the car.
 
 import pytest
 
-import VehicleController as vc
+from crawler.hardware import vehicle_controller as vc
 
 
 class FakeLogger:
@@ -142,6 +142,6 @@ def d():
     Named short because the driver tests say it a lot. Load the camera by
     assigning d.camera.depth and d.camera.imu.
     """
-    import driver as dv
+    from crawler.autopilot import driver as dv
 
     return dv.Driver(FakeController(), FakeCamera())

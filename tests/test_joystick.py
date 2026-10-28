@@ -19,7 +19,7 @@ two functions under test are module-level and pure.
 
 import pytest
 
-import Joystick as js
+from crawler.hardware import joystick as js
 
 
 # --- the axis and button maps -----------------------------------------------
@@ -72,7 +72,7 @@ def test_the_guide_button_is_named_so_it_is_not_rediscovered_as_a_stick_click():
 
 
 def test_the_mode_toggle_button_main_asks_for_still_exists():
-    """main.py names "START" for the mode toggle. If that key ever leaves this
+    """crawler/__main__.py names "START" for the mode toggle. If that key ever leaves this
     map, the mode button stops working with no import error to say so."""
     assert js.XBOX_BUTTONS["START"] == 7
     assert js.XBOX_BUTTONS["BACK"] == 6

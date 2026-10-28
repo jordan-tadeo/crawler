@@ -15,7 +15,7 @@ import os
 
 import pytest
 
-import Logger as lg
+from crawler.telemetry import logger as lg
 
 
 def test_prepare_creates_a_missing_parent_directory(tmp_path, monkeypatch):

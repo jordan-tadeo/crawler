@@ -27,7 +27,7 @@ import time
 import numpy as np
 import pytest
 
-import driver as dv
+from crawler.autopilot import driver as dv
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -1510,7 +1510,7 @@ def test_the_fixtures_depth_floor_matches_the_stereo_config_on_the_car():
     Read as text rather than imported, because importing oakd constructs a
     dai.Device and there is no camera on the laptop.
     """
-    source = (pathlib.Path(__file__).resolve().parent.parent / "oakd.py").read_text()
+    source = (pathlib.Path(__file__).resolve().parent.parent / "crawler" / "hardware" / "oakd.py").read_text()
     assert "stereo.setExtendedDisparity(True)" in source
     assert "stereo.setSubpixel(False)" in source
     assert MIN_Z_MM == pytest.approx(dv.FX_AT_640 * 75.0 / 190.0)

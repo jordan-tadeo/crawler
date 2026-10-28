@@ -24,9 +24,9 @@ import random
 import numpy as np
 import pytest
 
-import driver as dv
-import footprint as fp
-import main as mn
+from crawler.autopilot import driver as dv
+from crawler.autopilot import footprint as fp
+import crawler.__main__ as mn
 
 from test_main import FakeLogger, FakePad, FakeVecon, TickLimit
 from test_record import (FakeClock, FrameView, SessionTele, far_frame,
@@ -497,7 +497,7 @@ def standing_policy(command, cam):
     starts a recover, so the takeover's veto sees every scan of an approach
     the rules would have backed away from half way in."""
     from test_policy import STOP, StubModel
-    import policy as pl
+    from crawler.autopilot import policy as pl
     # Short of the goal its stop is driven on, at the magnitude it gave: 0.
     return pl.PolicyDriver(command, cam, StubModel(STOP, throttle=0.0))
 

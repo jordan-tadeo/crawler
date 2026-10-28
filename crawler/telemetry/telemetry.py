@@ -69,7 +69,7 @@ import queue
 import threading
 import time
 
-import policy_imu
+from crawler.autopilot import policy_imu
 
 # The Foxglove default, which is what Studio offers in the connection dialog,
 # so there is nothing to type but the host.
@@ -1086,7 +1086,7 @@ def controller_sample(joystick, throttle, steering_front, steering_rear):
     different SDL index leaves a handle whose getters raise, and this is a
     debug channel: a missing field beats an exception on the caller's thread.
     """
-    import Joystick as js
+    from crawler.hardware import joystick as js
 
     sample = {
         "connected": False,

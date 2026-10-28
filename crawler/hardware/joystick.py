@@ -9,7 +9,7 @@ import pygame
 # The count and the guide at 8 are measured. The identity of A/B/X/Y/LB/RB/
 # BACK/START below is xpadneo's order, which the count agrees with; I have not
 # pressed each one and watched its index move. BACK 6 and START 7 are what
-# they already were, so main.py's MODE_TOGGLE_BUTTON = "START" is untouched
+# they already were, so crawler/__main__.py's MODE_TOGGLE_BUTTON = "START" is untouched
 # and still the Menu button to the right of the guide.
 XBOX_BUTTONS = {
     "A": 0,

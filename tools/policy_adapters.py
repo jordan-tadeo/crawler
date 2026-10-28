@@ -7,7 +7,7 @@ of recording exist:
                     colourmapped 320x200 JPEG at 6-8 Hz, and the commanded
                     throttle and steering on /vehicle at 20 Hz. No tick id,
                     so a frame and a command are matched by timestamp.
-  FootprintAdapter  what record mode writes (TRAINING_DATA.md):
+  FootprintAdapter  what record mode writes (docs/TRAINING_DATA.md):
                     /policy/depth_small, policy_input.depth_small() of the
                     frame as a 16-bit PNG, and /footprint carrying the
                     command, the probes and the gradient verdict -- one of
@@ -26,9 +26,9 @@ from typing import NamedTuple
 
 import numpy as np
 
-import driver as dv
-import policy as pl
-import policy_imu as pimu
+from crawler.autopilot import driver as dv
+from crawler.autopilot import policy as pl
+from crawler.autopilot import policy_imu as pimu
 
 # ---- legacy recordings -----------------------------------------------------
 
@@ -47,7 +47,7 @@ LEGACY_VEHICLE = {
 }
 LEGACY_CONNECTED = "connected"         # on /controller
 
-# ---- record-mode recordings: TRAINING_DATA.md is the contract ------------
+# ---- record-mode recordings: docs/TRAINING_DATA.md is the contract ------------
 
 FOOTPRINT_TOPICS = {
     "depth": "/policy/depth_small",    # foxglove.CompressedImage, 16-bit PNG
@@ -77,7 +77,7 @@ FOOTPRINT_ROW = {
     # "driver" is auto's own scan; "tap" is the footprint tap's, which is
     # every record row and every auto row while a recover owns the wheels.
     "source": "source",
-    # Who the auto driver was: "rules" or "policy" (main.py --policy); ""
+    # Who the auto driver was: "rules" or "policy" (python -m crawler --policy); ""
     # in record and in files from before the field existed. A "driver"
     # group under "policy" is the model's own output, never a label.
     "autopilot": "autopilot",

@@ -38,7 +38,7 @@ holds it is `footprint.py` (the rows), `policy_input.py` (the picture) and
 Files: a record session is `log/mcap/crawler-record-<UTC>Z-p<pid>-001.mcap`
 (`/home/jt/Documents/py/crawler/log/mcap/` on the car, or `--record-dir`), one
 per session, never pruned by the ring; the rolling recording is
-`crawler-<UTC>Z-...mcap` in the same directory. `./pull-recordings.sh` pulls
+`crawler-<UTC>Z-...mcap` in the same directory. `./scripts/pull-recordings.sh` pulls
 both, into `~/crawler-data/mcap/` by default; `--records-only` pulls just the
 record sessions and leaves the drive logs on the car.
 
@@ -115,7 +115,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `imu_gyro_x/y/z` | float | same sample, rad/s |
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
 | `imu_up_x/y/z` | float | same sample: the unit vector pointing away from the ground, in the IMU's own axes, off `GAME_ROTATION_VECTOR`. **All three 0 when there is no orientation reading**, which is every recording made before this field existed. See "Tilt" |
-| `autopilot` | string | who drove auto's `driver` groups: `""` in record, `rules` or `policy` (`main.py --policy`) |
+| `autopilot` | string | who drove auto's `driver` groups: `""` in record, `rules` or `policy` (`python -m crawler --policy`) |
 | `policy_model` | string | which model drove, by name and version, e.g. `kblock 1.1` (the sidecar's `model_name` and `model_version`; a sidecar without them reads as its file's stem, e.g. `policy-20261028-170131Z`). `""` unless `autopilot` is `policy`. **Rows from before the name existed carry the sha256 here instead**: 64 hex characters, look it up in `~/crawler-data/models/registry.json` |
 | `policy_model_sha256` | string | sha256 of the `.onnx` driving, the exact model; `""` unless `autopilot` is `policy`. Absent in rows from before the name existed |
 | `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
@@ -279,7 +279,7 @@ MINOR is a retrain on the same contract: more data, other weights. The
 versions live on the Mac in `~/crawler-data/models/` as `kblock-X.Y.onnx` +
 `.json`, listed in `registry.json` with each one's sha256, training sessions
 (and their MCAPs' sha256), training commit and command, CV scores and parent.
-`./models.sh list | register | deploy | rollback | status` is the tool;
+`./scripts/models.sh list | register | deploy | rollback | status` is the tool;
 `tools/models.py` says how it works. Nothing in there is ever deleted.
 
 ## Getting it out

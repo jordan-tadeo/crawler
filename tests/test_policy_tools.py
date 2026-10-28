@@ -2,7 +2,7 @@
 
 These run on dicts and arrays, never an MCAP and never torch, so they are
 the contract the dataset tool keeps with what record mode writes
-(TRAINING_DATA.md) and with what the trainer and the eval read back.
+(docs/TRAINING_DATA.md) and with what the trainer and the eval read back.
 """
 
 import json
@@ -14,11 +14,8 @@ import cv2
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "tools"))
-
-import driver as dv  # noqa: E402
-import policy as pl  # noqa: E402
+from crawler.autopilot import driver as dv  # noqa: E402
+from crawler.autopilot import policy as pl  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 import policy_dataset as pd  # noqa: E402
 import policy_eval as pe  # noqa: E402
@@ -36,7 +33,7 @@ def png(small, seq):
 
 
 def row(seq, mode="record", throttle=0.2, front=0.0, **extra):
-    _, rear = __import__("driver").steering_pair(front)
+    _, rear = dv.steering_pair(front)
     r = {"seq": seq, "mode": mode, "throttle": throttle, "steering_front": front,
          "steering_rear": rear, "steering_mode": "unified",
          "verdict_action": "forward", "verdict_steer": 0.0,
@@ -199,7 +196,7 @@ def test_on_the_pad_every_reverse_tick_and_the_stop_after_it_is_a_decision():
 
 
 def test_steering_is_a_fraction_of_manuals_full_lock_clipped():
-    import main as mn
+    import crawler.__main__ as mn
     assert pa.STEER_SCALE == pl.STEER_SCALE == mn.STEERING_LIMIT_PERC / 100
     rows = [(0.0, row(0, front=0.35)), (0.1, row(1, front=-0.8))]
     ticks, _, _ = align(footprint_session(rows))
@@ -208,7 +205,7 @@ def test_steering_is_a_fraction_of_manuals_full_lock_clipped():
 
 def test_a_verdicts_steer_is_put_in_the_same_units_as_a_label():
     """read_the_gradient's steer is a fraction of max_turn (0.6), not 0.7."""
-    import driver as dv
+    from crawler.autopilot import driver as dv
     max_turn = dv.Driver(None, None).max_turn
     assert pa.RULE_MAX_TURN == max_turn
     ticks, _, _ = align(footprint_session([(0.0, row(0, verdict_steer=-1.0))]))

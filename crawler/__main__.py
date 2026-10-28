@@ -60,10 +60,10 @@ import sys
 import threading
 import time
 
-import camera
-import driver as dv
-import goal
-import Logger as lg
+from crawler.hardware import camera
+from crawler.autopilot import driver as dv
+from crawler.autopilot import goal
+from crawler.telemetry import logger as lg
 
 MANUAL = "manual"
 AUTO = "auto"
@@ -527,7 +527,7 @@ class SteerMode:
 #
 # Every /footprint row says which hand had each group (steer_by, throttle_by),
 # and a group that was mine is a correction: the label the policy should learn
-# from. See TRAINING_DATA.md.
+# from. See docs/TRAINING_DATA.md.
 
 DRIVER = "driver"
 PAD = "pad"
@@ -905,9 +905,9 @@ class AutoPilot:
         so is a test I cannot read.
         """
         if self.policy_path is None:
-            from driver import Driver
+            from crawler.autopilot.driver import Driver
             return Driver(self.command, view)
-        import policy
+        from crawler.autopilot import policy
         model = policy.PolicyModel(self.policy_path)
         self.logger.log("info", "Mode",
                         f"Auto is {model.label}, the policy in {self.policy_path} "
@@ -1196,8 +1196,8 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     whether Foxglove is installed, running or being watched.
     """
     import pygame
-    import marks as mk
-    import telemetry as tm
+    from crawler.autopilot import marks as mk
+    from crawler.telemetry import telemetry as tm
 
     if tele is None:
         tele = tm.Telemetry()  # never started, so every call below is a no-op
@@ -1216,7 +1216,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
 
     # Record mode. A session with no recorder factory refuses to begin, and a
     # tap with no view writes nothing, so the defaults are inert.
-    import footprint as fp
+    from crawler.autopilot import footprint as fp
     if session is None:
         session = RecordSession(tele, getattr(autopilot, "hub", None), log,
                                 markpad=markpad)
@@ -1585,7 +1585,7 @@ def _offer_connection(tele, now, mode, connected, last_error, autopilot,
 
 
 def _mute_camera(tele):
-    import telemetry as tm
+    from crawler.telemetry import telemetry as tm
     try:
         tele.mute(tm.CAMERA_KEYS)
     except Exception:
@@ -1622,7 +1622,8 @@ def _camera_open_s(autopilot) -> float:
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Drive the RC rock crawler.")
+    parser = argparse.ArgumentParser(prog="python -m crawler",
+                                     description="Drive the RC rock crawler.")
     parser.add_argument(
         "--mode",
         choices=[MANUAL, AUTO],
@@ -1728,9 +1729,9 @@ def main(argv=None):
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
     import pygame
-    import VehicleController as vc
-    import Joystick as js
-    import telemetry as tm
+    from crawler.hardware import vehicle_controller as vc
+    from crawler.hardware import joystick as js
+    from crawler.telemetry import telemetry as tm
 
     pygame.init()
     log = lg.Logger()
@@ -1766,7 +1767,7 @@ def main(argv=None):
     # Constructing it touches no disk.
     recorder = None
     if args.record:
-        import recording
+        from crawler.telemetry import recording
         recorder = recording.Recorder(
             logger=log,
             directory=args.record_dir or recording.DEFAULT_DIR,
@@ -1813,14 +1814,14 @@ def main(argv=None):
     # The two mark buttons. Built before the joystick for the same reason
     # telemetry is: it costs nothing to exist, and a press has to be able to
     # land the instant there is a pad to press.
-    import marks as mk
+    from crawler.autopilot import marks as mk
     markpad = mk.MarkPad(logger=log, tele=tele)
 
     # Record mode's two halves. Neither opens anything until Y is held: the
     # session's recorder is built on begin, and the tap's view is a one-deep
     # slot on a camera that is shut until somebody asks for it.
-    import footprint as fp
-    import recording
+    from crawler.autopilot import footprint as fp
+    from crawler.telemetry import recording
 
     def session_recorder():
         return recording.Recorder(
@@ -1866,7 +1867,7 @@ def main(argv=None):
     # With the dashboard, Qt owns the main thread and the control loop runs
     # beside it.
     from PyQt5.QtWidgets import QApplication
-    import Dashboard as db
+    from crawler.telemetry import dashboard as db
 
     # The camera is already up by here -- wait_ready() above saw to it -- so
     # the dashboard gets its own view on it and nothing needs resuming. The

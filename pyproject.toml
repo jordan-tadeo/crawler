@@ -72,7 +72,7 @@ dependencies = [
 
 # Deliberately empty, and the emptiness is the point.
 #
-# `main.py --dashboard` imports PyQt5, and PyQt5 cannot be a pip dependency on
+# `python -m crawler --dashboard` imports PyQt5, and PyQt5 cannot be a pip dependency on
 # this machine. PyQt5 5.15.x publishes no linux_aarch64 wheel -- 5.15.9 ships
 # x86_64 manylinux, x86_64 macOS, win32 and win_amd64, and that is it -- so pip
 # would fall back to the sdist and try to compile Qt bindings on the Pi, which
@@ -110,17 +110,26 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The project is a flat pile of modules imported by name (`import Joystick as
-# js`), so the tests have to import them the same way. conftest.py at the root
-# puts the checkout on sys.path; this just stops pytest from hunting for tests
-# anywhere else.
+# "." so `import crawler` is always this checkout's package, even from a venv
+# that has a different checkout installed (a worktree, say). "tools" because
+# the laptop tools are scripts and not a package, and the tests import them by
+# name (`import policy_train as pt`).
+pythonpath = [".", "tools"]
 addopts = "-q"
 
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+# The car's code is the one package, crawler/, and `uv sync` installs it into
+# .venv as editable. tools/, deploy/, scripts/ and tests/ are not part of it.
+# The car does not depend on the install: the unit runs `python -m crawler`
+# with WorkingDirectory at the checkout, and -m finds the package there.
+[tool.setuptools.packages.find]
+include = ["crawler", "crawler.*"]
+
 [tool.uv]
-# This is a flat pile of modules driven by `python main.py`, not a package to
-# build and install. Without this, uv tries to build `crawler` itself and wants
-# a build backend it has no use for.
-package = false
+package = true
 
 # The Mac this is committed from is macOS arm64 with none of the car's hardware
 # libraries on it, and the lock has to be good for the Pi regardless. This makes
