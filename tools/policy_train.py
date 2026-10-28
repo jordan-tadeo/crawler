@@ -59,6 +59,9 @@ the dataset had an up vector; without one the tilt columns are zeroed here
 and on the car (policy_imu.without_tilt). --imu and --prev combine. The
 flip augmentation mirrors the IMU too (policy_imu.MIRROR). A graph without
 --imu has no `imu` input at all, so every model before it loads unchanged.
+--imu-no-yaw is --imu without the yaw rate: the dataset's imu_no_yaw array
+(policy_imu.NO_YAW_FEATURES, built by the same ImuFeatures with yaw=False,
+as the car builds it), and imu_yaw false in the sidecar.
 """
 
 import argparse
@@ -89,11 +92,11 @@ MODE_SWITCH_WEIGHT = 10.0
 BLOCK_GUARD_S = 1.0
 
 
-def build_model(representation, uses_imu=False):
+def build_model(representation, uses_imu=False, imu_yaw=True):
     import torch
     from torch import nn
 
-    imu_width = pimu.IMU_SIZE if uses_imu else 0
+    imu_width = pimu.size(imu_yaw) if uses_imu else 0
 
     class Heads(nn.Module):
         def __init__(self, width):
@@ -150,6 +153,7 @@ def build_model(representation, uses_imu=False):
 
     model = ImageNet() if representation == pl.IMAGE else ProfileNet()
     model.uses_imu = bool(uses_imu)
+    model.imu_yaw = bool(imu_yaw)
     return model
 
 
@@ -164,23 +168,31 @@ def encode_modes(mode_in):
     return out
 
 
-def flip(x, prev, imu=None):
+def flip(x, prev, imu=None, imu_yaw=True):
     """Mirror left-right: the frame's last axis, and every steering sign.
     The steering mode has no side, so it goes through as it is. The IMU's
-    lateral parts flip sign (policy_imu.MIRROR)."""
+    lateral parts flip sign (policy_imu.mirror_of: MIRROR, or its no-yaw
+    columns)."""
     import torch
 
     prev = prev.clone()
     prev[:, -1] = -prev[:, -1]
     if imu is not None:
-        imu = imu * torch.from_numpy(pimu.MIRROR)
+        imu = imu * torch.from_numpy(pimu.mirror_of(imu_yaw))
     return torch.flip(x, dims=[-1]), prev, imu
 
 
-def imu_inputs(data, tilt):
-    """The dataset's IMU features as the model is fed them: with the tilt
-    columns zeroed unless it is trained with tilt."""
-    feats = np.asarray(data["imu"], dtype=np.float32)
+def imu_inputs(data, tilt, yaw=True):
+    """The dataset's IMU features as the model is fed them: the array for
+    its list (policy_imu.DATASET_KEY), with the tilt columns zeroed unless it
+    is trained with tilt."""
+    key = pimu.DATASET_KEY[bool(yaw)]
+    if key not in data:
+        raise ValueError(f"the dataset has no {key!r} array: rebuild it with policy_dataset.py")
+    feats = np.asarray(data[key], dtype=np.float32)
+    if feats.shape[-1] != pimu.size(yaw):
+        raise ValueError(f"the dataset's {key!r} is {feats.shape[-1]} wide, "
+                         f"not {pimu.size(yaw)}: rebuild it with policy_dataset.py")
     return feats if tilt else pimu.without_tilt(feats)
 
 
@@ -231,13 +243,14 @@ def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
 
 
 def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
-          good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False):
+          good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False,
+          imu_yaw=True):
     import torch
     from torch import nn
 
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = build_model(representation, uses_imu)
+    model = build_model(representation, uses_imu, imu_yaw)
 
     idx = np.flatnonzero(train_mask)
     x_all = torch.from_numpy(data["x"])
@@ -245,7 +258,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     prev = torch.from_numpy(data["prev"][idx] if uses_prev
                             else np.zeros_like(data["prev"][idx]))
     mode_in = torch.from_numpy(encode_modes(data["mode_in"][idx]))
-    imu = (torch.from_numpy(imu_inputs(data, dataset_has_tilt(data))[idx])
+    imu = (torch.from_numpy(imu_inputs(data, dataset_has_tilt(data), imu_yaw)[idx])
            if uses_imu else None)
     mode = torch.from_numpy(data["steer_mode"][idx].astype(np.int64))
     action = torch.from_numpy(data["action"][idx].astype(np.int64))
@@ -281,7 +294,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
             ib = imu[b] if imu is not None else None
             sb = steer[b]
             if torch.rand(1).item() < 0.5:
-                xb, pb, ib = flip(xb, pb, ib)
+                xb, pb, ib = flip(xb, pb, ib, imu_yaw)
                 sb = -sb
             logits, t_out, s_out, m_out = model(xb, pb, mode_in[b], ib)
             tok, sok = throttle_ok[b], steer_ok[b]
@@ -314,7 +327,7 @@ def export(model, representation, out_path, meta):
             torch.zeros((1, pl.MODE_SIZE)))
     names = ["x", "prev", pl.MODE_INPUT]
     if getattr(model, "uses_imu", False):
-        args += (torch.zeros((1, pimu.IMU_SIZE)),)
+        args += (torch.zeros((1, pimu.size(getattr(model, "imu_yaw", True)))),)
         names.append(pl.IMU_INPUT)
     torch.onnx.export(
         model, args, out_path,
@@ -323,12 +336,12 @@ def export(model, representation, out_path, meta):
     write_sidecar(out_path, meta)
 
 
-def imu_meta(uses_imu, tilt):
+def imu_meta(uses_imu, tilt, yaw=True):
     """The IMU half of the sidecar: what policy.check_imu reads."""
     if not uses_imu:
         return {}
-    return {"uses_imu": True, "imu_features": list(pimu.FEATURES),
-            "imu_window": pimu.WINDOW, "imu_tilt": bool(tilt),
+    return {"uses_imu": True, "imu_features": list(pimu.features(yaw)),
+            "imu_window": pimu.WINDOW, "imu_tilt": bool(tilt), "imu_yaw": bool(yaw),
             "imu_scales": {"gyro_rad_s": pimu.GYRO_SCALE,
                            "accel_m_s2": pimu.ACCEL_SCALE, "clip": pimu.CLIP,
                            "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.GAP_S}}
@@ -434,6 +447,9 @@ def main(argv=None):
     ap.add_argument("--imu", action="store_true",
                     help="feed the policy_imu features in as a fourth input "
                          "(tilt too, when the dataset has it)")
+    ap.add_argument("--imu-no-yaw", action="store_true",
+                    help="--imu without the yaw rate (gyro_x): pitch, roll, "
+                         "accel and tilt only (policy_imu.NO_YAW_FEATURES)")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--good-weight", type=float, default=GOOD_WEIGHT,
@@ -449,6 +465,8 @@ def main(argv=None):
     ap.add_argument("--model-version", default=None, help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     args = ap.parse_args(argv)
+    if args.imu_no_yaw:
+        args.imu = True
     if args.model_version is not None:
         print("--model-version is gone: a model gets a number only from "
               "tools/models.py promote, once it beats the latest release")
@@ -468,8 +486,9 @@ def main(argv=None):
         print(f"{args.data} steers at {meta_in.get('steer_scale')}, the car at "
               f"{pl.STEER_SCALE}: rebuild it with policy_dataset.py")
         return 1
-    if args.imu and "imu" not in data:
-        print(f"{args.data} has no IMU features: rebuild it with policy_dataset.py")
+    if args.imu and pimu.DATASET_KEY[not args.imu_no_yaw] not in data:
+        print(f"{args.data} has no {pimu.DATASET_KEY[not args.imu_no_yaw]} IMU features: "
+              f"rebuild it with policy_dataset.py")
         return 1
     steer_ok, throttle_ok = pe.label_masks(data, args.labels)
     labelled = steer_ok | throttle_ok
@@ -477,7 +496,7 @@ def main(argv=None):
     fit = dict(representation=args.representation, label_mode=args.labels,
                uses_prev=args.prev, epochs=args.epochs, seed=args.seed,
                good_weight=args.good_weight, switch_weight=args.switch_weight,
-               uses_imu=args.imu)
+               uses_imu=args.imu, imu_yaw=not args.imu_no_yaw)
     tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -558,7 +577,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
         "representation": args.representation,
         "actions": list(pl.ACTIONS),
         "uses_prev_action": bool(args.prev),
-        **imu_meta(getattr(args, "imu", False), meta_in.get("imu_tilt", False)),
+        **imu_meta(getattr(args, "imu", False), meta_in.get("imu_tilt", False),
+                   not getattr(args, "imu_no_yaw", False)),
         "outputs": OUTPUTS,
         "steer_scale": pl.STEER_SCALE,
         "labels": args.labels,

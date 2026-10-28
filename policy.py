@@ -128,7 +128,9 @@ dataset tool makes them by pushing each /footprint row through
 policy_imu.ImuFeatures; PolicyDriver makes them by building that same row
 live (policy_imu.row_fields, the function footprint.py writes the row with)
 and pushing it through its own ImuFeatures. check_imu() refuses a sidecar
-whose feature list is not policy_imu.FEATURES. A model with no uses_imu --
+whose feature list is not policy_imu.FEATURES, or NO_YAW_FEATURES when it
+says imu_yaw false: a model trained without the yaw rate (policy_imu,
+"Without yaw"), whose ImuFeatures is built yaw=False. A model with no uses_imu --
 every model before this, the deployed one included -- has no `imu` input
 and is never fed one.
 
@@ -330,35 +332,41 @@ def encode_prev(action, magnitude, steer):
 
 def encode_imu(features):
     """One decision's policy_imu features as the model's imu input."""
-    out = np.asarray(features, dtype=np.float32).reshape(1, pimu.IMU_SIZE)
+    out = np.asarray(features, dtype=np.float32).reshape(1, -1)
     return np.where(np.isfinite(out), out, 0.0).astype(np.float32)
 
 
 def check_imu(meta, inputs, where="sidecar"):
-    """The IMU half of the contract -> (uses_imu, tilt). ValueError when the
+    """The IMU half of the contract -> (uses_imu, tilt, yaw). ValueError when the
     sidecar and the graph disagree, or the features are not this car's.
 
     A sidecar with no uses_imu (every model before the IMU input) needs a
-    graph with no IMU_INPUT, and gets (False, False). One with uses_imu true
-    needs the input, imu_features equal to policy_imu.FEATURES in order, and
-    says in imu_tilt whether its training data had orientation.
+    graph with no IMU_INPUT, and gets (False, False, False). One with uses_imu
+    true needs the input, imu_features equal to policy_imu.features(yaw) in
+    order -- yaw is imu_yaw, true when absent (every model before it) --
+    and says in imu_tilt whether its training data had orientation.
     """
     inputs = set(inputs)
     if not meta.get("uses_imu", False):
         if IMU_INPUT in inputs:
             raise ValueError(f"{where}: the graph has an {IMU_INPUT!r} input the "
                              f"sidecar does not declare (no uses_imu)")
-        return False, False
+        return False, False, False
     if IMU_INPUT not in inputs:
         raise ValueError(f"{where}: uses_imu declared but the graph has no "
                          f"{IMU_INPUT!r} input")
+    yaw = meta.get("imu_yaw", True)
+    if not isinstance(yaw, bool):
+        raise ValueError(f"{where}: imu_yaw {yaw!r} is not true or false")
+    want = pimu.features(yaw)
     names = meta.get("imu_features")
-    if not isinstance(names, (list, tuple)) or tuple(names) != pimu.FEATURES:
-        raise ValueError(f"{where}: imu_features {names} != {list(pimu.FEATURES)}")
+    if not isinstance(names, (list, tuple)) or tuple(names) != want:
+        raise ValueError(f"{where}: imu_features {names} != {list(want)} "
+                         f"(imu_yaw {str(yaw).lower()})")
     window = meta.get("imu_window", pimu.WINDOW)
     if window != pimu.WINDOW:
         raise ValueError(f"{where}: imu_window {window!r} != {pimu.WINDOW}")
-    return True, bool(meta.get("imu_tilt", False))
+    return True, bool(meta.get("imu_tilt", False)), yaw
 
 
 def read_mode(outputs):
@@ -574,9 +582,10 @@ class PolicyModel:
         self.mode_switch = check_sidecar(
             self.meta, input_names, self.output_names, meta_path)
         self.has_mode = self.mode_switch is not None
-        # (False, False) for every model before the IMU input: it is never
-        # fed one, and runs exactly as it did.
-        self.uses_imu, self.imu_tilt = check_imu(self.meta, input_names, meta_path)
+        # (False, False, False) for every model before the IMU input: it is
+        # never fed one, and runs exactly as it did.
+        self.uses_imu, self.imu_tilt, self.imu_yaw = check_imu(
+            self.meta, input_names, meta_path)
         self.path = path
 
     def run(self, x, prev, mode=None, imu=None):
@@ -585,7 +594,7 @@ class PolicyModel:
             feed[MODE_INPUT] = mode if mode is not None else encode_mode(False)
         if self.uses_imu:
             feed[IMU_INPUT] = (imu if imu is not None
-                               else np.zeros((1, pimu.IMU_SIZE), dtype=np.float32))
+                               else np.zeros((1, pimu.size(self.imu_yaw)), dtype=np.float32))
         values = self.session.run(self.output_names, feed)
         return dict(zip(self.output_names, values))
 
@@ -632,7 +641,10 @@ class PolicyDriver(dv.Driver):
         # footprint.FootprintTap holds them, so the row this driver builds
         # its features off is the row a recording of this tick would carry.
         self.uses_imu = bool(getattr(model, "uses_imu", False))
-        self.imu_features = pimu.ImuFeatures(tilt=bool(getattr(model, "imu_tilt", False)))
+        # A model with no imu_yaw is a full-IMU one (and one with no IMU
+        # input is never fed these at all).
+        self.imu_features = pimu.ImuFeatures(tilt=bool(getattr(model, "imu_tilt", False)),
+                                             yaw=bool(getattr(model, "imu_yaw", True)))
         self._imu_sample = None
         self._imu_at = 0.0
         self.last_imu = None        # the features fed on the last model run

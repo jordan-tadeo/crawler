@@ -148,6 +148,9 @@ CONTRACT_KEYS = {
     "imu_features": None,
     "imu_window": None,
     "imu_tilt": False,
+    # False: the no-yaw IMU list (policy_imu.NO_YAW_FEATURES). An IMU model
+    # from before the key fed yaw.
+    "imu_yaw": True,
     "outputs": None,
     "steer_scale": None,
     "steer_modes": None,
@@ -217,12 +220,15 @@ def contract_of(meta):
     if not out["uses_imu"]:
         # Without the IMU input the IMU details mean nothing.
         out["imu_features"] = out["imu_window"] = None
-        out["imu_tilt"] = False
+        out["imu_tilt"] = out["imu_yaw"] = False
     return out
 
 
 def contract_diff(a, b):
-    """The contract keys that differ between two sidecars' contracts."""
+    """The contract keys that differ between two sidecars' contracts. Each
+    goes through contract_of first, so a contract stored before a key
+    existed reads as that key's default, not as a change."""
+    a, b = contract_of(a), contract_of(b)
     return [k for k in CONTRACT_KEYS if a.get(k) != b.get(k)]
 
 
@@ -594,8 +600,12 @@ def stamp(now=None):
 
 
 def register(onnx_path, models_dir=MODELS_DIR, mcap_dir=MCAP_DIR, name=None,
-             tag=None, notes="", now=None):
-    """Copy a trained model into the registry as a candidate. -> entry."""
+             tag=None, notes="", now=None, evidence=None):
+    """Copy a trained model into the registry as a candidate. -> entry.
+
+    evidence, a held-out A/B against the latest release, is checked and
+    copied in beside it (candidate-<tag>.evidence.json) as a record of why it
+    was worth registering. It earns nothing: promote still wants its own."""
     onnx_path = os.path.abspath(os.path.expanduser(onnx_path))
     json_path = os.path.splitext(onnx_path)[0] + ".json"
     for path in (onnx_path, json_path):
@@ -627,6 +637,14 @@ def register(onnx_path, models_dir=MODELS_DIR, mcap_dir=MCAP_DIR, name=None,
     name = name or meta.get("model_name") or FAMILY
     releases = versions_of(registry, name)
     parent = releases[-1]["version"] if releases else None
+    ev = None
+    if evidence is not None:
+        ev_path, ev = load_evidence(evidence)
+        want = (candidate_label(name, tag),releases[-1]["label"] if releases else None)
+        got = (ev["candidate"]["label"], ev["baseline"]["label"])
+        if got[0] != want[0] or (want[1] is not None and got[1] != want[1]):
+            raise SystemExit(f"Refusing: {ev_path} compares {got[0]!r} with {got[1]!r}, "
+                             f"not {want[0]!r} with {want[1]!r}")
 
     stem = os.path.join(models_dir, candidate_stem(tag))
     copy_verified(onnx_path, stem + ".onnx", onnx_sha)
@@ -641,6 +659,11 @@ def register(onnx_path, models_dir=MODELS_DIR, mcap_dir=MCAP_DIR, name=None,
     entry = make_candidate(name, tag, meta, onnx_path, json_path, onnx_sha, json_sha,
                            pm.sha256_local(json_path), sessions, parent, notes,
                            stamp(now))
+    if ev is not None:
+        ev_sha = pm.sha256_local(ev_path)
+        ev_name = candidate_stem(tag) + ".evidence.json"
+        copy_verified(ev_path, os.path.join(models_dir, ev_name), ev_sha)
+        entry["evidence"] = evidence_record(ev_path, ev, ev_name, ev_sha)
     if meta.get("model_version") not in (None, ""):
         # Only promote gives a number; one the sidecar carries is kept as a note.
         entry["sidecar_model_version_ignored"] = str(meta["model_version"])
@@ -1205,13 +1228,17 @@ def cmd_list(args, car_factory=Car):
 
 def cmd_register(args):
     entry = register(args.onnx, args.models_dir, args.mcap_dir, args.name, args.tag,
-                     args.notes)
+                     args.notes, evidence=args.evidence)
     print(f"registered {entry['label']} as {os.path.join(args.models_dir, entry['onnx'])}")
     print(f"  onnx sha256 {entry['onnx_sha256']}")
     print(f"  measured against {entry['parent'] or '(no release yet)'}, {short_scores(entry)}")
     if entry.get("sidecar_model_version_ignored"):
         print(f"  the sidecar said {entry['sidecar_model_version_ignored']}: ignored, "
               f"only promote gives a number")
+    if entry.get("evidence"):
+        print(f"  evidence {entry['evidence']['file']} vs {entry['evidence']['baseline']}:")
+        for line in describe_checks(entry["evidence"]["summary"]):
+            print(f"    {line}")
     print(f"  test drive: ./models.sh deploy {entry['onnx'][:-5]}")
     return 0
 
@@ -1349,6 +1376,8 @@ def parse_args(argv):
     s.add_argument("--name", default=None, help=f"family (default the sidecar's, else {FAMILY})")
     s.add_argument("--notes", default="")
     s.add_argument("--mcap-dir", default=MCAP_DIR)
+    s.add_argument("--evidence", default=None,
+                   help="a held-out A/B against the latest release, kept as a record")
 
     s = sub.add_parser("promote", help="give a candidate the next release number")
     s.add_argument("tag")

@@ -214,6 +214,15 @@ window. A model trained with `policy_train.py --imu` declares `uses_imu`,
 data had no up vector, and then the up columns are zeroed in training and on
 the car. A model without `uses_imu` has no `imu` input and never gets one.
 
+`--imu-no-yaw` trains without the yaw rate. gyro_x is yaw on this car, and a
+model fed it reads back the turn its steering label made; held out, the full
+IMU's steering gain was gone with the gyro zeroed. Its features are
+`policy_imu.NO_YAW_FEATURES`: no gyro_x, and `pitch_roll_peak` (the gyro peak
+over pitch and roll only) in place of `gyro_peak`. The dataset stores them as
+`imu_no_yaw`, built by the same `ImuFeatures` with `yaw=False` that the car
+builds them with, and the sidecar says `imu_yaw: false` with that list as
+`imu_features`. A car on code from before `imu_yaw` refuses such a model.
+
 ## The steering mode as a label
 
 Unified drives both axles off the left stick, the rear counter-phase through

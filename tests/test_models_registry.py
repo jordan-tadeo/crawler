@@ -132,6 +132,25 @@ def test_tags_are_short_file_safe_slugs():
 
 def test_imu_details_do_not_count_without_the_imu_input():
     assert md.contract_of(sidecar(imu_tilt=True)) == md.contract_of(sidecar())
+    assert md.contract_of(sidecar(imu_yaw=True)) == md.contract_of(sidecar())
+
+
+def test_dropping_the_yaw_is_a_major_and_an_old_contract_is_not_a_change():
+    """A contract stored before imu_yaw existed (1.2's, imu-1028's) reads as
+    the default: a retrain on it is still a minor. A no-yaw model off a
+    full-IMU release is a major, and says why."""
+    full = sidecar(**pt.imu_meta(True, False))
+    stored = {k: v for k, v in md.contract_of(full).items() if k != "imu_yaw"}
+    reg = md.empty_registry()
+    reg["releases"].append({"name": "kblock", "version": "2.0", "contract": stored})
+    assert md.next_version(reg, "kblock", md.contract_of(full))[0] == "2.1"
+    no_yaw = sidecar(**pt.imu_meta(True, False, yaw=False))
+    v, why = md.next_version(reg, "kblock", md.contract_of(no_yaw))
+    assert v == "3.0" and "imu_yaw" in why
+    base = registry_with("1.2", meta=sidecar())
+    base["releases"][0]["contract"].pop("imu_yaw")
+    assert md.next_version(base, "kblock", md.contract_of(sidecar()))[0] == "1.3"
+    assert md.contract_of(no_yaw)["imu_yaw"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +434,34 @@ def with_candidate(registered):
         json.dump(sidecar(), f)
     md.register(src + ".onnx", folder, folder, tag="next")
     return folder
+
+
+def test_register_keeps_evidence_for_the_right_pair_as_a_record(registered):
+    _, _, folder = registered
+    src = os.path.join(folder, "policy-20261030-120000Z")
+    with open(src + ".onnx", "wb") as f:
+        f.write(b"a no-yaw model")
+    with open(src + ".json", "w") as f:
+        json.dump(sidecar(), f)
+    wrong = evidence(folder, candidate="kblock candidate other", name="wrong.json")
+    with pytest.raises(SystemExit, match="Refusing"):
+        md.register(src + ".onnx", folder, folder, tag="nyaw", evidence=wrong)
+    stale = evidence(folder, candidate="kblock candidate nyaw", baseline="kblock 0.9",
+                     name="stale.json")
+    with pytest.raises(SystemExit, match="Refusing"):
+        md.register(src + ".onnx", folder, folder, tag="nyaw", evidence=stale)
+    assert md.find_candidate(md.load_registry(folder), "nyaw") is None
+    assert not os.path.exists(os.path.join(folder, "candidate-nyaw.onnx"))
+
+    good = evidence(folder, candidate="kblock candidate nyaw", name="good.json")
+    entry = md.register(src + ".onnx", folder, folder, tag="nyaw", evidence=good)
+    kept = os.path.join(folder, "candidate-nyaw.evidence.json")
+    assert entry["evidence"]["file"] == "candidate-nyaw.evidence.json"
+    assert entry["evidence"]["sha256"] == md.pm.sha256_local(good) == md.pm.sha256_local(kept)
+    assert entry["evidence"]["baseline"] == "kblock 1.0"
+    assert "passes" in entry["evidence"]["summary"]
+    assert "version" not in entry
+    assert md.find_candidate(md.load_registry(folder), "nyaw")["evidence"] == entry["evidence"]
 
 
 def test_promote_refuses_without_evidence(with_candidate):

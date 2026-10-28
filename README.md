@@ -210,6 +210,7 @@ python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/cr
 python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one session: time blocks
 python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu --prev   # + IMU, + last decision
+python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw    # + IMU without the yaw rate
 python tools/policy_eval.py data.npz models/policy.onnx --out report.md
 ```
 

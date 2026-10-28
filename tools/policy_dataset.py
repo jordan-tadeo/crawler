@@ -219,6 +219,7 @@ class Tick(NamedTuple):
     steer_mode: int = 0         # the mode I wanted: the label
     mode_switch: bool = False   # within MODE_WINDOW_S of a toggle
     imu: object = None          # (pimu.IMU_SIZE,) float32, the policy's IMU input
+    imu_no_yaw: object = None   # (pimu.NO_YAW_SIZE,) float32, the same without yaw
 
 
 def _is_split(cmd):
@@ -269,13 +270,14 @@ def mode_labels(commands):
     return out
 
 
-def imu_features(commands):
+def imu_features(commands, yaw=True):
     """Per command its policy_imu features, the window run over every row
     in the stream before any is dropped -- the runtime pushes every tick it
     has a frame on, not only the ones it is graded on. Built with tilt; the
     trainer zeroes it (pimu.without_tilt) for a model trained without.
+    yaw=False is the no-yaw list (pimu.NO_YAW_FEATURES), its own window.
     A legacy command has no IMU columns and comes out all zeros."""
-    feats = pimu.ImuFeatures(tilt=True)
+    feats = pimu.ImuFeatures(tilt=True, yaw=yaw)
     return [feats.push(dict(zip(pa.FOOTPRINT_ROW["imu_row"], cmd.imu)), cmd.t_ns / 1e9)
             for cmd in commands]
 
@@ -430,7 +432,9 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     prev_t = None
     modes = mode_labels(commands)
     imus = imu_features(commands)
-    for cmd, (mode_in, steer_mode, mode_switch), imu in zip(commands, modes, imus):
+    imus_no_yaw = imu_features(commands, yaw=False)
+    for cmd, (mode_in, steer_mode, mode_switch), imu, imu_no_yaw in zip(
+            commands, modes, imus, imus_no_yaw):
         if cmd.mode not in session.label_modes:
             drops["mode"] += 1
             prev_was_reverse = False
@@ -486,7 +490,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
             cmd.steer_by == pa.BY_PAD, cmd.throttle_by == pa.BY_PAD,
             float(cmd.throttle), float(cmd.front), float(cmd.accel), float(cmd.gyro),
             cmd.autopilot == pa.AUTOPILOT_POLICY, mode_in, steer_mode, mode_switch,
-            imu))
+            imu, imu_no_yaw))
         errors.append(age)
 
     if rules is not None:
@@ -617,6 +621,11 @@ def to_arrays(sessions_ticks):
                           else np.zeros(pimu.IMU_SIZE, np.float32) for r in rows])
                 .astype(np.float32) if n
                 else np.zeros((0, pimu.IMU_SIZE), np.float32)),
+        # pimu.NO_YAW_FEATURES per tick, for a model trained without yaw.
+        "imu_no_yaw": (np.stack([r[2].imu_no_yaw if r[2].imu_no_yaw is not None
+                                 else np.zeros(pimu.NO_YAW_SIZE, np.float32) for r in rows])
+                       .astype(np.float32) if n
+                       else np.zeros((0, pimu.NO_YAW_SIZE), np.float32)),
     }
     return a
 
@@ -883,6 +892,7 @@ def main(argv=None):
         # kept tick has a real up vector (False for every recording made
         # before GAME_ROTATION_VECTOR).
         "imu_features": list(pimu.FEATURES),
+        "imu_no_yaw_features": list(pimu.NO_YAW_FEATURES),
         "imu_window": pimu.WINDOW,
         "imu_tilt": bool(len(arrays["imu"])
                          and arrays["imu"][:, pimu.FEATURES.index("tilt_valid")].any()),

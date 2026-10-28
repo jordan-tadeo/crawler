@@ -58,6 +58,23 @@ Rows further apart than GAP_S restart the window: the car was not deciding
 in between (a recover, a manual stretch, a dropped row), and a peak from
 before the gap is not "the last half second".
 
+Without yaw
+-----------
+gyro_x is yaw on this car, and yaw is what steering does: a model fed it
+learns to read back the turn it is being graded on (held out, the steering
+gain of a full-IMU model was gone with the gyro zeroed), and that is no help
+on the car, where the turn has not happened yet. ImuFeatures(yaw=False)
+builds NO_YAW_FEATURES instead: FEATURES without gyro_x, and with gyro_peak
+replaced by pitch_roll_peak, the same peak over |(gyro_y, gyro_z)|, because
+a peak over all three would carry the yaw back in. What is left is what the
+camera cannot see -- a knock, a wheel held by a chair leg, a bump, a tilt.
+The sidecar says which list a model takes (imu_features, and imu_yaw false),
+and features(yaw) / mirror_of(yaw) / DATASET_KEY[yaw] are the one place each
+list's names, mirror and dataset array live. A sidecar without imu_yaw is a
+full-IMU model, every one from before this. A car on code from before this
+refuses a no-yaw model rather than feed it yaw: its check wants imu_features
+to be FEATURES, and the input is a column narrower.
+
 numpy only, no depthai: the car imports this from footprint.py and policy.py,
 and the laptop from the tools.
 """
@@ -76,6 +93,19 @@ FEATURES = ("gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z",
             "accel_peak", "gyro_peak", "valid", "up_x", "up_y", "up_z",
             "tilt_valid")
 IMU_SIZE = len(FEATURES)
+
+# The no-yaw list (see "Without yaw"). The up vector and tilt_valid stay the
+# last four, as in FEATURES, so without_tilt() is the same for both.
+NO_YAW_FEATURES = ("gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z",
+                   "accel_peak", "pitch_roll_peak", "valid", "up_x", "up_y",
+                   "up_z", "tilt_valid")
+NO_YAW_SIZE = len(NO_YAW_FEATURES)
+# Which FEATURES column each NO_YAW_FEATURES one is built in (the peak is
+# built in gyro_peak's place, over pitch and roll only).
+_NO_YAW_COLUMNS = [FEATURES.index("gyro_peak" if n == "pitch_roll_peak" else n)
+                   for n in NO_YAW_FEATURES]
+# The dataset array each list is stored in.
+DATASET_KEY = {True: "imu", False: "imu_no_yaw"}
 
 # The scales, off the same three recordings at 0.4/-1.0 (/footprint rows,
 # VERIFIED): |gyro| p99 1.63 rad/s moving forward, 1.46 reversing, 4.2 with
@@ -97,6 +127,22 @@ MAX_AGE_MS = 250.0
 # (gyro_z, about the forward axis) change sign, and so does everything
 # lateral (accel_y, up_y). Pitch, vertical and forward do not.
 MIRROR = np.array([-1, 1, -1, 1, -1, 1, 1, 1, 1, 1, -1, 1, 1], dtype=np.float32)
+# Without yaw: the same signs, gyro_x's left out. |(pitch, roll)| has no side.
+MIRROR_NO_YAW = MIRROR[_NO_YAW_COLUMNS]
+
+
+def features(yaw=True):
+    """The feature names a model with (yaw=True) or without yaw takes."""
+    return FEATURES if yaw else NO_YAW_FEATURES
+
+
+def size(yaw=True):
+    return len(features(yaw))
+
+
+def mirror_of(yaw=True):
+    """The left-right mirror's signs for that list."""
+    return MIRROR if yaw else MIRROR_NO_YAW
 
 
 def _num(value, fallback):
@@ -172,11 +218,13 @@ class ImuFeatures:
 
     push(row, t_s) takes a mapping with ROW_FIELDS (missing keys read as no
     reading, which is how a recording from before a field existed reads)
-    and the decision's time in seconds, and returns (IMU_SIZE,) float32.
+    and the decision's time in seconds, and returns (size(yaw),) float32:
+    FEATURES, or NO_YAW_FEATURES with yaw=False.
     """
 
-    def __init__(self, tilt=True, window=WINDOW, gap_s=GAP_S):
+    def __init__(self, tilt=True, yaw=True, window=WINDOW, gap_s=GAP_S):
         self.tilt = bool(tilt)
+        self.yaw = bool(yaw)
         self.window = int(window)
         self.gap_s = float(gap_s)
         self.reset()
@@ -201,7 +249,9 @@ class ImuFeatures:
                  and all(math.isfinite(v) for v in accel + gyro))
         if valid:
             self._accel.append(math.sqrt(sum(v * v for v in accel)))
-            self._gyro.append(math.sqrt(sum(v * v for v in gyro)))
+            # Without yaw the peak never sees gyro_x.
+            self._gyro.append(math.sqrt(sum(v * v for v in (gyro if self.yaw
+                                                            else gyro[1:]))))
             del self._accel[:-self.window], self._gyro[:-self.window]
             out[0:3] = [_clip(v / GYRO_SCALE) for v in gyro]
             out[3:6] = [_clip(v / ACCEL_SCALE) for v in accel]
@@ -215,21 +265,26 @@ class ImuFeatures:
             if 0.9 <= norm <= 1.1:
                 out[9:12] = [v / norm for v in up]
                 out[12] = 1.0
-        return out if self.tilt else without_tilt(out)
+        if not self.tilt:
+            out = without_tilt(out)
+        return out if self.yaw else out[_NO_YAW_COLUMNS]
 
 
-_TILT = slice(FEATURES.index("up_x"), IMU_SIZE)
+# The up vector and tilt_valid: the last four columns of either list.
+_TILT = slice(FEATURES.index("up_x") - IMU_SIZE, None)
+assert NO_YAW_FEATURES[_TILT] == FEATURES[_TILT]
 
 
 def without_tilt(features):
-    """Features, (..., IMU_SIZE), with up and tilt_valid zeroed: what a model
-    trained without orientation is fed. ImuFeatures(tilt=False) is this; the
-    trainer applies it to a dataset built with tilt."""
+    """Features, (..., IMU_SIZE) or (..., NO_YAW_SIZE), with up and
+    tilt_valid zeroed: what a model trained without orientation is fed.
+    ImuFeatures(tilt=False) is this; the trainer applies it to a dataset
+    built with tilt."""
     out = np.array(features, dtype=np.float32, copy=True)
     out[..., _TILT] = 0.0
     return out
 
 
-def mirror(features):
+def mirror(feats, yaw=True):
     """Features of the left-right mirror image of the same moment."""
-    return np.asarray(features, dtype=np.float32) * MIRROR
+    return np.asarray(feats, dtype=np.float32) * mirror_of(yaw)

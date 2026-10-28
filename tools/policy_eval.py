@@ -64,10 +64,11 @@ def label_masks(data, label_mode):
 
 
 def imu_input(model, data, i):
-    """Tick i's IMU input for a model that takes one, tilt zeroed unless the
-    model was trained with it -- as policy_imu.ImuFeatures(tilt=...) makes
-    it on the car."""
-    feats = data["imu"][i]
+    """Tick i's IMU input for a model that takes one: the dataset array for
+    its list (policy_imu.DATASET_KEY by imu_yaw), tilt zeroed unless the
+    model was trained with it -- as policy_imu.ImuFeatures(tilt=..., yaw=...)
+    makes it on the car."""
+    feats = data[pimu.DATASET_KEY[bool(getattr(model, "imu_yaw", True))]][i]
     if not getattr(model, "imu_tilt", False):
         feats = pimu.without_tilt(feats)
     return pl.encode_imu(feats)
