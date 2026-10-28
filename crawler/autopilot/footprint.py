@@ -90,6 +90,9 @@ AUTOPILOT_FIELDS = {
     "policy_reason": "",
     "goal_reached": False,       # goal.Goal said the car has arrived
     "policy_stop_masked": False, # the model said stop and was driven on
+    "policy_confidence": 0.0,    # softmax p of the committed action; -1 with none
+    "policy_confidence_smoothed": 0.0,  # its EMA over CONF_EMA_DECISIONS
+    "policy_speed_scale": 0.0,   # what the throttle magnitude was multiplied by
     "policy_infer_ms": 0.0,
     "policy_steer_mode": "",     # unified / split: the mode the model drove with
     "policy_steer_mode_p": 0.0,  # the mode head's p of that mode; -1 with no head

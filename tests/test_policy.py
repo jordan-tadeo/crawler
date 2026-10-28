@@ -947,3 +947,169 @@ def test_model_label_needs_both_name_and_version():
     assert pl.model_label({"model_name": "kblock", "model_version": "2.0"}, "/x/a.onnx") == "kblock 2.0"
     assert pl.model_label({"model_name": "kblock"}, "/x/a.onnx") == "a"
     assert pl.model_label({"model_version": "2.0"}, "/x/a.onnx") == "a"
+
+
+# --- confidence: the less sure the model is, the slower it drives -------------
+
+def sure_of(p, action=pl.FORWARD):
+    """Action logits whose softmax gives `action` probability p, the rest even."""
+    rest = math.log((1.0 - p) / 2.0)
+    return tuple(math.log(p) if a == action else rest for a in pl.ACTIONS)
+
+
+def set_logits(d, logits):
+    d.model.out["logits"] = np.array([logits], dtype=np.float32)
+
+
+def run_ticks(d, n, start=T0):
+    for k in range(n):
+        d.tick(start + 0.1 * k)
+    return start + 0.1 * n
+
+
+@pytest.mark.parametrize("action,speed", [(pl.FORWARD, "forward_speed"),
+                                          (pl.REVERSE, "reverse_speed")])
+def test_a_sure_model_drives_its_throttle_unchanged(action, speed):
+    d = policy_driver(StubModel(sure_of(0.95, action), throttle=0.75), clear())
+    run_ticks(d, 10)
+    assert d.confidence.scale == 1.0
+    assert d.controller.throttles[-1] == 0.75 * getattr(d, speed)
+
+
+def test_an_unsure_model_slows_to_the_speed_floor():
+    d = policy_driver(StubModel(sure_of(0.4), throttle=1.0), clear())
+    # A cap high enough that the moving floor is not what holds it.
+    d.forward_speed = 1.0
+    run_ticks(d, 20)
+    assert d.confidence.scale == pytest.approx(pl.SPEED_FLOOR)
+    assert d.controller.throttles[-1] == pytest.approx(pl.SPEED_FLOOR * 1.0)
+    # Half way up the ramp is half way between the floor and full speed.
+    assert pl.speed_scale_for((pl.CONF_FLOOR + pl.CONF_FULL) / 2) == pytest.approx(
+        (pl.SPEED_FLOOR + 1.0) / 2)
+
+
+def test_one_unsure_tick_moves_the_scale_one_step_at_most():
+    d = policy_driver(StubModel(sure_of(0.99), throttle=1.0), clear())
+    d.forward_speed = 1.0
+    t = run_ticks(d, 10)
+    assert d.confidence.scale == 1.0
+    # A stop the goal masks into a forward the model gives 1%: the most
+    # unsure a committed action gets.
+    set_logits(d, (math.log(0.01), math.log(0.005), math.log(0.985)))
+    d.tick(t)
+    assert d.last_decision.action == pl.FORWARD and d.last_decision.stop_masked
+    assert d.confidence.raw == pytest.approx(0.01, abs=1e-6)
+    assert d.confidence.scale == pytest.approx(1.0 - pl.MAX_SCALE_STEP)
+    assert d.controller.throttles[-1] == pytest.approx(1.0 - pl.MAX_SCALE_STEP)
+    # And back up no faster than it came down.
+    for k in range(20):
+        d.tick(t + 0.1 * (k + 1))
+    set_logits(d, sure_of(0.99))
+    scales = [d.confidence.scale]
+    assert scales[0] == pytest.approx(pl.SPEED_FLOOR)
+    for k in range(20):
+        d.tick(t + 5.0 + 0.1 * k)
+        scales.append(d.confidence.scale)
+    steps = np.diff(scales)
+    assert scales[-1] == 1.0
+    assert steps.max() == pytest.approx(pl.MAX_SCALE_STEP)
+    assert steps.min() >= 0.0
+
+
+@pytest.mark.parametrize("action,floor", [(pl.FORWARD, pl.MOVING_FLOOR_FORWARD),
+                                          (pl.REVERSE, -pl.MOVING_FLOOR_REVERSE)])
+def test_slowing_never_takes_the_throttle_under_what_moves_the_car(action, floor):
+    # 0.75 of either cap is over its floor, and half of it is under.
+    d = policy_driver(StubModel(sure_of(0.4, action), throttle=0.75), clear())
+    run_ticks(d, 20)
+    assert d.confidence.scale == pytest.approx(pl.SPEED_FLOOR)
+    assert d.controller.throttles[-1] == pytest.approx(floor)
+
+
+def test_a_throttle_already_under_the_moving_floor_is_left_where_it_was():
+    d = policy_driver(StubModel(sure_of(0.4), throttle=0.25), clear())
+    run_ticks(d, 20)
+    assert d.controller.throttles[-1] == pytest.approx(0.25 * d.forward_speed)
+    assert pl.slowed_throttle(0.0, 0.5, pl.MOVING_FLOOR_FORWARD) == 0.0
+
+
+def slowed_driver():
+    """A policy driver that has been driving unsure, so the scale is down."""
+    d = policy_driver(StubModel(sure_of(0.4), throttle=1.0), clear())
+    t = run_ticks(d, 20)
+    assert d.confidence.scale == pytest.approx(pl.SPEED_FLOOR)
+    return d, t
+
+
+def test_every_stop_is_immediate_and_unscaled_however_sure_the_model_was():
+    from crawler.autopilot import goal as gl
+
+    # Sure and at full speed, then a stop: zero on the very next tick, no slew.
+    for stop in ("no frame", "blind", "bad output", "goal reached", "model floor"):
+        d = policy_driver(StubModel(sure_of(0.99), throttle=1.0), clear())
+        d.goal = gl.Goal()
+        t = run_ticks(d, 10)
+        assert d.controller.throttles[-1] == pytest.approx(d.forward_speed)
+        if stop == "no frame":
+            d.camera.depth = None
+        elif stop == "blind":
+            d.camera.depth = np.zeros((400, 640), dtype=np.uint16)
+        elif stop == "bad output":
+            d.model.out["throttle"] = np.array([[float("nan")]], dtype=np.float32)
+        elif stop == "goal reached":
+            d.goal.set_reached(True)
+        else:
+            d.camera.depth = chair_leg()
+        d.tick(t)
+        assert d.controller.throttles[-1] == 0.0, stop
+        if stop != "model floor":
+            assert neutral(d), stop
+            # Nothing was committed, so nothing was sure and the scale held.
+            assert d.policy_fields()["policy_confidence"] == -1.0, stop
+            assert d.confidence.scale == 1.0, stop
+
+
+def test_a_stuck_recover_backs_out_at_the_full_reverse_cap():
+    d, t = slowed_driver()
+    d.recovering = lambda now: False
+    d.stuck = lambda imu, now: True
+    d.tick(t)
+    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.last_decision.reason == "stuck"
+
+
+def test_pausing_auto_starts_the_confidence_over():
+    d, t = slowed_driver()
+    d.abort()
+    assert d.confidence.smoothed is None and d.confidence.scale == 1.0
+    set_logits(d, sure_of(0.95))
+    d.tick(t + 10.0)
+    # Seeded off the first decision, not dragged up from the old EMA.
+    assert d.confidence.smoothed == pytest.approx(0.95, abs=1e-6)
+    assert d.confidence.scale == 1.0
+    assert d.controller.throttles[-1] == pytest.approx(d.forward_speed)
+
+
+def test_the_confidence_is_logged_in_every_footprint_row(monkeypatch):
+    from crawler.autopilot import footprint as fp
+    from crawler.telemetry import telemetry as tm
+    from test_record import SessionTele
+
+    names = ("policy_confidence", "policy_confidence_smoothed", "policy_speed_scale")
+    props = tm.JSON_SCHEMAS["footprint"]["schema"]["properties"]
+    for name in names:
+        assert name in props and name in fp.AUTOPILOT_FIELDS
+
+    tele = SessionTele()
+    out = run_policy(monkeypatch, StubModel(sure_of(0.4), throttle=1.0), 60,
+                     lambda n, pad, cam: None, tele=tele, tap=fp.FootprintTap(tele=tele))
+    rows = [row for row, _ in tele.of("footprint")]
+    assert rows
+    for row in rows:
+        assert set(row) == set(props)
+    last = rows[-1]
+    assert last["policy_confidence"] == pytest.approx(0.4, abs=1e-6)
+    assert last["policy_confidence_smoothed"] == pytest.approx(0.4, abs=1e-6)
+    assert last["policy_speed_scale"] == pytest.approx(pl.SPEED_FLOOR)
+    fields = out["driver"].policy_fields()
+    assert {k: fields[k] for k in names} == {k: last[k] for k in names}

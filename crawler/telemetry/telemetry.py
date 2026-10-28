@@ -384,6 +384,12 @@ JSON_SCHEMAS = {
         # model's own choice; committed_action is what was done.
         "goal_reached": _BOOL,
         "policy_stop_masked": _BOOL,
+        # How sure the model was of the action committed (softmax p, -1 on
+        # a tick it committed none), that smoothed, and the speed scale off
+        # it that multiplied the throttle's magnitude.
+        "policy_confidence": _NUM,
+        "policy_confidence_smoothed": _NUM,
+        "policy_speed_scale": _NUM,
         "policy_infer_ms": _NUM,
         # The steering mode the policy drove with, and its mode head's
         # probability of that mode (-1 for a model with no head).

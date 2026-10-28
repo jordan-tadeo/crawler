@@ -60,6 +60,19 @@ floor like any other. When the goal says yes, the tick is neutral with
 reason "goal reached". /footprint keeps the model's raw choice in
 policy_action and says goal_reached and policy_stop_masked beside it.
 
+Confidence
+----------
+The less sure the model is, the slower it drives. Confidence is the softmax
+probability of the action committed (after the goal mask), smoothed over
+CONF_EMA_DECISIONS decisions, ramped from SPEED_FLOOR at CONF_FLOOR to 1.0
+at CONF_FULL, and moved at most MAX_SCALE_STEP a decision. The scale only
+multiplies a forward or reverse throttle's magnitude, after the caps, and
+never takes it under MOVING_FLOOR_FORWARD / MOVING_FLOOR_REVERSE, so the
+car slows rather than stalls. Every stop in the table above returns before
+it, so they are all immediate and unscaled, and a neutral is never slewed.
+The EMA starts over whenever auto is paused. /footprint carries
+policy_confidence, policy_confidence_smoothed and policy_speed_scale.
+
 It is handed main.DriverCommand as its controller, exactly as Driver is, so
 it never writes the hardware: AutoPilot.step() mixes in whatever groups my
 hand has taken and writes once a pass. Takeover works the same on top of it.
@@ -256,6 +269,31 @@ MODE_MIN_INTERVAL_S = 2.0
 # not to clamp.
 OUTPUT_TOLERANCE = 1e-4
 
+# ---- how sure it is: the throttle slows as the model's confidence drops ------
+#
+# Confidence is the softmax probability, over the three action logits, of the
+# action actually committed -- after the goal mask, so a masked stop driven as
+# a reverse is as sure as the model was of reverse. It is smoothed, ramped to
+# a speed scale and slew-limited, and the scale multiplies the throttle's
+# magnitude after the caps. Every stop below is untouched by it. I tune these
+# by feel.
+CONF_FULL = 0.9          # smoothed confidence at or above this drives at full speed
+CONF_FLOOR = 0.5         # at or below this the scale bottoms out at SPEED_FLOOR
+SPEED_FLOOR = 0.5        # the slowest the scale goes, as a fraction of the throttle
+MAX_SCALE_STEP = 0.1     # the most the scale moves in one decision, either way
+CONF_EMA_DECISIONS = 5   # EMA length in decisions; 5 at 10 Hz is about 0.5 s
+
+# The least throttle that moves the car, by direction, as magnitudes. The
+# scale never takes a throttle under these; a throttle the model already put
+# under them is left where it was. Not calibrated: deploy/speed_cal.py
+# measures the real ones at full lock and has never been run into this file.
+# Forward 0.2 is the start threshold the first record session found (driver.py,
+# above FORWARD_SPEED). Reverse 0.6 is the old REVERSE_SPEED, which drove
+# every backup-and-turn recover with the wheels turned; -0.2957 barely moved
+# straight and did not move at lock.
+MOVING_FLOOR_FORWARD = 0.2
+MOVING_FLOOR_REVERSE = 0.6
+
 
 def legacy_levels_to_mm(levels):
     """Colourmap levels (0..255) back to millimetres, invalid as 0."""
@@ -402,6 +440,66 @@ def read_mode(outputs):
         return None, "mode not finite"
     e = np.exp(logits - logits.max())
     return float(e[STEER_MODES.index(SPLIT)] / e.sum()), ""
+
+
+def committed_confidence(outputs, action):
+    """The softmax probability of `action` over the model's action logits.
+
+    Only called on outputs read_output() has already checked, so the logits
+    are three finite numbers.
+    """
+    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
+    e = np.exp(logits - logits.max())
+    return float(e[ACTIONS.index(action)] / e.sum())
+
+
+def speed_scale_for(confidence):
+    """The linear ramp: CONF_FLOOR -> SPEED_FLOOR, CONF_FULL -> 1.0, clamped."""
+    t = (confidence - CONF_FLOOR) / (CONF_FULL - CONF_FLOOR)
+    t = min(1.0, max(0.0, t))
+    return SPEED_FLOOR + t * (1.0 - SPEED_FLOOR)
+
+
+def slowed_throttle(throttle, scale, floor):
+    """A signed throttle with its magnitude scaled, never under `floor`.
+
+    A throttle already under the floor is left as it is: the scale only
+    slows a throttle down to the floor, it never speeds one up. 0 stays 0.
+    """
+    mag = abs(float(throttle))
+    slowed = max(mag * scale, min(mag, floor))
+    return math.copysign(slowed, throttle) if mag > 0.0 else 0.0
+
+
+class ConfidenceScale:
+    """The smoothed confidence and the speed scale it sets. One per driver.
+
+    update() takes one committed decision's raw confidence. The first after a
+    reset() seeds the EMA and sets the scale straight off it -- the car is
+    starting from a neutral, so there is nothing to be jerky from -- and every
+    one after moves the scale by at most MAX_SCALE_STEP.
+    """
+
+    def __init__(self):
+        self.alpha = 2.0 / (CONF_EMA_DECISIONS + 1)
+        self.reset()
+
+    def reset(self):
+        self.raw = -1.0         # -1 on a tick with no committed model action
+        self.smoothed = None
+        self.scale = 1.0
+
+    def update(self, confidence):
+        self.raw = float(confidence)
+        if self.smoothed is None:
+            self.smoothed = self.raw
+            self.scale = speed_scale_for(self.smoothed)
+            return self.scale
+        self.smoothed += self.alpha * (self.raw - self.smoothed)
+        target = speed_scale_for(self.smoothed)
+        step = min(MAX_SCALE_STEP, max(-MAX_SCALE_STEP, target - self.scale))
+        self.scale += step
+        return self.scale
 
 
 class ModeLatch:
@@ -683,6 +781,9 @@ class PolicyDriver(dv.Driver):
         self._imu_sample = None
         self._imu_at = 0.0
         self.last_imu = None        # the features fed on the last model run
+        # How sure the model is of what it commits, and the speed scale off
+        # it. Reset with the latch, whenever auto stops.
+        self.confidence = ConfidenceScale()
 
     def abort(self):
         """Driver's abort, and the mode latch forgets the pad: the next tick
@@ -690,6 +791,7 @@ class PolicyDriver(dv.Driver):
         super().abort()
         self._pad_seen = None
         self.imu_features.reset()
+        self.confidence.reset()
 
     def _sync_mode(self, now):
         """The pad's say in the policy's mode, before the model has its own.
@@ -773,6 +875,13 @@ class PolicyDriver(dv.Driver):
             "policy_reason": d.reason if d is not None else "",
             "goal_reached": bool(self.goal_reached),
             "policy_stop_masked": bool(d.stop_masked) if d is not None else False,
+            # The committed action's softmax probability (-1 on a tick the
+            # model committed nothing), its EMA, and the scale on the throttle.
+            "policy_confidence": float(self.confidence.raw),
+            "policy_confidence_smoothed": float(self.confidence.smoothed
+                                                if self.confidence.smoothed is not None
+                                                else -1.0),
+            "policy_speed_scale": float(self.confidence.scale),
             "policy_infer_ms": float(self.last_infer_ms),
             # The mode the policy drove with, and the head's probability of
             # that mode on its last answer: low while it wants to switch. -1
@@ -802,6 +911,8 @@ class PolicyDriver(dv.Driver):
 
     def _tick(self, now):
         self._now = now
+        # Only a tick that commits a model action says how sure it was.
+        self.confidence.raw = -1.0
         # First, so every row says it, whichever path the tick takes. A goal
         # that raises is the exception path: neutral, and auto parks.
         was = self.goal_reached
@@ -890,15 +1001,21 @@ class PolicyDriver(dv.Driver):
             # floor below still holds a forward, as it holds any other.
             action = moving_action(outputs)
 
+        # Every neutral has returned by here, so this is a committed model
+        # action. The floor's hold below is a 0 no scale touches, so the
+        # scale only ever multiplies a moving throttle.
+        scale = self.confidence.update(committed_confidence(outputs, action))
         reason = "model"
         if action == FORWARD and self.floor_veto.vetoes():
             # Blocks the forward, not the decision: the steering still goes
             # out, and next tick the model can choose to reverse.
             throttle, reason = 0.0, "model floor"
         elif action == FORWARD:
-            throttle = self.forward_speed * magnitude
+            throttle = slowed_throttle(self.forward_speed * magnitude, scale,
+                                       MOVING_FLOOR_FORWARD)
         elif action == REVERSE:
-            throttle = self.reverse_speed * magnitude
+            throttle = slowed_throttle(self.reverse_speed * magnitude, scale,
+                                       MOVING_FLOOR_REVERSE)
         else:
             throttle = 0.0
 
