@@ -4,8 +4,8 @@ The learned policy is a small CNN over a downsampled depth image. Every
 decision tick the car writes the picture that policy would see and the command
 that was actually on the wheels, at one log time, into the MCAP recording.
 This file is the contract between the car and the trainer. The code that
-holds it is `footprint.py` (the rows), `policy_input.py` (the picture) and
-`telemetry.py` (`JSON_SCHEMAS["footprint"]`, `RAW_DEPTH_CHANNELS`).
+holds it is `crawler/autopilot/footprint.py` (the rows), `crawler/autopilot/policy_input.py` (the picture) and
+`crawler/telemetry/telemetry.py` (`JSON_SCHEMAS["footprint"]`, `RAW_DEPTH_CHANNELS`).
 
 ## Where the data comes from
 
@@ -86,11 +86,11 @@ It is `policy_input.depth_small(depth_frame)` and nothing else:
 - No clipping, scaling or normalising. That is the trainer's job.
 
 **Inference on the car calls this same function.** Import it from
-`policy_input.py`; do not reimplement it. `deploy/footprint_dump.py --verify`
+`crawler/autopilot/policy_input.py`; do not reimplement it. `deploy/footprint_dump.py --verify`
 checks, frame by frame, that every recorded picture with a raw frame behind it
 equals `depth_small(raw)` byte for byte.
 
-Depth frame facts (`oakd.py`): 400P mono pair at 16 fps, depth aligned to the
+Depth frame facts (`crawler/hardware/oakd.py`): 400P mono pair at 16 fps, depth aligned to the
 RGB socket, left-right check on, extended disparity instead of subpixel. So
 the nearest valid depth is about 165 mm (closer reads 0), and depth is
 quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
@@ -138,7 +138,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `committed_action`, `committed_steer`, `committed_reason` | str, float, str | auto only: what the driver actually did after its evade latch. Empty in record |
 
 The reason strings are free text: the first word names the rule, and a number
-after it is that rule's measure. As of `driver.py` at `11cecdd`:
+after it is that rule's measure. As of `crawler/autopilot/driver.py` at `11cecdd`:
 
 - forward: `clear`
 - reverse: `no_return`; `floor <mm>` (nearest blocked probe under
@@ -148,7 +148,7 @@ after it is that rule's measure. As of `driver.py` at `11cecdd`:
   block in the middle)
 - committed only: `holding out`, `evade flipped`, `evade timeout`
 
-Split on the first space to get the rule. The list moves with `driver.py`, so
+Split on the first space to get the rule. The list moves with `crawler/autopilot/driver.py`, so
 treat an unknown first word as a new rule, not an error.
 
 The probe and verdict fields are the rule-based driver's opinion, recorded as
@@ -198,11 +198,11 @@ vector rides in its own report slot.
 
 ## The IMU as a policy input
 
-`policy_imu.py` is the one place IMU numbers become the policy's `imu`
+`crawler/autopilot/policy_imu.py` is the one place IMU numbers become the policy's `imu`
 input. The dataset tool pushes each session's `/footprint` rows through
 `policy_imu.ImuFeatures` in time order (every row, before any is dropped) and
 stores the result as the `.npz`'s `imu` array; `PolicyDriver` builds the
-same row live with `policy_imu.row_fields` (the function `footprint.py`
+same row live with `policy_imu.row_fields` (the function `crawler/autopilot/footprint.py`
 writes the row with) and pushes it through its own `ImuFeatures`. Features,
 in order (`policy_imu.FEATURES`): gyro xyz over 2 rad/s, linear accel xyz
 over 10 m/s^2, the largest |accel| and |gyro| of the last 5 decisions (0.5 s)
@@ -296,3 +296,53 @@ The table has one column per number (arrays spread out as
 `--small DIR` writes `DIR/<recording>.npz` with `depth` `(N, 50, 80)` uint16,
 `seq` and `log_time_ns`, in row order. `--depth DIR` writes the 2 Hz raw
 frames as `DIR/<log_time_ns>.npy`.
+
+## Training a model
+
+On the laptop, in `~/crawler-train` (see the README):
+
+```sh
+python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/crawler-record-*.mcap
+python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
+python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one session: time blocks
+python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu --prev   # + IMU, + last decision
+python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw    # + IMU without the yaw rate
+python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu-no-yaw --imu-tilt   # + which way is up
+python tools/policy_eval.py data.npz models/policy.onnx --out report.md
+```
+
+The dataset tool prints, per session, every tick it dropped and why, the
+not-driving spans (parked, idle, the reach for Y, the car in my hands) as a
+one-character-a-second timeline, and what the `/marks` did: a BAD window on
+my own driving comes out of training, a GOOD one counts double
+(`--good-weight`). Validate on a whole session, never a random tick. With
+only one session, `--blocks 5` holds out five contiguous stretches of it in
+turn (with a second either side left out of training) and then trains the
+model it exports on all of it.
+
+The trainer prints the model against always-forward, the hand-written rule
+and the median throttle, which is the number that says whether it learned
+anything, and the mode head against always-stay: its recall on the ticks
+around each L3 press, and how many of my presses its latch reproduces. Old
+rolling recordings work too with `--labels any`, but all they can teach is a
+copy of the autopilot. A group a learned policy drove is never a label, not
+even with `--labels any`.
+
+`policy_train.py --model-name kblock` names the family at training time,
+never the number, and every sidecar it writes says the commit and command it
+came from. A model trained before the steering moved to manual's units says
+`steer_scale` 0.6 in its `.json`, and the car refuses it; retrain it.
+
+### How a model with a mode head drives
+
+It picks four-wheel (unified, the rear counter-phase through
+`steering_pair`) or two-wheel (split with the rear straight). It starts in
+whatever mode the pad is in when auto engages, and only switches when its
+head has wanted the other mode at over 0.7 for 0.5 s and the last switch was
+2 s ago, so it cannot flap. L3 while it drives sets its mode to the pad's and
+restarts the 2 s, so my press sticks. While my stick has the steering my mode
+drives, and when I let go it carries on in my mode. A model with no mode head
+drives four-wheel whatever the pad says.
+
+On the Pi 4 the column profile model takes 0.35 ms to run and about 4.5 ms
+with its input made, against a 100 ms tick.

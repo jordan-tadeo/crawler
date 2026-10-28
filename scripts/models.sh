@@ -7,19 +7,19 @@
 # is the tool and its docstring says what earns a number and how a deploy
 # keeps the car safe.
 #
-#   ./models.sh list                       # releases, candidates, * = on the car
-#   ./models.sh register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
-#   ./models.sh deploy candidate-imu-gyro  # a test drive (or --candidate imu-gyro)
-#   ./models.sh promote imu-gyro --evidence ab.json --approved-on-car --notes "..."
-#   ./models.sh promote imu-gyro --force-gate "why" --approved-on-car
-#   ./models.sh deploy 1.3 --dry-run       # what it would do, touching nothing
-#   ./models.sh deploy 1.3                 # copy, verify, re-point, restart, check
-#   ./models.sh rollback                   # back to what drove before
-#   ./models.sh status                     # the car's symlink, by sha256
-#   ./models.sh approve 1.2 --notes "..."  # it drove well on the car
-#   ./models.sh note 1.2 "..." [--kind general]   # a dated drive note
-#   ./models.sh notes 1.2                  # every note on that model
-#   ./models.sh demote 2.0 --tag imu-1028 --reason "..."   # give a number back
+#   ./scripts/models.sh list                       # releases, candidates, * = on the car
+#   ./scripts/models.sh register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
+#   ./scripts/models.sh deploy candidate-imu-gyro  # a test drive (or --candidate imu-gyro)
+#   ./scripts/models.sh promote imu-gyro --evidence ab.json --approved-on-car --notes "..."
+#   ./scripts/models.sh promote imu-gyro --force-gate "why" --approved-on-car
+#   ./scripts/models.sh deploy 1.3 --dry-run       # what it would do, touching nothing
+#   ./scripts/models.sh deploy 1.3                 # copy, verify, re-point, restart, check
+#   ./scripts/models.sh rollback                   # back to what drove before
+#   ./scripts/models.sh status                     # the car's symlink, by sha256
+#   ./scripts/models.sh approve 1.2 --notes "..."  # it drove well on the car
+#   ./scripts/models.sh note 1.2 "..." [--kind general]   # a dated drive note
+#   ./scripts/models.sh notes 1.2                  # every note on that model
+#   ./scripts/models.sh demote 2.0 --tag imu-1028 --reason "..."   # give a number back
 #
 # A new model is a candidate with no number. promote gives it the next one
 # only when it beats the latest release on held-out folds (--evidence) and I

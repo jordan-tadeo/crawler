@@ -1,31 +1,46 @@
 # crawler
 
-RC rock crawler control for a Raspberry Pi 4. It boots into hand driving off a
-Bluetooth pad; START hands the car to the OAK-D for auto mode. A and B mark
-the moment, good and bad, so a run can be read back afterwards instead of
-remembered. Holding Y for a second in manual starts a record session: I drive
-at auto's speeds and every decision is written down as training data for the
-learned policy (see `TRAINING_DATA.md`).
+Control for my RC rock crawler. It boots into hand driving off a Bluetooth
+pad, and START hands the car to the OAK-D for auto mode: either the
+hand-written rules or a small learned policy. Every run is recorded, so a
+drive can be read back afterwards instead of remembered.
 
-The car is a Pi 4 on Raspberry Pi OS Bookworm 64-bit, aarch64, Python 3.11.2.
-That is the only machine this actually drives on. A laptop checkout is for
-editing and for importing the controller without any hardware attached.
+## Hardware
+
+- Raspberry Pi 4, Raspberry Pi OS Bookworm 64-bit, Python 3.11. This is the
+  only machine that drives; a laptop checkout is for editing, tests and
+  training.
+- Quicrun 880 ESC on GPIO 18 through pigpio. Neutral is 1575 us.
+- Front and rear steering servos on a PCA9685 over I2C.
+- OAK-D: stereo depth and the IMU, computed on the camera.
+- An Xbox pad over Bluetooth, driven by xpadneo.
+
+## Layout
+
+```
+crawler/            the code that runs on the car, one package
+  __main__.py       the app: `python -m crawler`
+  hardware/         ESC and servos, the pad, the OAK-D, the camera hub
+  autopilot/        the rules driver, the learned policy and its inputs, marks
+  telemetry/        Foxglove channels, MCAP recording, the log, the dashboard
+tools/              laptop tools: dataset, training, eval, the models registry
+scripts/            run.sh, models.sh, pull-recordings.sh; scratch/ for one-off checks
+deploy/             the systemd unit and its installer, the pad timeout, car-side tools
+docs/               TRAINING_DATA.md, the recording schema
+tests/              pytest, runs on the laptop with no hardware
+```
+
+Models (`models/`), logs (`log/`) and recordings never go in the repo. On the
+car they sit at the checkout root, untracked.
 
 ## Setup
 
-Dependencies live in `pyproject.toml` and are locked in `uv.lock`. There is no
-`requirements.txt` any more.
-
-[uv](https://docs.astral.sh/uv/) does the installing:
+Dependencies are in `pyproject.toml`, locked in `uv.lock`. On the car, pigpio
+and PyQt5 come from apt, so the venv is built on the system Python and can see
+its packages:
 
 ```sh
 curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Two things on the car come from apt rather than pip, so the environment has to
-be built to see them:
-
-```sh
 sudo apt install pigpio python3-pigpio python3-pyqt5
 sudo systemctl enable --now pigpiod
 
@@ -33,42 +48,158 @@ uv venv --python /usr/bin/python3 --system-site-packages
 uv sync
 ```
 
-Both of those flags are load-bearing:
+`uv sync` also installs `crawler/` into `.venv` as editable. The car does not
+rely on that: run from the checkout root, `python -m crawler` finds the package
+in the working directory.
 
-- `--python /usr/bin/python3` keeps uv off its own downloaded CPython. apt's
-  PyQt5 is built for the system 3.11 and installs into
-  `/usr/lib/python3/dist-packages`; a uv-managed interpreter never looks there.
-  `requires-python` is pinned to `==3.11.*` for the same reason.
-- `--system-site-packages` is what lets the venv see `dist-packages` at all.
-  Without it the dashboard has no PyQt5.
+PyQt5 (only for `--dashboard`) has no aarch64 wheel, which is why it comes from
+apt and why the venv needs `--system-site-packages`. The comments in
+`pyproject.toml` say why each pin is a pin.
 
-`pigpio` itself is in `pyproject.toml` and comes from PyPI, so the lock covers
-the ESC driver instead of leaving it to whatever apt happens to have. The apt
-`python3-pigpio` is the same 1.78 and is a fine fallback; the pip one shadows
-it inside the venv.
+## Running it on the car
 
-### Extras
+The service starts the car at boot:
 
-There was a `vision` extra here for TensorFlow. It is gone, and so are the four
-files that were its only consumers: `PersonFollower.py`, `USBCamera.py`,
-`scratch_persondetect.py` and `convert_pb_to_tflite.py`, plus the 45 MiB of
-SavedModel and `.tflite` weights they loaded.
+```sh
+./deploy/install-service.sh --print-unit        # show the unit, write nothing
+sudo ./deploy/install-service.sh --start        # install, enable, start now
+journalctl -u crawler -f
+```
 
-That whole branch of the project was a whole-image classifier on a USB webcam,
-aimed at a pan/tilt gimbal that is not bolted to the car any more. Vision is the
-OAK-D now: `oakd.py` and `camera.py` take stereo depth off the camera's own chip
-and `driver.py` crawls on it. Nothing left in the tree imports TensorFlow.
+The unit is `deploy/crawler.service.template`. It runs `python -m crawler
+--mode manual` with the checkout as its working directory. The installer fills
+in the interpreter, paths, user and groups from the machine it runs on. To
+drive a learned model, a drop-in adds `--policy models/policy.onnx`:
 
-The `dashboard` extra is deliberately empty. `main.py --dashboard` needs PyQt5,
-and PyQt5 5.15.x publishes **no `linux_aarch64` wheel at all** -- 5.15.9 ships
-x86_64 manylinux, x86_64 macOS, win32 and win_amd64, and nothing else -- so pip
-falls back to the sdist and tries to compile Qt bindings on a Pi, which wants
-the Qt5 dev headers and sip. It comes from `apt install python3-pyqt5`
-instead, which is the whole reason the venv needs `--system-site-packages`.
+```sh
+sudo systemctl edit crawler     # ExecStart= then ExecStart=<python> -m crawler --mode manual --policy models/policy.onnx
+```
 
-`opencv-contrib-python` is installed on the car but is not a dependency: every
-`cv2` call in the tree is in the base module. Having both installed is a known
-way to end up with two native extensions fighting over one `cv2` name.
+In a shell instead, with the log on screen:
+
+```sh
+./scripts/run.sh                         # manual, telemetry on
+./scripts/run.sh --telemetry-camera      # also open the OAK-D in manual
+./scripts/run.sh --no-telemetry --no-record
+./scripts/run.sh --policy models/policy.onnx
+```
+
+`run.sh` and the installer pick `env/bin/python` (the old hand-made venv) if it
+exists, then `.venv/bin/python`. `CRAWLER_PYTHON=...` or `--python PATH`
+overrides that.
+
+The pad's Bluetooth link timeout is cut to 5 s on every connection, so a pad
+that dies quietly puts the car at neutral in about 6 s instead of 20:
+
+```sh
+sudo ./deploy/install-pad-lst.sh                # once
+journalctl -u 'crawler-pad-lst@*'               # one line per connection
+```
+
+The OAK-D's udev rule is already on the car and the installer does not touch
+it. The comment at the top of `deploy/install-service.sh` says what it is.
+
+## Modes and controls
+
+| control | what it does |
+| --- | --- |
+| RT / LT | throttle forward / reverse |
+| left stick | steering, both axles (unified mode) |
+| right stick | rear axle, in split mode |
+| L3 | toggle unified / split steering |
+| START | manual and auto |
+| hold Y 1 s | record mode (manual only); any press of Y leaves it |
+| A / B | mark the last few seconds good / bad |
+
+- **Manual** is hand driving.
+- **Auto** drives on depth. With no `--policy` it is the rules in
+  `crawler/autopilot/driver.py`. With `--policy MODEL.onnx` the model decides
+  forward, reverse or stop, a throttle and a steer every 100 ms, behind the
+  same forward-floor veto and stuck detector. A frame that is missing, stale
+  or blind is neutral, and so is any output that is not finite. A model that
+  will not load means auto is unavailable; it never falls back to the rules
+  quietly. My stick or trigger takes over from either one.
+- **Record** drives like manual at auto's speed caps (full RT is auto's
+  forward speed) and writes every decision down as training data. START ends
+  the session and goes to auto.
+- Coming back to manual, the throttle stays at 0 until both triggers have been
+  released once.
+
+A mark is a window, 4 s back and 1 s ahead of the press. It goes to the MCAP
+on `/marks`, to the journal, and to `log/marks.csv`. The pad buzzes once for
+A and twice for B.
+
+## Watching and recording
+
+The car serves Foxglove on port 8765. In Foxglove: Open connection, Foxglove
+WebSocket, `ws://jtpi.local:8765`. Use the name, not an address: the DHCP lease
+moves. If mDNS fails, `ssh jt@jtpi.local 'hostname -I'` gives the address.
+
+Every run is written to `log/mcap/` from service start, in 128 MiB segments,
+with the oldest deleted past 8 GiB and recording stopped under 4 GiB free.
+Record sessions get their own `crawler-record-*.mcap` files and are never
+pruned. Nothing in telemetry or recording can delay a throttle command or stop
+the car if it fails.
+
+## Record, pull, train, deploy
+
+1. **Record.** Hold Y in manual and drive.
+2. **Pull**, on the Mac. Recordings go to `~/crawler-data/mcap`, never into a
+   git tree (the repo is public and a recording is video of my house):
+
+   ```sh
+   ./scripts/pull-recordings.sh                  # everything new, checked and repaired
+   ./scripts/pull-recordings.sh --records-only   # only the training sessions
+   ./scripts/pull-recordings.sh --list           # what the car holds
+   ./scripts/pull-recordings.sh --prune --yes    # delete car copies that are safe here
+   ```
+
+   Is a drive any good as training data:
+
+   ```sh
+   uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
+       python tools/session_report.py ~/crawler-data/mcap/crawler-record-*.mcap
+   ```
+
+3. **Train**, in its own venv. Torch never goes near the car or
+   `pyproject.toml`:
+
+   ```sh
+   python3.11 -m venv ~/crawler-train && ~/crawler-train/bin/pip install -r tools/requirements-train.txt
+   python tools/policy_dataset.py data.npz
+   python tools/policy_train.py data.npz models/policy.onnx --val <session>
+   python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw --imu-tilt
+   python tools/policy_eval.py data.npz models/policy.onnx --out report.md
+   ```
+
+   `docs/TRAINING_DATA.md` has the recording schema and what the dataset tool
+   and trainer report.
+
+4. **Deploy** through the models registry, below.
+
+Whether a model drives well is something I find out by driving behind it with
+a hand on START. The numbers only say it agrees with me on recorded frames.
+
+## Models registry
+
+Models live on the Mac in `~/crawler-data/models`, listed in `registry.json`.
+A new model is a candidate with no number. `promote` gives it the next
+`kblock X.Y` only when it beats the latest release on held-out folds and I say
+it drove well. `deploy` and `rollback` refuse unless the car is parked.
+
+```sh
+./scripts/models.sh list                      # releases, candidates, * = on the car
+./scripts/models.sh register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
+./scripts/models.sh deploy candidate-imu-gyro --dry-run   # then without --dry-run
+./scripts/models.sh promote imu-gyro --evidence ab.json --approved-on-car --notes "..."
+./scripts/models.sh rollback                  # back to what drove before
+./scripts/models.sh status                    # the car's link, checked by sha256
+./scripts/models.sh note 1.2 "..."            # a dated drive note
+```
+
+`deploy` copies the files into the car's `models/`, re-points the
+`models/policy.onnx` and `.json` symlinks, restarts the service and checks it
+came back. The docstring in `tools/models.py` has the rules.
 
 ## Tests
 
@@ -76,513 +207,6 @@ way to end up with two native extensions fighting over one `cv2` name.
 uv run pytest
 ```
 
-Runs on a laptop in under a second. Nothing in the suite wants pigpio talking
-to a daemon, a pad paired, or the OAK-D plugged in -- which is the point. These
-cover the arithmetic and the gating that had never run anywhere but on the car,
-and every one of them is aimed at something that has already gone wrong:
-
-- **`tests/test_driver.py`** -- the stuck check. The journal used to show
-  "Switched to auto" and "STUCK - backing up to recover." on the same second,
-  then STUCK again every five seconds on a car that was driving fine. Three
-  faults made that: a missing IMU packet filed as "not moving", no check that
-  the car had even been asked to move, and `last_recovery_time` stamped on
-  every false positive. One test per fault, plus the fail-closed depth checks.
-- **`tests/test_vehicle_controller.py`** -- pulse widths and servo angles,
-  including that half throttle is still 1787 us, and the nan/inf guard.
-  `min()` and `max()` do not clamp a nan, so a nan throttle used to come out of
-  the clamp as a clean 1.0 and reach the ESC as 2000 us, full forward.
-- **`tests/test_joystick.py`** -- the axis and button map, which was wrong in a
-  way that held the rear steering servo at full lock, and the trigger scaling,
-  which turned an unreported axis reading of 0.0 into half throttle.
-- **`tests/test_logger.py`** -- that `log/` makes itself. It is gitignored, so
-  it is not in a fresh clone, and `open(..., 'a')` does not create a missing
-  parent -- which with `Restart=on-failure` was a restart loop a few seconds
-  into every run.
-
-`conftest.py` at the root is what lets the tests `import driver` the same way
-`main.py` does. There is no `src/` layout and no installed package: the flat
-module names are load-bearing in `main.py` and in the systemd unit.
-
-## Driving it
-
-```sh
-./run.sh                    # hand driving, in a shell, with the log on screen
-```
-
-`run.sh` and the installer both look for `env/bin/python` first, then
-`.venv/bin/python`, then system `python3`. `env` is the old hand-rolled venv.
-The installed service has been moved onto `.venv` (its `ExecStart` names
-`.venv/bin/python` outright), but `env/` is still on the car, so `run.sh` in a
-shell keeps picking it until it is deleted -- and re-running the installer
-without `--python` would pick it too. `CRAWLER_PYTHON=... ./run.sh`, or
-`--python PATH` on the installer, overrides that.
-
-## Service
-
-```sh
-./deploy/install-service.sh --print-unit        # show the unit, write nothing
-sudo ./deploy/install-service.sh                # install + enable for boot
-sudo ./deploy/install-service.sh --start        # install + enable + start now
-journalctl -u crawler -f
-```
-
-The unit is `deploy/crawler.service.template`, with `@PLACEHOLDERS@` the
-installer fills from the machine it is run on: interpreter, checkout path,
-service user and group, the supplementary groups that actually exist, the
-`pigs` binary and the `pigpiod` unit. Three lines drop out entirely when what
-they need is missing. `--print-unit` renders it without root and without
-touching `/etc`, which is how I check it before it goes anywhere.
-
-Auto mode also needs a udev rule for the OAK-D, which the installer does not
-write -- see the comment at the top of it.
-
-### The pad's link timeout
-
-```sh
-sudo ./deploy/install-pad-lst.sh                # once, on the car
-journalctl -u 'crawler-pad-lst@*'               # one line per pad connection
-```
-
-A pad sitting still sends nothing, so the only thing that notices one that
-died quietly (flat battery, out of range) is the Bluetooth link supervision
-timeout, and its default is 20 s. That is 20 s of the car holding whatever it
-was last told. On every connection the pad's link is cut to **5 s** (8000
-slots): a udev rule sees xpadneo bind the pad and starts
-`crawler-pad-lst@<mac>.service`, which runs `deploy/pad-lst.sh` as root and
-logs the value it reads back, `link supervision timeout 8000 slots (5000 ms)`.
-It is per connection, so it has to run on every one, and it does not depend on
-`crawler.service` at all. Only xpadneo devices match. The kernel drops the
-input device when the 5 s run out, and the car's lost-pad path sees that
-within about 0.8 s, so a silent pad is at neutral after about 5.8 s.
-
-It uses `hcitool lst` because nothing else on the car sends that HCI command:
-`btmgmt` has none, and `LinkSupervisionTimeout` in `/etc/bluetooth/main.conf`
-only sets a kernel default the 6.6 kernel never sends to the controller.
-
-## A learned autopilot
-
-Off unless I ask for it. `main.py --policy models/policy.onnx` makes START
-hand the wheels to a small network instead of the hand-written rules, behind
-vetoes of its own: no frame, a stale frame or a blind frame is neutral, a
-forward with anything under `FORWARD_FLOOR_MM` (363 mm at forward 0.4), or
-with a probe that went blind on the way in, becomes throttle 0 with its
-steering still going out (`driver.ForwardFloorVeto`, the same veto my trigger
-is held by), and an output that is not finite or not in range is neutral, never
-clamped (a nan through `min(1, v)` is full forward). The stuck detector still
-fires, and is the only thing that runs the canned backup-and-turn. A model
-that will not load is auto unavailable, not a quiet fall back to the rules.
-
-Every tick it picks forward, reverse or stop, a throttle as a fraction of the
-speed cap (forward 0.4, reverse -1.0, so never faster than auto already
-drives) and a front steer in manual's units, a fraction of the pad's full
-lock (0.7). A reverse is the model's too, decided again every tick, so it can
-stop backing up the moment the picture says so. It writes into the same held
-command the rules do, so takeover works over it unchanged: my stick or my
-trigger replaces its group, and stuck stays off while the throttle is mine.
-Every `/footprint` row in auto says `autopilot` `rules` or `policy`, and
-under a policy the model's own command (after its floor veto), its reason
-and the model's name and sha256. That command, during a takeover is not what reached
-the wheels.
-
-A model with the mode head also picks the steering mode: four-wheel
-(unified, the rear counter-phase through `steering_pair`) or two-wheel
-(split with the rear straight, which is the only split I drive). It starts
-in whatever mode the pad is in when auto engages, and only switches when its
-head has wanted the other mode at over 0.7 for 0.5 s and the last switch was
-2 s ago, so it cannot flap. L3 while it drives sets its mode to the pad's
-and restarts the 2 s, so my press sticks. While my stick has the steering my
-mode drives, and when I let go it carries on in my mode. The rows say
-`policy_steer_mode` and the head's confidence in it,
-`policy_steer_mode_p`. A model with no mode head drives four-wheel whatever
-the pad says, as every model before it did.
-
-The car runs the `.onnx` through onnxruntime and nothing else. Torch is only
-on the laptop. On the Pi 4 the default (column profile) model takes 0.35 ms
-to run and about 4.5 ms with its input made, against a 100 ms tick.
-
-Building one, on the laptop, in its own venv; torch never goes near the car
-or `pyproject.toml`:
-
-```sh
-python3.11 -m venv ~/crawler-train && ~/crawler-train/bin/pip install -r tools/requirements-train.txt
-./pull-recordings.sh                              # into ~/crawler-data/mcap
-python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/crawler-record-*.mcap
-python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
-python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one session: time blocks
-python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu --prev   # + IMU, + last decision
-python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw    # + IMU without the yaw rate
-python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu-no-yaw --imu-tilt   # + which way is up
-python tools/policy_eval.py data.npz models/policy.onnx --out report.md
-```
-
-The dataset tool prints, per session, every tick it dropped and why, the
-not-driving spans (parked, idle, the reach for Y, the car in my hands) as a
-one-character-a-second timeline, and what the `/marks` did: a BAD window on
-my own driving comes out of training, a GOOD one counts double
-(`--good-weight`). Validate on a whole session, never a random tick; with
-only one session, `--blocks 5` holds out five contiguous stretches of it in
-turn (with a second either side left out of training) and then trains the
-model it exports on all of it. The
-trainer prints the model against always-forward, the hand-written rule and
-the median throttle, which is the number that says whether it learned
-anything, and the mode head against always-stay: its recall on the ticks
-around each L3 press, and how many of my presses its latch reproduces. Old rolling recordings work too with `--labels any`, but all they
-can teach is a copy of the autopilot. A group a learned policy drove is never
-a label, not even with `--labels any`.
-
-Putting it on the car (`models/` is gitignored, so the file is only ever one
-I copied there). onnxruntime is in `pyproject.toml` and `uv.lock`, aarch64
-wheel included, so `uv sync` in the checkout puts it in the `.venv` the
-service runs:
-
-```sh
-ssh jtpi mkdir -p Documents/py/crawler/models
-scp models/policy.onnx models/policy.json jtpi:Documents/py/crawler/models/
-ssh jtpi 'cd Documents/py/crawler && ~/.local/bin/uv sync'
-sudo systemctl edit crawler                       # ExecStart= then ExecStart=... --policy models/policy.onnx
-```
-
-After the first time, a model goes on the car by name, in
-`~/crawler-data/models/registry.json`. A new model registers as a
-candidate with no number, `kblock candidate <tag>`, and can go on the car
-for a test drive. A version number means better than the version before:
-`promote` gives a candidate the next one only when it beats the latest
-release on held-out folds (`--evidence`, the schema is in
-`tools/models.py`) and I say it drove well (`--approved-on-car`). MAJOR
-when the car has to know (a new input, representation or output), MINOR
-for a retrain on the same contract. `deploy` puts a release or a candidate
-on the car, re-points `models/policy.onnx` and `.json`, restarts the
-service and checks it came back, and only does any of that with the car
-parked. Every `/footprint` row in auto then says which model drove
-(`policy_model`, e.g. `kblock 1.2` or `kblock candidate imu-1028`).
-
-```sh
-./models.sh register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
-./models.sh list                      # releases, candidates, * = on the car
-./models.sh deploy candidate-imu-gyro --dry-run   # then without --dry-run
-./models.sh promote imu-gyro --evidence ab.json --approved-on-car --notes "..."
-./models.sh rollback                  # back to what drove before
-./models.sh status                    # the car's link, checked by sha256
-```
-
-`policy_train.py --model-name kblock` names the family at training time,
-never the number, and every sidecar it writes says the commit and command
-it came from.
-
-A model trained before the steering moved to manual's units says
-`steer_scale` 0.6 in its `.json`, and the car refuses it; retrain it.
-
-Whether it drives well is something I find out by driving behind it with a
-hand on START. The numbers say whether it agrees with me on recorded frames,
-not whether it is any good on new ones.
-
-## Watching it in Foxglove
-
-The car serves the Foxglove WebSocket protocol on port 8765 while it runs.
-[Foxglove](https://foxglove.dev) on the laptop opens it directly: **Open
-connection -> Foxglove WebSocket ->**
-
-```
-ws://jtpi.local:8765
-```
-
-By name and not by address. The DHCP lease the car used to hold has already
-moved once, and the device holding that address now answers a ping and refuses
-SSH -- which looks exactly like the car being broken. `jtpi.local` is mDNS and
-resolves on the same wifi with nothing configured. If Foxglove ever cannot
-resolve it, `ssh jt@jtpi.local 'hostname -I'` says what the address is today
-and `ws://<that>:8765` works as the fallback.
-
-On a Mac that is `brew install --cask foxglove`, and then `open -a Foxglove`
--- the cask installs an app, not a command.
-
-Eight channels. The five JSON ones carry a named schema so Studio labels them:
-
-| topic | schema | rate | what it is |
-| --- | --- | --- | --- |
-| `/controller` | `crawler.Controller` | 20 Hz | every axis and button by raw SDL index, the named view through `Joystick`'s own maps, the calibrated trigger rest, and the throttle and steering the code derived |
-| `/vehicle` | `crawler.Vehicle` | 20 Hz | mode, commanded throttle and steering, the ESC pulse width that was written, and the pigpio read-back with its age |
-| `/diagnostics` | `crawler.Diagnostics` | 4 Hz | mode, pad connected, auto available, camera state and error, last error, loop rate and worst tick, whether this run is being recorded -- which file, how big, and why not if not -- and how many moments I have marked good and bad so far |
-| `/imu` | `crawler.Imu` | 20 Hz | the OAK-D's linear accelerometer and gyro, and the up vector off its rotation vector, downsampled from 100 Hz |
-| `/marks` | `crawler.Mark` | on a press | one message per press of A or B, carrying the window it stands for and a snapshot of what the car was doing and seeing |
-| `/camera/depth` | `foxglove.CompressedImage` | 8 Hz | depth, colourmapped over a fixed 300-3000 mm window |
-| `/camera/disparity` | `foxglove.CompressedImage` | 8 Hz | disparity, per-frame stretch |
-| `/camera/rectified_left` | `foxglove.CompressedImage` | 2 Hz | the actual mono picture |
-
-The image channels use a well-known Foxglove schema, so the Image panel finds
-them on its own with no layout to build. There is no well-known Foxglove IMU
-schema -- the SDK ships forty-odd and none of them is an IMU -- so `/imu` is
-JSON and the panel for it is Plot.
-
-```sh
-./run.sh                             # telemetry on, no camera in manual
-./run.sh --telemetry-camera          # also open the OAK-D, so the camera
-                                     #   channels work while hand driving
-./run.sh --no-telemetry              # no server, no thread, no port bound
-./run.sh --telemetry-port 9000       # somewhere else
-```
-
-Telemetry is on by default and `--telemetry-camera` is off by default. The
-camera one costs a USB enumeration and about a watt on every boot, and the
-mode that has to always work does not need a picture. In auto the camera is
-up anyway, so the camera channels flow either way.
-
-None of it can delay a throttle command. The control loop calls `wants()`,
-which is a couple of dict lookups, and `offer()`, which drops a value into a
-one-deep mailbox and returns; the JSON, the colourmapping, the JPEG and the
-socket writes are all on the telemetry thread. Every channel is gated on the
-server's own subscriber count, so with Foxglove shut nothing is built and
-nothing is encoded. Measured on the car with a client subscribed to all seven
-and the camera running: p50 23 us, p99 147 us, worst 720 us, against a 10 ms
-tick.
-
-And it is never fatal. A missing `foxglove-sdk`, a port already bound, a
-laptop that closed mid-frame -- all logged and swallowed. `Not starting
-telemetry, driving as normal` in the log means exactly that. A port that
-cannot be bound now costs the live view only: the channels are built before
-the socket, so the recording below carries on without it.
-
-### Recording it
-
-Every run is written to `log/mcap/`, from service start, whether or not
-Foxglove is open. That is the whole point -- the run worth looking at is
-always the one that just ended badly, and by then the laptop is shut.
-
-```sh
-./pull-recordings.sh                 # everything new into ~/crawler-data/mcap, verified
-./pull-recordings.sh --list          # what the car is holding and which file is live
-./pull-recordings.sh -n 20 -o ~/Desktop/crawl
-./pull-recordings.sh --prune         # which car copies have a matching copy here
-./pull-recordings.sh --prune --yes   # and delete those off the car
-```
-
-They land outside the repo on purpose, and a destination inside any git work
-tree is refused: this repo is public and a recording is video of the house.
-Each copy is checked by size and sha256 on both ends, the segment the service
-still has open is skipped, and nothing is deleted off the car without
-`--prune --yes`. Whether a drive is worth training on:
-
-```sh
-uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
-    python tools/session_report.py ~/crawler-data/mcap/crawler-record-*.mcap
-```
-
-Then `open -a Foxglove` and drag a file from `~/crawler-data/mcap` onto the window.
-**Open connection** is for live; a file is a drag, or **File -> Open local
-file**. The same panels work on a file as on the socket.
-
-`pull-recordings.sh` also says what is in each file -- per topic, the message
-count, the rate and the schema, plus how many moments I marked -- which
-answers "did that run record what I think it did" without opening anything. A
-run with no `/camera/depth` in it was a run with the camera shut, not a bug.
-
-### Marking a moment
-
-While I am driving, in either mode: **A** means the car just made the right
-call and **B** means it got it wrong. The pad buzzes once for A and twice for
-B, so I know it took without looking at anything. Holding the button is one
-mark, not a stream of them.
-
-A mark is a *window*, not an instant, and that is the part worth
-understanding. I press the button after I have seen the behaviour and judged
-it, so the decision I am marking happened before the press -- and a full
-recovery is 2.0 s of reverse plus 0.5 s of settle. So each mark carries
-4 seconds of look-back and 1 second of lead, which reaches past the whole
-recovery and into the approach that caused it.
-
-Each mark lands in three places: the MCAP on `/marks`, which is the record; a
-line in the journal, so `journalctl -u crawler | grep Mark` finds it with no
-tooling at all; and a row in `log/marks.csv`, which is append-only across
-runs and which I can `cat` on the car.
-
-```sh
-# on the laptop, after ./pull-recordings.sh
-uv run --with mcap python deploy/mcap_check.py --marks ~/crawler-data/mcap
-uv run --with mcap python deploy/mcap_check.py --window 2 ~/crawler-data/mcap/<file>.mcap
-```
-
-`--marks` lists every mark with its wall-clock time, its offset into the run
-and the snapshot taken at the press: the mode, the commanded throttle and
-steering, the footprint scan and its block reason, the recover phase, and what
-the IMU was saying. `--window N` dumps every message on every channel inside
-that mark's window, which is what the algorithm actually saw.
-
-Nothing about this is allowed to cost a tick. The button poll cannot raise, it
-does no file I/O, and the CSV row and the journal line go out on a writer
-thread of their own -- so a card that stalls mid-write costs me a line in a
-file, never the control loop. The rumble call is timed, and if one ever comes
-back slow, rumble switches itself off for the rest of the run and says so
-once.
-
-```sh
-./run.sh --no-record                 # drive, do not write it down
-./run.sh --record-dir /mnt/usb/runs  # somewhere other than log/mcap
-./run.sh --no-telemetry              # record, but bind no socket
-./run.sh --no-telemetry --no-record  # no thread, no socket, no file
-```
-
-The filenames are `crawler-<UTC>Z-p<pid>-<NNN>.mcap`. The pid is in there
-because this Pi has no RTC: at boot the clock is whatever the last shutdown
-wrote until NTP lands, so two boots genuinely can produce the same second.
-
-#### Recording training drives
-
-Hold **Y for one second** in manual: two buzzes, and the car is in record
-mode. The camera opens (3.3 s on the car, off the control loop) and a new file
-starts, `crawler-record-<UTC>Z-p<pid>-001.mcap`, one per session and never
-pruned by the ring. It drives like manual with the throttle scaled rather
-than clipped: full RT is auto's forward speed and full LT auto's reverse speed,
-read off `driver.Driver`, so whatever auto drives at, I drive at. Steering is
-unchanged. Any fresh press of Y is back to manual (one buzz) and gives the
-camera back; START ends the session and goes to auto; losing the pad ends it
-at neutral, and a pad that just goes quiet counts as lost after 5 s (see
-"The pad's link timeout"). Y does nothing in auto. Coming back to manual from record or
-from auto, the throttle stays at 0 until both triggers have been let go once,
-so leaving record with RT still held is not a jump from 0.4 to full; the
-steering is live the whole time. No flag, so nothing in the unit file
-changes. With `--no-telemetry --no-record` there is no publisher thread to
-write with, so record refuses and says so.
-
-Every decision (10 Hz, auto's rate) writes one `/footprint` row with the
-command on the wheels and the IMU, one 80x50 `/policy/depth_small` picture at
-the same log time, and every fifth one the full lossless frame on
-`/camera/depth_raw`. Auto writes the same rows and pictures for its own
-decisions. The schema, and how to pair them, is in `TRAINING_DATA.md`;
-`deploy/footprint_dump.py` turns a pile of sessions into one table plus the
-pictures, and `--verify` re-runs this checkout's `driver.py` and
-`policy_input.py` over the raw frames to check the rows.
-
-Nothing the record side computes can reach the wheels: `footprint.py` is never
-handed the controller, and a test drives record mode over frames the rules
-would reverse and swerve on and checks every command is my sticks, scaled.
-
-What it costs, on the car (Pi 4, real OAK-D, record session, desk scene):
-
-- Loop period with the full-res frame as RawImage was p99 34 ms; as a 16-bit
-  PNG it is encoded with the GIL released (24 ms, 133 KB a frame, level 1).
-- The downsample is 2.8 ms p50, 5.0 ms p99 a tick, on the control loop, at
-  10 Hz. A picture is 4.4 KB as PNG.
-- On the card, on top of the 10.8 MiB/min the camera channels cost when
-  driving: pictures 2.5 MiB/min, rows 0.3, raw frames at 2 Hz about 15.5. So
-  about **29 MiB/min with the raw frames, 14 without**: 98 GB free is about
-  50 hours of record sessions.
-
-#### What it costs
-
-An MCAP writer in this SDK is a *sink*, exactly like a connected Studio
-client, so opening one makes `has_sinks()` true and the existing
-`wants()`/`offer()` path does the rest. There is no second encode and no
-second thread. The consequence is that "nothing is built when nobody is
-watching" now means **no laptop and no recording**: with recording on, the
-publisher thread colourmaps and JPEG-encodes the camera channels whenever the
-camera is up.
-
-Measured on the car, 120 s a condition, a 100 Hz replica of the control
-loop's telemetry block, camera up, nothing connected to the socket:
-
-| | p50 | p90 | p99 | max | process CPU |
-| --- | --- | --- | --- | --- | --- |
-| recording off | 9 us | 13 us | 25 us | 109 us | 16.0% of a core |
-| recording on | 11 us | 190 us | 268 us | 831 us | 33.8% of a core |
-
-Camera shut, which is how the service actually boots: 7/8/10/54 us and 2.0%
-off, 9/120/151/240 us and 3.0% on.
-
-So about 240 us at p99 against a 10 ms tick, which is 2.4% of it, and the
-same order as the p99 147 us already measured for having Studio connected --
-for the same reason. The p90 jump is not `offer()` getting slower, it is the
-GIL coming back from a publisher thread that is now busy in zstd and cv2. The
-18 points of extra CPU is that thread, on a 4-core Pi, so about 4.5% of the
-machine, and none of it on the thread that commands the throttle.
-
-#### What it costs on the card
-
-Measured by reading a finished file back over its own span. The camera-up
-number is off a real 469 s run with the car being driven, which the service
-recorded by itself while I was not watching:
-
-| | bytes/s | per hour |
-| --- | --- | --- |
-| camera up, all seven channels | 184.9 KiB/s | **650 MiB** |
-| camera shut, the three JSON channels | 1.2 KiB/s | **4 MiB** |
-
-The camera is 90% of that and it is the part zstd cannot help with -- the
-payload is already JPEG. Whole-file compression came out at 0.87 of the raw
-message bytes, the JSON half compressing well and the images not at all. Per
-channel: disparity 117.3 KiB/s, depth 60.4, rectified_left 13.9, controller
-12.2, vehicle 5.0, imu 3.2, diagnostics 1.3.
-
-**Do not size this off a bench run.** A static scene on a desk measured 71
-KiB/s, which is 2.6x low, and the whole gap is one channel:
-`/camera/disparity` went from 5 098 bytes a frame to 17 053. It gets a
-min/max stretch, so a real driving scene is high-entropy noise and JPEGs
-three times larger than a flat close-up of nothing.
-
-A full SD card is a dead car, and worse than dead: a Pi that cannot write is
-a Pi whose filesystem corrupts, and the only thing that can take the ESC back
-to neutral is this process staying alive. So there are two brakes and they do
-not trust each other:
-
-- a new segment every **128 MiB** (about twelve minutes of auto driving, a
-  20-second scp), and the oldest segments deleted once `log/mcap/` passes
-  **8 GiB** -- 64 segments, 12.6 hours of auto driving, 8% of this card.
-  That is a ring buffer at the file level, which is the only shape
-  available: this SDK's writer has no ring mode and building one would mean
-  re-encoding every message to drop the old ones. `MAX_TOTAL_BYTES` in
-  `recording.py` is the one line to change if I want more than 12 hours.
-- under **4 GiB free on the volume**, recording stops dead and says so once
-  -- even if `log/mcap/` is well inside its own budget, because something
-  else filling the card is not something pruning my own directory can fix.
-
-Nothing in `recording.py` can reach the hardware. A disk-full, a write error,
-a read-only filesystem, a missing SDK: `start()` returns False, `tick()`
-returns, `stop()` returns, and the car drives exactly as it did. `tests/
-test_recording.py` pins that, because it is the requirement that matters more
-than the rest put together.
-
-#### Two things I had to measure rather than assume
-
-**zstd buffers a whole chunk before writing anything.** Twenty seconds into a
-recording the file on the card held 128 bytes, and 24 003 after close -- all
-of it still in memory. A run that ends with the battery out never reaches
-close(). So the recorder flushes every five seconds, which bounds that to
-five seconds of loss. With the camera up, five seconds is already about a
-megabyte, so the chunking is unchanged.
-
-**A run that is killed loses its index, not its data.** Only `close()` writes
-the summary and the message index. On a recording killed with `SIGKILL`,
-every message was still there and streamed back fine with its schemas, but
-the *indexed* reader -- the fast path Studio takes -- refused the file
-outright, and `disable_seeking` makes no difference. `pull-recordings.sh`
-detects that and rewrites the file with an index, which is the `mcap recover`
-operation done through the `mcap` Python library so there is no Go toolchain
-to install; `uv run --with mcap` builds the environment for it and leaves
-nothing behind. The original is kept as `.orig`.
-
-The newest file is normally one of the ones it repairs, and that is not the
-car crashing: it is the run happening right now, still open, with its index
-not written yet. Pulling it gives a snapshot up to the last flush, which is
-at most five seconds behind.
-
-### Two things that have to be true on the car
-
-The OAK-D needs its udev rule or only root can see it -- `depthai` reports
-`Cannot find any device with given deviceInfo` to everyone else, which is the
-same thing auto mode has always hit:
-
-```sh
-echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' \
-  | sudo tee /etc/udev/rules.d/80-movidius.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-And the interpreter the service runs has to have the SDK in it. The
-installed unit runs `.venv/bin/python`, so `uv sync` is all it takes; a unit
-installed from an older checkout may still point at `env/`, which `uv sync`
-does not touch:
-
-```sh
-~/.local/bin/uv sync
-# a unit still on env/: move it onto the uv venv
-sudo ./deploy/install-service.sh --python "$PWD/.venv/bin/python" --start
-```
+A few seconds on the laptop. Nothing needs pigpio, a pad or the OAK-D: the
+hardware is faked in `tests/conftest.py`. Most tests pin something that has
+already gone wrong on the car once.
