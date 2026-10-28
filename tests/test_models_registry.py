@@ -683,3 +683,96 @@ def test_the_trainer_writes_where_a_model_came_from():
 def test_the_trainer_cannot_stamp_a_release_number(capsys):
     assert pt.main(["data.npz", "out.onnx", "--model-version", "2.0"]) == 2
     assert "promote" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Per-model drive notes.
+# ---------------------------------------------------------------------------
+
+def noted(tmp_path):
+    row = {"name": "kblock", "created": "2026-10-01", "onnx_sha256": "ab" * 32,
+           "parent": None, "train_sessions": []}
+    reg = md.upgrade_registry({"schema": 1, "versions": [
+        {**row, "version": "1.0", "label": "kblock 1.0"},
+        {**row, "version": "1.1", "label": "kblock 1.1"}]})
+    md.save_registry(reg, str(tmp_path))
+    return str(tmp_path)
+
+
+def test_a_note_is_appended_dated_and_kinded(tmp_path):
+    import datetime
+    folder = noted(tmp_path)
+    at = datetime.datetime(2026, 10, 28, 9, 30, tzinfo=datetime.timezone.utc)
+    md.note("1.1", "loops on a 3-point turn", folder, now=at)
+    md.note("1.1", "good on carpet", folder, kind="general", now=at)
+    reg = md.load_registry(folder)
+    assert md.find(reg, "kblock", "1.1")["notes_log"] == [
+        {"date": "2026-10-28T09:30:00Z", "kind": "drive", "text": "loops on a 3-point turn"},
+        {"date": "2026-10-28T09:30:00Z", "kind": "general", "text": "good on carpet"}]
+    assert md.find(reg, "kblock", "1.0").get("notes_log") is None
+
+
+def test_notes_keep_the_order_they_were_added(tmp_path):
+    folder = noted(tmp_path)
+    for text in ("first", "second", "third"):
+        md.note("1.0", text, folder)
+    log = md.find(md.load_registry(folder), "kblock", "1.0")["notes_log"]
+    assert [n["text"] for n in log] == ["first", "second", "third"]
+
+
+def test_a_candidate_takes_a_note_and_the_registration_note_stays(tmp_path):
+    folder = noted(tmp_path)
+    reg = md.load_registry(folder)
+    reg["candidates"].append({"name": "kblock", "tag": "side", "label": "kblock candidate side",
+                              "registered": "2026-10-28T00:00:00Z", "notes": "reg note"})
+    md.save_registry(reg, folder)
+    md.note("candidate-side", "wobbles", folder)
+    cand = md.find_candidate(md.load_registry(folder), "side")
+    assert cand["notes"] == "reg note"
+    assert cand["notes_log"][0]["text"] == "wobbles"
+
+
+def test_the_list_shows_the_count_and_the_newest_drive_note(tmp_path):
+    folder = noted(tmp_path)
+    md.note("1.1", "old drive note", folder)
+    md.note("1.1", "newest drive note " + "x" * 200, folder)
+    md.note("1.1", "a general one", folder, kind="general")
+    lines = md.list_lines(md.load_registry(folder), None, folder, offline=True)
+    shown = [line for line in lines if "3 notes" in line]
+    assert len(shown) == 1
+    assert "newest drive note" in shown[0] and "old drive note" not in shown[0]
+    assert "a general one" not in shown[0]
+    assert len(shown[0]) < 140
+    assert not any("note" in line for line in lines if "kblock 1.0" in line)
+
+
+def test_approve_notes_land_in_the_list_as_an_approval(tmp_path):
+    folder = noted(tmp_path)
+    md.approve("1.1", folder, notes="drove the loop twice")
+    log = md.find(md.load_registry(folder), "kblock", "1.1")["notes_log"]
+    assert [(n["kind"], n["text"]) for n in log] == [("approval", "drove the loop twice")]
+    md.approve("1.0", folder)    # no notes, no entry
+    assert md.find(md.load_registry(folder), "kblock", "1.0").get("notes_log") is None
+
+
+def test_a_note_on_an_unknown_model_is_refused_and_writes_nothing(tmp_path):
+    folder = noted(tmp_path)
+    before = (tmp_path / "registry.json").read_text()
+    for target in ("9.9", "candidate-nope", "banana"):
+        with pytest.raises(SystemExit, match="no "):
+            md.note(target, "hello", folder)
+    with pytest.raises(SystemExit, match="kind"):
+        md.note("1.0", "hello", folder, kind="rant")
+    with pytest.raises(SystemExit, match="text"):
+        md.note("1.0", "  ", folder)
+    assert (tmp_path / "registry.json").read_text() == before
+
+
+def test_the_notes_command_prints_them_all(tmp_path, capsys):
+    folder = noted(tmp_path)
+    md.note("1.1", "one", folder)
+    md.note("1.1", "two", folder, kind="general")
+    assert md.main(["--models-dir", folder, "notes", "1.1"]) == 0
+    out = capsys.readouterr().out
+    assert "[drive]  one" in out and "[general]  two" in out
+    assert out.index("one") < out.index("two")

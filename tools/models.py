@@ -11,6 +11,8 @@
     python3 tools/models.py rollback                # back to what drove before
     python3 tools/models.py status                  # what the car points at
     python3 tools/models.py approve 1.2 --notes ".."  # record that a release drove well
+    python3 tools/models.py note 1.2 "loops on a 3-point turn"   # a dated drive note
+    python3 tools/models.py notes 1.2               # every note on that model
     python3 tools/models.py attach 1.2 --evidence ab.json --gate-note "won held-out A/B"
     python3 tools/models.py demote 2.0 --tag imu-1028 --reason "..."
 
@@ -786,6 +788,47 @@ def demote(version, tag, reason, car, models_dir=MODELS_DIR, name=None, now=None
     return cand
 
 
+NOTE_KINDS = ("drive", "general")
+NOTES_KEY = "notes_log"
+
+
+def add_note(entry, kind, text, now=None):
+    """Append a dated {date, kind, text} to the entry's note list. The single
+    `notes` string stays what it was at registration."""
+    entry.setdefault(NOTES_KEY, []).append(
+        {"date": stamp(now), "kind": kind, "text": text})
+
+
+def note(target, text, models_dir=MODELS_DIR, name=None, kind="drive", now=None):
+    """Add a note to a release (1.2) or a candidate (candidate-<tag>); only the
+    registry is written, never a model file. -> entry."""
+    if kind not in NOTE_KINDS:
+        raise SystemExit(f"note kind is one of {', '.join(NOTE_KINDS)}, not {kind!r}")
+    if not (text or "").strip():
+        raise SystemExit("a note needs some text")
+    registry = load_registry(models_dir)
+    entry = find_entry(registry, target, name)
+    add_note(entry, kind, text.strip(), now)
+    save_registry(registry, models_dir)
+    return entry
+
+
+def find_entry(registry, target, name=None):
+    if target.startswith(CANDIDATE_PREFIX):
+        entry = find_candidate(registry, target[len(CANDIDATE_PREFIX):])
+        if entry is None:
+            raise SystemExit(f"no candidate {target[len(CANDIDATE_PREFIX):]} in the registry")
+        return entry
+    entry = None
+    try:
+        entry = find(registry, name or FAMILY, target)
+    except ValueError:
+        pass
+    if entry is None:
+        raise SystemExit(f"no {label(name or FAMILY, target)} in the registry")
+    return entry
+
+
 def approve(version, models_dir=MODELS_DIR, name=None, notes="", now=None):
     """Record my on-car approval of a release that has none yet. -> entry."""
     registry = load_registry(models_dir)
@@ -797,6 +840,8 @@ def approve(version, models_dir=MODELS_DIR, name=None, notes="", now=None):
                          f"{entry['approval']['date']} already")
     entry["approval"] = {"status": "approved", "date": utc_now(now).strftime("%Y-%m-%d"),
                          "notes": notes or ""}
+    if (notes or "").strip():
+        add_note(entry, "approval", notes.strip(), now)
     save_registry(registry, models_dir)
     return entry
 
@@ -1085,6 +1130,21 @@ def gate_text(e):
     return f"gate {gate}; on-car {on_car}"
 
 
+def note_summary(e):
+    """'N notes' and the newest drive note cut to one line, or '' for none."""
+    notes = e.get(NOTES_KEY) or []
+    if not notes:
+        return ""
+    text = f"{len(notes)} note{'s' if len(notes) != 1 else ''}"
+    drive = [n for n in notes if n["kind"] == "drive"]
+    if drive:
+        one = " ".join(drive[-1]["text"].split())
+        if len(one) > 60:
+            one = one[:59].rstrip() + "…"
+        text += f", latest drive {drive[-1]['date'][:10]}: {one}"
+    return text
+
+
 def list_lines(registry, active, models_dir, offline):
     lines = []
 
@@ -1108,6 +1168,8 @@ def list_lines(registry, active, models_dir, offline):
             lines.append(f"    promoted from candidate {e['candidate']}")
         if e.get("notes"):
             lines.append(f"    {e['notes']}")
+        if note_summary(e):
+            lines.append(f"    {note_summary(e)}")
     lines.append("Candidates")
     if not registry["candidates"]:
         lines.append("  (none)")
@@ -1120,6 +1182,8 @@ def list_lines(registry, active, models_dir, offline):
             lines.append(f"    demoted from {d['from']} on {d['date'][:10]}: {d['reason']}")
         if e.get("notes"):
             lines.append(f"    {e['notes']}")
+        if note_summary(e):
+            lines.append(f"    {note_summary(e)}")
     if not offline:
         lines.append("* = what the car's models/policy.onnx points at"
                      if active else "(the car's policy.onnx is no registered model)")
@@ -1176,6 +1240,24 @@ def cmd_demote(args, car_factory=Car):
 def cmd_approve(args):
     entry = approve(args.version, args.models_dir, args.name, args.notes)
     print(f"{entry['label']}: {gate_text(entry)}")
+    return 0
+
+
+def cmd_note(args):
+    entry = note(args.target, args.text, args.models_dir, args.name, args.kind)
+    print(f"{entry['label']}: {len(entry[NOTES_KEY])} notes")
+    return 0
+
+
+def cmd_notes(args):
+    entry = find_entry(load_registry(args.models_dir), args.target, args.name)
+    print(entry["label"])
+    if entry.get("notes"):
+        print(f"  registered: {entry['notes']}")
+    for n in entry.get(NOTES_KEY) or []:
+        print(f"  {n['date']}  [{n['kind']}]  {n['text']}")
+    if not entry.get("notes") and not entry.get(NOTES_KEY):
+        print("  (no notes)")
     return 0
 
 
@@ -1289,6 +1371,16 @@ def parse_args(argv):
     s.add_argument("--notes", default="", help="how it drove")
     s.add_argument("--name", default=None)
 
+    s = sub.add_parser("note", help="add a dated note to a release or candidate")
+    s.add_argument("target", help="a release (1.2) or candidate-<tag>")
+    s.add_argument("text")
+    s.add_argument("--kind", choices=NOTE_KINDS, default="drive")
+    s.add_argument("--name", default=None)
+
+    s = sub.add_parser("notes", help="print every note on a release or candidate")
+    s.add_argument("target")
+    s.add_argument("--name", default=None)
+
     s = sub.add_parser("attach", help="attach held-out evidence to a pre-gate release")
     s.add_argument("version")
     s.add_argument("--evidence", required=True)
@@ -1314,7 +1406,8 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     return {"list": cmd_list, "register": cmd_register, "promote": cmd_promote,
-            "demote": cmd_demote, "approve": cmd_approve, "attach": cmd_attach,
+            "demote": cmd_demote, "approve": cmd_approve, "note": cmd_note,
+            "notes": cmd_notes, "attach": cmd_attach,
             "deploy": cmd_deploy, "rollback": cmd_rollback,
             "status": cmd_status}[args.command](args)
 

@@ -17,6 +17,8 @@
 #   ./models.sh rollback                   # back to what drove before
 #   ./models.sh status                     # the car's symlink, by sha256
 #   ./models.sh approve 1.2 --notes "..."  # it drove well on the car
+#   ./models.sh note 1.2 "..." [--kind general]   # a dated drive note
+#   ./models.sh notes 1.2                  # every note on that model
 #   ./models.sh demote 2.0 --tag imu-1028 --reason "..."   # give a number back
 #
 # A new model is a candidate with no number. promote gives it the next one
