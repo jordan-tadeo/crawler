@@ -127,6 +127,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `policy_steer_mode_p` | float | the mode head's probability of `policy_steer_mode` on its last answer, low while it wants to switch; -1 with no head |
 | `reverse_commit` | bool | a reverse commit held this tick: a fresh model reverse kept for `policy.REVERSE_COMMIT_S` at `policy.REVERSE_STEER`, whatever the model said. `policy_action` is still the model's own pick |
 | `standoff_ticks` | int | decisions in a row the floor has held a model forward; 0 otherwise |
+| `policy_steer_dir_p` | float[3] | a direction-head model's steering class probabilities on its last answer, `[left, straight, right]`; all -1 for a regression-head model, all 0 when no policy drives. Absent in rows from before the direction head |
 | `depth_small` | bool | a `/policy/depth_small` picture carries this row's log time |
 | `depth_raw` | bool | a `/camera/depth_raw` frame carries this row's log time |
 | `probe_distance_mm` | float[9] | the hand-written scan, left to right; -1 means infinite |
@@ -310,6 +311,7 @@ python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one sess
 python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu --prev   # + IMU, + last decision
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw    # + IMU without the yaw rate
 python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu-no-yaw --imu-tilt   # + which way is up
+python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --steer-head direction   # left/straight/right + how far
 python tools/policy_eval.py data.npz models/policy.onnx --out report.md
 ```
 
@@ -321,6 +323,15 @@ my own driving comes out of training, a GOOD one counts double
 only one session, `--blocks 5` holds out five contiguous stretches of it in
 turn (with a second either side left out of training) and then trains the
 model it exports on all of it.
+
+`--steer-head direction` replaces the one tanh steering output with a
+left / straight / right class and a magnitude trained only on the turns
+(`policy_train.STRAIGHT_BAND`, 0.1 of full lock, is straight). The single
+output averages: backing out of a 3-point turn I go hard left or hard right,
+and the flip augmentation makes those scenes exactly half and half, so the
+answer that minimises its error is the middle. The sidecar says `steer_head`;
+one without it is a regression, and `policy.decode_steer` reads both, on the
+car and in the eval. A different head is a different contract, so a MAJOR.
 
 The trainer prints the model against always-forward, the hand-written rule
 and the median throttle, which is the number that says whether it learned

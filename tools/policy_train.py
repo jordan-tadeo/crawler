@@ -16,7 +16,16 @@ The heads
                     inverse class frequency (reverse and stop are rare)
   throttle  (1, 1)  sigmoid, the fraction of that direction's speed cap;
                     trained only on ticks that are moving
-  steer     (1, 1)  tanh, front steering as a fraction of STEER_SCALE (0.7)
+  steer     (1, 1)  tanh, front steering as a fraction of STEER_SCALE (0.7);
+                    the regression head, and the default (--steer-head)
+  steer_dir (1, 3)  --steer-head direction instead of steer: logits over
+                    policy.STEER_DIRS, left / straight / right, cross-entropy
+                    on every steering label, the class off STRAIGHT_BAND
+  steer_mag (1, 1)  and sigmoid, how far as a fraction of STEER_SCALE,
+                    trained only where the label is a turn. The car steers
+                    the class's side times this, 0 for straight
+                    (policy.decode_steer). One regression averages a hard
+                    left and a hard right into straight; this cannot
   mode_logits (1, 2) logits over policy.STEER_MODES, the mode I want, given
                     the third input `mode` (the one the car is in). The rear
                     is not a head: unified is steering_pair(front) and split
@@ -63,7 +72,8 @@ the few that have it is a choice of recipe, and an A/B needs both arms off
 the same dataset. --imu-tilt on a dataset with no up vector anywhere is
 refused. A session without one is in the dataset as zeros and tilt_valid 0,
 never a made-up reading. --imu and --prev combine. The
-flip augmentation mirrors the IMU too (policy_imu.MIRROR). A graph without
+flip augmentation mirrors the IMU too (policy_imu.MIRROR), and swaps the
+left and right steering classes (flip_steer_labels). A graph without
 --imu has no `imu` input at all, so every model before it loads unchanged.
 --imu-no-yaw is --imu without the yaw rate: the dataset's imu_no_yaw array
 (policy_imu.NO_YAW_FEATURES, built by the same ImuFeatures with yaw=False,
@@ -100,10 +110,47 @@ MODE_SWITCH_WEIGHT = 10.0
 BLOCK_GUARD_S = 1.0
 
 
-def build_model(representation, uses_imu=False, imu_yaw=True):
+# The direction head's straight class: a label inside this, either side of
+# 0, is straight; past it, left or right by its sign. A fraction of full lock.
+# Off my 19 record sessions' 7416 steering labels: 20% are exactly 0 (the
+# pad's 0.12 stick deadzone gives a literal 0), and the rest spread flat
+# from 0 up, with no shoulder to put an edge on, so the band only has to
+# be wider than noise: 0.1 takes 24% in, 0.05 would take 22%. 0.1 is 0.07
+# of servo travel, the rest drift a recording from before the deadzone
+# carries (up to about 0.07 raw, docs/TRAINING_DATA.md). Reversing, only 8%
+# of my labels are inside it, and the rest are 46% left and 46% right.
+STRAIGHT_BAND = 0.1
+
+
+def steer_classes(steer, band=STRAIGHT_BAND):
+    """Steering labels -> pl.STEER_DIRS indices: left past -band, right
+    past +band, straight between."""
+    s = np.asarray(steer)
+    return np.where(s < -band, pl.STEER_DIRS.index(pl.LEFT),
+                    np.where(s > band, pl.STEER_DIRS.index(pl.RIGHT),
+                             pl.STEER_DIRS.index(pl.STRAIGHT))).astype(np.int64)
+
+
+def flip_steer_labels(steer, steer_dir):
+    """The mirror's steering labels: every steer's sign, and left and right
+    swapped (straight stays straight). numpy or torch."""
+    return -steer, (len(pl.STEER_DIRS) - 1) - steer_dir
+
+
+def output_names(steer_head=pl.STEER_REGRESSION):
+    """The graph's outputs, in order, for a steering head."""
+    steer = ([pl.STEER_OUTPUT] if steer_head == pl.STEER_REGRESSION
+             else [pl.STEER_DIR_OUTPUT, pl.STEER_MAG_OUTPUT])
+    return ["logits", "throttle", *steer, pl.MODE_OUTPUT]
+
+
+def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION):
     import torch
     from torch import nn
 
+    if steer_head not in pl.STEER_HEADS:
+        raise ValueError(f"steer head {steer_head!r}: one of {pl.STEER_HEADS}")
+    direction = steer_head == pl.STEER_DIRECTION
     imu_width = pimu.size(imu_yaw) if uses_imu else 0
 
     class Heads(nn.Module):
@@ -117,7 +164,11 @@ def build_model(representation, uses_imu=False, imu_yaw=True):
                 nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width, 64), nn.ReLU())
             self.logits = nn.Linear(64, len(pl.ACTIONS))
             self.throttle = nn.Linear(64, 1)
-            self.steer = nn.Linear(64, 1)
+            if direction:
+                self.steer_dir = nn.Linear(64, len(pl.STEER_DIRS))
+                self.steer_mag = nn.Linear(64, 1)
+            else:
+                self.steer = nn.Linear(64, 1)
             self.mode = nn.Linear(64, pl.MODE_SIZE)
             # The mode going in, straight to the mode logits: "stay" is one
             # weight, and the trunk only has to learn when not to.
@@ -126,8 +177,10 @@ def build_model(representation, uses_imu=False, imu_yaw=True):
         def forward(self, features, prev, mode, imu=None):
             parts = [features, prev, mode] + ([imu] if imu_width else [])
             h = self.trunk(torch.cat(parts, dim=1))
-            return (self.logits(h), torch.sigmoid(self.throttle(h)),
-                    torch.tanh(self.steer(h)), self.mode(h) + self.mode_skip(mode))
+            steer = ((self.steer_dir(h), torch.sigmoid(self.steer_mag(h))) if direction
+                     else (torch.tanh(self.steer(h)),))
+            return (self.logits(h), torch.sigmoid(self.throttle(h)), *steer,
+                    self.mode(h) + self.mode_skip(mode))
 
     class ImageNet(nn.Module):
         """(1, 2, 50, 80) -> four strided convs, 25x40, 13x20, 7x10, 4x5."""
@@ -162,6 +215,7 @@ def build_model(representation, uses_imu=False, imu_yaw=True):
     model = ImageNet() if representation == pl.IMAGE else ProfileNet()
     model.uses_imu = bool(uses_imu)
     model.imu_yaw = bool(imu_yaw)
+    model.steer_head = steer_head
     return model
 
 
@@ -262,13 +316,15 @@ def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
 
 def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False,
-          imu_yaw=True, imu_tilt=False):
+          imu_yaw=True, imu_tilt=False, steer_head=pl.STEER_REGRESSION,
+          straight_band=STRAIGHT_BAND):
     import torch
     from torch import nn
 
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = build_model(representation, uses_imu, imu_yaw)
+    model = build_model(representation, uses_imu, imu_yaw, steer_head)
+    direction = steer_head == pl.STEER_DIRECTION
 
     idx = np.flatnonzero(train_mask)
     x_all = torch.from_numpy(data["x"])
@@ -282,6 +338,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     action = torch.from_numpy(data["action"][idx].astype(np.int64))
     mag = torch.from_numpy(data["magnitude"][idx])
     steer = torch.from_numpy(data["steer"][idx])
+    steer_dir = torch.from_numpy(steer_classes(data["steer"][idx], straight_band))
+    straight = pl.STEER_DIRS.index(pl.STRAIGHT)
     w_all = torch.from_numpy(tick_weights(data, idx, good_weight))
     w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
     steer_all, throttle_all = pe.label_masks(data, label_mode)
@@ -300,6 +358,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     ce = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32),
                              reduction="none")
     ce_mode = nn.CrossEntropyLoss(reduction="none")
+    ce_steer = nn.CrossEntropyLoss(reduction="none")
 
     opt = torch.optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-4)
     batch = 64
@@ -310,11 +369,12 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
             b = order[start:start + batch]
             xb, pb = x[b], prev[b]
             ib = imu[b] if imu is not None else None
-            sb = steer[b]
+            sb, db = steer[b], steer_dir[b]
             if torch.rand(1).item() < 0.5:
                 xb, pb, ib = flip(xb, pb, ib, imu_yaw)
-                sb = -sb
-            logits, t_out, s_out, m_out = model(xb, pb, mode_in[b], ib)
+                sb, db = flip_steer_labels(sb, db)
+            out = model(xb, pb, mode_in[b], ib)
+            logits, t_out, m_out = out[0], out[1], out[-1]
             tok, sok = throttle_ok[b], steer_ok[b]
             wb = w_all[b]
             moving = tok & (action[b] != pl.ACTIONS.index(pl.STOP))
@@ -323,8 +383,17 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 loss = loss + _weighted(ce(logits[tok], action[b][tok]), wb[tok])
             if moving.any():
                 loss = loss + _weighted((t_out[moving, 0] - mag[b][moving]).abs(), wb[moving])
+            if sok.any() and direction:
+                # Which way, on every steering label; how far, only where it
+                # is a turn: a straight label says nothing about how hard.
+                d_out, g_out = out[2], out[3]
+                loss = loss + _weighted(ce_steer(d_out[sok], db[sok]), wb[sok])
+                turn = sok & (db != straight)
+                if turn.any():
+                    loss = loss + _weighted((g_out[turn, 0] - sb[turn].abs()).abs(), wb[turn])
+            elif sok.any():
+                loss = loss + _weighted((out[2][sok, 0] - sb[sok]).abs(), wb[sok])
             if sok.any():
-                loss = loss + _weighted((s_out[sok, 0] - sb[sok]).abs(), wb[sok])
                 loss = loss + _weighted(ce_mode(m_out[sok], mode[b][sok]), w_mode[b][sok])
             opt.zero_grad()
             loss.backward()
@@ -333,7 +402,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     return model, weights.tolist()
 
 
-OUTPUTS = ["logits", "throttle", "steer", pl.MODE_OUTPUT]
+OUTPUTS = output_names(pl.STEER_REGRESSION)
 
 
 def export(model, representation, out_path, meta):
@@ -349,7 +418,8 @@ def export(model, representation, out_path, meta):
         names.append(pl.IMU_INPUT)
     torch.onnx.export(
         model, args, out_path,
-        input_names=names, output_names=OUTPUTS,
+        input_names=names,
+        output_names=output_names(getattr(model, "steer_head", pl.STEER_REGRESSION)),
         opset_version=17, dynamo=False)
     write_sidecar(out_path, meta)
 
@@ -424,6 +494,16 @@ def mode_meta(switch_weight=MODE_SWITCH_WEIGHT):
     }
 
 
+def steer_meta(steer_head=pl.STEER_REGRESSION, band=STRAIGHT_BAND):
+    """The steering head's half of the sidecar: what policy.check_steer_head
+    reads, and the outputs the graph has."""
+    out = {"steer_head": steer_head, "outputs": output_names(steer_head)}
+    if steer_head == pl.STEER_DIRECTION:
+        out["steer_dirs"] = list(pl.STEER_DIRS)
+        out["steer_straight_band"] = float(band)
+    return out
+
+
 def _mean_scores(folds):
     """Fold scores -> the mean of every number, and the switch counts summed."""
     keys = [k for k, v in folds[0].items() if isinstance(v, (int, float))]
@@ -471,6 +551,12 @@ def main(argv=None):
     ap.add_argument("--imu-tilt", action="store_true",
                     help="--imu with the up vector fed in (zeros and tilt_valid 0 "
                          "on sessions without one); refused on a dataset with none")
+    ap.add_argument("--steer-head", choices=pl.STEER_HEADS, default=pl.STEER_REGRESSION,
+                    help="regression: one tanh steer. direction: left/straight/right "
+                         "plus how far, which cannot average two hard turns into straight")
+    ap.add_argument("--straight-band", type=float, default=STRAIGHT_BAND,
+                    help="with --steer-head direction: |steer| under this is the "
+                         f"straight class (default {STRAIGHT_BAND} of full lock)")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--good-weight", type=float, default=GOOD_WEIGHT,
@@ -524,7 +610,8 @@ def main(argv=None):
                uses_prev=args.prev, epochs=args.epochs, seed=args.seed,
                good_weight=args.good_weight, switch_weight=args.switch_weight,
                uses_imu=args.imu, imu_yaw=not args.imu_no_yaw,
-               imu_tilt=args.imu_tilt)
+               imu_tilt=args.imu_tilt, steer_head=args.steer_head,
+               straight_band=args.straight_band)
     tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -615,7 +702,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
         **imu_meta(getattr(args, "imu", False),
                    tilt_of(getattr(args, "imu_tilt", False), meta_in),
                    not getattr(args, "imu_no_yaw", False)),
-        "outputs": OUTPUTS,
+        **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
+                     getattr(args, "straight_band", STRAIGHT_BAND)),
         "steer_scale": pl.STEER_SCALE,
         "labels": args.labels,
         "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids],

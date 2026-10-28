@@ -400,6 +400,9 @@ JSON_SCHEMAS = {
         # (policy.STANDOFF_S runs the recover).
         "reverse_commit": _BOOL,
         "standoff_ticks": _INT,
+        # A direction-head model's [left, straight, right] probabilities on
+        # its last answer; all -1 for a regression head, 0 when no policy drives.
+        "policy_steer_dir_p": {"type": "array", "items": _NUM, "minItems": 3, "maxItems": 3},
     }),
 }
 

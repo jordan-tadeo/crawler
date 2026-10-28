@@ -98,6 +98,8 @@ AUTOPILOT_FIELDS = {
     "policy_steer_mode_p": 0.0,  # the mode head's p of that mode; -1 with no head
     "reverse_commit": False,     # a fresh model reverse was being held this tick
     "standoff_ticks": 0,         # decisions in a row the floor held a model forward
+    # The direction head's [left, straight, right]; all -1 for a regression head.
+    "policy_steer_dir_p": [0.0, 0.0, 0.0],
 }
 
 
@@ -119,6 +121,14 @@ def autopilot_fields(driver):
                     out[key] = str(value)
                 elif isinstance(out[key], int):
                     out[key] = int(_num(value, 0.0))
+                elif isinstance(out[key], list):
+                    # A fixed-width list of numbers: always that many, -1
+                    # for any that is not one.
+                    width = len(AUTOPILOT_FIELDS[key])
+                    value = list(value)
+                    if len(value) != width:
+                        value = [-1.0] * width
+                    out[key] = [_num(v, -1.0) for v in value]
                 else:
                     out[key] = _num(value, 0.0)
     except Exception:

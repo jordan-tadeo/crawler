@@ -249,6 +249,30 @@ REPRESENTATIONS = (IMAGE, PROFILE)
 # because main imports pygame and this must not; a test holds them equal.
 STEER_SCALE = 0.7
 
+# The steering head, which the sidecar names as steer_head. A model with no
+# steer_head is a REGRESSION: one tanh output, `steer`. That head averages
+# when I could have gone either way: backing out of a 3-point turn I go hard
+# left or hard right, the flip augmentation makes those scenes exactly
+# bimodal, and the L1 answer between full left and full right is straight.
+# DIRECTION is a class over STEER_DIRS (`steer_dir`, three logits) and how
+# far (`steer_mag`, a sigmoid, the fraction of full lock), and the steer is
+# the class's side times the magnitude, 0 for straight. decode_steer() is
+# the one place either is read, on the car and in the eval.
+STEER_REGRESSION = "regression"
+STEER_DIRECTION = "direction"
+STEER_HEADS = (STEER_REGRESSION, STEER_DIRECTION)
+STEER_OUTPUT = "steer"
+STEER_DIR_OUTPUT = "steer_dir"
+STEER_MAG_OUTPUT = "steer_mag"
+# Negative steering is left, as driver.turn_sweep_clears(scan, -1) is.
+LEFT = "left"
+STRAIGHT = "straight"
+RIGHT = "right"
+STEER_DIRS = (LEFT, STRAIGHT, RIGHT)
+STEER_SIDE = (-1.0, 0.0, 1.0)
+# What /footprint's policy_steer_dir_p says for a regression head.
+NO_STEER_DIR_P = (-1.0, -1.0, -1.0)
+
 # /footprint's autopilot field: who was driving the "driver" groups.
 AUTOPILOT_RULES = "rules"
 AUTOPILOT_POLICY = "policy"
@@ -647,6 +671,23 @@ def check_sidecar(meta, inputs, outputs, where="sidecar"):
     return out
 
 
+def check_steer_head(meta, outputs, where="sidecar"):
+    """The steering head's half of the contract -> STEER_REGRESSION or
+    STEER_DIRECTION. A sidecar with no steer_head is every model from
+    before the direction head, a regression. ValueError when the sidecar
+    names a head the runtime does not know, or one the graph does not have.
+    """
+    head = meta.get("steer_head", STEER_REGRESSION)
+    if head not in STEER_HEADS:
+        raise ValueError(f"{where}: unknown steer_head {head!r}")
+    if steer_head_of({name: None for name in outputs}) != head:
+        raise ValueError(f"{where}: steer_head {head!r} but the graph's outputs are "
+                         f"{sorted(outputs)}")
+    if head == STEER_DIRECTION and tuple(meta.get("steer_dirs", ())) != STEER_DIRS:
+        raise ValueError(f"{where}: steer_dirs {meta.get('steer_dirs')} != {list(STEER_DIRS)}")
+    return head
+
+
 class Decision(NamedTuple):
     """What the policy decided on one tick, and why. Read-only bookkeeping.
 
@@ -673,35 +714,94 @@ def _in(value, low, high):
     return low - OUTPUT_TOLERANCE <= value <= high + OUTPUT_TOLERANCE
 
 
+def steer_head_of(outputs):
+    """Which steering head these outputs come from, by their names. None
+    when it is neither or both: a graph that answers both ways is not one
+    anything here knows how to read."""
+    has_dir = STEER_DIR_OUTPUT in outputs or STEER_MAG_OUTPUT in outputs
+    has_reg = STEER_OUTPUT in outputs
+    if has_dir == has_reg:
+        return None
+    return STEER_DIRECTION if has_dir else STEER_REGRESSION
+
+
+def decode_steer(outputs):
+    """Either steering head -> (steer, p_dir, ""), or (None, None, why).
+
+    steer is a fraction of full lock in [-1, 1]. p_dir is the direction
+    head's softmax over STEER_DIRS, None for a regression head. The one
+    decode for both: the car's read_output and the eval go through here.
+    Checked as read_output checks the rest, finite and in range first, and
+    never clamped into range.
+    """
+    head = steer_head_of(outputs)
+    if head is None:
+        return None, None, "missing"
+    try:
+        if head == STEER_REGRESSION:
+            steer = np.asarray(outputs[STEER_OUTPUT], dtype=np.float64).ravel()
+        else:
+            dir_logits = np.asarray(outputs[STEER_DIR_OUTPUT], dtype=np.float64).ravel()
+            mag = np.asarray(outputs[STEER_MAG_OUTPUT], dtype=np.float64).ravel()
+    except (KeyError, TypeError, ValueError):
+        return None, None, "missing"
+    if head == STEER_REGRESSION:
+        if steer.shape != (1,):
+            return None, None, "shape"
+        if not math.isfinite(steer[0]):
+            return None, None, "not finite"
+        if not _in(steer[0], -1.0, 1.0):
+            return None, None, "steer out of range"
+        return float(np.clip(steer[0], -1.0, 1.0)), None, ""
+    if dir_logits.shape != (len(STEER_DIRS),) or mag.shape != (1,):
+        return None, None, "shape"
+    if not all(math.isfinite(v) for v in (*dir_logits, mag[0])):
+        return None, None, "not finite"
+    if not _in(mag[0], 0.0, 1.0):
+        return None, None, "steer out of range"
+    e = np.exp(dir_logits - dir_logits.max())
+    p = e / e.sum()
+    side = STEER_SIDE[int(np.argmax(dir_logits))]
+    return side * float(np.clip(mag[0], 0.0, 1.0)), tuple(float(v) for v in p), ""
+
+
+def steer_dir_p(outputs):
+    """The direction head's [left, straight, right] probabilities, or
+    NO_STEER_DIR_P for a regression head or an answer decode_steer refuses."""
+    _, p, _ = decode_steer(outputs)
+    return NO_STEER_DIR_P if p is None else p
+
+
 def read_output(outputs):
     """Model outputs -> (action, magnitude, steer, rear), or None + why.
 
-    `outputs` maps logits, throttle, steer and optionally rear to arrays.
-    isfinite() before anything else touches the numbers. Nothing here
-    clamps: a value past its range from a sigmoid or tanh head is a broken
-    model, and the answer to a broken model is neutral.
+    `outputs` maps logits, throttle, either steering head (decode_steer) and
+    optionally rear to arrays. isfinite() before anything else touches the
+    numbers. Nothing here clamps: a value past its range from a sigmoid or
+    tanh head is a broken model, and the answer to a broken model is neutral.
     """
     try:
         logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
         mag = np.asarray(outputs["throttle"], dtype=np.float64).ravel()
-        steer = np.asarray(outputs["steer"], dtype=np.float64).ravel()
         rear = outputs.get("rear")
         rear = None if rear is None else np.asarray(rear, dtype=np.float64).ravel()
     except (KeyError, TypeError, ValueError):
         return None, "missing"
-    if (logits.shape != (len(ACTIONS),) or mag.shape != (1,) or steer.shape != (1,)
+    if (logits.shape != (len(ACTIONS),) or mag.shape != (1,)
             or (rear is not None and rear.shape != (1,))):
         return None, "shape"
-    values = [*logits, mag[0], steer[0]] + ([] if rear is None else [rear[0]])
+    values = [*logits, mag[0]] + ([] if rear is None else [rear[0]])
     if not all(math.isfinite(v) for v in values):
         return None, "not finite"
+    steer, _, why = decode_steer(outputs)
+    if steer is None:
+        return None, why
     if not _in(mag[0], 0.0, 1.0):
         return None, "throttle out of range"
-    if not _in(steer[0], -1.0, 1.0) or (rear is not None and not _in(rear[0], -1.0, 1.0)):
+    if rear is not None and not _in(rear[0], -1.0, 1.0):
         return None, "steer out of range"
     # Inside the tolerance, now known finite, so a clip cannot invent a value.
-    return (ACTIONS[int(np.argmax(logits))], float(np.clip(mag[0], 0.0, 1.0)),
-            float(np.clip(steer[0], -1.0, 1.0)),
+    return (ACTIONS[int(np.argmax(logits))], float(np.clip(mag[0], 0.0, 1.0)), steer,
             None if rear is None else float(np.clip(rear[0], -1.0, 1.0))), ""
 
 
@@ -779,6 +879,7 @@ class PolicyModel:
         self.mode_switch = check_sidecar(
             self.meta, input_names, self.output_names, meta_path)
         self.has_mode = self.mode_switch is not None
+        self.steer_head = check_steer_head(self.meta, self.output_names, meta_path)
         # (False, False, False) for every model before the IMU input: it is
         # never fed one, and runs exactly as it did.
         self.uses_imu, self.imu_tilt, self.imu_yaw = check_imu(
@@ -838,6 +939,7 @@ class PolicyDriver(dv.Driver):
         self.last_decision = None
         self.last_infer_ms = 0.0
         self.last_split_p = -1.0    # the head's p(split); -1 with no head
+        self.last_steer_dir_p = NO_STEER_DIR_P  # [left, straight, right]
         # The IMU input. The newest sample and when it was taken, held as
         # footprint.FootprintTap holds them, so the row this driver builds
         # its features off is the row a recording of this tick would carry.
@@ -1000,6 +1102,9 @@ class PolicyDriver(dv.Driver):
             # in a row the floor has held a model forward (0 when it is not).
             "reverse_commit": bool(self.reverse_commit),
             "standoff_ticks": int(self.standoff_ticks),
+            # The direction head's [left, straight, right] on its last
+            # answer; all -1 for a regression head.
+            "policy_steer_dir_p": [float(v) for v in self.last_steer_dir_p],
         }
 
     def _recover(self, now, reason):
@@ -1103,6 +1208,7 @@ class PolicyDriver(dv.Driver):
         self.last_infer_ms = (time.perf_counter() - started) * 1000.0
 
         decided, why = read_output(outputs)
+        self.last_steer_dir_p = steer_dir_p(outputs)
         if decided is None:
             self._neutral(f"model {why}")
             return

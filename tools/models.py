@@ -42,7 +42,7 @@ refuses unless both gates pass:
 The number: MINOR up when the candidate's contract (CONTRACT_KEYS) is the same
 as the latest release's, MAJOR up when it differs -- the input contract,
 representation, an input added (IMU, the previous action), the outputs, the
-steering scale. Only releases count, so a number given back by demote is
+steering head, the steering scale. Only releases count, so a number given back by demote is
 given out again to the next model that earns it. policy_train.py does not
 write a number into a sidecar, and register ignores one if it is there.
 
@@ -152,6 +152,9 @@ CONTRACT_KEYS = {
     "outputs": None,
     "steer_scale": None,
     "steer_modes": None,
+    # How the steering is read (policy.decode_steer): one tanh, or a
+    # left/straight/right class and a magnitude. Before the key, a regression.
+    "steer_head": "regression",
 }
 
 # The scores list shows, off the CV mean or the held-out sessions.
