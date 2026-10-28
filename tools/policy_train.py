@@ -62,8 +62,11 @@ flip augmentation mirrors the IMU too (policy_imu.MIRROR). A graph without
 """
 
 import argparse
+import datetime
 import json
 import os
+import shlex
+import subprocess
 import sys
 
 import numpy as np
@@ -331,6 +334,47 @@ def imu_meta(uses_imu, tilt):
                            "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.GAP_S}}
 
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def git_commit(repo=REPO):
+    """(commit, dirty) of the training code, or (None, None) outside git.
+
+    dirty is whether the tree had uncommitted changes, which means the commit
+    alone does not reproduce this model.
+    """
+    try:
+        head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+        if head.returncode != 0:
+            return None, None
+        status = subprocess.run(["git", "-C", repo, "status", "--porcelain",
+                                 "--untracked-files=no"],
+                                capture_output=True, text=True, timeout=10)
+        return head.stdout.strip(), bool(status.stdout.strip())
+    except Exception:
+        return None, None
+
+
+def provenance_meta(argv, model_name=None, model_version=None, commit=git_commit):
+    """Where the model came from: when, off which code, by which command, and
+    the name it is to be registered under if I gave one (tools/models.py
+    reads model_name / model_version, and so does policy.model_label)."""
+    sha, dirty = commit()
+    out = {
+        "created": datetime.datetime.now(datetime.timezone.utc)
+                   .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "train_commit": sha,
+        "train_commit_dirty": dirty,
+        "train_command": shlex.join(["tools/policy_train.py", *argv]),
+    }
+    if model_name:
+        out["model_name"] = model_name
+    if model_version:
+        out["model_version"] = model_version
+    return out
+
+
 def write_sidecar(out_path, meta):
     with open(os.path.splitext(out_path)[0] + ".json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -398,7 +442,18 @@ def main(argv=None):
     ap.add_argument("--switch-weight", type=float, default=MODE_SWITCH_WEIGHT,
                     help="mode-loss weight of a tick inside a switch window "
                          f"(default {MODE_SWITCH_WEIGHT})")
+    ap.add_argument("--model-name", default=None,
+                    help="family name for the sidecar, e.g. kblock")
+    ap.add_argument("--model-version", default=None,
+                    help="MAJOR.MINOR for the sidecar, e.g. 2.0; tools/models.py "
+                         "register uses it unless told otherwise")
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = ap.parse_args(argv)
+    if args.model_version is not None:
+        parts = args.model_version.split(".")
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            print(f"--model-version {args.model_version!r} is not MAJOR.MINOR")
+            return 2
 
     import torch
 
@@ -476,7 +531,8 @@ def main(argv=None):
             "class_weights": weights,
             "good_marked_train_ticks": int((train_mask & (pe.marks_of(data) == pe.MARK_GOOD)).sum()),
             "bad_marked_left_out": int((data["decision"] & pe.bad_marked(data)).sum()),
-            "parameters": params}
+            "parameters": params,
+            **provenance_meta(argv, args.model_name, args.model_version)}
     with torch.no_grad():
         export(model, args.representation, args.out, meta)
 

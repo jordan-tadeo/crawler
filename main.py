@@ -906,8 +906,10 @@ class AutoPilot:
         import policy
         model = policy.PolicyModel(self.policy_path)
         self.logger.log("info", "Mode",
-                        f"Auto is the policy in {self.policy_path} "
-                        f"({model.representation}, {model.contract})")
+                        f"Auto is {model.label}, the policy in {self.policy_path} "
+                        f"({model.representation}, {model.contract}, "
+                        f"sha256 {model.sha256[:12]})")
+        print(f"[auto] policy {model.label} sha256 {model.sha256}", file=sys.stderr)
         return policy.PolicyDriver(self.command, view, model)
 
     def step(self, now, takeover=None, split=False):

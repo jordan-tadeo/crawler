@@ -116,7 +116,8 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
 | `imu_up_x/y/z` | float | same sample: the unit vector pointing away from the ground, in the IMU's own axes, off `GAME_ROTATION_VECTOR`. **All three 0 when there is no orientation reading**, which is every recording made before this field existed. See "Tilt" |
 | `autopilot` | string | who drove auto's `driver` groups: `""` in record, `rules` or `policy` (`main.py --policy`) |
-| `policy_model` | string | sha256 of the `.onnx` driving; `""` unless `autopilot` is `policy` |
+| `policy_model` | string | which model drove, by name and version, e.g. `kblock 1.1` (the sidecar's `model_name` and `model_version`; a sidecar without them reads as its file's stem, e.g. `policy-20261028-170131Z`). `""` unless `autopilot` is `policy`. **Rows from before the name existed carry the sha256 here instead**: 64 hex characters, look it up in `~/crawler-data/models/registry.json` |
+| `policy_model_sha256` | string | sha256 of the `.onnx` driving, the exact model; `""` unless `autopilot` is `policy`. Absent in rows from before the name existed |
 | `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
 | `policy_throttle` | float | the model's throttle after its floor veto; what it would have driven even while my trigger has the group |
 | `policy_steering_front` | float | the model's front steering, in manual's units (full lock 0.7) |
@@ -255,6 +256,18 @@ session recorded at 0.4 / -0.296. A session that
 recorded no caps at all is kept with a warning; its throttle is the
 autopilot's and never a label. The `.npz` meta carries `throttle_unit`,
 `runtime_caps` and each session's `session_caps`.
+
+## Which model drove
+
+Learned models are a family name plus MAJOR.MINOR, like `kblock 1.1`. MAJOR
+changes when the car's runtime has to know: a new input (IMU, the previous
+action), a different representation or input contract, different outputs.
+MINOR is a retrain on the same contract: more data, other weights. The
+versions live on the Mac in `~/crawler-data/models/` as `kblock-X.Y.onnx` +
+`.json`, listed in `registry.json` with each one's sha256, training sessions
+(and their MCAPs' sha256), training commit and command, CV scores and parent.
+`./models.sh list | register | deploy | rollback | status` is the tool;
+`tools/models.py` says how it works. Nothing in there is ever deleted.
 
 ## Getting it out
 

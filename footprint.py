@@ -82,7 +82,8 @@ PAD = "pad"
 # while my hand has a group.
 AUTOPILOT_FIELDS = {
     "autopilot": "",
-    "policy_model": "",          # sha256 of the .onnx
+    "policy_model": "",          # the model's name, e.g. "kblock 1.1"
+    "policy_model_sha256": "",   # sha256 of the .onnx
     "policy_action": "",         # forward / reverse / stop
     "policy_throttle": 0.0,
     "policy_steering_front": 0.0,

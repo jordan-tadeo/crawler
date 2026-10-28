@@ -511,8 +511,30 @@ def read_output(outputs):
             None if rear is None else float(np.clip(rear[0], -1.0, 1.0))), ""
 
 
+def model_label(meta, path):
+    """The name a model drives under: "kblock 1.1" off a registered sidecar.
+
+    tools/models.py writes model_name and model_version into the sidecar of
+    every copy it registers, and policy_train.py --model-name/--model-version
+    writes them at training time. A sidecar from before either has neither,
+    and is named by its file instead -- the real file, past the
+    models/policy.onnx symlink the service is pointed at, because "policy"
+    says nothing about which model drove.
+    """
+    name = meta.get("model_name")
+    version = meta.get("model_version")
+    if isinstance(name, str) and name and version not in (None, ""):
+        return f"{name} {version}"
+    return os.path.splitext(os.path.basename(os.path.realpath(path)))[0]
+
+
 class PolicyModel:
-    """An exported policy: the ONNX session plus the sidecar it came with."""
+    """An exported policy: the ONNX session plus the sidecar it came with.
+
+    Keys in the sidecar this does not read are ignored, so a registered copy's
+    model_name / model_version and the trainer's provenance fields load the
+    same as before.
+    """
 
     def __init__(self, path, threads=1):
         meta_path = os.path.splitext(path)[0] + ".json"
@@ -534,6 +556,8 @@ class PolicyModel:
         with open(path, "rb") as f:
             # Which model drove, in every /footprint row it wrote.
             self.sha256 = hashlib.sha256(f.read()).hexdigest()
+        # And by name, which is what a person reads off a row.
+        self.label = model_label(self.meta, path)
 
         import onnxruntime as ort
 
@@ -691,7 +715,10 @@ class PolicyDriver(dv.Driver):
         d = self.last_decision
         return {
             "autopilot": AUTOPILOT_POLICY,
-            "policy_model": str(getattr(self.model, "sha256", "")),
+            # Which model drove, by name ("kblock 1.1"), and exactly, by hash.
+            "policy_model": str(getattr(self.model, "label", "")
+                                or getattr(self.model, "sha256", "")),
+            "policy_model_sha256": str(getattr(self.model, "sha256", "")),
             "policy_action": d.action if d is not None else "",
             "policy_throttle": float(d.throttle) if d is not None else 0.0,
             "policy_steering_front": float(d.front) if d is not None else 0.0,

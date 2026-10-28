@@ -23,6 +23,7 @@ import pytest
 import camera
 import column_profile as cp
 import driver as dv
+import footprint as fp
 import main as mn
 import policy as pl
 
@@ -448,13 +449,15 @@ def test_a_sidecar_at_another_steering_scale_is_refused(tmp_path):
         pl.PolicyModel(str(tmp_path / "m.onnx"))
 
 
-def test_policy_fields_name_the_model_by_its_hash():
+def test_policy_fields_name_the_model_by_its_stem_and_its_hash():
     model = pl.PolicyModel(str(FIXTURE))
     d = pl.PolicyDriver(FakeController(), FakeCamera(depth=clear()), model)
     d.tick(T0)
     fields = d.policy_fields()
     assert fields["autopilot"] == pl.AUTOPILOT_POLICY
-    assert fields["policy_model"] == hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
+    # An unregistered sidecar: named by its file.
+    assert fields["policy_model"] == "policy-smoke"
+    assert fields["policy_model_sha256"] == hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
     assert fields["policy_action"] == d.last_decision.action
     assert fields["policy_throttle"] == d.controller.throttles[-1]
     assert fields["policy_steering_front"] == d.controller.steerings[-1][0]
@@ -805,3 +808,39 @@ def test_l3_in_policy_auto_reaches_the_model_and_the_footprint_rows(monkeypatch)
     modes = [row["policy_steer_mode"] for row in rows]
     assert modes[0] == pl.UNIFIED and modes[-1] == pl.SPLIT
     assert all(row["policy_steer_mode_p"] == pytest.approx(0.5, abs=1e-6) for row in rows)
+
+
+def test_a_registered_sidecar_loads_and_names_the_model_in_every_row(tmp_path):
+    meta = json.loads(FIXTURE.with_suffix(".json").read_text())
+    meta.update(model_name="kblock", model_version="1.1",
+                train_commit=None, train_command="tools/policy_train.py x y")
+    (tmp_path / "kblock-1.1.json").write_text(json.dumps(meta))
+    (tmp_path / "kblock-1.1.onnx").write_bytes(FIXTURE.read_bytes())
+    # The car loads models/policy.onnx, a symlink: the name comes off the
+    # sidecar, not the link.
+    (tmp_path / "policy.onnx").symlink_to("kblock-1.1.onnx")
+    (tmp_path / "policy.json").symlink_to("kblock-1.1.json")
+    model = pl.PolicyModel(str(tmp_path / "policy.onnx"))
+    assert model.label == "kblock 1.1"
+    d = pl.PolicyDriver(FakeController(), FakeCamera(depth=clear()), model)
+    d.tick(T0)
+    row = fp.autopilot_fields(d)
+    assert row["policy_model"] == "kblock 1.1"
+    assert row["policy_model_sha256"] == model.sha256
+
+
+def test_an_old_sidecar_behind_the_symlink_is_named_by_the_real_file(tmp_path):
+    meta = json.loads(FIXTURE.with_suffix(".json").read_text())
+    assert "model_name" not in meta
+    (tmp_path / "policy-20261028-170131Z.json").write_text(json.dumps(meta))
+    (tmp_path / "policy-20261028-170131Z.onnx").write_bytes(FIXTURE.read_bytes())
+    (tmp_path / "policy.onnx").symlink_to("policy-20261028-170131Z.onnx")
+    (tmp_path / "policy.json").symlink_to("policy-20261028-170131Z.json")
+    model = pl.PolicyModel(str(tmp_path / "policy.onnx"))
+    assert model.label == "policy-20261028-170131Z"
+
+
+def test_model_label_needs_both_name_and_version():
+    assert pl.model_label({"model_name": "kblock", "model_version": "2.0"}, "/x/a.onnx") == "kblock 2.0"
+    assert pl.model_label({"model_name": "kblock"}, "/x/a.onnx") == "a"
+    assert pl.model_label({"model_version": "2.0"}, "/x/a.onnx") == "a"

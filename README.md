@@ -181,7 +181,7 @@ command the rules do, so takeover works over it unchanged: my stick or my
 trigger replaces its group, and stuck stays off while the throttle is mine.
 Every `/footprint` row in auto says `autopilot` `rules` or `policy`, and
 under a policy the model's own command (after its floor veto), its reason
-and the sha256 of the `.onnx`, which during a takeover is not what reached
+and the model's name and sha256. That command, during a takeover is not what reached
 the wheels.
 
 A model with the mode head also picks the steering mode: four-wheel
@@ -239,6 +239,27 @@ scp models/policy.onnx models/policy.json jtpi:Documents/py/crawler/models/
 ssh jtpi 'cd Documents/py/crawler && ~/.local/bin/uv sync'
 sudo systemctl edit crawler                       # ExecStart= then ExecStart=... --policy models/policy.onnx
 ```
+
+After the first time, a model goes on the car by name. Every model I keep
+is a version of `kblock` in `~/crawler-data/models/registry.json`: MAJOR
+when the car has to know (a new input, representation or output), MINOR
+for a retrain on the same contract. `register` copies a trained model in,
+`deploy` puts a version on the car, re-points `models/policy.onnx` and
+`.json`, restarts the service and checks it came back, and only does any of
+that with the car parked. Every `/footprint` row in auto then says which
+version drove (`policy_model`, e.g. `kblock 1.1`).
+
+```sh
+./models.sh register ~/crawler-data/models/policy-<stamp>.onnx --notes "IMU in"
+./models.sh list                      # versions, scores, * = on the car
+./models.sh deploy 2.0 --dry-run      # then without --dry-run
+./models.sh rollback                  # back to what drove before
+./models.sh status                    # the car's link, checked by sha256
+```
+
+`policy_train.py --model-name kblock --model-version 2.0` names a model at
+training time, and every sidecar it writes says the commit and command it
+came from.
 
 A model trained before the steering moved to manual's units says
 `steer_scale` 0.6 in its `.json`, and the car refuses it; retrain it.

@@ -369,10 +369,11 @@ JSON_SCHEMAS = {
         "imu_up_x": _NUM, "imu_up_y": _NUM, "imu_up_z": _NUM,
         # Who drove auto's "driver" groups: "" in record, "rules" or
         # "policy" in auto. The policy_* fields are a learned driver's own
-        # command after its floor veto, and its model's sha256; empty and
-        # zero under the rules.
+        # command after its floor veto, and its model's name ("kblock 1.1")
+        # and sha256; empty and zero under the rules.
         "autopilot": _STR,
         "policy_model": _STR,
+        "policy_model_sha256": _STR,
         "policy_action": _STR,
         "policy_throttle": _NUM,
         "policy_steering_front": _NUM,

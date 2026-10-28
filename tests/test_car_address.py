@@ -28,6 +28,8 @@ SEARCHED = (
     "deploy/mcap_check.py",
     "deploy/install-service.sh",
     "deploy/crawler.service.template",
+    "models.sh",
+    "tools/models.py",
 )
 
 ADDRESS = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
