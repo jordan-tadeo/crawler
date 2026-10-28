@@ -513,11 +513,17 @@ class FootprintAdapter:
 ADAPTERS = {LegacyAdapter.name: LegacyAdapter, FootprintAdapter.name: FootprintAdapter}
 
 
-def pick_adapter(topics):
-    """The adapter a recording's topic list calls for, or None."""
+def pick_adapter(topics, settled=True):
+    """The adapter a recording's topic list calls for, or None.
+
+    settled False means more channels may still be announced. A legacy match
+    waits then: record mode writes /camera/depth and /vehicle too, and when
+    those are announced before /policy/depth_small the whole recording would
+    be read as legacy and every record tick dropped by mode.
+    """
     topics = set(topics)
     if {FOOTPRINT_TOPICS["depth"], FOOTPRINT_TOPICS["row"]} <= topics:
         return FootprintAdapter
-    if {LEGACY_TOPICS["depth"], LEGACY_TOPICS["vehicle"]} <= topics:
+    if settled and {LEGACY_TOPICS["depth"], LEGACY_TOPICS["vehicle"]} <= topics:
         return LegacyAdapter
     return None

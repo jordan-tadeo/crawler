@@ -52,10 +52,12 @@ magnitude -- came off the pad. policy_adapters.control_sources() decides it
 from steer_by / throttle_by; the trainer drops a "driver" group from that
 head's loss unless it is told to clone the autopilot.
 
-Kept but not trained on: the ticks inside a recover. A reverse is a two-second
-phase machine, and only the tick that started it was a decision; the rest
-are the machine. They stay in the file so the eval can say what the model
-would have done at a /marks window that landed in one.
+Kept but not trained on: the ticks inside an autopilot recover. There a
+reverse is a two-second phase machine, and only the tick that started it was
+a decision; the rest are the machine. They stay in the file so the eval can
+say what the model would have done at a /marks window that landed in one.
+On the pad (record, manual) there is no machine: I chose to keep backing up
+on every tick, and the policy is asked every tick, so every one is a decision.
 
 Dropped as not driving (pad-driven modes only, record and manual; IdleRules, every number a
 CLI option): the car parked or in my hands is not a decision, and a model
@@ -460,7 +462,9 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
 
         action = pa.action_of(cmd.throttle)
         consecutive = prev_t is not None and (cmd.t_ns - prev_t) / 1e9 <= PREV_GAP_S
-        if action == pl.REVERSE:
+        if cmd.mode in pa.PAD_MODES:
+            decision = True
+        elif action == pl.REVERSE:
             decision = not (consecutive and prev_was_reverse)
             last_reverse = cmd.t_ns
         elif (action == pl.STOP and last_reverse is not None
@@ -619,6 +623,12 @@ def to_arrays(sessions_ticks):
 
 # ---- reading MCAPs (laptop only) ------------------------------------------
 
+# Messages read before a recording's kind is decided on what has been
+# announced by then. Record mode can announce its own topics after the legacy
+# ones, so a legacy match is only taken once this many have gone by.
+ANNOUNCE_MESSAGES = 2000
+
+
 def read_session(path, adapter_name=None):
     """One MCAP file -> a Session. Survives a file cut off mid-chunk.
 
@@ -663,11 +673,12 @@ def read_session(path, adapter_name=None):
                     pending.append(rec) if adapter is None else None
                     if adapter is None:
                         topics = {c.topic for c in channels.values()}
+                        settled = len(pending) >= ANNOUNCE_MESSAGES
                         cls = (pa.ADAPTERS[adapter_name] if adapter_name
-                               else pa.pick_adapter(topics))
+                               else pa.pick_adapter(topics, settled))
                         # Wait for enough channels to know the recording's kind,
                         # but not forever: one is never announced in some files.
-                        if cls is None and len(pending) < 2000:
+                        if cls is None and not settled:
                             continue
                         if cls is None:
                             cls = pa.LegacyAdapter
@@ -684,7 +695,9 @@ def read_session(path, adapter_name=None):
         except Exception as e:
             truncated = f"{type(e).__name__}"
     if adapter is None:
-        adapter = (pa.ADAPTERS[adapter_name] if adapter_name else pa.LegacyAdapter)(name)
+        cls = (pa.ADAPTERS[adapter_name] if adapter_name
+               else pa.pick_adapter({c.topic for c in channels.values()}))
+        adapter = (cls or pa.LegacyAdapter)(name)
         for m in pending:
             ch = channels[m.channel_id]
             if ch.topic in adapter.topics:

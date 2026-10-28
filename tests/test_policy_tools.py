@@ -127,6 +127,16 @@ def test_pick_adapter_goes_off_the_topics():
     assert pa.pick_adapter(["/vehicle"]) is None
 
 
+def test_a_record_file_that_announces_the_legacy_topics_first_is_not_legacy():
+    # Record mode writes /camera/depth and /vehicle too. Until the channel
+    # list is settled, those alone must not decide it.
+    early = ["/camera/depth", "/vehicle", "/controller", "/imu"]
+    assert pa.pick_adapter(early, settled=False) is None
+    assert pa.pick_adapter(early + ["/policy/depth_small", "/footprint"],
+                           settled=False) is pa.FootprintAdapter
+    assert pa.pick_adapter(early, settled=True) is pa.LegacyAdapter
+
+
 # --- what is dropped ----------------------------------------------------------
 
 def test_align_drops_what_cannot_be_a_label_and_says_why():
@@ -168,9 +178,9 @@ def test_the_slowest_creep_the_triggers_make_is_motion_not_a_stop():
     assert pa.magnitude_of(0.1, forward_cap=-1, reverse_cap=-1) == pytest.approx(0.5)
 
 
-def test_only_the_tick_that_starts_a_reverse_and_not_its_settle_is_a_decision():
+def test_in_auto_only_the_tick_that_starts_a_reverse_and_not_its_settle_is_a_decision():
     throttles = [0.2, -0.6, -0.6, -0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2]
-    rows = [(i * 0.1, row(i, throttle=t)) for i, t in enumerate(throttles)]
+    rows = [(i * 0.1, row(i, mode="auto", throttle=t)) for i, t in enumerate(throttles)]
     ticks, _, _ = align(footprint_session(rows))
     got = [(t.action, t.decision) for t in ticks]
     assert got[:4] == [(pl.FORWARD, True), (pl.REVERSE, True),
@@ -178,6 +188,14 @@ def test_only_the_tick_that_starts_a_reverse_and_not_its_settle_is_a_decision():
     settle = int(round(pd.SETTLE_S / 0.1))
     assert all(not d for a, d in got[4:4 + settle])
     assert got[4 + settle:] and all(d for a, d in got[4 + settle:])
+
+
+def test_on_the_pad_every_reverse_tick_and_the_stop_after_it_is_a_decision():
+    throttles = [0.2, -0.6, -0.6, -0.6, 0.0, 0.0, 0.2]
+    rows = [(i * 0.1, row(i, throttle=t)) for i, t in enumerate(throttles)]
+    ticks, _, _ = align(footprint_session(rows))
+    assert [t.action for t in ticks] == [pl.FORWARD] + [pl.REVERSE] * 3 + [pl.STOP] * 2 + [pl.FORWARD]
+    assert all(t.decision for t in ticks)
 
 
 def test_steering_is_a_fraction_of_manuals_full_lock_clipped():
