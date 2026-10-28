@@ -1,40 +1,80 @@
 #!/usr/bin/env python3
-"""Named, versioned driving models: the registry on the Mac and the car's pick.
+"""Named driving models: candidates, the releases that earned a number, and the car's pick.
 
-    python3 tools/models.py list                    # every version, which one drives
-    python3 tools/models.py register ~/crawler-data/models/policy-<stamp>.onnx
-    python3 tools/models.py register X.onnx --version 2.0 --notes "IMU in"
-    python3 tools/models.py register X.onnx --bump minor
-    python3 tools/models.py deploy 1.1 --dry-run    # say what it would do
-    python3 tools/models.py deploy 1.1              # put kblock 1.1 on the car
+    python3 tools/models.py list                    # releases, candidates, which one drives
+    python3 tools/models.py register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
+    python3 tools/models.py deploy candidate-imu-gyro --dry-run   # say what it would do
+    python3 tools/models.py deploy --candidate imu-gyro           # a test drive on the car
+    python3 tools/models.py promote imu-gyro --evidence ab.json --approved-on-car \\
+        --notes "held the line through the turn"
+    python3 tools/models.py deploy 1.3              # put kblock 1.3 on the car
     python3 tools/models.py rollback                # back to what drove before
     python3 tools/models.py status                  # what the car points at
+    python3 tools/models.py approve 1.2 --notes ".."  # record that a release drove well
+    python3 tools/models.py attach 1.2 --evidence ab.json --gate-note "won held-out A/B"
+    python3 tools/models.py demote 2.0 --tag imu-1028 --reason "..."
 
 models.sh runs this. Standard library only, so plain python3 on the Mac runs
 it; nothing in here imports pigpio or commands a wheel.
 
-Names. A model is a family name and MAJOR.MINOR, like a product: "kblock 1.1".
-MAJOR goes up when the car's runtime has to know about the change -- the
-input contract, representation, an input added (IMU, the previous action),
-the outputs, the steering scale. MINOR goes up for a retrain on the same
-contract. register works that out by comparing the new sidecar's contract
-(CONTRACT_KEYS) with the newest registered version's, unless told with
---version or --bump, or the sidecar already carries model_version (written by
-policy_train.py --model-version).
+Names. A version number means "better than the version before it", the way a
+product's does, so a model only gets one by proving it. A newly trained model
+registers as a CANDIDATE with no number: "kblock candidate <tag>", files
+candidate-<tag>.onnx and .json, the tag from --tag or else the policy-<stamp>
+stem. A candidate can go on the car for a test drive like any release.
 
-The registry is ~/crawler-data/models/registry.json, beside kblock-X.Y.onnx and
-kblock-X.Y.json, never inside a git tree (the repo is public; the guard is
+promote <tag> turns a candidate into the next RELEASE, "kblock X.Y", and
+refuses unless both gates pass:
+
+  1. The held-out test. --evidence is a results JSON comparing the
+     candidate's training recipe with the latest release's on identical
+     held-out folds (leave-one-session-out). Its pooled numbers must have
+     reverse recall not worse, reverse precision not worse by more than
+     GATE_REVERSE_PRECISION_SLACK and steering MAE not worse by more than
+     GATE_STEER_MAE_SLACK. --force-gate "<reason>" skips the rule and the
+     reason is kept in the registry. The evidence file is copied in beside
+     the release as kblock-X.Y.evidence.json.
+  2. My approval on the car: --approved-on-car, with an optional --notes on
+     how it drove. promote records the date.
+
+The number: MINOR up when the candidate's contract (CONTRACT_KEYS) is the same
+as the latest release's, MAJOR up when it differs -- the input contract,
+representation, an input added (IMU, the previous action), the outputs, the
+steering scale. Only releases count, so a number given back by demote is
+given out again to the next model that earns it. policy_train.py does not
+write a number into a sidecar, and register ignores one if it is there.
+
+The evidence schema (EVIDENCE_SCHEMA = 1), one JSON object:
+
+    evidence_schema  1
+    candidate        {"label": "kblock candidate <tag>", "recipe": "..."}
+    baseline         {"label": "kblock X.Y" -- the latest release, "recipe": "..."}
+    method           how the folds were made and graded, in words
+    sessions         every session the folds were cut from
+    folds            [{"name", "held_out": [session], "candidate": M, "baseline": M}]
+    pooled           {"candidate": M, "baseline": M} over every fold
+    M                {"reverse_recall", "reverse_precision", "steer_mae",
+                      "direction_balanced_accuracy", ...counts as wanted}
+
+promote never deletes: the candidate's files and entry stay, linked to the
+release (promoted_to / candidate). demote <X.Y> --tag <tag> is the way back
+for a release that should not have had its number: it copies kblock-X.Y.*
+to candidate-<tag>.*, keeps kblock-X.Y.* on disk, and drops the release
+entry. It refuses the model the car is running.
+
+The registry is ~/crawler-data/models/registry.json, beside the model files,
+never inside a git tree (the repo is public; the guard is
 pull_mcaps.refuse_reason). Registering copies: the policy-<stamp> files the
 trainer wrote stay exactly where and what they were, the copy is hashed against
 the original before it is renamed into place, and the copy's sidecar gets
-model_name / model_version so the car can say which model drove
-(policy.model_label, the /footprint policy_model field). Nothing is ever
-deleted and no version number is ever reused.
+model_name / model_version ("1.3", or "candidate <tag>") so the car can say
+which model drove (policy.model_label, the /footprint policy_model field).
+Nothing is overwritten.
 
 Deploy. The service runs `main.py --policy models/policy.onnx`, and
 models/policy.onnx and models/policy.json are symlinks on the car. deploy
-copies kblock-X.Y.* into the car's models/ if they are not there, checks their
-sha256 on the car, and then -- in one ssh, behind a fresh parked check --
+copies the model's files into the car's models/ if they are not there, checks
+their sha256 on the car, and then -- in one ssh, behind a fresh parked check --
 re-points each symlink atomically (ln -sfn to a temp name, mv -T over the
 real one), remembers the old target in models/.policy-previous for rollback,
 and restarts crawler.service. It refuses unless `pigs gpw 18` reads 1575, the
@@ -42,7 +82,8 @@ ESC's neutral pulse: a car with the throttle off neutral is a car someone is
 driving, and a restart under it is a restart at speed. After the restart it
 checks the service is active, has not crash-looped (NRestarts), is listening
 on 8765, is still at neutral, and has written no Traceback since the restart.
---dry-run does only the read-only half and prints the rest.
+--dry-run does only the read-only half and prints the rest. A candidate goes
+through exactly the same steps.
 
 The car is CRAWLER_HOST, else jt@jtpi.local, the same as pull_mcaps.py: by name,
 because the DHCP lease moves (tests/test_car_address.py).
@@ -50,7 +91,6 @@ because the DHCP lease moves (tests/test_car_address.py).
 
 import argparse
 import datetime
-import hashlib
 import json
 import math
 import os
@@ -69,7 +109,18 @@ FAMILY = "kblock"
 MODELS_DIR = os.path.expanduser(os.environ.get("CRAWLER_MODELS", "~/crawler-data/models"))
 MCAP_DIR = os.path.expanduser(os.environ.get("CRAWLER_DATA", "~/crawler-data/mcap"))
 REGISTRY = "registry.json"
-SCHEMA = 1
+# 1: one "versions" list. 2: "releases" and "candidates"; a schema 1 registry
+# is read as releases that predate the gate (upgrade_registry).
+SCHEMA = 2
+
+# The held-out gate, on the evidence's pooled numbers, candidate against the
+# latest release. Reverse recall may not drop at all: reversing out of a
+# corner is the thing these models are still bad at.
+GATE_REVERSE_PRECISION_SLACK = 0.05
+GATE_STEER_MAE_SLACK = 0.02
+EVIDENCE_SCHEMA = 1
+EVIDENCE_METRICS = ("reverse_recall", "reverse_precision", "steer_mae",
+                    "direction_balanced_accuracy")
 
 CAR_REPO = "/home/jt/Documents/py/crawler"
 CAR_MODELS = CAR_REPO + "/models"
@@ -110,6 +161,8 @@ SHORT_SCORES = (
 
 STAMP = re.compile(r"(\d{8})-(\d{6})Z")
 VERSION = re.compile(r"^(\d+)\.(\d+)$")
+TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
+CANDIDATE_PREFIX = "candidate-"
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +191,19 @@ def bump(version, part):
     raise ValueError(f"bump {part!r}: major or minor")
 
 
+def check_tag(tag):
+    """A candidate's tag, or ValueError: a short slug, safe as a file name."""
+    if not isinstance(tag, str) or not TAG.match(tag):
+        raise ValueError(f"tag {tag!r}: letters, digits, '.', '_' and '-', "
+                         f"at most 48, starting with a letter or digit")
+    return tag
+
+
+def default_tag(source_path):
+    """The policy-<stamp> stem the trainer wrote, as the tag."""
+    return os.path.splitext(os.path.basename(source_path))[0]
+
+
 def contract_of(meta):
     """The part of a sidecar the car's runtime depends on."""
     out = {}
@@ -162,79 +228,79 @@ def label(name, version):
     return f"{name} {version}"
 
 
+def candidate_label(name, tag):
+    return f"{name} candidate {tag}"
+
+
 def file_stem(name, version):
     return f"{name}-{version}"
 
 
+def candidate_stem(tag):
+    return CANDIDATE_PREFIX + tag
+
+
 def empty_registry():
-    return {"schema": SCHEMA, "versions": []}
+    return {"schema": SCHEMA, "releases": [], "candidates": []}
+
+
+def upgrade_registry(doc):
+    """A schema 1 registry as schema 2: every version it has is a release that
+    predates the gate, with no on-car approval recorded."""
+    if doc.get("schema") == 1 and isinstance(doc.get("versions"), list):
+        releases = [{**e, "gate": e.get("gate", "pre-gate"),
+                     "approval": e.get("approval")} for e in doc["versions"]]
+        return {"schema": SCHEMA, "releases": releases, "candidates": []}
+    if (doc.get("schema") == SCHEMA and isinstance(doc.get("releases"), list)
+            and isinstance(doc.get("candidates"), list)):
+        return doc
+    raise ValueError(f"not a schema 1 or {SCHEMA} registry")
 
 
 def versions_of(registry, name):
-    """That family's entries, oldest version first."""
-    return sorted((e for e in registry["versions"] if e["name"] == name),
+    """That family's releases, oldest version first. Candidates have no
+    number and never count."""
+    return sorted((e for e in registry["releases"] if e["name"] == name),
                   key=lambda e: parse_version(e["version"]))
 
 
 def find(registry, name, version):
-    for e in registry["versions"]:
+    for e in registry["releases"]:
         if e["name"] == name and parse_version(e["version"]) == parse_version(version):
             return e
     return None
 
 
-def find_by_sha(registry, sha):
-    for e in registry["versions"]:
-        if e["onnx_sha256"] == sha:
+def find_candidate(registry, tag):
+    for e in registry["candidates"]:
+        if e["tag"] == tag:
             return e
     return None
 
 
-def choose_version(registry, name, meta, version=None, part=None, force=False):
-    """(version, why) for a new model of `name` with sidecar `meta`.
+def find_by_sha(registry, sha, onnx_name=None):
+    """The entry with that onnx sha256. A promoted candidate and its release
+    are the same bytes, so the file name decides first, then a release wins."""
+    hits = [e for e in registry["releases"] + registry["candidates"]
+            if e["onnx_sha256"] == sha]
+    for e in hits:
+        if onnx_name and e["onnx"] == onnx_name:
+            return e
+    return hits[0] if hits else None
 
-    Order: --version, then --bump, then the sidecar's own model_version, then
-    the contract against the newest version. ValueError for a version already
-    taken, one that does not sort after every version of its major... and for
-    a contract change kept under the same MAJOR, unless forced.
-    """
+
+def next_version(registry, name, contract):
+    """(version, why) for the next release of `name`: MINOR on the latest
+    release's contract, MAJOR off it, 1.0 for the first."""
     existing = versions_of(registry, name)
-    latest = existing[-1] if existing else None
-    if version is not None:
-        chosen, why = format_version(parse_version(version)), "given"
-    elif part is not None:
-        chosen = bump(latest["version"], part) if latest else "1.0"
-        why = f"--bump {part}" + (f" from {latest['version']}" if latest else "")
-    elif meta.get("model_version") not in (None, ""):
-        chosen, why = format_version(parse_version(meta["model_version"])), "sidecar"
-    elif latest is None:
-        chosen, why = "1.0", "first version"
-    else:
-        changed = contract_diff(contract_of(meta), latest["contract"])
-        if changed:
-            chosen = bump(latest["version"], "major")
-            why = f"contract differs from {latest['version']} in {', '.join(changed)}"
-        else:
-            chosen = bump(latest["version"], "minor")
-            why = f"same contract as {latest['version']}"
-
-    if find(registry, name, chosen):
-        raise ValueError(f"{label(name, chosen)} is already registered; "
-                         f"versions are never reused")
-    major = parse_version(chosen)[0]
-    same_major = [e for e in existing if parse_version(e["version"])[0] == major]
-    if same_major:
-        top = same_major[-1]
-        if parse_version(chosen) < parse_version(top["version"]):
-            raise ValueError(f"{label(name, chosen)} sorts before {top['version']}, "
-                             f"the newest {major}.x")
-        changed = contract_diff(contract_of(meta), top["contract"])
-        if changed and not force:
-            raise ValueError(
-                f"{label(name, chosen)} keeps MAJOR {major} but its contract "
-                f"differs from {top['version']} in {', '.join(changed)}: that is "
-                f"a MAJOR bump (--bump major), or --force if it really is not")
-    return chosen, why
+    if not existing:
+        return "1.0", "first release"
+    latest = existing[-1]
+    changed = contract_diff(contract, latest["contract"])
+    if changed:
+        return (bump(latest["version"], "major"),
+                f"contract differs from {latest['version']} in {', '.join(changed)}")
+    return bump(latest["version"], "minor"), f"same contract as {latest['version']}"
 
 
 def created_of(meta, source_path, mtime=None):
@@ -291,13 +357,13 @@ def short_scores(entry):
     return " ".join(parts)
 
 
-def make_entry(name, version, meta, source_onnx, source_json, onnx_sha,
-               json_sha, source_json_sha, sessions, parent, notes, registered):
-    stem = file_stem(name, version)
+def make_candidate(name, tag, meta, source_onnx, source_json, onnx_sha,
+                   json_sha, source_json_sha, sessions, parent, notes, registered):
+    stem = candidate_stem(tag)
     return {
         "name": name,
-        "version": version,
-        "label": label(name, version),
+        "tag": tag,
+        "label": candidate_label(name, tag),
         "onnx": stem + ".onnx",
         "json": stem + ".json",
         "created": created_of(meta, source_onnx),
@@ -316,12 +382,112 @@ def make_entry(name, version, meta, source_onnx, source_json, onnx_sha,
         "scores": scores_of(meta),
         "parent": parent,
         "notes": notes or "",
+        "promoted_to": None,
     }
 
 
 def registered_sidecar(meta, name, version):
-    """The sidecar the registered copy carries: the trainer's, named."""
+    """The sidecar a registered copy carries: the trainer's, named. version
+    is "1.3" for a release and "candidate <tag>" for a candidate, so the car
+    reports "kblock 1.3" or "kblock candidate <tag>"."""
     return {**meta, "model_name": name, "model_version": version}
+
+
+# ---------------------------------------------------------------------------
+# Pure: the held-out gate.
+# ---------------------------------------------------------------------------
+
+def _metrics_problems(where, m):
+    if not isinstance(m, dict):
+        return [f"{where} is not an object"]
+    return [f"{where}.{k} is not a number" for k in EVIDENCE_METRICS
+            if not isinstance(m.get(k), (int, float)) or isinstance(m.get(k), bool)
+            or not math.isfinite(m[k])]
+
+
+def evidence_problems(doc):
+    """What is wrong with an evidence document's shape, [] when nothing is."""
+    if not isinstance(doc, dict):
+        return ["evidence is not a JSON object"]
+    problems = []
+    if doc.get("evidence_schema") != EVIDENCE_SCHEMA:
+        problems.append(f"evidence_schema is {doc.get('evidence_schema')!r}, "
+                        f"not {EVIDENCE_SCHEMA}")
+    for side in ("candidate", "baseline"):
+        if not isinstance((doc.get(side) or {}).get("label"), str):
+            problems.append(f"{side}.label is missing")
+    if not isinstance(doc.get("method"), str) or not doc["method"].strip():
+        problems.append("method is missing")
+    sessions = doc.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        problems.append("sessions is missing or empty")
+    folds = doc.get("folds")
+    if not isinstance(folds, list) or not folds:
+        problems.append("folds is missing or empty")
+    else:
+        for i, fold in enumerate(folds):
+            if not isinstance(fold, dict):
+                problems.append(f"folds[{i}] is not an object")
+                continue
+            held = fold.get("held_out")
+            if not isinstance(held, list) or not held:
+                problems.append(f"folds[{i}].held_out is missing or empty")
+            elif isinstance(sessions, list) and any(s not in sessions for s in held):
+                problems.append(f"folds[{i}].held_out names a session not in sessions")
+            for side in ("candidate", "baseline"):
+                problems += _metrics_problems(f"folds[{i}].{side}", fold.get(side))
+    pooled = doc.get("pooled") or {}
+    for side in ("candidate", "baseline"):
+        problems += _metrics_problems(f"pooled.{side}", pooled.get(side))
+    return problems
+
+
+def gate_check(doc):
+    """The pass rule on an evidence document's pooled numbers.
+    -> {"passes", "checks": [...], "pooled": {...}}"""
+    cand, base = doc["pooled"]["candidate"], doc["pooled"]["baseline"]
+    rules = (
+        ("reverse_recall", cand["reverse_recall"] >= base["reverse_recall"],
+         "not worse"),
+        ("reverse_precision",
+         cand["reverse_precision"] >= base["reverse_precision"] - GATE_REVERSE_PRECISION_SLACK,
+         f"not worse by more than {GATE_REVERSE_PRECISION_SLACK}"),
+        ("steer_mae", cand["steer_mae"] <= base["steer_mae"] + GATE_STEER_MAE_SLACK,
+         f"not worse by more than {GATE_STEER_MAE_SLACK}"),
+    )
+    checks = [{"metric": k, "candidate": cand[k], "baseline": base[k], "rule": rule,
+               "ok": bool(ok)} for k, ok, rule in rules]
+    return {"passes": all(c["ok"] for c in checks), "checks": checks,
+            "pooled": {side: {k: doc["pooled"][side][k] for k in EVIDENCE_METRICS}
+                       for side in ("candidate", "baseline")},
+            "folds": len(doc["folds"]), "sessions": list(doc["sessions"])}
+
+
+def describe_checks(check):
+    return [f"{c['metric']} {c['candidate']:.3f} vs {c['baseline']:.3f} "
+            f"({c['rule']}): {'ok' if c['ok'] else 'FAILS'}" for c in check["checks"]]
+
+
+def load_evidence(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise SystemExit(f"no evidence file {path}")
+    with open(path) as f:
+        try:
+            doc = json.load(f)
+        except ValueError as e:
+            raise SystemExit(f"{path} is not JSON: {e}")
+    problems = evidence_problems(doc)
+    if problems:
+        raise SystemExit(f"{path} is not schema {EVIDENCE_SCHEMA} evidence:\n  "
+                         + "\n  ".join(problems))
+    return path, doc
+
+
+def evidence_record(path, doc, file_name, sha):
+    return {"file": file_name, "sha256": sha, "source": os.path.basename(path),
+            "candidate": doc["candidate"]["label"], "baseline": doc["baseline"]["label"],
+            "summary": gate_check(doc)}
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +504,10 @@ def load_registry(models_dir=MODELS_DIR):
         return empty_registry()
     with open(path) as f:
         doc = json.load(f)
-    if doc.get("schema") != SCHEMA or not isinstance(doc.get("versions"), list):
-        raise SystemExit(f"{path}: not a schema {SCHEMA} registry")
-    return doc
+    try:
+        return upgrade_registry(doc)
+    except ValueError as e:
+        raise SystemExit(f"{path}: {e}")
 
 
 def save_registry(registry, models_dir=MODELS_DIR):
@@ -348,6 +515,9 @@ def save_registry(registry, models_dir=MODELS_DIR):
     so a crash leaves the old registry or the new one, never half of one."""
     path = registry_path(models_dir)
     tmp = path + ".tmp"
+    registry["releases"].sort(key=lambda e: (e["name"], parse_version(e["version"])))
+    # Stable, so two registered in the same second keep their order.
+    registry["candidates"].sort(key=lambda e: e["registered"])
     with open(tmp, "w") as f:
         json.dump(registry, f, indent=2, allow_nan=False)
         f.write("\n")
@@ -387,6 +557,21 @@ def write_verified_json(doc, dest):
     return pm.sha256_local(dest)
 
 
+def copy_model(entry, models_dir, stem, model_version):
+    """entry's onnx to <stem>.onnx and its sidecar, renamed, to <stem>.json.
+    -> (onnx name, json name, json sha256)."""
+    src = {k: os.path.join(models_dir, entry[k]) for k in ("onnx", "json")}
+    if pm.sha256_local(src["onnx"]) != entry["onnx_sha256"]:
+        raise SystemExit(f"{src['onnx']} is not what the registry recorded")
+    with open(src["json"]) as f:
+        meta = json.load(f)
+    dest = os.path.join(models_dir, stem)
+    copy_verified(src["onnx"], dest + ".onnx", entry["onnx_sha256"])
+    json_sha = write_verified_json(registered_sidecar(meta, entry["name"], model_version),
+                                   dest + ".json")
+    return stem + ".onnx", stem + ".json", json_sha
+
+
 def session_hashes(names, mcap_dir=MCAP_DIR, hash_file=None):
     """[{name, mcap_sha256}] with None for a session not on this Mac."""
     hash_file = hash_file or pm.sha256_local
@@ -398,10 +583,17 @@ def session_hashes(names, mcap_dir=MCAP_DIR, hash_file=None):
     return out
 
 
+def utc_now(now=None):
+    return now or datetime.datetime.now(datetime.timezone.utc)
+
+
+def stamp(now=None):
+    return utc_now(now).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def register(onnx_path, models_dir=MODELS_DIR, mcap_dir=MCAP_DIR, name=None,
-             version=None, part=None, parent=None, notes="", force=False,
-             now=None):
-    """Copy a trained model into the registry as the next version. -> entry."""
+             tag=None, notes="", now=None):
+    """Copy a trained model into the registry as a candidate. -> entry."""
     onnx_path = os.path.abspath(os.path.expanduser(onnx_path))
     json_path = os.path.splitext(onnx_path)[0] + ".json"
     for path in (onnx_path, json_path):
@@ -416,6 +608,11 @@ def register(onnx_path, models_dir=MODELS_DIR, mcap_dir=MCAP_DIR, name=None,
     for key in ("input_contract", "representation", "actions", "steer_scale"):
         if key not in meta:
             raise SystemExit(f"{json_path} has no {key}: not a policy sidecar")
+    tag = tag if tag is not None else default_tag(onnx_path)
+    try:
+        check_tag(tag)
+    except ValueError as e:
+        raise SystemExit(f"{e}; give one with --tag")
 
     registry = load_registry(models_dir)
     onnx_sha = pm.sha256_local(onnx_path)
@@ -423,35 +620,209 @@ def register(onnx_path, models_dir=MODELS_DIR, mcap_dir=MCAP_DIR, name=None,
     if already:
         raise SystemExit(f"{os.path.basename(onnx_path)} is already "
                          f"{already['label']} ({already['onnx']})")
+    if find_candidate(registry, tag):
+        raise SystemExit(f"candidate {tag} is already registered; give another --tag")
     name = name or meta.get("model_name") or FAMILY
-    try:
-        chosen, reason = choose_version(registry, name, meta, version, part, force)
-    except ValueError as e:
-        raise SystemExit(str(e))
-    if parent is None:
-        before = [e for e in versions_of(registry, name)
-                  if parse_version(e["version"]) < parse_version(chosen)]
-        parent = before[-1]["version"] if before else None
-    elif not find(registry, name, parent):
-        raise SystemExit(f"--parent {parent}: no {label(name, parent)}")
+    releases = versions_of(registry, name)
+    parent = releases[-1]["version"] if releases else None
 
-    stem = os.path.join(models_dir, file_stem(name, chosen))
+    stem = os.path.join(models_dir, candidate_stem(tag))
     copy_verified(onnx_path, stem + ".onnx", onnx_sha)
-    json_sha = write_verified_json(registered_sidecar(meta, name, chosen), stem + ".json")
+    json_sha = write_verified_json(registered_sidecar(meta, name, f"candidate {tag}"),
+                                   stem + ".json")
     # The original is untouched: still the bytes that were registered.
     if pm.sha256_local(onnx_path) != onnx_sha:
         raise SystemExit(f"{onnx_path} changed while it was being registered")
 
     sessions = {"train": session_hashes(meta.get("train_sessions"), mcap_dir),
                 "val": session_hashes(meta.get("val_sessions"), mcap_dir)}
-    registered = (now or datetime.datetime.now(datetime.timezone.utc)) \
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
-    entry = make_entry(name, chosen, meta, onnx_path, json_path, onnx_sha,
-                       json_sha, pm.sha256_local(json_path), sessions, parent,
-                       notes, registered)
-    entry["why_version"] = reason
-    registry["versions"].append(entry)
-    registry["versions"].sort(key=lambda e: (e["name"], parse_version(e["version"])))
+    entry = make_candidate(name, tag, meta, onnx_path, json_path, onnx_sha, json_sha,
+                           pm.sha256_local(json_path), sessions, parent, notes,
+                           stamp(now))
+    if meta.get("model_version") not in (None, ""):
+        # Only promote gives a number; one the sidecar carries is kept as a note.
+        entry["sidecar_model_version_ignored"] = str(meta["model_version"])
+    registry["candidates"].append(entry)
+    save_registry(registry, models_dir)
+    return entry
+
+
+def promote(tag, models_dir=MODELS_DIR, evidence=None, approved_on_car=False,
+            notes="", force_gate=None, now=None):
+    """Turn candidate `tag` into the next release, behind both gates. -> entry."""
+    registry = load_registry(models_dir)
+    cand = find_candidate(registry, tag)
+    if cand is None:
+        raise SystemExit(f"no candidate {tag} in the registry")
+    if cand.get("promoted_to"):
+        raise SystemExit(f"{cand['label']} is already "
+                         f"{label(cand['name'], cand['promoted_to'])}")
+    name = cand["name"]
+    releases = versions_of(registry, name)
+    latest = releases[-1] if releases else None
+
+    if not approved_on_car:
+        raise SystemExit(f"Refusing: {cand['label']} needs --approved-on-car. Deploy it "
+                         f"(./models.sh deploy {cand['onnx'][:-5]}), drive it, and "
+                         f"promote it once it drove well.")
+    ev = None
+    if evidence is not None:
+        ev_path, ev = load_evidence(evidence)
+        mismatch = []
+        if ev["candidate"]["label"] != cand["label"]:
+            mismatch.append(f"its candidate is {ev['candidate']['label']!r}, "
+                            f"not {cand['label']!r}")
+        if latest and ev["baseline"]["label"] != latest["label"]:
+            mismatch.append(f"its baseline is {ev['baseline']['label']!r}, "
+                            f"not the latest release {latest['label']!r}")
+        if mismatch:
+            raise SystemExit(f"Refusing: {ev_path} is evidence for another pair: "
+                             + "; ".join(mismatch))
+    check = gate_check(ev) if ev is not None else None
+    if latest is None:
+        gate = "first release"
+    elif force_gate:
+        gate = "forced"
+    elif ev is None:
+        raise SystemExit(f"Refusing: promoting {cand['label']} over {latest['label']} "
+                         f"needs --evidence, a held-out comparison of the two "
+                         f"(or --force-gate \"<reason>\")")
+    elif not check["passes"]:
+        raise SystemExit(f"Refusing: {cand['label']} does not beat {latest['label']} "
+                         f"on the held-out folds:\n  " + "\n  ".join(describe_checks(check)))
+    else:
+        gate = "passed"
+
+    version, why = next_version(registry, name, cand["contract"])
+    stem = file_stem(name, version)
+    set_aside_demoted(registry, models_dir, stem)
+    onnx_name, json_name, json_sha = copy_model(cand, models_dir, stem, version)
+    record = None
+    if ev is not None:
+        ev_name = stem + ".evidence.json"
+        ev_sha = pm.sha256_local(ev_path)
+        copy_verified(ev_path, os.path.join(models_dir, ev_name), ev_sha)
+        record = evidence_record(ev_path, ev, ev_name, ev_sha)
+
+    keep = {k: v for k, v in cand.items()
+            if k not in ("tag", "promoted_to", "demoted", "sidecar_model_version_ignored")}
+    entry = {**keep, "version": version, "label": label(name, version),
+             "onnx": onnx_name, "json": json_name, "json_sha256": json_sha,
+             "parent": latest["version"] if latest else None,
+             "why_version": why, "candidate": tag, "promoted": stamp(now),
+             "gate": gate, "evidence": record,
+             "approval": {"status": "approved", "date": utc_now(now).strftime("%Y-%m-%d"),
+                          "notes": notes or ""}}
+    if gate == "forced":
+        entry["gate_reason"] = force_gate
+    cand["promoted_to"] = version
+    registry["releases"].append(entry)
+    save_registry(registry, models_dir)
+    return entry
+
+
+def set_aside_demoted(registry, models_dir, stem):
+    """A number given back by demote leaves its kblock-X.Y.* files on disk.
+    When the number is given out again, those files move to
+    kblock-X.Y.demoted-<tag>.* first -- renamed, never deleted, and the
+    demoted candidate's record says where they went. Any other file already
+    under the name stops the promote in copy_verified."""
+    for cand in registry["candidates"]:
+        demoted = cand.get("demoted") or {}
+        files = demoted.get("files") or {}
+        for kind in ("onnx", "json"):
+            old = files.get(kind)
+            if old != f"{stem}.{kind}":
+                continue
+            path = os.path.join(models_dir, old)
+            if not os.path.exists(path):
+                continue
+            if pm.sha256_local(path) != files.get(f"{kind}_sha256"):
+                raise SystemExit(f"{path} is not the file {cand['label']} was demoted "
+                                 f"from; not moving it")
+            new = f"{stem}.demoted-{cand['tag']}.{kind}"
+            if os.path.exists(os.path.join(models_dir, new)):
+                raise SystemExit(f"{new} already exists; nothing is overwritten")
+            os.rename(path, os.path.join(models_dir, new))
+            files[kind] = new
+
+
+def demote(version, tag, reason, car, models_dir=MODELS_DIR, name=None, now=None):
+    """Release `version` back to a candidate: its number is given back.
+    Refuses the model the car is running. -> the candidate entry."""
+    registry = load_registry(models_dir)
+    name = name or FAMILY
+    entry = find(registry, name, version)
+    if entry is None:
+        raise SystemExit(f"no {label(name, version)} in the registry")
+    if not reason or not reason.strip():
+        raise SystemExit("demote needs --reason: the registry keeps why")
+    try:
+        check_tag(tag)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    if find_candidate(registry, tag):
+        raise SystemExit(f"candidate {tag} is already registered; give another --tag")
+    # Survey the car before anything moves; an unreachable car stops this here.
+    _, state, sha = active_entry(registry, car)
+    if sha == entry["onnx_sha256"]:
+        raise SystemExit(f"Refusing: the car's policy.onnx ({state.get('onnx')}) is "
+                         f"{entry['label']}. Deploy another model first.")
+
+    onnx_name, json_name, json_sha = copy_model(
+        entry, models_dir, candidate_stem(tag), f"candidate {tag}")
+    keep = {k: v for k, v in entry.items()
+            if k not in ("version", "label", "why_version", "gate", "gate_reason",
+                         "evidence", "approval", "candidate", "promoted")}
+    cand = {**keep, "tag": tag, "label": candidate_label(name, tag),
+            "onnx": onnx_name, "json": json_name, "json_sha256": json_sha,
+            "promoted_to": None,
+            "demoted": {"from": entry["version"], "date": stamp(now), "reason": reason,
+                        "files": {"onnx": entry["onnx"], "onnx_sha256": entry["onnx_sha256"],
+                                  "json": entry["json"], "json_sha256": entry["json_sha256"]}}}
+    registry["releases"].remove(entry)
+    registry["candidates"].append(cand)
+    save_registry(registry, models_dir)
+    return cand
+
+
+def approve(version, models_dir=MODELS_DIR, name=None, notes="", now=None):
+    """Record my on-car approval of a release that has none yet. -> entry."""
+    registry = load_registry(models_dir)
+    entry = find(registry, name or FAMILY, version)
+    if entry is None:
+        raise SystemExit(f"no {label(name or FAMILY, version)} in the registry")
+    if (entry.get("approval") or {}).get("status") == "approved":
+        raise SystemExit(f"{entry['label']} was approved on "
+                         f"{entry['approval']['date']} already")
+    entry["approval"] = {"status": "approved", "date": utc_now(now).strftime("%Y-%m-%d"),
+                         "notes": notes or ""}
+    save_registry(registry, models_dir)
+    return entry
+
+
+def attach(version, evidence, gate_note, models_dir=MODELS_DIR, name=None):
+    """Attach held-out evidence to a release from before the gate, as a record.
+    It does not make the release gated: the rule's verdict is kept beside it,
+    pass or fail, and the gate reads "pre-gate, <note>". -> entry."""
+    registry = load_registry(models_dir)
+    entry = find(registry, name or FAMILY, version)
+    if entry is None:
+        raise SystemExit(f"no {label(name or FAMILY, version)} in the registry")
+    if not str(entry.get("gate", "")).startswith("pre-gate"):
+        raise SystemExit(f"{entry['label']} went through the gate ({entry.get('gate')}); "
+                         f"its evidence is already its own")
+    ev_path, ev = load_evidence(evidence)
+    if ev["candidate"]["label"] != entry["label"]:
+        raise SystemExit(f"{ev_path} is evidence for {ev['candidate']['label']!r}, "
+                         f"not {entry['label']!r}")
+    ev_name = file_stem(entry["name"], entry["version"]) + ".evidence.json"
+    ev_sha = pm.sha256_local(ev_path)
+    copy_verified(ev_path, os.path.join(models_dir, ev_name), ev_sha)
+    entry["gate"] = f"pre-gate, {gate_note}" if gate_note else "pre-gate"
+    entry["evidence"] = evidence_record(ev_path, ev, ev_name, ev_sha)
+    if entry.get("approval") is None:
+        entry["approval"] = {"status": "pending"}
     save_registry(registry, models_dir)
     return entry
 
@@ -543,7 +914,7 @@ def health_problems(h, nrestarts_before):
 
 def copy_plan(entry, remote_sha):
     """The registered files the car is missing -> [name]. SystemExit for one
-    it has under the same name with other bytes: that is not this version."""
+    it has under the same name with other bytes: that is not this model."""
     missing = []
     for name, sha in ((entry["onnx"], entry["onnx_sha256"]),
                       (entry["json"], entry["json_sha256"])):
@@ -597,12 +968,14 @@ def active_entry(registry, car, state=None):
         return None, state, None
     path = target if target.startswith("/") else f"{CAR_MODELS}/{target}"
     sha = car.sha256([path]).get(path)
-    return (find_by_sha(registry, sha) if sha else None), state, sha
+    entry = find_by_sha(registry, sha, os.path.basename(target)) if sha else None
+    return entry, state, sha
 
 
 def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
            out=print, wait_s=30.0, sleep=time.sleep, clock=time.monotonic):
-    """Put `entry` on the car and restart the service under it. -> exit code."""
+    """Put `entry`, a release or a candidate, on the car and restart the
+    service under it. -> exit code."""
     say = (lambda s: out(f"[dry-run] {s}")) if dry_run else out
     local = {n: os.path.join(models_dir, entry[n]) for n in ("onnx", "json")}
     for kind, path in local.items():
@@ -669,26 +1042,89 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
         return 1
     out(f"healthy: active, NRestarts {h.get('nrestarts')}, listening on {PORT}, "
         f"throttle {h.get('pulse')}, no Traceback. {entry['label']} drives.")
+    if "tag" in entry:
+        out(f"A test drive: promote {entry['tag']} --approved-on-car once it drove well.")
     return 0
 
 
 def rollback_entry(registry, car):
-    """The registered version models/.policy-previous names, by its hash."""
+    """The registered model models/.policy-previous names, by its hash."""
     state = survey(car)
     target = state.get("previous", "")
     if not target:
-        raise SystemExit("the car has no models/.policy-previous: deploy a version by name")
+        raise SystemExit("the car has no models/.policy-previous: deploy a model by name")
     path = f"{CAR_MODELS}/{target}"
     sha = car.sha256([path]).get(path)
-    entry = find_by_sha(registry, sha) if sha else None
+    entry = find_by_sha(registry, sha, os.path.basename(target)) if sha else None
     if entry is None:
-        raise SystemExit(f"{target} on the car is not a registered version")
+        raise SystemExit(f"{target} on the car is not a registered model")
     return entry
 
 
 # ---------------------------------------------------------------------------
 # The commands.
 # ---------------------------------------------------------------------------
+
+def gate_text(e):
+    gate = e.get("gate") or "-"
+    if e.get("gate_reason"):
+        gate += f" ({e['gate_reason']})"
+    approval = e.get("approval")
+    if approval is None:
+        on_car = "not recorded"
+    elif approval.get("status") == "approved":
+        on_car = f"approved {approval.get('date')}"
+        if approval.get("notes"):
+            on_car += f": {approval['notes']}"
+    else:
+        on_car = approval.get("status", "?")
+    ev = e.get("evidence")
+    if ev:
+        verdict = "passes" if ev["summary"]["passes"] else "fails"
+        gate += f"; evidence {ev['file']} ({verdict} the rule vs {ev['baseline']})"
+    return f"gate {gate}; on-car {on_car}"
+
+
+def list_lines(registry, active, models_dir, offline):
+    lines = []
+
+    def row(e):
+        mark = "*" if active is e else " "
+        sessions = len(e.get("train_sessions") or [])
+        lines.append(f"{mark} {e['label']:<28} {e['created']}  {e['onnx_sha256'][:12]}  "
+                     f"{sessions} session{'s' if sessions != 1 else ''}  "
+                     f"parent {e['parent'] or '-':<4} {short_scores(e)}")
+
+    if not registry["releases"] and not registry["candidates"]:
+        return [f"no models in {registry_path(models_dir)}"]
+    lines.append("Releases")
+    if not registry["releases"]:
+        lines.append("  (none)")
+    for e in sorted(registry["releases"],
+                    key=lambda e: (e["name"], parse_version(e["version"]))):
+        row(e)
+        lines.append(f"    {gate_text(e)}")
+        if e.get("candidate"):
+            lines.append(f"    promoted from candidate {e['candidate']}")
+        if e.get("notes"):
+            lines.append(f"    {e['notes']}")
+    lines.append("Candidates")
+    if not registry["candidates"]:
+        lines.append("  (none)")
+    for e in registry["candidates"]:
+        row(e)
+        if e.get("promoted_to"):
+            lines.append(f"    promoted to {e['promoted_to']}")
+        if e.get("demoted"):
+            d = e["demoted"]
+            lines.append(f"    demoted from {d['from']} on {d['date'][:10]}: {d['reason']}")
+        if e.get("notes"):
+            lines.append(f"    {e['notes']}")
+    if not offline:
+        lines.append("* = what the car's models/policy.onnx points at"
+                     if active else "(the car's policy.onnx is no registered model)")
+    return lines
+
 
 def cmd_list(args, car_factory=Car):
     registry = load_registry(args.models_dir)
@@ -698,38 +1134,75 @@ def cmd_list(args, car_factory=Car):
             active, _, _ = active_entry(registry, car_factory())
         except SystemExit as e:
             print(f"(car not reachable: {e})")
-    if not registry["versions"]:
-        print(f"no versions in {registry_path(args.models_dir)}")
-        return 0
-    for e in registry["versions"]:
-        mark = "*" if active is e else " "
-        sessions = len(e.get("train_sessions") or [])
-        print(f"{mark} {e['label']:<12} {e['created']}  {e['onnx_sha256'][:12]}  "
-              f"{sessions} session{'s' if sessions != 1 else ''}  "
-              f"parent {e['parent'] or '-':<4} {short_scores(e)}")
-        if e.get("notes"):
-            print(f"    {e['notes']}")
-    if not args.offline:
-        print("* = what the car's models/policy.onnx points at"
-              if active else "(the car's policy.onnx is no registered version)")
+    for line in list_lines(registry, active, args.models_dir, args.offline):
+        print(line)
     return 0
 
 
 def cmd_register(args):
-    entry = register(args.onnx, args.models_dir, args.mcap_dir, args.name,
-                     args.version, args.bump, args.parent, args.notes, args.force)
-    print(f"registered {entry['label']} ({entry['why_version']}) as "
-          f"{os.path.join(args.models_dir, entry['onnx'])}")
+    entry = register(args.onnx, args.models_dir, args.mcap_dir, args.name, args.tag,
+                     args.notes)
+    print(f"registered {entry['label']} as {os.path.join(args.models_dir, entry['onnx'])}")
     print(f"  onnx sha256 {entry['onnx_sha256']}")
-    print(f"  parent {entry['parent']}, {short_scores(entry)}")
+    print(f"  measured against {entry['parent'] or '(no release yet)'}, {short_scores(entry)}")
+    if entry.get("sidecar_model_version_ignored"):
+        print(f"  the sidecar said {entry['sidecar_model_version_ignored']}: ignored, "
+              f"only promote gives a number")
+    print(f"  test drive: ./models.sh deploy {entry['onnx'][:-5]}")
+    return 0
+
+
+def cmd_promote(args):
+    entry = promote(args.tag, args.models_dir, args.evidence, args.approved_on_car,
+                    args.notes, args.force_gate)
+    print(f"promoted candidate {args.tag} to {entry['label']} ({entry['why_version']}) as "
+          f"{os.path.join(args.models_dir, entry['onnx'])}")
+    print(f"  {gate_text(entry)}")
+    if entry.get("evidence"):
+        for line in describe_checks(entry["evidence"]["summary"]):
+            print(f"    {line}")
+    return 0
+
+
+def cmd_demote(args, car_factory=Car):
+    cand = demote(args.version, args.tag, args.reason, car_factory(), args.models_dir,
+                  args.name)
+    print(f"{label(cand['name'], args.version)} is now {cand['label']} "
+          f"({os.path.join(args.models_dir, cand['onnx'])}); "
+          f"{cand['demoted']['files']['onnx']} stays on disk")
+    return 0
+
+
+def cmd_approve(args):
+    entry = approve(args.version, args.models_dir, args.name, args.notes)
+    print(f"{entry['label']}: {gate_text(entry)}")
+    return 0
+
+
+def cmd_attach(args):
+    entry = attach(args.version, args.evidence, args.gate_note, args.models_dir, args.name)
+    print(f"{entry['label']}: {gate_text(entry)}")
+    for line in describe_checks(entry["evidence"]["summary"]):
+        print(f"    {line}")
     return 0
 
 
 def _entry_for(registry, args):
+    target = args.candidate
+    if target is None and args.target and args.target.startswith(CANDIDATE_PREFIX):
+        target = args.target[len(CANDIDATE_PREFIX):]
+    if target is not None:
+        entry = find_candidate(registry, target)
+        if entry is None:
+            raise SystemExit(f"no candidate {target} in the registry")
+        return entry
+    if not args.target:
+        raise SystemExit("deploy what? a release (1.2) or a candidate "
+                         "(candidate-<tag>, or --candidate <tag>)")
     name = args.name or FAMILY
-    entry = find(registry, name, args.version)
+    entry = find(registry, name, args.target)
     if entry is None:
-        raise SystemExit(f"no {label(name, args.version)} in the registry")
+        raise SystemExit(f"no {label(name, args.target)} in the registry")
     return entry
 
 
@@ -756,7 +1229,7 @@ def cmd_status(args, car_factory=Car):
     print(f"  models/policy.json -> {state.get('json') or '(no link)'}")
     print(f"  sha256 {sha or '(unreadable)'}")
     if entry is None:
-        print("  NOT a registered version")
+        print("  NOT a registered model")
         rc = 1
     else:
         json_path = (state.get("json") if state.get("json", "").startswith("/")
@@ -785,26 +1258,50 @@ def parse_args(argv):
     p.add_argument("--models-dir", default=MODELS_DIR)
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("list", help="every version, and which one the car runs")
+    s = sub.add_parser("list", help="releases and candidates, and which one the car runs")
     s.add_argument("--offline", action="store_true", help="do not ask the car")
 
-    s = sub.add_parser("register", help="copy a trained model in as the next version")
+    s = sub.add_parser("register", help="copy a trained model in as a candidate")
     s.add_argument("onnx")
-    g = s.add_mutually_exclusive_group()
-    g.add_argument("--version", help="MAJOR.MINOR, instead of working it out")
-    g.add_argument("--bump", choices=("major", "minor"))
+    s.add_argument("--tag", default=None, help="short slug (default the policy-<stamp> stem)")
     s.add_argument("--name", default=None, help=f"family (default the sidecar's, else {FAMILY})")
-    s.add_argument("--parent", default=None, help="parent version (default the one before)")
     s.add_argument("--notes", default="")
-    s.add_argument("--force", action="store_true",
-                   help="allow a contract change under the same MAJOR")
     s.add_argument("--mcap-dir", default=MCAP_DIR)
 
-    for name, text in (("deploy", "put a version on the car and restart"),
+    s = sub.add_parser("promote", help="give a candidate the next release number")
+    s.add_argument("tag")
+    s.add_argument("--evidence", default=None,
+                   help=f"held-out comparison JSON (evidence schema {EVIDENCE_SCHEMA})")
+    s.add_argument("--approved-on-car", action="store_true",
+                   help="I drove it and it drove well")
+    s.add_argument("--notes", default="", help="how it drove")
+    s.add_argument("--force-gate", default=None, metavar="REASON",
+                   help="promote without the held-out rule; the reason is kept")
+
+    s = sub.add_parser("demote", help="give a release's number back; it becomes a candidate")
+    s.add_argument("version")
+    s.add_argument("--tag", required=True)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--name", default=None)
+
+    s = sub.add_parser("approve", help="record that a release drove well on the car")
+    s.add_argument("version")
+    s.add_argument("--notes", default="", help="how it drove")
+    s.add_argument("--name", default=None)
+
+    s = sub.add_parser("attach", help="attach held-out evidence to a pre-gate release")
+    s.add_argument("version")
+    s.add_argument("--evidence", required=True)
+    s.add_argument("--gate-note", default="", help='e.g. "won held-out A/B"')
+    s.add_argument("--name", default=None)
+
+    for name, text in (("deploy", "put a release or a candidate on the car and restart"),
                        ("rollback", "deploy what drove before the last deploy")):
         s = sub.add_parser(name, help=text)
         if name == "deploy":
-            s.add_argument("version")
+            s.add_argument("target", nargs="?", default=None,
+                           help="a release (1.2) or candidate-<tag>")
+            s.add_argument("--candidate", default=None, metavar="TAG")
         s.add_argument("--name", default=None)
         s.add_argument("--dry-run", action="store_true")
 
@@ -816,8 +1313,10 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    return {"list": cmd_list, "register": cmd_register, "deploy": cmd_deploy,
-            "rollback": cmd_rollback, "status": cmd_status}[args.command](args)
+    return {"list": cmd_list, "register": cmd_register, "promote": cmd_promote,
+            "demote": cmd_demote, "approve": cmd_approve, "attach": cmd_attach,
+            "deploy": cmd_deploy, "rollback": cmd_rollback,
+            "status": cmd_status}[args.command](args)
 
 
 if __name__ == "__main__":

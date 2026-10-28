@@ -515,8 +515,8 @@ def model_label(meta, path):
     """The name a model drives under: "kblock 1.1" off a registered sidecar.
 
     tools/models.py writes model_name and model_version into the sidecar of
-    every copy it registers, and policy_train.py --model-name/--model-version
-    writes them at training time. A sidecar from before either has neither,
+    every copy it registers ("1.2" for a release, "candidate <tag>" for a
+    candidate, so "kblock candidate <tag>"). A sidecar from before has neither,
     and is named by its file instead -- the real file, past the
     models/policy.onnx symlink the service is pointed at, because "policy"
     says nothing about which model drove.

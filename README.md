@@ -240,26 +240,32 @@ ssh jtpi 'cd Documents/py/crawler && ~/.local/bin/uv sync'
 sudo systemctl edit crawler                       # ExecStart= then ExecStart=... --policy models/policy.onnx
 ```
 
-After the first time, a model goes on the car by name. Every model I keep
-is a version of `kblock` in `~/crawler-data/models/registry.json`: MAJOR
+After the first time, a model goes on the car by name, in
+`~/crawler-data/models/registry.json`. A new model registers as a
+candidate with no number, `kblock candidate <tag>`, and can go on the car
+for a test drive. A version number means better than the version before:
+`promote` gives a candidate the next one only when it beats the latest
+release on held-out folds (`--evidence`, the schema is in
+`tools/models.py`) and I say it drove well (`--approved-on-car`). MAJOR
 when the car has to know (a new input, representation or output), MINOR
-for a retrain on the same contract. `register` copies a trained model in,
-`deploy` puts a version on the car, re-points `models/policy.onnx` and
-`.json`, restarts the service and checks it came back, and only does any of
-that with the car parked. Every `/footprint` row in auto then says which
-version drove (`policy_model`, e.g. `kblock 1.1`).
+for a retrain on the same contract. `deploy` puts a release or a candidate
+on the car, re-points `models/policy.onnx` and `.json`, restarts the
+service and checks it came back, and only does any of that with the car
+parked. Every `/footprint` row in auto then says which model drove
+(`policy_model`, e.g. `kblock 1.2` or `kblock candidate imu-1028`).
 
 ```sh
-./models.sh register ~/crawler-data/models/policy-<stamp>.onnx --notes "IMU in"
-./models.sh list                      # versions, scores, * = on the car
-./models.sh deploy 2.0 --dry-run      # then without --dry-run
+./models.sh register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
+./models.sh list                      # releases, candidates, * = on the car
+./models.sh deploy candidate-imu-gyro --dry-run   # then without --dry-run
+./models.sh promote imu-gyro --evidence ab.json --approved-on-car --notes "..."
 ./models.sh rollback                  # back to what drove before
 ./models.sh status                    # the car's link, checked by sha256
 ```
 
-`policy_train.py --model-name kblock --model-version 2.0` names a model at
-training time, and every sidecar it writes says the commit and command it
-came from.
+`policy_train.py --model-name kblock` names the family at training time,
+never the number, and every sidecar it writes says the commit and command
+it came from.
 
 A model trained before the steering moved to manual's units says
 `steer_scale` 0.6 in its `.json`, and the car refuses it; retrain it.

@@ -356,10 +356,12 @@ def git_commit(repo=REPO):
         return None, None
 
 
-def provenance_meta(argv, model_name=None, model_version=None, commit=git_commit):
+def provenance_meta(argv, model_name=None, commit=git_commit):
     """Where the model came from: when, off which code, by which command, and
-    the name it is to be registered under if I gave one (tools/models.py
-    reads model_name / model_version, and so does policy.model_label)."""
+    the family it is to be registered under if I gave one. Never a version:
+    a number means better than the one before, and only tools/models.py
+    promote can say that, so tools/models.py register files every model as a
+    candidate."""
     sha, dirty = commit()
     out = {
         "created": datetime.datetime.now(datetime.timezone.utc)
@@ -370,8 +372,6 @@ def provenance_meta(argv, model_name=None, model_version=None, commit=git_commit
     }
     if model_name:
         out["model_name"] = model_name
-    if model_version:
-        out["model_version"] = model_version
     return out
 
 
@@ -444,16 +444,15 @@ def main(argv=None):
                          f"(default {MODE_SWITCH_WEIGHT})")
     ap.add_argument("--model-name", default=None,
                     help="family name for the sidecar, e.g. kblock")
-    ap.add_argument("--model-version", default=None,
-                    help="MAJOR.MINOR for the sidecar, e.g. 2.0; tools/models.py "
-                         "register uses it unless told otherwise")
+    # Kept only to say why it is gone: a release number is earned through
+    # tools/models.py promote, never stamped at training time.
+    ap.add_argument("--model-version", default=None, help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     args = ap.parse_args(argv)
     if args.model_version is not None:
-        parts = args.model_version.split(".")
-        if len(parts) != 2 or not all(p.isdigit() for p in parts):
-            print(f"--model-version {args.model_version!r} is not MAJOR.MINOR")
-            return 2
+        print("--model-version is gone: a model gets a number only from "
+              "tools/models.py promote, once it beats the latest release")
+        return 2
 
     import torch
 
@@ -532,7 +531,7 @@ def main(argv=None):
             "good_marked_train_ticks": int((train_mask & (pe.marks_of(data) == pe.MARK_GOOD)).sum()),
             "bad_marked_left_out": int((data["decision"] & pe.bad_marked(data)).sum()),
             "parameters": params,
-            **provenance_meta(argv, args.model_name, args.model_version)}
+            **provenance_meta(argv, args.model_name)}
     with torch.no_grad():
         export(model, args.representation, args.out, meta)
 

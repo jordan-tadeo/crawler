@@ -10,6 +10,7 @@ re-pointed and no restart.
 import json
 import math
 import os
+import pathlib
 import sys
 
 import pytest
@@ -74,57 +75,59 @@ def test_versions_parse_and_bump():
 def test_versions_sort_as_numbers_not_text():
     reg = md.empty_registry()
     for v in ("1.10", "1.9", "1.2"):
-        reg["versions"].append({"name": "kblock", "version": v, "contract": {}})
+        reg["releases"].append({"name": "kblock", "version": v, "contract": {}})
     assert [e["version"] for e in md.versions_of(reg, "kblock")] == ["1.2", "1.9", "1.10"]
 
 
 def registry_with(*versions, meta=None):
     reg = md.empty_registry()
     for v in versions:
-        reg["versions"].append({"name": "kblock", "version": v,
+        reg["releases"].append({"name": "kblock", "version": v,
                                 "contract": md.contract_of(meta or sidecar())})
     return reg
 
 
 def test_a_retrain_on_the_same_contract_is_a_minor():
-    v, why = md.choose_version(registry_with("1.0", "1.1"), "kblock", sidecar())
+    v, why = md.next_version(registry_with("1.0", "1.1"), "kblock", md.contract_of(sidecar()))
     assert v == "1.2" and "same contract" in why
 
 
 def test_a_new_input_is_a_major():
     imu = sidecar(uses_imu=True, imu_features=["gx"], imu_window=5, imu_tilt=True)
-    assert md.choose_version(registry_with("1.0", "1.1"), "kblock", imu)[0] == "2.0"
+    assert md.next_version(registry_with("1.0", "1.1"), "kblock", md.contract_of(imu))[0] == "2.0"
     prev = sidecar(uses_prev_action=True)
-    v, why = md.choose_version(registry_with("1.1"), "kblock", prev)
+    v, why = md.next_version(registry_with("1.1"), "kblock", md.contract_of(prev))
     assert v == "2.0" and "uses_prev_action" in why
 
 
-def test_the_first_version_is_1_0():
-    assert md.choose_version(md.empty_registry(), "kblock", sidecar())[0] == "1.0"
+def test_the_first_release_is_1_0():
+    assert md.next_version(md.empty_registry(), "kblock", md.contract_of(sidecar()))[0] == "1.0"
 
 
-def test_an_explicit_version_or_the_sidecars_own_wins():
+def test_candidates_never_count_toward_the_next_number():
     reg = registry_with("1.0", "1.1")
-    imu = sidecar(uses_imu=True, imu_features=["gx"], imu_window=5)
-    assert md.choose_version(reg, "kblock", imu, version="2.0")[0] == "2.0"
-    assert md.choose_version(reg, "kblock", sidecar(model_version="1.5"))[0] == "1.5"
-    assert md.choose_version(reg, "kblock", sidecar(), part="major")[0] == "2.0"
+    reg["candidates"].append({"name": "kblock", "tag": "x", "version": "9.9",
+                              "contract": md.contract_of(sidecar(uses_imu=True))})
+    assert md.next_version(reg, "kblock", md.contract_of(sidecar()))[0] == "1.2"
 
 
-def test_a_taken_or_backwards_version_is_refused():
-    reg = registry_with("1.0", "1.1")
-    with pytest.raises(ValueError, match="already registered"):
-        md.choose_version(reg, "kblock", sidecar(), version="1.1")
-    with pytest.raises(ValueError, match="sorts before"):
-        md.choose_version(registry_with("1.0", "1.2"), "kblock", sidecar(), version="1.1")
+def test_a_schema_1_registry_reads_as_pre_gate_releases():
+    old = {"schema": 1, "versions": [{"name": "kblock", "version": "1.0"},
+                                     {"name": "kblock", "version": "1.1"}]}
+    new = md.upgrade_registry(old)
+    assert new["schema"] == md.SCHEMA and new["candidates"] == []
+    assert [(e["version"], e["gate"], e["approval"]) for e in new["releases"]] == \
+        [("1.0", "pre-gate", None), ("1.1", "pre-gate", None)]
+    with pytest.raises(ValueError):
+        md.upgrade_registry({"schema": 7})
 
 
-def test_a_contract_change_under_the_same_major_is_refused_unless_forced():
-    imu = sidecar(uses_imu=True, imu_features=["gx"], imu_window=5)
-    reg = registry_with("1.0", "1.1")
-    with pytest.raises(ValueError, match="MAJOR"):
-        md.choose_version(reg, "kblock", imu, part="minor")
-    assert md.choose_version(reg, "kblock", imu, part="minor", force=True)[0] == "1.2"
+def test_tags_are_short_file_safe_slugs():
+    for good in ("imu-1028", "policy-20261028-195833Z", "a", "x.y_z"):
+        assert md.check_tag(good) == good
+    for bad in ("", "-x", "a/b", "a b", "..", "x" * 49, None):
+        with pytest.raises(ValueError):
+            md.check_tag(bad)
 
 
 def test_imu_details_do_not_count_without_the_imu_input():
@@ -135,7 +138,7 @@ def test_imu_details_do_not_count_without_the_imu_input():
 # The registry on disk.
 # ---------------------------------------------------------------------------
 
-def test_register_round_trip(tmp_path):
+def test_a_new_model_registers_as_a_candidate_with_no_number(tmp_path):
     models = tmp_path / "models"
     mcaps = tmp_path / "mcap"
     models.mkdir()
@@ -143,50 +146,64 @@ def test_register_round_trip(tmp_path):
     (mcaps / "crawler-record-a.mcap").write_bytes(b"session a")
     first = write_model(models, "policy-20261027-231046Z", b"onnx one",
                         sidecar(train_sessions=["crawler-record-a"]))
-    second = write_model(models, "policy-20261028-170131Z", b"onnx two", sidecar())
+    # A sidecar stamped with a number by an older trainer still lands as a candidate.
+    second = write_model(models, "policy-20261028-170131Z", b"onnx two",
+                         sidecar(model_name="kblock", model_version="2.0"))
     originals = {p: p.read_bytes() for p in models.iterdir()}
 
     e1 = md.register(str(first), str(models), str(mcaps), notes="first model")
-    e2 = md.register(str(second), str(models), str(mcaps))
-    assert (e1["label"], e2["label"]) == ("kblock 1.0", "kblock 1.1")
+    e2 = md.register(str(second), str(models), str(mcaps), tag="imu-gyro")
+    assert (e1["label"], e2["label"]) == ("kblock candidate policy-20261027-231046Z",
+                                          "kblock candidate imu-gyro")
+    assert "version" not in e1 and "version" not in e2
+    assert e2["sidecar_model_version_ignored"] == "2.0"
 
     # The originals are exactly where and what they were.
     for path, data in originals.items():
         assert path.read_bytes() == data
+    assert not list(models.glob("kblock-*"))
 
     reg = strict_json(models / "registry.json")   # no NaN made it in
     assert reg == md.load_registry(str(models))
-    v10, v11 = reg["versions"]
-    assert v10["version"] == "1.0" and v10["parent"] is None and v10["notes"] == "first model"
-    assert v11["version"] == "1.1" and v11["parent"] == "1.0"
-    assert v10["created"] == "2026-10-27T23:10:46Z"
-    assert v10["onnx_sha256"] == md.pm.sha256_local(str(first))
-    assert (models / "kblock-1.0.onnx").read_bytes() == b"onnx one"
-    assert v10["train_sessions"] == [{"name": "crawler-record-a",
-                                      "mcap_sha256": md.pm.sha256_local(
-                                          str(mcaps / "crawler-record-a.mcap"))}]
-    assert v11["train_sessions"][1] == {"name": "crawler-record-b", "mcap_sha256": None}
-    assert v10["train_commit"] is None
-    assert v10["scores"]["cv"]["mean"]["direction_accuracy"] == 0.95
-    assert v10["scores"]["cv"]["mean"]["mode_switch_recall"] is None
-    assert "folds" not in v10["scores"]["cv"]
+    assert reg["releases"] == []
+    c1, c2 = reg["candidates"]
+    assert c1["tag"] == "policy-20261027-231046Z" and c1["notes"] == "first model"
+    assert c1["onnx"] == "candidate-policy-20261027-231046Z.onnx"
+    assert c2["onnx"] == "candidate-imu-gyro.onnx" and c2["promoted_to"] is None
+    assert c1["parent"] is None
+    assert c1["created"] == "2026-10-27T23:10:46Z"
+    assert c1["onnx_sha256"] == md.pm.sha256_local(str(first))
+    assert (models / "candidate-imu-gyro.onnx").read_bytes() == b"onnx two"
+    assert c1["train_sessions"] == [{"name": "crawler-record-a",
+                                     "mcap_sha256": md.pm.sha256_local(
+                                         str(mcaps / "crawler-record-a.mcap"))}]
+    assert c2["train_sessions"][1] == {"name": "crawler-record-b", "mcap_sha256": None}
+    assert c1["train_commit"] is None
+    assert c1["scores"]["cv"]["mean"]["direction_accuracy"] == 0.95
+    assert c1["scores"]["cv"]["mean"]["mode_switch_recall"] is None
+    assert "folds" not in c1["scores"]["cv"]
 
-    copy = json.loads((models / "kblock-1.1.json").read_text())
-    assert (copy["model_name"], copy["model_version"]) == ("kblock", "1.1")
+    copy = json.loads((models / "candidate-imu-gyro.json").read_text())
+    assert (copy["model_name"], copy["model_version"]) == ("kblock", "candidate imu-gyro")
     assert math.isnan(copy["cv"]["mean"]["mode_switch_recall"])  # the copy is the sidecar
-    assert v11["json_sha256"] == md.pm.sha256_local(str(models / "kblock-1.1.json"))
+    assert c2["json_sha256"] == md.pm.sha256_local(str(models / "candidate-imu-gyro.json"))
 
-    with pytest.raises(SystemExit, match="already kblock 1.1"):
-        md.register(str(second), str(models), str(mcaps))
-    assert len(md.load_registry(str(models))["versions"]) == 2
+    with pytest.raises(SystemExit, match="already kblock candidate imu-gyro"):
+        md.register(str(second), str(models), str(mcaps), tag="again")
+    third = write_model(models, "policy-3", b"onnx three", sidecar())
+    with pytest.raises(SystemExit, match="already registered"):
+        md.register(str(third), str(models), str(mcaps), tag="imu-gyro")
+    with pytest.raises(SystemExit, match="--tag"):
+        md.register(str(third), str(models), str(mcaps), tag="no/slash")
+    assert len(md.load_registry(str(models))["candidates"]) == 2
 
 
 def test_register_never_overwrites_a_file(tmp_path):
     src = write_model(tmp_path, "policy-x", b"bytes", sidecar())
-    (tmp_path / "kblock-1.0.onnx").write_bytes(b"something else")
+    (tmp_path / "candidate-policy-x.onnx").write_bytes(b"something else")
     with pytest.raises(SystemExit, match="already exists"):
         md.register(str(src), str(tmp_path), str(tmp_path))
-    assert (tmp_path / "kblock-1.0.onnx").read_bytes() == b"something else"
+    assert (tmp_path / "candidate-policy-x.onnx").read_bytes() == b"something else"
     assert not (tmp_path / "registry.json").exists()
 
 
@@ -246,10 +263,12 @@ class FakeCar:
 
 @pytest.fixture
 def registered(tmp_path):
+    """kblock 1.0, the first release: a candidate promoted with no baseline."""
     src = write_model(tmp_path, "policy-20261028-170131Z", b"the model", sidecar())
-    md.register(str(src), str(tmp_path), str(tmp_path))
+    md.register(str(src), str(tmp_path), str(tmp_path), tag="first")
+    md.promote("first", str(tmp_path), approved_on_car=True)
     reg = md.load_registry(str(tmp_path))
-    return reg, reg["versions"][0], str(tmp_path)
+    return reg, reg["releases"][0], str(tmp_path)
 
 
 def deploy(registered, car, **kw):
@@ -328,14 +347,339 @@ def test_an_unhealthy_restart_says_so(registered, bad):
     assert rc == 1 and "UNHEALTHY after the restart:" in lines
 
 
+def test_a_candidate_deploys_through_the_same_checks(registered):
+    reg, _, folder = registered
+    src = os.path.join(folder, "policy-20261029-100000Z")
+    with open(src + ".onnx", "wb") as f:
+        f.write(b"a test drive")
+    with open(src + ".json", "w") as f:
+        json.dump(sidecar(), f)
+    md.register(src + ".onnx", folder, folder, tag="try-me")
+    reg = md.load_registry(folder)
+    args = md.parse_args(["--models-dir", folder, "deploy", "candidate-try-me"])
+    assert md._entry_for(reg, args)["tag"] == "try-me"
+    args = md.parse_args(["--models-dir", folder, "deploy", "--candidate", "try-me"])
+    cand = md._entry_for(reg, args)
+    assert cand["label"] == "kblock candidate try-me"
+
+    car = FakeCar()
+    lines = []
+    rc = md.deploy(reg, cand, car, folder, out=lines.append, sleep=lambda s: None)
+    assert rc == 0, lines
+    assert [r for _, r in car.puts] == [f"{md.CAR_MODELS}/candidate-try-me.onnx",
+                                        f"{md.CAR_MODELS}/candidate-try-me.json"]
+    (swap,) = swaps(car)
+    assert swap.index('[ "$p" = "1575" ]') < swap.index("ln -sfn")
+    assert "ln -sfn candidate-try-me.onnx .policy.onnx.tmp" in swap
+    assert any("test drive" in line for line in lines)
+
+    # Not parked: nothing copied, nothing re-pointed, as for a release.
+    car = FakeCar(pulse="1700")
+    assert md.deploy(reg, cand, car, folder, out=lambda s: None) == 3
+    assert car.puts == [] and swaps(car) == []
+
+
+# ---------------------------------------------------------------------------
+# Promote: the held-out gate and my approval on the car.
+# ---------------------------------------------------------------------------
+
+def metrics(recall=0.5, precision=0.5, steer=0.5, bal=0.5):
+    return {"reverse_recall": recall, "reverse_precision": precision,
+            "steer_mae": steer, "direction_balanced_accuracy": bal}
+
+
+def evidence(folder, candidate="kblock candidate next", baseline="kblock 1.0",
+             cand=None, base=None, name="ab.json"):
+    cand, base = cand or metrics(), base or metrics()
+    doc = {"evidence_schema": 1,
+           "candidate": {"label": candidate, "recipe": "new"},
+           "baseline": {"label": baseline, "recipe": "old"},
+           "method": "leave-one-session-out", "sessions": ["s1", "s2"],
+           "folds": [{"name": s, "held_out": [s], "candidate": cand, "baseline": base}
+                     for s in ("s1", "s2")],
+           "pooled": {"candidate": cand, "baseline": base}}
+    path = os.path.join(folder, name)
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    return path
+
+
+@pytest.fixture
+def with_candidate(registered):
+    """kblock 1.0 released, and candidate "next" on the same contract."""
+    _, _, folder = registered
+    src = os.path.join(folder, "policy-20261029-120000Z")
+    with open(src + ".onnx", "wb") as f:
+        f.write(b"the next model")
+    with open(src + ".json", "w") as f:
+        json.dump(sidecar(), f)
+    md.register(src + ".onnx", folder, folder, tag="next")
+    return folder
+
+
+def test_promote_refuses_without_evidence(with_candidate):
+    with pytest.raises(SystemExit, match="needs --evidence"):
+        md.promote("next", with_candidate, approved_on_car=True)
+    assert [e["version"] for e in md.load_registry(with_candidate)["releases"]] == ["1.0"]
+
+
+def test_promote_refuses_a_failing_gate(with_candidate):
+    base = metrics(recall=0.5, precision=0.6, steer=0.50)
+    for cand, metric in ((metrics(recall=0.49, precision=0.6, steer=0.50), "reverse_recall"),
+                         (metrics(recall=0.6, precision=0.54, steer=0.50), "reverse_precision"),
+                         (metrics(recall=0.6, precision=0.6, steer=0.53), "steer_mae")):
+        path = evidence(with_candidate, cand=cand, base=base)
+        with pytest.raises(SystemExit, match=f"{metric} .*FAILS"):
+            md.promote("next", with_candidate, evidence=path, approved_on_car=True)
+    assert len(md.load_registry(with_candidate)["releases"]) == 1
+    assert not os.path.exists(os.path.join(with_candidate, "kblock-1.1.onnx"))
+
+
+def test_the_gate_allows_the_slack_and_no_more():
+    def doc(cand, base):
+        return {"pooled": {"candidate": cand, "baseline": base}, "folds": [{}],
+                "sessions": ["s"]}
+    base = metrics(recall=0.5, precision=0.6, steer=0.5)
+    assert md.gate_check(doc(metrics(recall=0.5, precision=0.551, steer=0.5195), base))["passes"]
+    assert not md.gate_check(doc(metrics(recall=0.5, precision=0.549, steer=0.5), base))["passes"]
+    assert not md.gate_check(doc(metrics(recall=0.5, precision=0.6, steer=0.521), base))["passes"]
+
+
+def test_promote_refuses_evidence_for_another_pair_or_a_bad_shape(with_candidate):
+    path = evidence(with_candidate, baseline="kblock 0.9")
+    with pytest.raises(SystemExit, match="another pair"):
+        md.promote("next", with_candidate, evidence=path, approved_on_car=True)
+    path = evidence(with_candidate, candidate="kblock candidate other")
+    with pytest.raises(SystemExit, match="another pair"):
+        md.promote("next", with_candidate, evidence=path, approved_on_car=True)
+    path = evidence(with_candidate, cand={"reverse_recall": 0.9})
+    with pytest.raises(SystemExit, match="reverse_precision is not a number"):
+        md.promote("next", with_candidate, evidence=path, approved_on_car=True)
+
+
+def test_promote_refuses_without_my_approval_on_the_car(with_candidate):
+    path = evidence(with_candidate, cand=metrics(recall=0.9))
+    with pytest.raises(SystemExit, match="--approved-on-car"):
+        md.promote("next", with_candidate, evidence=path)
+    assert len(md.load_registry(with_candidate)["releases"]) == 1
+
+
+def test_promote_on_the_same_contract_is_the_next_minor(with_candidate):
+    folder = with_candidate
+    path = evidence(folder, cand=metrics(recall=0.7, precision=0.47, steer=0.51))
+    entry = md.promote("next", folder, evidence=path, approved_on_car=True,
+                       notes="clean three-point turn",
+                       now=md.datetime.datetime(2026, 10, 29, 18, 0, tzinfo=md.datetime.timezone.utc))
+    assert entry["label"] == "kblock 1.1" and entry["parent"] == "1.0"
+    assert entry["gate"] == "passed" and entry["candidate"] == "next"
+    assert entry["approval"] == {"status": "approved", "date": "2026-10-29",
+                                 "notes": "clean three-point turn"}
+    assert entry["evidence"]["summary"]["passes"] is True
+    assert entry["evidence"]["file"] == "kblock-1.1.evidence.json"
+    assert entry["evidence"]["sha256"] == md.pm.sha256_local(path)
+    assert md.pm.sha256_local(os.path.join(folder, "kblock-1.1.evidence.json")) == \
+        md.pm.sha256_local(path)
+
+    strict_json(pathlib.Path(folder) / "registry.json")    # no NaN made it in
+    reg = md.load_registry(folder)
+    cand = md.find_candidate(reg, "next")
+    assert cand["promoted_to"] == "1.1"     # kept, and linked
+    for kind in ("onnx", "json"):
+        assert os.path.exists(os.path.join(folder, f"candidate-next.{kind}"))
+    with open(os.path.join(folder, "kblock-1.1.onnx"), "rb") as f:
+        assert f.read() == b"the next model"
+    with open(os.path.join(folder, "kblock-1.1.json")) as f:
+        assert json.load(f)["model_version"] == "1.1"
+    assert entry["onnx_sha256"] == cand["onnx_sha256"]
+    with pytest.raises(SystemExit, match="already kblock 1.1"):
+        md.promote("next", folder, evidence=path, approved_on_car=True)
+
+
+def test_promote_off_the_contract_is_the_next_major(registered):
+    _, _, folder = registered
+    src = os.path.join(folder, "policy-imu")
+    with open(src + ".onnx", "wb") as f:
+        f.write(b"imu model")
+    with open(src + ".json", "w") as f:
+        json.dump(sidecar(uses_imu=True, imu_features=["gx"], imu_window=5), f)
+    md.register(src + ".onnx", folder, folder, tag="imu")
+    path = evidence(folder, candidate="kblock candidate imu")
+    entry = md.promote("imu", folder, evidence=path, approved_on_car=True)
+    assert entry["label"] == "kblock 2.0" and "uses_imu" in entry["why_version"]
+
+
+def test_force_gate_is_recorded(with_candidate):
+    path = evidence(with_candidate, cand=metrics(recall=0.1))
+    entry = md.promote("next", with_candidate, evidence=path, approved_on_car=True,
+                       force_gate="the folds miss the new terrain")
+    assert entry["gate"] == "forced"
+    assert entry["gate_reason"] == "the folds miss the new terrain"
+    assert entry["evidence"]["summary"]["passes"] is False
+    saved = md.find(md.load_registry(with_candidate), "kblock", "1.1")
+    assert saved["gate_reason"] == "the folds miss the new terrain"
+
+
+def test_force_gate_still_needs_the_car(with_candidate):
+    with pytest.raises(SystemExit, match="--approved-on-car"):
+        md.promote("next", with_candidate, force_gate="trust me")
+
+
+# ---------------------------------------------------------------------------
+# Demote: a number given back.
+# ---------------------------------------------------------------------------
+
+class CarOn(FakeCar):
+    """A car whose policy.onnx points at `target` with sha256 `sha`."""
+
+    def __init__(self, target, sha):
+        super().__init__(on_car={f"{md.CAR_MODELS}/{target}": sha})
+        self.target = target
+
+    def run(self, command, check=True):
+        code, text = super().run(command, check)
+        return code, text.replace("policy-old.onnx", self.target)
+
+
+@pytest.fixture
+def with_imu_release(registered):
+    """kblock 1.0, and kblock 2.0 the IMU model forced in over it."""
+    _, _, folder = registered
+    src = os.path.join(folder, "policy-20261028-195833Z")
+    with open(src + ".onnx", "wb") as f:
+        f.write(b"imu model")
+    with open(src + ".json", "w") as f:
+        json.dump(sidecar(uses_imu=True, imu_features=["gx"], imu_window=5), f)
+    md.register(src + ".onnx", folder, folder, tag="imu-a")
+    md.promote("imu-a", folder, approved_on_car=True, force_gate="before the gate")
+    return folder
+
+
+def test_demote_refuses_the_model_the_car_runs(with_imu_release):
+    folder = with_imu_release
+    two = md.find(md.load_registry(folder), "kblock", "2.0")
+    with pytest.raises(SystemExit, match="Refusing: the car"):
+        md.demote("2.0", "imu-1028", "lost the A/B",
+                  CarOn("kblock-2.0.onnx", two["onnx_sha256"]), folder)
+    assert md.find(md.load_registry(folder), "kblock", "2.0") is not None
+    assert not os.path.exists(os.path.join(folder, "candidate-imu-1028.onnx"))
+
+
+def test_demote_gives_the_number_back(with_imu_release):
+    folder = with_imu_release
+    one = md.find(md.load_registry(folder), "kblock", "1.0")
+    cand = md.demote("2.0", "imu-1028", "lost the held-out A/B",
+                     CarOn("kblock-1.0.onnx", one["onnx_sha256"]), folder)
+    assert cand["label"] == "kblock candidate imu-1028"
+    assert cand["demoted"]["from"] == "2.0"
+    assert cand["demoted"]["reason"] == "lost the held-out A/B"
+    reg = md.load_registry(folder)
+    assert [e["version"] for e in reg["releases"]] == ["1.0"]
+    assert md.find_candidate(reg, "imu-1028")["onnx_sha256"] == \
+        md.pm.sha256_local(os.path.join(folder, "kblock-2.0.onnx"))
+    # The old files stay on disk; the candidate's own copy carries its new name.
+    for kind in ("onnx", "json"):
+        assert os.path.exists(os.path.join(folder, f"kblock-2.0.{kind}"))
+    with open(os.path.join(folder, "candidate-imu-1028.json")) as f:
+        assert json.load(f)["model_version"] == "candidate imu-1028"
+
+    # The next number comes from releases only: the next IMU winner is 2.0 again,
+    # and the files 2.0 left behind are set aside, never overwritten.
+    left = md.pm.sha256_local(os.path.join(folder, "kblock-2.0.onnx"))
+    src = os.path.join(folder, "policy-imu-b")
+    with open(src + ".onnx", "wb") as f:
+        f.write(b"a better imu model")
+    with open(src + ".json", "w") as f:
+        json.dump(sidecar(uses_imu=True, imu_features=["gx"], imu_window=5), f)
+    md.register(src + ".onnx", folder, folder, tag="imu-b")
+    path = evidence(folder, candidate="kblock candidate imu-b")
+    entry = md.promote("imu-b", folder, evidence=path, approved_on_car=True)
+    assert entry["label"] == "kblock 2.0"
+    with open(os.path.join(folder, "kblock-2.0.onnx"), "rb") as f:
+        assert f.read() == b"a better imu model"
+    assert md.pm.sha256_local(os.path.join(folder, "kblock-2.0.demoted-imu-1028.onnx")) == left
+    files = md.find_candidate(md.load_registry(folder), "imu-1028")["demoted"]["files"]
+    assert files["onnx"] == "kblock-2.0.demoted-imu-1028.onnx"
+
+
+def test_demote_refuses_when_the_car_cannot_be_asked(with_imu_release):
+    class Gone(FakeCar):
+        def run(self, command, check=True):
+            raise SystemExit("ssh jt@fake failed (255)")
+    with pytest.raises(SystemExit, match="ssh"):
+        md.demote("2.0", "imu-1028", "x", Gone(), with_imu_release)
+    assert md.find(md.load_registry(with_imu_release), "kblock", "2.0") is not None
+
+
+def test_approve_and_attach_on_a_pre_gate_release(tmp_path):
+    reg = md.upgrade_registry({"schema": 1, "versions": [
+        {"name": "kblock", "version": "1.0", "label": "kblock 1.0"},
+        {"name": "kblock", "version": "1.1", "label": "kblock 1.1"}]})
+    md.save_registry(reg, str(tmp_path))
+    path = evidence(str(tmp_path), candidate="kblock 1.1",
+                    cand=metrics(recall=0.5, precision=0.3), base=metrics(precision=0.6))
+    entry = md.attach("1.1", path, "won held-out A/B", str(tmp_path))
+    assert entry["gate"] == "pre-gate, won held-out A/B"
+    assert entry["approval"] == {"status": "pending"}
+    assert entry["evidence"]["summary"]["passes"] is False   # the verdict is kept honest
+    with pytest.raises(SystemExit, match="evidence for"):
+        md.attach("1.0", path, "", str(tmp_path))
+    entry = md.approve("1.1", str(tmp_path), notes="drove the loop twice")
+    assert entry["approval"]["status"] == "approved"
+    with pytest.raises(SystemExit, match="approved on"):
+        md.approve("1.1", str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# list.
+# ---------------------------------------------------------------------------
+
+def test_list_shows_releases_and_candidates_apart_and_marks_the_car(with_imu_release):
+    folder = with_imu_release
+    reg = md.load_registry(folder)
+    one = md.find(reg, "kblock", "1.0")
+    md.demote("2.0", "imu-1028", "lost the A/B", CarOn("kblock-1.0.onnx", one["onnx_sha256"]),
+              folder)
+    reg = md.load_registry(folder)
+    active, _, _ = md.active_entry(reg, CarOn("kblock-1.0.onnx", one["onnx_sha256"]))
+    lines = md.list_lines(reg, active, folder, offline=False)
+    text = "\n".join(lines)
+    releases, candidates = lines.index("Releases"), lines.index("Candidates")
+    assert releases < candidates
+    rel = lines[releases + 1:candidates]
+    can = lines[candidates + 1:]
+    assert rel[0].startswith("* kblock 1.0 ")
+    assert not any("candidate imu-1028" in line for line in rel)
+    assert any(line.startswith("  kblock candidate imu-1028") for line in can)
+    assert any("demoted from 2.0" in line for line in can)
+    assert any("promoted to 1.0" in line for line in can)    # the first one
+    assert "gate first release; on-car approved" in text
+    assert text.endswith("* = what the car's models/policy.onnx points at")
+
+
+def test_the_car_running_a_promoted_candidate_is_named_by_its_file(with_candidate):
+    folder = with_candidate
+    path = evidence(folder, cand=metrics(recall=0.9))
+    release = md.promote("next", folder, evidence=path, approved_on_car=True)
+    reg = md.load_registry(folder)
+    sha = release["onnx_sha256"]
+    assert md.active_entry(reg, CarOn("kblock-1.1.onnx", sha))[0]["label"] == "kblock 1.1"
+    assert md.active_entry(reg, CarOn("candidate-next.onnx", sha))[0]["label"] == \
+        "kblock candidate next"
+
+
 # ---------------------------------------------------------------------------
 # The trainer's half.
 # ---------------------------------------------------------------------------
 
 def test_the_trainer_writes_where_a_model_came_from():
-    meta = pt.provenance_meta(["data.npz", "out.onnx", "--imu"], "kblock", "2.0",
+    meta = pt.provenance_meta(["data.npz", "out.onnx", "--imu"], "kblock",
                               commit=lambda: ("abc123", False))
     assert meta["train_commit"] == "abc123" and meta["train_commit_dirty"] is False
     assert meta["train_command"] == "tools/policy_train.py data.npz out.onnx --imu"
-    assert (meta["model_name"], meta["model_version"]) == ("kblock", "2.0")
+    assert meta["model_name"] == "kblock" and "model_version" not in meta
     assert "model_name" not in pt.provenance_meta([], commit=lambda: (None, None))
+
+
+def test_the_trainer_cannot_stamp_a_release_number(capsys):
+    assert pt.main(["data.npz", "out.onnx", "--model-version", "2.0"]) == 2
+    assert "promote" in capsys.readouterr().out
