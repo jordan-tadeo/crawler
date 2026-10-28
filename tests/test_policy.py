@@ -102,7 +102,10 @@ def test_a_model_stop_short_of_the_goal_drives_the_better_of_forward_and_reverse
     d = policy_driver(StubModel(logits, throttle=0.5, steer=-0.25), clear())
     d.tick(T0)
     assert d.controller.throttles[-1] == pytest.approx(0.5 * getattr(d, speed))
-    assert d.controller.steerings[-1] == dv.steering_pair(-0.25 * pl.STEER_SCALE)
+    # A reverse out of a stop is a fresh one, so the commit steers it: to the
+    # model's own side, at REVERSE_STEER.
+    front = -pl.REVERSE_STEER if want == pl.REVERSE else -0.25 * pl.STEER_SCALE
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(front))
     assert d.last_decision.action == want
     assert d.last_decision.model_action == pl.STOP
     assert d.last_decision.stop_masked
@@ -174,18 +177,23 @@ def test_full_steer_is_manuals_full_lock():
     assert d.controller.steerings[-1] == dv.steering_pair(-mn.STEERING_LIMIT_PERC / 100)
 
 
-def test_a_model_reverse_is_decided_again_every_tick():
+def test_a_model_reverse_is_decided_again_every_tick_once_its_commit_is_up():
     model = StubModel(REVERSE, throttle=0.5, steer=1.0)
     d = policy_driver(model, clear())
     d.tick(T0)
     assert d._phase is None and not d.recovering(T0 + 0.1)
     assert d.controller.throttles[-1] == pytest.approx(0.5 * d.reverse_speed)
     assert d.controller.steerings[-1] == dv.steering_pair(pl.STEER_SCALE)
-    # The next tick asks again, and the model can change its mind at once.
+    # Past the commit, still reversing, it is the model's tick by tick: its
+    # own steering, and it can change its mind at once.
+    model.out["steer"] = np.array([[0.1]], dtype=np.float32)
+    d.tick(T0 + pl.REVERSE_COMMIT_S)
+    assert not d.reverse_commit
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(0.1 * pl.STEER_SCALE))
     model.out["logits"] = np.array([FORWARD], dtype=np.float32)
     model.out["steer"] = np.array([[-0.5]], dtype=np.float32)
-    d.tick(T0 + 0.1)
-    assert len(model.calls) == 2
+    d.tick(T0 + pl.REVERSE_COMMIT_S + 0.1)
+    assert len(model.calls) == 3
     assert d.controller.throttles[-1] == pytest.approx(0.5 * d.forward_speed)
     assert d.controller.steerings[-1] == dv.steering_pair(-0.5 * pl.STEER_SCALE)
 
@@ -297,7 +305,10 @@ def test_the_floor_never_holds_a_model_reverse():
     d = policy_driver(StubModel(REVERSE, throttle=1.0, steer=-0.4), chair_leg())
     d.tick(T0)
     assert d.controller.throttles[-1] == pytest.approx(d.reverse_speed)
-    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(-0.4 * pl.STEER_SCALE))
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(-pl.REVERSE_STEER))
+    assert d.last_decision.reason == "model commit"
+    d.tick(T0 + pl.REVERSE_COMMIT_S)
+    assert d.controller.throttles[-1] == pytest.approx(d.reverse_speed)
     assert d.last_decision.reason == "model"
 
 
@@ -1113,3 +1124,274 @@ def test_the_confidence_is_logged_in_every_footprint_row(monkeypatch):
     assert last["policy_speed_scale"] == pytest.approx(pl.SPEED_FLOOR)
     fields = out["driver"].policy_fields()
     assert {k: fields[k] for k in names} == {k: last[k] for k in names}
+
+
+# --- the standoff with the floor ---------------------------------------------
+
+def floor_held(d, ticks, start=T0):
+    """`ticks` decisions 0.1 s apart against the chair leg. The reasons."""
+    return drive_through(d, [chair_leg()] * ticks, start)
+
+
+def test_the_floor_holding_a_forward_for_standoff_s_runs_the_stuck_recover():
+    model = StubModel(FORWARD, throttle=1.0, steer=0.3)
+    d = policy_driver(model, chair_leg())
+    n = round(pl.STANDOFF_S / 0.1)
+    reasons = floor_held(d, n + 1)
+    assert reasons == ["model floor"] * n + ["standoff"]
+    assert d._phase == dv._PHASE_REVERSE
+    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.last_verdict.reason == "policy standoff"
+    assert d.policy_fields()["standoff_ticks"] == n + 1
+    assert d.last_recovery_time == pytest.approx(T0 + pl.STANDOFF_S)
+    # The recover owns the wheels, then the model has them back.
+    calls = len(model.calls)
+    now = T0 + pl.STANDOFF_S
+    while len(model.calls) == calls:
+        now += 0.1
+        d.tick(now)
+        if len(model.calls) == calls:
+            assert d.policy_fields()["standoff_ticks"] == 0
+    # The settle ends and the same tick asks the model.
+    assert now - (T0 + pl.STANDOFF_S) == pytest.approx(
+        dv.REVERSE_SECONDS + dv.SETTLE_SECONDS, abs=0.25)  # a tick each phase
+    assert d.last_decision.reason == "model floor"
+    assert d.standoff_ticks == 1
+
+
+def test_a_floor_hold_shorter_than_standoff_s_does_not_recover():
+    d = policy_driver(StubModel(FORWARD), chair_leg())
+    n = round(pl.STANDOFF_S / 0.1)
+    assert floor_held(d, n) == ["model floor"] * n
+    # A tick the floor lets go starts the count over.
+    d.camera.depth = clear()
+    d.tick(T0 + n * 0.1)
+    assert d.last_decision.reason == "model" and d.standoff_ticks == 0
+    assert floor_held(d, n, start=T0 + (n + 1) * 0.1) == ["model floor"] * n
+    assert d._phase is None and d.last_recovery_time == 0.0
+
+
+def test_a_floor_hold_under_my_throttle_is_never_a_standoff():
+    d = policy_driver(StubModel(FORWARD), chair_leg())
+    d.human_throttle = True
+    floor_held(d, 30)
+    assert d._phase is None and d.standoff_ticks == 0
+
+
+# --- the reverse commit --------------------------------------------------------
+
+def commit_ticks():
+    return round(pl.REVERSE_COMMIT_S / 0.1)
+
+
+def test_a_fresh_reverse_is_held_for_the_commit_even_when_the_model_says_forward():
+    model = StubModel(REVERSE, throttle=1.0, steer=0.0)
+    d = policy_driver(model, clear())
+    d.tick(T0)
+    assert d.reverse_commit
+    model.out["logits"] = np.array([FORWARD], dtype=np.float32)
+    n = commit_ticks()
+    for k in range(1, n):
+        d.tick(T0 + k * 0.1)
+        assert d.reverse_commit, k
+        assert d.controller.throttles[-1] < 0.0
+        assert d.last_decision.reason == "model commit"
+        assert d.policy_fields()["policy_action"] == pl.FORWARD
+        assert d.policy_fields()["reverse_commit"] is True
+    assert len(model.calls) == n
+    d.tick(T0 + n * 0.1)
+    assert not d.reverse_commit
+    # Forward, slowed: the model was not sure of the reverse it was held to.
+    assert 0.0 < d.controller.throttles[-1] <= d.forward_speed
+    assert d.policy_fields()["reverse_commit"] is False
+
+
+def test_a_reverse_after_a_reverse_is_not_a_fresh_commit():
+    model = StubModel(REVERSE, throttle=1.0, steer=0.1)
+    d = policy_driver(model, clear())
+    for k in range(commit_ticks() + 3):
+        d.tick(T0 + k * 0.1)
+    assert not d.reverse_commit
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(0.1 * pl.STEER_SCALE))
+
+
+def test_the_commit_reverses_away_from_the_forward_turn_it_came_out_of():
+    for steer in (0.5, -0.5):
+        model = StubModel(FORWARD, throttle=1.0, steer=steer)
+        d = policy_driver(model, clear())
+        d.tick(T0)
+        d.tick(T0 + 0.1)
+        # The model's own reverse steer is the turn's side, and loses.
+        model.out["logits"] = np.array([REVERSE], dtype=np.float32)
+        d.tick(T0 + 0.2)
+        want = -math.copysign(pl.REVERSE_STEER, steer)
+        assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(want))
+        assert d.last_decision.front == pytest.approx(want)
+
+
+def test_the_commit_side_rule():
+    f = pl.reverse_commit_front
+    lock = pl.REVERSE_STEER
+    # A recent turn: the other side, whatever the model says.
+    assert f(0.35, 0.2, 0.5) == pytest.approx(-lock)
+    assert f(-0.35, 0.2, -0.5) == pytest.approx(lock)
+    # A turn too old, or too small, is no turn: the model's side.
+    assert f(0.35, pl.REVERSE_TURN_WINDOW_S + 0.1, 0.3) == pytest.approx(lock)
+    assert f(0.1, 0.2, -0.3) == pytest.approx(-lock)
+    # Nothing either way: the default side.
+    assert f(None, math.inf, 0.05) == pytest.approx(pl.REVERSE_DEFAULT_SIDE * lock)
+
+
+def test_the_commit_steers_in_the_mode_the_policy_is_in():
+    d = policy_driver(StubModel(REVERSE, throttle=1.0, steer=0.5), clear())
+    d.tick(T0)
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(pl.REVERSE_STEER))
+    # Split as I drive it: the rear straight.
+    d = policy_driver(StubModel(REVERSE, throttle=1.0, steer=0.5), clear())
+    d._sync_mode = lambda now: None
+    d.mode.split = True
+    d.tick(T0)
+    assert d.controller.steerings[-1] == pytest.approx((pl.REVERSE_STEER, 0.0))
+
+
+def test_the_confidence_still_slows_the_commit():
+    model = StubModel(REVERSE, throttle=1.0)
+    d = policy_driver(model, clear())
+    d.tick(T0)
+    model.out["logits"] = np.array([FORWARD], dtype=np.float32)  # p(reverse) tiny
+    for k in range(1, commit_ticks()):
+        d.tick(T0 + k * 0.1)
+    assert d.reverse_commit
+    assert d.confidence.scale < 1.0
+    assert d.controller.throttles[-1] == pytest.approx(
+        pl.slowed_throttle(d.reverse_speed, d.confidence.scale, pl.MOVING_FLOOR_REVERSE))
+
+
+class ReachedLater:
+    def __init__(self):
+        self.now = False
+
+    def reached(self):
+        return self.now
+
+
+STILL_IMU = {"accel": (0.0, 0.0, 0.0), "gyro": (0.001, 0.001, 0.001)}
+
+
+def _no_frame(d):
+    d.camera.depth = None
+
+
+def _blind(d):
+    d.camera.depth = np.zeros((400, 640), dtype=np.uint16)
+
+
+def _bad_output(d):
+    d.model.out["throttle"] = np.array([[math.nan]], dtype=np.float32)
+
+
+def _goal(d):
+    d.goal.now = True
+
+
+def _stuck(d):
+    d.stuck = lambda imu, now: True
+
+
+@pytest.mark.parametrize("name, stop, reason", [
+    ("no frame", _no_frame, "no frame"),
+    ("blind", _blind, "blind"),
+    ("bad output", _bad_output, "model not finite"),
+    ("goal", _goal, "goal reached"),
+    ("stuck", _stuck, "stuck"),
+])
+def test_every_safety_stop_preempts_the_commit(name, stop, reason):
+    d = pl.PolicyDriver(FakeController(), FakeCamera(depth=clear()),
+                        StubModel(REVERSE, throttle=1.0), goal=ReachedLater())
+    d.tick(T0)
+    d.tick(T0 + 0.1)
+    assert d.reverse_commit
+    stop(d)
+    d.tick(T0 + 0.2)
+    assert not d.reverse_commit
+    assert d.last_decision.reason == reason
+    if name == "stuck":
+        assert d._phase == dv._PHASE_REVERSE
+    else:
+        assert neutral(d)
+
+
+def test_the_rear_bumper_cuts_a_commit_long_enough_for_it(monkeypatch):
+    # At 0.7 s the bumper cannot speak (it needs 0.9 s of reverse); a commit
+    # I raise past that gets the recover's bumper.
+    monkeypatch.setattr(pl, "REVERSE_COMMIT_S", 3.0)
+    d = policy_driver(StubModel(REVERSE, throttle=1.0), clear(), imu=STILL_IMU)
+    for k in range(20):
+        d.tick(T0 + k * 0.1)
+        if d.last_decision.reason != "model commit":
+            break
+    assert d.last_decision.reason == "rear bumper"
+    # The first tick's sample is cleared, five fill the window, four confirm.
+    assert k == d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 1
+    assert not d.reverse_commit and neutral(d)
+
+
+@pytest.mark.parametrize("group", ["human_throttle", "human_steering"])
+def test_my_hand_on_either_group_ends_the_commit(group):
+    model = StubModel(REVERSE, throttle=1.0)
+    d = policy_driver(model, clear())
+    d.tick(T0)
+    model.out["logits"] = np.array([FORWARD], dtype=np.float32)
+    d.tick(T0 + 0.1)
+    assert d.reverse_commit
+    setattr(d, group, True)
+    d.tick(T0 + 0.2)
+    assert not d.reverse_commit
+    # The model's own answer goes out under my hand, which the pad mixes over.
+    assert d.controller.throttles[-1] > 0.0
+    # And when I let go it is the model's, with no commit left to resume.
+    setattr(d, group, False)
+    d.tick(T0 + 0.3)
+    assert not d.reverse_commit
+    assert d.controller.throttles[-1] > 0.0
+
+
+def test_my_trigger_wins_over_the_commit_through_the_control_loop(monkeypatch):
+    import test_takeover as tk
+    out = run_policy(monkeypatch, StubModel(REVERSE, throttle=1.0), 60,
+                     tk.at(5, throttle=0.5))
+    assert out["snaps"][4]["throttle"] < 0.0
+    for snap in out["snaps"][6:]:
+        assert snap["throttle_by"] == mn.PAD
+        assert snap["throttle"] == pytest.approx(0.5 * out["driver"].forward_speed)
+    assert not out["driver"].reverse_commit
+
+
+def test_the_commit_and_the_standoff_are_logged_in_every_footprint_row(monkeypatch):
+    from crawler.autopilot import footprint as fp
+    from crawler.telemetry import telemetry as tm
+    import test_takeover as tk
+    from test_record import SessionTele
+
+    props = tm.JSON_SCHEMAS["footprint"]["schema"]["properties"]
+    assert props["reverse_commit"]["type"] == "boolean"
+    assert props["standoff_ticks"]["type"] == "integer"
+    assert fp.AUTOPILOT_FIELDS["reverse_commit"] is False
+    assert fp.AUTOPILOT_FIELDS["standoff_ticks"] == 0
+
+    tele = SessionTele()
+    run_policy(monkeypatch, StubModel(REVERSE, throttle=1.0), 200,
+               lambda n, pad, cam: None, tele=tele, tap=fp.FootprintTap(tele=tele))
+    rows = [row for row, _ in tele.of("footprint")]
+    assert rows and all(set(row) == set(props) for row in rows)
+    flags = [row["reverse_commit"] for row in rows]
+    assert True in flags and flags[-1] is False
+
+    tele = SessionTele()
+    tk.run_auto(monkeypatch, 80, tk.Camera(chair_leg()), tele=tele,
+                tap=fp.FootprintTap(tele=tele),
+                make_driver=lambda command, cam: pl.PolicyDriver(
+                    command, cam, StubModel(FORWARD)))
+    counts = [row["standoff_ticks"] for row, _ in tele.of("footprint")]
+    assert max(counts) >= 2
+    assert all(isinstance(c, int) and not isinstance(c, bool) for c in counts)

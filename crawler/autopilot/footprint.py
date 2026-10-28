@@ -96,6 +96,8 @@ AUTOPILOT_FIELDS = {
     "policy_infer_ms": 0.0,
     "policy_steer_mode": "",     # unified / split: the mode the model drove with
     "policy_steer_mode_p": 0.0,  # the mode head's p of that mode; -1 with no head
+    "reverse_commit": False,     # a fresh model reverse was being held this tick
+    "standoff_ticks": 0,         # decisions in a row the floor held a model forward
 }
 
 
@@ -115,6 +117,8 @@ def autopilot_fields(driver):
                     out[key] = bool(value)
                 elif isinstance(out[key], str):
                     out[key] = str(value)
+                elif isinstance(out[key], int):
+                    out[key] = int(_num(value, 0.0))
                 else:
                     out[key] = _num(value, 0.0)
     except Exception:

@@ -42,9 +42,28 @@ failure commands neutral. In the order they are checked:
                                     model reverse is never vetoed: the
                                     camera cannot see behind, so the floor
                                     has nothing to say about it
+  the floor holds a model forward
+  for STANDOFF_S in a row           the STUCK recover, reason "standoff";
+                                    the model has the car back after it
   anything raises                   neutral, then the exception goes on up
                                     to AutoPilot.step(), which parks auto
   the goal is reached               neutral, whatever the model said
+
+The reverse commit
+------------------
+A reverse the model starts after not reversing is held for REVERSE_COMMIT_S
+at REVERSE_STEER, on the side reverse_commit_front() picks off my record
+data, whatever the model says in between; then the model decides again.
+The model is still run every tick of it and every row above still stops it
+at once: no frame, blind, a bad output, STUCK, the goal. So does my hand on
+either group, and the recover's rear bumper -- though at 10 Hz the bumper
+needs 0.9 s of reverse to speak (driver.REVERSE_STALL_SAMPLES), so at
+REVERSE_COMMIT_S 0.7 it cannot, and only would if I raise it. The
+confidence scale still slows its throttle. The steering mode is the
+latch's, as always: in unified the rear goes counter-phase through
+steering_pair(), which tightens the arc and swings the nose the same way,
+faster; in split the rear stays straight. /footprint says reverse_commit
+and standoff_ticks.
 
 The goal
 --------
@@ -92,8 +111,8 @@ gets neutral, not that.
 
 A reverse is the model's, tick by tick: reverse_speed times its magnitude,
 on its steering, decided again at the next 10 Hz tick like every other
-answer. The canned 2 s recover is the thing being replaced, so it is kept
-for STUCK only.
+answer -- except the first REVERSE_COMMIT_S of a fresh one (below). The
+canned 2 s recover is kept for STUCK and for a standoff with the floor.
 
 Steering is in manual's units, a fraction of STEER_SCALE (main's
 STEERING_LIMIT_PERC, 70%), not of the autopilot's max_turn 0.6: the labels
@@ -294,6 +313,27 @@ CONF_EMA_DECISIONS = 5   # EMA length in decisions; 5 at 10 Hz is about 0.5 s
 MOVING_FLOOR_FORWARD = 0.2
 MOVING_FLOOR_REVERSE = 0.6
 
+# ---- the standoff: the model pushing forward into the floor ----------------
+#
+# The floor holds a forward at 0 and the model keeps saying forward, so
+# neither gives way and the car sits there until I take it. The first drive
+# on base17 had four of these, 4.5 to 9.8 s each. A floor-held forward
+# commands no throttle, so STUCK never arms on one. I tune this by feel.
+STANDOFF_S = 1.0         # a floor hold this long runs the STUCK recover
+
+# ---- the reverse commit: a fresh model reverse is held, at lock -------------
+#
+# Tick by tick, the model reverses almost straight (median |front| 0.10) for
+# about 3 ticks, so it rocks back and forth on one line. I reverse at lock
+# (median 0.70) for 7 ticks. So a reverse the model starts after not
+# reversing is held for REVERSE_COMMIT_S at REVERSE_STEER, then it decides
+# again. Every stop still ends it at once. I tune these by feel.
+REVERSE_COMMIT_S = 0.7   # how long a fresh reverse is held; 7 ticks, my median run
+REVERSE_STEER = 0.7      # the commit's front servo command, my median reversing; full lock
+REVERSE_TURN_MIN = 0.15  # a front past this is a turn, not straight (servo units)
+REVERSE_TURN_WINDOW_S = 1.5  # a turning forward this recent sets the commit's side
+REVERSE_DEFAULT_SIDE = -1.0  # with no turn to go on: left, as I did 15 of 19 times
+
 
 def legacy_levels_to_mm(levels):
     """Colourmap levels (0..255) back to millimetres, invalid as 0."""
@@ -469,6 +509,34 @@ def slowed_throttle(throttle, scale, floor):
     mag = abs(float(throttle))
     slowed = max(mag * scale, min(mag, floor))
     return math.copysign(slowed, throttle) if mag > 0.0 else 0.0
+
+
+def reverse_commit_front(turn_front, turn_age_s, model_front):
+    """The front servo command a reverse commit holds. Pure.
+
+    My record reverses say one thing clearly: I reverse to the opposite side
+    of the forward turn I was just in -- 83 of 85 times when I had turned
+    within 1.5 s -- which keeps the car yawing the same way, a K-turn. Which
+    side had more room said nothing: steering toward the tighter side fits 36
+    of 69, a coin. So:
+
+      a forward turn (|front| > REVERSE_TURN_MIN) inside REVERSE_TURN_WINDOW_S
+                         the other side
+      else the model's own reverse steer, if it is past REVERSE_TURN_MIN
+                         its side
+      else               REVERSE_DEFAULT_SIDE
+
+    turn_front is None when there has been no turn; turn_age_s is how long
+    ago it was. Positive is right, as everywhere.
+    """
+    if (turn_front is not None and turn_age_s <= REVERSE_TURN_WINDOW_S
+            and abs(turn_front) > REVERSE_TURN_MIN):
+        side = -math.copysign(1.0, turn_front)
+    elif abs(model_front) > REVERSE_TURN_MIN:
+        side = math.copysign(1.0, model_front)
+    else:
+        side = REVERSE_DEFAULT_SIDE
+    return side * min(REVERSE_STEER, STEER_SCALE)
 
 
 class ConfidenceScale:
@@ -784,6 +852,21 @@ class PolicyDriver(dv.Driver):
         # How sure the model is of what it commits, and the speed scale off
         # it. Reset with the latch, whenever auto stops.
         self.confidence = ConfidenceScale()
+        # The standoff: when the floor first held the current run of model
+        # forwards, and how many decisions it has held. None / 0 otherwise.
+        self._standoff_since = None
+        self.standoff_ticks = 0
+        # The reverse commit: when it started (None while there is none), and
+        # the magnitude and front it holds.
+        self._commit_since = None
+        self._commit_magnitude = 0.0
+        self._commit_front = 0.0
+        # The last forward this driver drove with a turn in it, and when: the
+        # commit's side comes off it.
+        self._turn_front = None
+        self._turn_at = None
+        # What the IMU said this tick, for the commit's rear bumper.
+        self._evidence = dv.UNKNOWN
 
     def abort(self):
         """Driver's abort, and the mode latch forgets the pad: the next tick
@@ -792,6 +875,27 @@ class PolicyDriver(dv.Driver):
         self._pad_seen = None
         self.imu_features.reset()
         self.confidence.reset()
+        self._end_commit()
+        self._reset_standoff()
+        self._turn_front = self._turn_at = None
+
+    @property
+    def reverse_commit(self):
+        """True while a reverse commit holds the wheels."""
+        return self._commit_since is not None
+
+    def _end_commit(self):
+        self._commit_since = None
+
+    def _reset_standoff(self):
+        self._standoff_since = None
+        self.standoff_ticks = 0
+
+    def motion_evidence(self, imu):
+        """Driver's, remembered for the tick, so the commit's rear bumper
+        counts the sample stuck() already took instead of taking another."""
+        self._evidence = super().motion_evidence(imu)
+        return self._evidence
 
     def _sync_mode(self, now):
         """The pad's say in the policy's mode, before the model has its own.
@@ -837,6 +941,8 @@ class PolicyDriver(dv.Driver):
             pass
         self._commanded(0.0, self._now)
         self._clear_motion_evidence()
+        self._end_commit()
+        self._reset_standoff()
         self._prev = (STOP, 0.0, 0.0)
         self._note(Decision(STOP, 0.0, 0.0, None, reason))
 
@@ -890,11 +996,17 @@ class PolicyDriver(dv.Driver):
             "policy_steer_mode_p": (-1.0 if self.last_split_p < 0
                                     else self.last_split_p if self.mode.split
                                     else 1.0 - self.last_split_p),
+            # Whether a reverse commit held this tick, and how many decisions
+            # in a row the floor has held a model forward (0 when it is not).
+            "reverse_commit": bool(self.reverse_commit),
+            "standoff_ticks": int(self.standoff_ticks),
         }
 
     def _recover(self, now, reason):
-        """The canned backup-and-turn. STUCK only: every other reverse is
-        the model's own, tick by tick."""
+        """The canned backup-and-turn, for STUCK and for a standoff with the
+        floor. Every other reverse is the model's own."""
+        self._end_commit()
+        self._standoff_since = None   # standoff_ticks stays on this row
         self._note(Decision(REVERSE, 1.0, 0.0, None, reason, self.reverse_speed, 0.0))
         self._prev = (REVERSE, 1.0, 0.0)
         self.begin_recover(now)
@@ -925,7 +1037,15 @@ class PolicyDriver(dv.Driver):
             # record of what the wheels were told.
             self._commanded(self.reverse_speed
                             if self._phase == dv._PHASE_REVERSE else 0.0, now)
+            self._reset_standoff()
             return
+        # My hand on either group ends a commit: the pad wins, and when I let
+        # go the model decides from scratch. My throttle also ends a
+        # standoff, for the reason it disarms STUCK below.
+        if self.human_throttle or self.human_steering:
+            self._end_commit()
+        if self.human_throttle:
+            self._reset_standoff()
 
         depth = self.camera.get_depth_frame()
         if depth is None or getattr(depth, "ndim", 0) != 2:
@@ -951,6 +1071,7 @@ class PolicyDriver(dv.Driver):
 
         # Driver's own rule: under my throttle the driver is not telling the
         # car to go, so the stuck detector has nothing to judge.
+        self._evidence = dv.UNKNOWN
         if self.human_throttle:
             self._throttle_since = None
             self._still_samples = 0
@@ -958,6 +1079,13 @@ class PolicyDriver(dv.Driver):
             self.last_recovery_time = now
             print("STUCK - backing up to recover.")
             self._recover(now, "stuck")
+            return
+        elif self.reverse_commit and self._rear_bumper_counts(self._evidence):
+            # The recover's rear bumper, on the commit's reverse: the gyro
+            # says the car stopped moving while told to back up, so it is
+            # against something. Off the sample stuck() just took.
+            print("Rear bumper - something behind me, cutting the reverse.")
+            self._neutral("rear bumper")
             return
 
         x = encode_input(self.model.representation, self.downsample(depth))
@@ -1001,15 +1129,50 @@ class PolicyDriver(dv.Driver):
             # floor below still holds a forward, as it holds any other.
             action = moving_action(outputs)
 
+        # The reverse commit. One running past REVERSE_COMMIT_S ends, and the
+        # model's answer this tick stands. One still running holds reverse,
+        # whatever the model said. A reverse after anything but a reverse
+        # starts one. 1 ms of slack, as the mode latch has, so seven ticks
+        # 0.1 s apart make 0.7.
+        if (self.reverse_commit
+                and now - self._commit_since >= REVERSE_COMMIT_S - 1e-3):
+            self._end_commit()
+        starting = False
+        if self.reverse_commit:
+            action, magnitude = REVERSE, self._commit_magnitude
+            steer, rear = self._commit_front / STEER_SCALE, None
+        elif (action == REVERSE and self._prev[0] != REVERSE
+                and not (self.human_throttle or self.human_steering)):
+            starting = True
+            self._commit_since = now
+            self._commit_magnitude = magnitude
+            age = (now - self._turn_at) if self._turn_at is not None else math.inf
+            self._commit_front = reverse_commit_front(
+                self._turn_front, age, steer * STEER_SCALE)
+            steer, rear = self._commit_front / STEER_SCALE, None
+
         # Every neutral has returned by here, so this is a committed model
         # action. The floor's hold below is a 0 no scale touches, so the
         # scale only ever multiplies a moving throttle.
         scale = self.confidence.update(committed_confidence(outputs, action))
-        reason = "model"
+        reason = "model commit" if self.reverse_commit else "model"
         if action == FORWARD and self.floor_veto.vetoes():
             # Blocks the forward, not the decision: the steering still goes
             # out, and next tick the model can choose to reverse.
             throttle, reason = 0.0, "model floor"
+            # Under my trigger the floor is holding me, not the model, so
+            # it is no standoff (the count was reset above).
+            if not self.human_throttle:
+                if self._standoff_since is None:
+                    self._standoff_since = now
+                self.standoff_ticks += 1
+                if now - self._standoff_since >= STANDOFF_S - 1e-3:
+                    # Neither side is giving way. Back out the way STUCK
+                    # does, then the model has the car again.
+                    self.last_recovery_time = now
+                    print("Standoff with the floor - backing up to recover.")
+                    self._recover(now, "standoff")
+                    return
         elif action == FORWARD:
             throttle = slowed_throttle(self.forward_speed * magnitude, scale,
                                        MOVING_FLOOR_FORWARD)
@@ -1018,6 +1181,8 @@ class PolicyDriver(dv.Driver):
                                        MOVING_FLOOR_REVERSE)
         else:
             throttle = 0.0
+        if reason != "model floor":
+            self._reset_standoff()
 
         # magnitude, steer and rear are already known finite and in range,
         # so none of these can exceed a cap or STEER_SCALE.
@@ -1038,9 +1203,18 @@ class PolicyDriver(dv.Driver):
         if throttle > 0.0:
             if self._throttle_since is None:
                 self._throttle_since = now
+            if (abs(front) > REVERSE_TURN_MIN
+                    and not (self.human_throttle or self.human_steering)):
+                self._turn_front, self._turn_at = front, now
+        elif self.reverse_commit and not starting:
+            # The commit's reverse is sampled for its rear bumper, as the
+            # recover's is. Nothing arms STUCK: _throttle_since stays None.
+            pass
         else:
-            # Only a forward the driver itself commanded arms STUCK.
+            # Only a forward the driver itself commanded arms STUCK. A
+            # commit starts with the windows empty, as begin_recover() does.
             self._clear_motion_evidence()
         self._prev = (action, magnitude, steer)
         self._note(Decision(action, magnitude, steer, rear, reason, throttle, front,
-                            model_action if stop_masked else "", stop_masked))
+                            model_action if (stop_masked or self.reverse_commit) else "",
+                            stop_masked))

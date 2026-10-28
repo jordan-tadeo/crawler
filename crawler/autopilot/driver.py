@@ -1713,8 +1713,12 @@ class Driver:
         in the forward detector: a dropped packet is not evidence of no
         motion, and a blind reverse is the worst place to start guessing.
         """
-        evidence = self.motion_evidence(self.camera.get_imu_sample())
+        return self._rear_bumper_counts(
+            self.motion_evidence(self.camera.get_imu_sample()))
 
+    def _rear_bumper_counts(self, evidence) -> bool:
+        """_rear_bumper_hit()'s count, off evidence already taken this tick:
+        the policy's reverse commit asks it of the sample stuck() took."""
         if len(self.gyro_history) < self.imu_window_size:
             return False
 

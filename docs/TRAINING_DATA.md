@@ -121,10 +121,12 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
 | `policy_throttle` | float | the model's throttle after its floor veto; what it would have driven even while my trigger has the group |
 | `policy_steering_front` | float | the model's front steering, in manual's units (full lock 0.7) |
-| `policy_reason` | string | why it did that: `model`, `model floor` (a forward held by `driver.ForwardFloorVeto`: something under `FORWARD_FLOOR_MM`, or a probe that went blind on the way in), `blind`, `stuck`, ... |
+| `policy_reason` | string | why it did that: `model`, `model floor` (a forward held by `driver.ForwardFloorVeto`: something under `FORWARD_FLOOR_MM`, or a probe that went blind on the way in), `model commit` (a fresh reverse held by the reverse commit), `standoff` (the floor held a forward for `policy.STANDOFF_S`, so the STUCK recover ran), `rear bumper`, `blind`, `stuck`, ... |
 | `policy_infer_ms` | float | the model's inference time that tick |
 | `policy_steer_mode` | string | the steering mode the model drove with, `unified` or `split` (`policy.ModeLatch`); always `unified` for a model with no mode head. Not the row's `steering_mode`, which is the pad's |
 | `policy_steer_mode_p` | float | the mode head's probability of `policy_steer_mode` on its last answer, low while it wants to switch; -1 with no head |
+| `reverse_commit` | bool | a reverse commit held this tick: a fresh model reverse kept for `policy.REVERSE_COMMIT_S` at `policy.REVERSE_STEER`, whatever the model said. `policy_action` is still the model's own pick |
+| `standoff_ticks` | int | decisions in a row the floor has held a model forward; 0 otherwise |
 | `depth_small` | bool | a `/policy/depth_small` picture carries this row's log time |
 | `depth_raw` | bool | a `/camera/depth_raw` frame carries this row's log time |
 | `probe_distance_mm` | float[9] | the hand-written scan, left to right; -1 means infinite |

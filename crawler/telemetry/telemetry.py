@@ -395,6 +395,11 @@ JSON_SCHEMAS = {
         # probability of that mode (-1 for a model with no head).
         "policy_steer_mode": _STR,
         "policy_steer_mode_p": _NUM,
+        # Whether a reverse commit held the tick (policy.REVERSE_COMMIT_S),
+        # and how many decisions in a row the floor has held a model forward
+        # (policy.STANDOFF_S runs the recover).
+        "reverse_commit": _BOOL,
+        "standoff_ticks": _INT,
     }),
 }
 
