@@ -119,6 +119,19 @@ model whose contract it cannot reproduce. Two exist:
                 reproduce the JPEG noise; that is the smoke-test model's
                 problem, not the next one's.
 
+The IMU
+-------
+A model whose sidecar says uses_imu has a fourth input, `imu`: the
+policy_imu features of the tick (gyro, linear accel, their half-second
+peaks, a validity flag, and the up vector when its data had one). The
+dataset tool makes them by pushing each /footprint row through
+policy_imu.ImuFeatures; PolicyDriver makes them by building that same row
+live (policy_imu.row_fields, the function footprint.py writes the row with)
+and pushing it through its own ImuFeatures. check_imu() refuses a sidecar
+whose feature list is not policy_imu.FEATURES. A model with no uses_imu --
+every model before this, the deployed one included -- has no `imu` input
+and is never fed one.
+
 numpy only at import. onnxruntime is imported when a model is loaded, so this
 file imports on a laptop and in every test without it.
 """
@@ -135,6 +148,7 @@ import numpy as np
 
 import column_profile as cp
 import driver as dv
+import policy_imu as pimu
 
 # ---- the frame the model sees ----------------------------------------------
 
@@ -204,6 +218,10 @@ MODE_SIZE = len(STEER_MODES)
 # and an output share one.
 MODE_INPUT = "mode"
 MODE_OUTPUT = "mode_logits"
+
+# The IMU input, for a model whose sidecar says uses_imu: (1, pimu.IMU_SIZE),
+# built by policy_imu.ImuFeatures off the same columns /footprint records.
+IMU_INPUT = "imu"
 
 # The mode latch. 0.7 for 0.5 s: six ticks in a row at 10 Hz of a head that
 # clearly wants the other mode, not one tick of a coin flip. 2 s between
@@ -308,6 +326,39 @@ def encode_prev(action, magnitude, steer):
         value = float(value)
         out[0, i] = value if math.isfinite(value) else 0.0
     return out
+
+
+def encode_imu(features):
+    """One decision's policy_imu features as the model's imu input."""
+    out = np.asarray(features, dtype=np.float32).reshape(1, pimu.IMU_SIZE)
+    return np.where(np.isfinite(out), out, 0.0).astype(np.float32)
+
+
+def check_imu(meta, inputs, where="sidecar"):
+    """The IMU half of the contract -> (uses_imu, tilt). ValueError when the
+    sidecar and the graph disagree, or the features are not this car's.
+
+    A sidecar with no uses_imu (every model before the IMU input) needs a
+    graph with no IMU_INPUT, and gets (False, False). One with uses_imu true
+    needs the input, imu_features equal to policy_imu.FEATURES in order, and
+    says in imu_tilt whether its training data had orientation.
+    """
+    inputs = set(inputs)
+    if not meta.get("uses_imu", False):
+        if IMU_INPUT in inputs:
+            raise ValueError(f"{where}: the graph has an {IMU_INPUT!r} input the "
+                             f"sidecar does not declare (no uses_imu)")
+        return False, False
+    if IMU_INPUT not in inputs:
+        raise ValueError(f"{where}: uses_imu declared but the graph has no "
+                         f"{IMU_INPUT!r} input")
+    names = meta.get("imu_features")
+    if not isinstance(names, (list, tuple)) or tuple(names) != pimu.FEATURES:
+        raise ValueError(f"{where}: imu_features {names} != {list(pimu.FEATURES)}")
+    window = meta.get("imu_window", pimu.WINDOW)
+    if window != pimu.WINDOW:
+        raise ValueError(f"{where}: imu_window {window!r} != {pimu.WINDOW}")
+    return True, bool(meta.get("imu_tilt", False))
 
 
 def read_mode(outputs):
@@ -495,16 +546,22 @@ class PolicyModel:
                                             providers=["CPUExecutionProvider"])
         self.output_names = [o.name for o in self.session.get_outputs()]
         # None: no mode head, fixed unified. Else the latch's numbers.
+        input_names = [i.name for i in self.session.get_inputs()]
         self.mode_switch = check_sidecar(
-            self.meta, [i.name for i in self.session.get_inputs()],
-            self.output_names, meta_path)
+            self.meta, input_names, self.output_names, meta_path)
         self.has_mode = self.mode_switch is not None
+        # (False, False) for every model before the IMU input: it is never
+        # fed one, and runs exactly as it did.
+        self.uses_imu, self.imu_tilt = check_imu(self.meta, input_names, meta_path)
         self.path = path
 
-    def run(self, x, prev, mode=None):
+    def run(self, x, prev, mode=None, imu=None):
         feed = {"x": x, "prev": prev}
         if self.has_mode:
             feed[MODE_INPUT] = mode if mode is not None else encode_mode(False)
+        if self.uses_imu:
+            feed[IMU_INPUT] = (imu if imu is not None
+                               else np.zeros((1, pimu.IMU_SIZE), dtype=np.float32))
         values = self.session.run(self.output_names, feed)
         return dict(zip(self.output_names, values))
 
@@ -515,7 +572,9 @@ class PolicyDriver(dv.Driver):
     `model` is anything with .contract, .representation, .uses_prev and
     .run(x, prev) -> {name: array} -- a PolicyModel on the car, a stub in the
     tests. One with .has_mode true is run as .run(x, prev, mode), and its
-    .mode_switch dict sets the latch.
+    .mode_switch dict sets the latch. One with .uses_imu true also gets
+    imu=, its policy_imu features, built by this driver's own ImuFeatures
+    off the row footprint.py would have written for the tick.
 
     AutoPilot.step() sets two things before each tick, as it sets
     human_throttle: pad_split, the pad's SteerMode (None reads as unified),
@@ -545,12 +604,21 @@ class PolicyDriver(dv.Driver):
         self.last_decision = None
         self.last_infer_ms = 0.0
         self.last_split_p = -1.0    # the head's p(split); -1 with no head
+        # The IMU input. The newest sample and when it was taken, held as
+        # footprint.FootprintTap holds them, so the row this driver builds
+        # its features off is the row a recording of this tick would carry.
+        self.uses_imu = bool(getattr(model, "uses_imu", False))
+        self.imu_features = pimu.ImuFeatures(tilt=bool(getattr(model, "imu_tilt", False)))
+        self._imu_sample = None
+        self._imu_at = 0.0
+        self.last_imu = None        # the features fed on the last model run
 
     def abort(self):
         """Driver's abort, and the mode latch forgets the pad: the next tick
         is an engage, and starts at whatever SteerMode is then."""
         super().abort()
         self._pad_seen = None
+        self.imu_features.reset()
 
     def _sync_mode(self, now):
         """The pad's say in the policy's mode, before the model has its own.
@@ -670,6 +738,12 @@ class PolicyDriver(dv.Driver):
             return
 
         imu = self.camera.get_imu_sample()
+        if imu is not None:
+            self._imu_sample, self._imu_at = imu, now
+        # Every tick with a frame pushes, blind and stuck ones too, so the
+        # window is the last half second of the car and not of the model.
+        imu_x = self.imu_features.push(
+            pimu.row_fields(self._imu_sample, self._imu_at, now), now)
         scan = self.scan_footprint(depth)
         # Every scan, blind ones too: a blind scan is exactly the one the
         # latch is for. The cap is read each tick, as the throttle is.
@@ -694,9 +768,13 @@ class PolicyDriver(dv.Driver):
         x = encode_input(self.model.representation, self.downsample(depth))
         prev = (encode_prev(*self._prev) if self.model.uses_prev
                 else np.zeros((1, PREV_SIZE), dtype=np.float32))
+        mode = encode_mode(self.mode.split) if self.has_mode else None
         started = time.perf_counter()
-        if self.has_mode:
-            outputs = self.model.run(x, prev, encode_mode(self.mode.split))
+        if self.uses_imu:
+            self.last_imu = encode_imu(imu_x)
+            outputs = self.model.run(x, prev, mode, imu=self.last_imu)
+        elif self.has_mode:
+            outputs = self.model.run(x, prev, mode)
         else:
             outputs = self.model.run(x, prev)
         self.last_infer_ms = (time.perf_counter() - started) * 1000.0

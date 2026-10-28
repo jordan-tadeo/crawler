@@ -28,6 +28,7 @@ import numpy as np
 
 import driver as dv
 import policy as pl
+import policy_imu as pimu
 
 # ---- legacy recordings -----------------------------------------------------
 
@@ -86,6 +87,10 @@ FOOTPRINT_ROW = {
     "accel": ("imu_accel_x", "imu_accel_y", "imu_accel_z"),
     "gyro": ("imu_gyro_x", "imu_gyro_y", "imu_gyro_z"),
     "imu_age": "imu_age_ms",
+    # Every IMU column, for the policy's IMU input. Named in policy_imu
+    # because the car builds the same row live; the up vector is absent from
+    # recordings before GAME_ROTATION_VECTOR and reads as no tilt.
+    "imu_row": pimu.ROW_FIELDS,
 }
 # The picture's frame_id is "footprint/<seq>", the row's tick id. Both also
 # carry the same log_time; the seq is the join, the log time the check.
@@ -203,6 +208,7 @@ class Command(NamedTuple):
     gyro: float = float("nan")    # |gyro|, rad/s; nan with no sample
     source: str = ""              # "driver" / "tap" on a /footprint row
     autopilot: str = ""           # "rules" / "policy" in auto, "" otherwise
+    imu: tuple = ()               # FOOTPRINT_ROW["imu_row"] values, nan where absent
 
 
 def imu_magnitudes(payload):
@@ -482,7 +488,8 @@ class FootprintAdapter:
                                  payload.get(r["throttle_by"])),
                 *imu_magnitudes(payload),
                 str(payload.get(r["source"]) or ""),
-                str(payload.get(r["autopilot"]) or "")))
+                str(payload.get(r["autopilot"]) or ""),
+                tuple(_f(payload.get(k)) for k in r["imu_row"])))
         elif topic == FOOTPRINT_TOPICS["depth"]:
             decoded = decode_depth_small(payload)
             if decoded is None:

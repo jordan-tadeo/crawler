@@ -50,9 +50,15 @@ nearly the same picture), and reports every fold and the mean. Never a
 random split by tick. After the folds it trains once more on everything and
 exports that; its sidecar carries the fold numbers under "cv".
 
-All three inputs are always in the graph, so the runtime has one code path:
+Three inputs are always in the graph, so the runtime has one code path:
 x (the frame, as policy.encode_input() builds it), prev (the last decision,
-zeros when the sidecar says uses_prev_action is false) and mode.
+zeros when the sidecar says uses_prev_action is false) and mode. --imu adds
+a fourth, `imu`: the dataset's policy_imu features, which the car rebuilds
+live with the same ImuFeatures. Its sidecar says uses_imu, and imu_tilt when
+the dataset had an up vector; without one the tilt columns are zeroed here
+and on the car (policy_imu.without_tilt). --imu and --prev combine. The
+flip augmentation mirrors the IMU too (policy_imu.MIRROR). A graph without
+--imu has no `imu` input at all, so every model before it loads unchanged.
 """
 
 import argparse
@@ -67,6 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import column_profile as cp  # noqa: E402
 import policy as pl  # noqa: E402
+import policy_imu as pimu  # noqa: E402
 import policy_eval as pe  # noqa: E402
 
 GOOD_WEIGHT = 2.0
@@ -79,18 +86,21 @@ MODE_SWITCH_WEIGHT = 10.0
 BLOCK_GUARD_S = 1.0
 
 
-def build_model(representation):
+def build_model(representation, uses_imu=False):
     import torch
     from torch import nn
+
+    imu_width = pimu.IMU_SIZE if uses_imu else 0
 
     class Heads(nn.Module):
         def __init__(self, width):
             super().__init__()
             # prev is always wired in, so every exported graph has the same
             # inputs; a model trained without it is fed zeros on both sides
-            # and its weights there never see a gradient.
+            # and its weights there never see a gradient. The IMU is only
+            # wired in when it is used, so an old graph stays an old graph.
             self.trunk = nn.Sequential(
-                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE, 64), nn.ReLU())
+                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width, 64), nn.ReLU())
             self.logits = nn.Linear(64, len(pl.ACTIONS))
             self.throttle = nn.Linear(64, 1)
             self.steer = nn.Linear(64, 1)
@@ -99,8 +109,9 @@ def build_model(representation):
             # weight, and the trunk only has to learn when not to.
             self.mode_skip = nn.Linear(pl.MODE_SIZE, pl.MODE_SIZE, bias=False)
 
-        def forward(self, features, prev, mode):
-            h = self.trunk(torch.cat([features, prev, mode], dim=1))
+        def forward(self, features, prev, mode, imu=None):
+            parts = [features, prev, mode] + ([imu] if imu_width else [])
+            h = self.trunk(torch.cat(parts, dim=1))
             return (self.logits(h), torch.sigmoid(self.throttle(h)),
                     torch.tanh(self.steer(h)), self.mode(h) + self.mode_skip(mode))
 
@@ -117,8 +128,8 @@ def build_model(representation):
                 nn.Flatten())
             self.heads = Heads(16 * 4 * 5)
 
-        def forward(self, x, prev, mode):
-            return self.heads(self.features(x), prev, mode)
+        def forward(self, x, prev, mode, imu=None):
+            return self.heads(self.features(x), prev, mode, imu)
 
     class ProfileNet(nn.Module):
         """(1, 3, 32) -> two 1-D convs along the columns -> the heads."""
@@ -131,10 +142,12 @@ def build_model(representation):
                 nn.Flatten())
             self.heads = Heads(16 * (cp.PROFILE_COLUMNS // 2))
 
-        def forward(self, x, prev, mode):
-            return self.heads(self.features(x), prev, mode)
+        def forward(self, x, prev, mode, imu=None):
+            return self.heads(self.features(x), prev, mode, imu)
 
-    return ImageNet() if representation == pl.IMAGE else ProfileNet()
+    model = ImageNet() if representation == pl.IMAGE else ProfileNet()
+    model.uses_imu = bool(uses_imu)
+    return model
 
 
 def encode_frames(frames, representation):
@@ -148,14 +161,28 @@ def encode_modes(mode_in):
     return out
 
 
-def flip(x, prev):
+def flip(x, prev, imu=None):
     """Mirror left-right: the frame's last axis, and every steering sign.
-    The steering mode has no side, so it goes through as it is."""
+    The steering mode has no side, so it goes through as it is. The IMU's
+    lateral parts flip sign (policy_imu.MIRROR)."""
     import torch
 
     prev = prev.clone()
     prev[:, -1] = -prev[:, -1]
-    return torch.flip(x, dims=[-1]), prev
+    if imu is not None:
+        imu = imu * torch.from_numpy(pimu.MIRROR)
+    return torch.flip(x, dims=[-1]), prev, imu
+
+
+def imu_inputs(data, tilt):
+    """The dataset's IMU features as the model is fed them: with the tilt
+    columns zeroed unless it is trained with tilt."""
+    feats = np.asarray(data["imu"], dtype=np.float32)
+    return feats if tilt else pimu.without_tilt(feats)
+
+
+def dataset_has_tilt(data):
+    return bool(data["meta"].get("imu_tilt", False))
 
 
 def tick_weights(data, idx, good_weight):
@@ -201,13 +228,13 @@ def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
 
 
 def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
-          good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT):
+          good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False):
     import torch
     from torch import nn
 
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = build_model(representation)
+    model = build_model(representation, uses_imu)
 
     idx = np.flatnonzero(train_mask)
     x_all = torch.from_numpy(data["x"])
@@ -215,6 +242,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     prev = torch.from_numpy(data["prev"][idx] if uses_prev
                             else np.zeros_like(data["prev"][idx]))
     mode_in = torch.from_numpy(encode_modes(data["mode_in"][idx]))
+    imu = (torch.from_numpy(imu_inputs(data, dataset_has_tilt(data))[idx])
+           if uses_imu else None)
     mode = torch.from_numpy(data["steer_mode"][idx].astype(np.int64))
     action = torch.from_numpy(data["action"][idx].astype(np.int64))
     mag = torch.from_numpy(data["magnitude"][idx])
@@ -246,11 +275,12 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
         for start in range(0, len(idx), batch):
             b = order[start:start + batch]
             xb, pb = x[b], prev[b]
+            ib = imu[b] if imu is not None else None
             sb = steer[b]
             if torch.rand(1).item() < 0.5:
-                xb, pb = flip(xb, pb)
+                xb, pb, ib = flip(xb, pb, ib)
                 sb = -sb
-            logits, t_out, s_out, m_out = model(xb, pb, mode_in[b])
+            logits, t_out, s_out, m_out = model(xb, pb, mode_in[b], ib)
             tok, sok = throttle_ok[b], steer_ok[b]
             wb = w_all[b]
             moving = tok & (action[b] != pl.ACTIONS.index(pl.STOP))
@@ -277,12 +307,28 @@ def export(model, representation, out_path, meta):
 
     shape = ((1, 2, pl.INPUT_HEIGHT, pl.INPUT_WIDTH) if representation == pl.IMAGE
              else (1, cp.PROFILE_FEATURES, cp.PROFILE_COLUMNS))
+    args = (torch.zeros(shape), torch.zeros((1, pl.PREV_SIZE)),
+            torch.zeros((1, pl.MODE_SIZE)))
+    names = ["x", "prev", pl.MODE_INPUT]
+    if getattr(model, "uses_imu", False):
+        args += (torch.zeros((1, pimu.IMU_SIZE)),)
+        names.append(pl.IMU_INPUT)
     torch.onnx.export(
-        model, (torch.zeros(shape), torch.zeros((1, pl.PREV_SIZE)),
-                torch.zeros((1, pl.MODE_SIZE))), out_path,
-        input_names=["x", "prev", pl.MODE_INPUT], output_names=OUTPUTS,
+        model, args, out_path,
+        input_names=names, output_names=OUTPUTS,
         opset_version=17, dynamo=False)
     write_sidecar(out_path, meta)
+
+
+def imu_meta(uses_imu, tilt):
+    """The IMU half of the sidecar: what policy.check_imu reads."""
+    if not uses_imu:
+        return {}
+    return {"uses_imu": True, "imu_features": list(pimu.FEATURES),
+            "imu_window": pimu.WINDOW, "imu_tilt": bool(tilt),
+            "imu_scales": {"gyro_rad_s": pimu.GYRO_SCALE,
+                           "accel_m_s2": pimu.ACCEL_SCALE, "clip": pimu.CLIP,
+                           "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.GAP_S}}
 
 
 def write_sidecar(out_path, meta):
@@ -341,6 +387,9 @@ def main(argv=None):
                          "whatever was commanded (the autopilot smoke test)")
     ap.add_argument("--prev", action="store_true",
                     help="feed the previous decision in as a second input")
+    ap.add_argument("--imu", action="store_true",
+                    help="feed the policy_imu features in as a fourth input "
+                         "(tilt too, when the dataset has it)")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--good-weight", type=float, default=GOOD_WEIGHT,
@@ -365,12 +414,16 @@ def main(argv=None):
         print(f"{args.data} steers at {meta_in.get('steer_scale')}, the car at "
               f"{pl.STEER_SCALE}: rebuild it with policy_dataset.py")
         return 1
+    if args.imu and "imu" not in data:
+        print(f"{args.data} has no IMU features: rebuild it with policy_dataset.py")
+        return 1
     steer_ok, throttle_ok = pe.label_masks(data, args.labels)
     labelled = steer_ok | throttle_ok
     data["x"] = encode_frames(data["frames"], args.representation)
     fit = dict(representation=args.representation, label_mode=args.labels,
                uses_prev=args.prev, epochs=args.epochs, seed=args.seed,
-               good_weight=args.good_weight, switch_weight=args.switch_weight)
+               good_weight=args.good_weight, switch_weight=args.switch_weight,
+               uses_imu=args.imu)
     tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -450,6 +503,7 @@ def _base_meta(meta_in, args, val_ids, val_names):
         "representation": args.representation,
         "actions": list(pl.ACTIONS),
         "uses_prev_action": bool(args.prev),
+        **imu_meta(getattr(args, "imu", False), meta_in.get("imu_tilt", False)),
         "outputs": OUTPUTS,
         "steer_scale": pl.STEER_SCALE,
         "labels": args.labels,

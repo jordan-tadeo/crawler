@@ -69,6 +69,8 @@ import queue
 import threading
 import time
 
+import policy_imu
+
 # The Foxglove default, which is what Studio offers in the connection dialog,
 # so there is nothing to type but the host.
 DEFAULT_PORT = 8765
@@ -261,6 +263,11 @@ JSON_SCHEMAS = {
         "accel_x": _NUM, "accel_y": _NUM, "accel_z": _NUM,
         "gyro_x": _NUM, "gyro_y": _NUM, "gyro_z": _NUM,
         "accel_magnitude": _NUM,
+        # Which way is up, as a unit vector in the IMU's own axes (x is
+        # vertical on this car), off GAME_ROTATION_VECTOR -- gravity
+        # referenced, so this is the tilt the accel channels cannot show.
+        # All three 0 when there is no orientation reading. See policy_imu.
+        "up_x": _NUM, "up_y": _NUM, "up_z": _NUM,
     }),
     # One message per press of a mark button. See marks.py for what a mark is
     # and why it is a window rather than an instant; everything in here is a
@@ -358,6 +365,8 @@ JSON_SCHEMAS = {
         "imu_accel_x": _NUM, "imu_accel_y": _NUM, "imu_accel_z": _NUM,
         "imu_gyro_x": _NUM, "imu_gyro_y": _NUM, "imu_gyro_z": _NUM,
         "imu_age_ms": _NUM,
+        # The same sample's up vector, as /imu's up_*; all 0 with none.
+        "imu_up_x": _NUM, "imu_up_y": _NUM, "imu_up_z": _NUM,
         # Who drove auto's "driver" groups: "" in record, "rules" or
         # "policy" in auto. The policy_* fields are a learned driver's own
         # command after its floor veto, and its model's sha256; empty and
@@ -1150,8 +1159,10 @@ def imu_sample(reading):
         gx, gy, gz = (float(v) for v in reading["gyro"])
     except Exception:
         return None
+    up = policy_imu.row_fields(reading, 0.0, 0.0)
     return {
         "accel_x": ax, "accel_y": ay, "accel_z": az,
         "gyro_x": gx, "gyro_y": gy, "gyro_z": gz,
         "accel_magnitude": (ax * ax + ay * ay + az * az) ** 0.5,
+        "up_x": up["imu_up_x"], "up_y": up["imu_up_y"], "up_z": up["imu_up_z"],
     }

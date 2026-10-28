@@ -113,6 +113,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `imu_accel_x/y/z` | float | newest OAK-D IMU sample at the tick, linear acceleration, m/s^2 |
 | `imu_gyro_x/y/z` | float | same sample, rad/s |
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
+| `imu_up_x/y/z` | float | same sample: the unit vector pointing away from the ground, in the IMU's own axes, off `GAME_ROTATION_VECTOR`. **All three 0 when there is no orientation reading**, which is every recording made before this field existed. See "Tilt" |
 | `autopilot` | string | who drove auto's `driver` groups: `""` in record, `rules` or `policy` (`main.py --policy`) |
 | `policy_model` | string | sha256 of the `.onnx` driving; `""` unless `autopilot` is `policy` |
 | `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
@@ -169,6 +170,47 @@ Rows that do not exist: manual mode, and auto's 2.5 s recover manoeuvre (no
 scan, no decision) -- unless my hand has a group during it. Then the rows come
 at 10 Hz off the car's own view, `source` `"tap"`, `mode` `"auto"`, with a
 `/policy/depth_small` picture and no raw frame.
+
+## Tilt, and what the IMU columns mean
+
+`imu_accel_*` is `LINEAR_ACCELERATION`: gravity is removed, so a parked car
+reads about 0 whatever slope it sits on. Tilt was not recorded at all until
+`imu_up_*`, which comes off a second IMU report, `GAME_ROTATION_VECTOR`
+(accelerometer and gyro fused, roll and pitch referenced to gravity, no
+magnetometer; `oakd.IMU_SENSORS` says why this one). The existing columns did
+not change: accel and gyro are still the first packet's numbers, and the up
+vector rides in its own report slot.
+
+- Units: none. `imu_up_*` is a unit vector, `(0, 0, 0)` meaning "no reading".
+- Axes, measured off the three 0.4 / -1.0 recordings: **x is vertical**
+  (`imu_gyro_x` is yaw), **y is lateral**, **z is along the car**. So a level
+  car should read `imu_up` near `(+-1, 0, 0)`, and pitch and roll are the
+  angles of the up vector away from x toward z and toward y:
+  `pitch = atan2(up_z, |up_x|)`, `roll = atan2(up_y, |up_x|)`, in radians.
+- The quaternion to up-vector step (`policy_imu.up_from_quaternion`) uses
+  Android's rotation-vector convention, which the BNO08x follows. **Not yet
+  checked on the car.** The first parked recording should read `|up_x|` near
+  1; if it reads near 1 on another axis instead, the mounting or the
+  convention is not what this says.
+- `/imu` carries the same three as `up_x/y/z`.
+
+## The IMU as a policy input
+
+`policy_imu.py` is the one place IMU numbers become the policy's `imu`
+input. The dataset tool pushes each session's `/footprint` rows through
+`policy_imu.ImuFeatures` in time order (every row, before any is dropped) and
+stores the result as the `.npz`'s `imu` array; `PolicyDriver` builds the
+same row live with `policy_imu.row_fields` (the function `footprint.py`
+writes the row with) and pushes it through its own `ImuFeatures`. Features,
+in order (`policy_imu.FEATURES`): gyro xyz over 2 rad/s, linear accel xyz
+over 10 m/s^2, the largest |accel| and |gyro| of the last 5 decisions (0.5 s)
+on the same scales, `valid`, up xyz and `tilt_valid`; every value clipped to
++-3. A row with no sample (`imu_age_ms` -1) or one older than 250 ms is all
+zeros with `valid` 0. Rows more than 0.25 s apart restart the half-second
+window. A model trained with `policy_train.py --imu` declares `uses_imu`,
+`imu_features` and `imu_tilt` in its sidecar; `imu_tilt` is false when its
+data had no up vector, and then the up columns are zeroed in training and on
+the car. A model without `uses_imu` has no `imu` input and never gets one.
 
 ## The steering mode as a label
 

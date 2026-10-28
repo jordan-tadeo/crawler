@@ -209,6 +209,7 @@ python3.11 -m venv ~/crawler-train && ~/crawler-train/bin/pip install -r tools/r
 python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/crawler-record-*.mcap
 python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one session: time blocks
+python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu --prev   # + IMU, + last decision
 python tools/policy_eval.py data.npz models/policy.onnx --out report.md
 ```
 
@@ -273,7 +274,7 @@ Eight channels. The five JSON ones carry a named schema so Studio labels them:
 | `/controller` | `crawler.Controller` | 20 Hz | every axis and button by raw SDL index, the named view through `Joystick`'s own maps, the calibrated trigger rest, and the throttle and steering the code derived |
 | `/vehicle` | `crawler.Vehicle` | 20 Hz | mode, commanded throttle and steering, the ESC pulse width that was written, and the pigpio read-back with its age |
 | `/diagnostics` | `crawler.Diagnostics` | 4 Hz | mode, pad connected, auto available, camera state and error, last error, loop rate and worst tick, whether this run is being recorded -- which file, how big, and why not if not -- and how many moments I have marked good and bad so far |
-| `/imu` | `crawler.Imu` | 20 Hz | the OAK-D's accelerometer and gyro, downsampled from 100 Hz |
+| `/imu` | `crawler.Imu` | 20 Hz | the OAK-D's linear accelerometer and gyro, and the up vector off its rotation vector, downsampled from 100 Hz |
 | `/marks` | `crawler.Mark` | on a press | one message per press of A or B, carrying the window it stands for and a snapshot of what the car was doing and seeing |
 | `/camera/depth` | `foxglove.CompressedImage` | 8 Hz | depth, colourmapped over a fixed 300-3000 mm window |
 | `/camera/disparity` | `foxglove.CompressedImage` | 8 Hz | disparity, per-frame stretch |

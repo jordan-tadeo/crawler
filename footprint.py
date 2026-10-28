@@ -51,6 +51,7 @@ import math
 import time
 
 import driver as dv
+import policy_imu
 import policy_input
 
 # The decision rate. main.AUTO_TICK_INTERVAL is the same number; it is not
@@ -111,8 +112,8 @@ def autopilot_fields(driver):
     return out
 
 
-IMU_FIELDS = ("imu_accel_x", "imu_accel_y", "imu_accel_z",
-              "imu_gyro_x", "imu_gyro_y", "imu_gyro_z")
+# Every IMU column a row carries, age included. Named in policy_imu.
+IMU_FIELDS = policy_imu.ROW_FIELDS
 
 
 def _num(value, fallback=-1.0) -> float:
@@ -183,21 +184,12 @@ def imu_fields(sample, sampled_at, now):
     """The IMU part of a row: a camera.get_imu_sample() dict, flattened.
 
     Zeros and an age of -1 when there has been no sample, so every row has
-    the same columns whether or not the IMU has spoken yet.
+    the same columns whether or not the IMU has spoken yet. The flattening
+    is policy_imu.row_fields(), because a learned driver builds its IMU input
+    off exactly these columns and the car rebuilds them live with the same
+    call.
     """
-    out = dict.fromkeys(IMU_FIELDS, 0.0)
-    out["imu_age_ms"] = -1.0
-    if not sample:
-        return out
-    try:
-        accel = [float(v) for v in sample["accel"]]
-        gyro = [float(v) for v in sample["gyro"]]
-    except Exception:
-        return out
-    for key, value in zip(IMU_FIELDS, accel + gyro):
-        out[key] = _num(value, 0.0)
-    out["imu_age_ms"] = _num((now - sampled_at) * 1000.0, -1.0)
-    return out
+    return policy_imu.row_fields(sample, sampled_at, now)
 
 
 class FootprintTap:

@@ -35,6 +35,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import policy as pl  # noqa: E402
+import policy_imu as pimu  # noqa: E402
 
 FWD = pl.ACTIONS.index(pl.FORWARD)
 STOP = pl.ACTIONS.index(pl.STOP)
@@ -62,17 +63,32 @@ def label_masks(data, label_mode):
     return steer | ~policy, throttle | ~policy
 
 
+def imu_input(model, data, i):
+    """Tick i's IMU input for a model that takes one, tilt zeroed unless the
+    model was trained with it -- as policy_imu.ImuFeatures(tilt=...) makes
+    it on the car."""
+    feats = data["imu"][i]
+    if not getattr(model, "imu_tilt", False):
+        feats = pimu.without_tilt(feats)
+    return pl.encode_imu(feats)
+
+
 def _run(model, data, i, split=None):
     """One tick through the model. A mode head is fed `split`, or the
     recorded mode going into the tick when that is None."""
     x = pl.encode_input(model.representation, data["frames"][data["frame"][i]])
     prev = (data["prev"][i:i + 1] if model.uses_prev
             else np.zeros((1, pl.PREV_SIZE), dtype=np.float32))
-    if not getattr(model, "has_mode", False):
+    mode = None
+    if getattr(model, "has_mode", False):
+        if split is None:
+            split = int(data["mode_in"][i]) == pl.STEER_MODES.index(pl.SPLIT)
+        mode = pl.encode_mode(split)
+    if getattr(model, "uses_imu", False):
+        return model.run(x, prev, mode, imu=imu_input(model, data, i))
+    if mode is None:
         return model.run(x, prev)
-    if split is None:
-        split = int(data["mode_in"][i]) == pl.STEER_MODES.index(pl.SPLIT)
-    return model.run(x, prev, pl.encode_mode(split))
+    return model.run(x, prev, mode)
 
 
 def predict(model, data, ticks):

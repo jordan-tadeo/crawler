@@ -123,6 +123,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import driver as dv  # noqa: E402
 import policy as pl  # noqa: E402
 import policy_adapters as pa  # noqa: E402
+import policy_imu as pimu  # noqa: E402
 
 TICK_S = 0.1
 # Slack on the 10 Hz sampling of a 20 Hz channel, so jitter in /vehicle does
@@ -215,6 +216,7 @@ class Tick(NamedTuple):
     mode_in: int = 0            # pl.STEER_MODES index going into the tick
     steer_mode: int = 0         # the mode I wanted: the label
     mode_switch: bool = False   # within MODE_WINDOW_S of a toggle
+    imu: object = None          # (pimu.IMU_SIZE,) float32, the policy's IMU input
 
 
 def _is_split(cmd):
@@ -263,6 +265,17 @@ def mode_labels(commands):
                    for t in times[max(0, k - 1):k + 1])
         out.append((mode_in, want, near))
     return out
+
+
+def imu_features(commands):
+    """Per command its policy_imu features, the window run over every row
+    in the stream before any is dropped -- the runtime pushes every tick it
+    has a frame on, not only the ones it is graded on. Built with tilt; the
+    trainer zeroes it (pimu.without_tilt) for a model trained without.
+    A legacy command has no IMU columns and comes out all zeros."""
+    feats = pimu.ImuFeatures(tilt=True)
+    return [feats.push(dict(zip(pa.FOOTPRINT_ROW["imu_row"], cmd.imu)), cmd.t_ns / 1e9)
+            for cmd in commands]
 
 
 def _rear_off_pair(cmd):
@@ -414,7 +427,8 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     prev_was_reverse = False
     prev_t = None
     modes = mode_labels(commands)
-    for cmd, (mode_in, steer_mode, mode_switch) in zip(commands, modes):
+    imus = imu_features(commands)
+    for cmd, (mode_in, steer_mode, mode_switch), imu in zip(commands, modes, imus):
         if cmd.mode not in session.label_modes:
             drops["mode"] += 1
             prev_was_reverse = False
@@ -467,7 +481,8 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
             rule_action, float(rule_steer), decision, cmd.mode,
             cmd.steer_by == pa.BY_PAD, cmd.throttle_by == pa.BY_PAD,
             float(cmd.throttle), float(cmd.front), float(cmd.accel), float(cmd.gyro),
-            cmd.autopilot == pa.AUTOPILOT_POLICY, mode_in, steer_mode, mode_switch))
+            cmd.autopilot == pa.AUTOPILOT_POLICY, mode_in, steer_mode, mode_switch,
+            imu))
         errors.append(age)
 
     if rules is not None:
@@ -593,6 +608,11 @@ def to_arrays(sessions_ticks):
         "mode_switch": np.array([r[2].mode_switch for r in rows], dtype=bool),
         "prev": (np.stack([r[3] for r in rows]) if n
                  else np.zeros((0, pl.PREV_SIZE), np.float32)),
+        # pimu.FEATURES per tick, tilt included where the session had it.
+        "imu": (np.stack([r[2].imu if r[2].imu is not None
+                          else np.zeros(pimu.IMU_SIZE, np.float32) for r in rows])
+                .astype(np.float32) if n
+                else np.zeros((0, pimu.IMU_SIZE), np.float32)),
     }
     return a
 
@@ -791,6 +811,10 @@ def main(argv=None):
                 f"unified {sum(t.steer_mode == 0 for t in ticks)}, "
                 f"split {sum(t.steer_mode == 1 for t in ticks)}, "
                 f"inside a switch window {sum(t.mode_switch for t in ticks)}")
+        vi, ti = pimu.FEATURES.index("valid"), pimu.FEATURES.index("tilt_valid")
+        line += (f"\n    imu: a real sample on {sum(bool(t.imu[vi]) for t in ticks)} of "
+                 f"{len(ticks)} kept ticks, an up vector on "
+                 f"{sum(bool(t.imu[ti]) for t in ticks)}")
         flags = mark_flags(ticks, session.marks)
         kinds = Counter(str(m.get("kind", "?")).lower() for _, m in session.marks)
         line += (f"\n    marks: {kinds.get('good', 0)} good, {kinds.get('bad', 0)} bad; "
@@ -842,6 +866,13 @@ def main(argv=None):
         "mode_lead_s": MODE_LEAD_S,
         "mode_window_s": MODE_WINDOW_S,
         "toggles": {s.name: toggles_by_session.get(s.name, []) for s, _ in kept},
+        # The IMU input: what the "imu" array's columns are, and whether any
+        # kept tick has a real up vector (False for every recording made
+        # before GAME_ROTATION_VECTOR).
+        "imu_features": list(pimu.FEATURES),
+        "imu_window": pimu.WINDOW,
+        "imu_tilt": bool(len(arrays["imu"])
+                         and arrays["imu"][:, pimu.FEATURES.index("tilt_valid")].any()),
         "alignment_ms_histogram": {"edges": hist_edges[:-1], "counts": hist},
         "report": report,
     }

@@ -34,6 +34,8 @@ the same packets. Everything in here now is a raw frame off one queue.
 import depthai as dai
 import numpy as np
 
+import policy_imu
+
 
 def frame_from_payload(packet, label=""):
     """An ImgFrame's pixels, worked out from the payload instead of the label.
@@ -140,6 +142,75 @@ POST_PROCESSING_SHAVES = 5
 POST_PROCESSING_SLICES = 3
 
 
+# The IMU, a BNO086. LINEAR_ACCELERATION and GYROSCOPE_RAW are what the
+# stuck detector and every recording so far read, and they do not change.
+# GAME_ROTATION_VECTOR is new, and it is there for one thing: which way is
+# down. LINEAR_ACCELERATION has gravity taken out, so a parked car reads ~0
+# and nothing recorded says whether the car is on a slope.
+#
+# Why this one, off the depthai docs (dai.IMUSensor's own docstrings and the
+# IMU node page):
+#
+#   * It is "an orientation output ... expressed as a quaternion with no
+#     specific reference for heading, while roll and pitch are referenced
+#     against gravity", fused from the accelerometer and the gyro. Roll and
+#     pitch are the whole of what tilt is; the heading drift it admits to is
+#     a number I never read.
+#   * No magnetometer. ROTATION_VECTOR fuses one in for heading, and a
+#     magnetometer a few centimetres from a brushed motor and an ESC is a
+#     liability for a number I do not want.
+#   * It has its own slot. An IMUPacket carries one acceleroMeter, one
+#     gyroscope, one magneticField and one rotationVector. ACCELEROMETER_RAW
+#     (or GRAVITY) would report into the same acceleroMeter slot that
+#     LINEAR_ACCELERATION already fills, so the existing imu_accel_* columns
+#     would no longer say which of the two they were. The rotation vector
+#     lands in rotationVector and nothing that exists moves.
+#   * Fused, not raw. Tilt off ACCELEROMETER_RAW is gravity plus every bump,
+#     and a bump is exactly the moment the policy needs tilt and jolt told
+#     apart. RAW is also "without any postprocessing", uncalibrated.
+#
+# The rate. 100 Hz is what LINEAR_ACCELERATION and GYROSCOPE_RAW have always
+# been asked for. The BNO "rounds up" to its next available rate, and the
+# documented ones are 15/31/62/125/250/500 Hz for the accelerometer family and
+# 25/33/50/100/200/400 Hz for the gyro family, so by that table the accel
+# runs at 125 Hz and the gyro at 100. The hub measured 87.6 Hz of delivered
+# IMU messages on the car (driver.py). The rotation vector is fused at up to 400 Hz; 100 is
+# plenty for a car that decides at 10. The ~17 /imu messages a second a
+# recording shows is not the sensor: telemetry.RATES gates /imu at 20 Hz
+# (0.05 s) and the 5 ms hub loop's phase against that gate loses a few.
+#
+# The "imu" XLinkOut queue is opened shallow and non-blocking like every
+# other one (OakD.__init__), so a third report in each packet cannot back
+# anything up.
+IMU_SENSORS = [dai.IMUSensor.LINEAR_ACCELERATION, dai.IMUSensor.GYROSCOPE_RAW,
+               dai.IMUSensor.GAME_ROTATION_VECTOR]
+IMU_RATE_HZ = 100
+
+
+def imu_reading(data):
+    """An IMUData message -> the sample dict every consumer reads, or None.
+
+    "accel" and "gyro" are the first packet's, as they always were. "up" is
+    present only when a packet in the message carries a real rotation vector
+    (policy_imu.up_from_quaternion); depthai leaves the quaternion all zeros
+    in a packet the rotation vector did not report into.
+    """
+    if data is None or not data.packets:
+        return None
+    packet = data.packets[0]
+    accel = packet.acceleroMeter
+    gyro = packet.gyroscope
+    sample = {"accel": (accel.x, accel.y, accel.z),
+              "gyro": (gyro.x, gyro.y, gyro.z)}
+    for p in data.packets:
+        rv = p.rotationVector
+        up = policy_imu.up_from_quaternion(rv.i, rv.j, rv.k, rv.real)
+        if up is not None:
+            sample["up"] = up
+            break
+    return sample
+
+
 def build_pipeline(rectified: bool = True) -> dai.Pipeline:
     """The whole device config, with no device attached.
 
@@ -165,7 +236,7 @@ def build_pipeline(rectified: bool = True) -> dai.Pipeline:
 
     # Create IMU node
     imu = pipeline.create(dai.node.IMU)
-    imu.enableIMUSensor([dai.IMUSensor.LINEAR_ACCELERATION, dai.IMUSensor.GYROSCOPE_RAW], 100)
+    imu.enableIMUSensor(IMU_SENSORS, IMU_RATE_HZ)
     imu.setBatchReportThreshold(1)
     imu.setMaxBatchReports(10)
 
@@ -336,14 +407,7 @@ class OakD:
     def get_imu_sample(self):
         if self.imu_queue is None:
             return None
-        data = self.imu_queue.tryGet()
-        if data is None or not data.packets:
-            return None
-        packet = data.packets[0]
-        accel = packet.acceleroMeter  # correct
-        gyro = packet.gyroscope
-        return {"accel": (accel.x, accel.y, accel.z),
-                "gyro": (gyro.x, gyro.y, gyro.z)}
+        return imu_reading(self.imu_queue.tryGet())
 
     # There used to be a reset_pipeline() here that called self.__init__() on
     # an X_LINK error. It is gone on purpose. Rebuilding the pipeline takes
