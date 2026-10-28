@@ -54,9 +54,15 @@ Three inputs are always in the graph, so the runtime has one code path:
 x (the frame, as policy.encode_input() builds it), prev (the last decision,
 zeros when the sidecar says uses_prev_action is false) and mode. --imu adds
 a fourth, `imu`: the dataset's policy_imu features, which the car rebuilds
-live with the same ImuFeatures. Its sidecar says uses_imu, and imu_tilt when
-the dataset had an up vector; without one the tilt columns are zeroed here
-and on the car (policy_imu.without_tilt). --imu and --prev combine. The
+live with the same ImuFeatures. Its sidecar says uses_imu. The tilt columns
+(the up vector and tilt_valid) are zeroed here and on the car
+(policy_imu.without_tilt) unless --imu-tilt asks for them, and then the
+sidecar says imu_tilt. Tilt is asked for, never taken because the dataset
+has it: most sessions predate the up vector, so whether a model learns off
+the few that have it is a choice of recipe, and an A/B needs both arms off
+the same dataset. --imu-tilt on a dataset with no up vector anywhere is
+refused. A session without one is in the dataset as zeros and tilt_valid 0,
+never a made-up reading. --imu and --prev combine. The
 flip augmentation mirrors the IMU too (policy_imu.MIRROR). A graph without
 --imu has no `imu` input at all, so every model before it loads unchanged.
 --imu-no-yaw is --imu without the yaw rate: the dataset's imu_no_yaw array
@@ -200,6 +206,16 @@ def dataset_has_tilt(data):
     return bool(data["meta"].get("imu_tilt", False))
 
 
+def tilt_of(want_tilt, meta_in):
+    """Whether a model is trained with tilt: only when asked (--imu-tilt),
+    and ValueError when asked of a dataset with no up vector in it."""
+    if not want_tilt:
+        return False
+    if not meta_in.get("imu_tilt", False):
+        raise ValueError("--imu-tilt, but no session in the dataset has an up vector")
+    return True
+
+
 def tick_weights(data, idx, good_weight):
     """Per training tick loss weight: good_weight inside a GOOD mark, else 1."""
     return np.where(pe.marks_of(data)[idx] == pe.MARK_GOOD,
@@ -244,7 +260,7 @@ def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
 
 def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False,
-          imu_yaw=True):
+          imu_yaw=True, imu_tilt=False):
     import torch
     from torch import nn
 
@@ -258,7 +274,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     prev = torch.from_numpy(data["prev"][idx] if uses_prev
                             else np.zeros_like(data["prev"][idx]))
     mode_in = torch.from_numpy(encode_modes(data["mode_in"][idx]))
-    imu = (torch.from_numpy(imu_inputs(data, dataset_has_tilt(data), imu_yaw)[idx])
+    imu = (torch.from_numpy(imu_inputs(data, imu_tilt, imu_yaw)[idx])
            if uses_imu else None)
     mode = torch.from_numpy(data["steer_mode"][idx].astype(np.int64))
     action = torch.from_numpy(data["action"][idx].astype(np.int64))
@@ -446,10 +462,13 @@ def main(argv=None):
                     help="feed the previous decision in as a second input")
     ap.add_argument("--imu", action="store_true",
                     help="feed the policy_imu features in as a fourth input "
-                         "(tilt too, when the dataset has it)")
+                         "(tilt zeroed unless --imu-tilt)")
     ap.add_argument("--imu-no-yaw", action="store_true",
                     help="--imu without the yaw rate (gyro_x): pitch, roll, "
                          "accel and tilt only (policy_imu.NO_YAW_FEATURES)")
+    ap.add_argument("--imu-tilt", action="store_true",
+                    help="--imu with the up vector fed in (zeros and tilt_valid 0 "
+                         "on sessions without one); refused on a dataset with none")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--good-weight", type=float, default=GOOD_WEIGHT,
@@ -465,14 +484,12 @@ def main(argv=None):
     ap.add_argument("--model-version", default=None, help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     args = ap.parse_args(argv)
-    if args.imu_no_yaw:
+    if args.imu_no_yaw or args.imu_tilt:
         args.imu = True
     if args.model_version is not None:
         print("--model-version is gone: a model gets a number only from "
               "tools/models.py promote, once it beats the latest release")
         return 2
-
-    import torch
 
     data = pe.load(args.data)
     meta_in = data["meta"]
@@ -490,13 +507,22 @@ def main(argv=None):
         print(f"{args.data} has no {pimu.DATASET_KEY[not args.imu_no_yaw]} IMU features: "
               f"rebuild it with policy_dataset.py")
         return 1
+    try:
+        tilt_of(args.imu_tilt, meta_in)
+    except ValueError as e:
+        print(f"{args.data}: {e}")
+        return 1
+
+    import torch
+
     steer_ok, throttle_ok = pe.label_masks(data, args.labels)
     labelled = steer_ok | throttle_ok
     data["x"] = encode_frames(data["frames"], args.representation)
     fit = dict(representation=args.representation, label_mode=args.labels,
                uses_prev=args.prev, epochs=args.epochs, seed=args.seed,
                good_weight=args.good_weight, switch_weight=args.switch_weight,
-               uses_imu=args.imu, imu_yaw=not args.imu_no_yaw)
+               uses_imu=args.imu, imu_yaw=not args.imu_no_yaw,
+               imu_tilt=args.imu_tilt)
     tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -541,6 +567,12 @@ def main(argv=None):
               "pad-labelled (legacy files are all autopilot: try --labels any)")
         return 1
 
+    if args.imu_tilt:
+        # A fold can hold out every session with an up vector, and then the
+        # model learns tilt off zeros alone: say so, it is not a tilt model.
+        tilt_col = pimu.FEATURES.index("tilt_valid")
+        tilt_ticks = int((train_mask & (data["imu"][:, tilt_col] > 0)).sum())
+        print(f"tilt: an up vector on {tilt_ticks} of {int(train_mask.sum())} training ticks")
     model, weights = train(data, train_mask=train_mask, **fit)
     params = int(sum(p.numel() for p in model.parameters()))
 
@@ -550,6 +582,7 @@ def main(argv=None):
             "good_marked_train_ticks": int((train_mask & (pe.marks_of(data) == pe.MARK_GOOD)).sum()),
             "bad_marked_left_out": int((data["decision"] & pe.bad_marked(data)).sum()),
             "parameters": params,
+            **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **provenance_meta(argv, args.model_name)}
     with torch.no_grad():
         export(model, args.representation, args.out, meta)
@@ -577,7 +610,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
         "representation": args.representation,
         "actions": list(pl.ACTIONS),
         "uses_prev_action": bool(args.prev),
-        **imu_meta(getattr(args, "imu", False), meta_in.get("imu_tilt", False),
+        **imu_meta(getattr(args, "imu", False),
+                   tilt_of(getattr(args, "imu_tilt", False), meta_in),
                    not getattr(args, "imu_no_yaw", False)),
         "outputs": OUTPUTS,
         "steer_scale": pl.STEER_SCALE,

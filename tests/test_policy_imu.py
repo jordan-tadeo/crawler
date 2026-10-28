@@ -10,6 +10,7 @@ from before the up vector existed, and a model that predates the IMU input
 entirely, which has to load and run exactly as it did.
 """
 
+import argparse
 import json
 import math
 import os
@@ -500,3 +501,69 @@ def test_eval_and_training_feed_a_no_yaw_model_the_no_yaw_array():
                                   pimu.without_tilt(no_yaw[None]))
     with pytest.raises(ValueError, match="imu_no_yaw"):
         pt.imu_inputs({"imu": full[None]}, False, yaw=False)
+
+
+# --- tilt, asked for ----------------------------------------------------------------
+
+def _tilt_session(name, up):
+    extra = dict(imu_age_ms=2.0, imu_accel_x=0.1, imu_accel_y=0.0, imu_accel_z=0.0,
+                 imu_gyro_x=0.3, imu_gyro_y=0.0, imu_gyro_z=0.0)
+    if up:
+        extra.update(imu_up_x=-0.99, imu_up_y=-0.1, imu_up_z=0.0)
+    rows = [(k * 0.1, row(k, throttle=0.4, forward_limit=pa.RUNTIME_CAPS[0],
+                          reverse_limit=pa.RUNTIME_CAPS[1], **extra)) for k in range(20)]
+    return footprint_session(rows)._replace(name=name)
+
+
+def _tilt_dataset(tmp_path, monkeypatch, names):
+    monkeypatch.setattr(pd, "read_session", lambda path, adapter=None: (
+        _tilt_session(pathlib.Path(path).stem, "new" in pathlib.Path(path).stem), False))
+    out = tmp_path / "d.npz"
+    assert pd.main([str(out)] + [str(tmp_path / f"{n}.mcap") for n in names]
+                   + ["--no-idle-rules"]) == 0
+    return out
+
+
+def test_old_sessions_beside_new_ones_feed_tilt_as_no_reading(tmp_path, monkeypatch):
+    """A dataset of a session from before the up vector and one after: the
+    old one's tilt columns are zeros and tilt_valid 0 even with tilt asked
+    for, and the new one's are its real reading."""
+    a = pe.load(str(_tilt_dataset(tmp_path, monkeypatch, ["old", "new"])))
+    assert a["meta"]["imu_tilt"] is True
+    old = a["session"] == a["meta"]["sessions"].index("old")
+    fed = pt.imu_inputs(a, tilt=True, yaw=False)
+    assert fed[old][:, NY["valid"]].all()
+    assert not fed[old][:, NY["up_x"]:].any()
+    assert fed[~old][:, NY["tilt_valid"]].all()
+    np.testing.assert_allclose(fed[~old][0, NY["up_x"]:NY["up_z"] + 1],
+                               np.array([-0.99, -0.1, 0.0]) / math.hypot(0.99, 0.1), atol=1e-6)
+    # Not asked for, the new session's reading is gone too.
+    assert not pt.imu_inputs(a, tilt=False, yaw=False)[:, NY["up_x"]:].any()
+
+
+def test_tilt_is_asked_for_never_taken_because_the_dataset_has_it():
+    has, hasnt = {"imu_tilt": True}, {"imu_tilt": False}
+    assert pt.tilt_of(False, has) is False
+    assert pt.tilt_of(True, has) is True
+    with pytest.raises(ValueError, match="up vector"):
+        pt.tilt_of(True, hasnt)
+    with pytest.raises(ValueError, match="up vector"):
+        pt.tilt_of(True, {})
+
+    def meta(imu_tilt):
+        args = argparse.Namespace(representation="profile", prev=False, labels="pad",
+                                  good_weight=1.0, epochs=1, seed=0, imu=True,
+                                  imu_no_yaw=True, imu_tilt=imu_tilt)
+        return pt._base_meta({"sessions": ["s"], "input_contract": "c", **has}, args, [], [])
+
+    assert meta(False)["imu_tilt"] is False
+    assert meta(True)["imu_tilt"] is True
+    # And the car reads a tilt sidecar as one it feeds the up vector to.
+    assert pl.check_imu(json.loads(json.dumps(meta(True))), {"imu"}) == (True, True, False)
+
+
+def test_the_trainer_refuses_tilt_on_a_dataset_with_no_up_vector(tmp_path, monkeypatch, capsys):
+    out = _tilt_dataset(tmp_path, monkeypatch, ["old"])
+    assert pt.main([str(out), str(tmp_path / "m.onnx"), "--imu-no-yaw", "--imu-tilt"]) == 1
+    assert "up vector" in capsys.readouterr().out
+    assert not (tmp_path / "m.onnx").exists()

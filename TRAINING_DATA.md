@@ -210,9 +210,13 @@ on the same scales, `valid`, up xyz and `tilt_valid`; every value clipped to
 +-3. A row with no sample (`imu_age_ms` -1) or one older than 250 ms is all
 zeros with `valid` 0. Rows more than 0.25 s apart restart the half-second
 window. A model trained with `policy_train.py --imu` declares `uses_imu`,
-`imu_features` and `imu_tilt` in its sidecar; `imu_tilt` is false when its
-data had no up vector, and then the up columns are zeroed in training and on
-the car. A model without `uses_imu` has no `imu` input and never gets one.
+`imu_features` and `imu_tilt` in its sidecar. `imu_tilt` is true only with
+`--imu-tilt`; without it the up columns are zeroed in training and on the
+car, even when the dataset has an up vector. `--imu-tilt` is refused on a
+dataset with none, and a session recorded before the up vector existed goes
+in as zeros with `tilt_valid` 0, never a made-up reading. The trainer prints
+how many training ticks had a real up vector. A model without `uses_imu` has
+no `imu` input and never gets one.
 
 `--imu-no-yaw` trains without the yaw rate. gyro_x is yaw on this car, and a
 model fed it reads back the turn its steering label made; held out, the full
