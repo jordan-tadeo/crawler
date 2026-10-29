@@ -350,6 +350,19 @@ def test_dry_run_changes_nothing(registered):
     assert any("systemctl restart" in line for line in lines)
 
 
+def test_a_deploy_writes_down_what_the_car_runs_and_a_dry_run_does_not(registered):
+    _, entry, folder = registered
+    deploy(registered, FakeCar(), dry_run=True)
+    assert "deployed" not in md.load_registry(folder)
+    deploy(registered, FakeCar(pulse="1700"))
+    assert "deployed" not in md.load_registry(folder)
+    rc, _ = deploy(registered, FakeCar())
+    assert rc == 0
+    mark = md.load_registry(folder)["deployed"]
+    assert (mark["label"], mark["onnx"], mark["onnx_sha256"]) == (
+        entry["label"], entry["onnx"], entry["onnx_sha256"])
+
+
 def test_a_car_that_moves_before_the_swap_is_left_alone(registered):
     rc, lines = deploy(registered, FakeCar(swap_pulse="1650"))
     assert rc == 3 and any("stopped being parked" in line for line in lines)

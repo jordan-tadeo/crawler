@@ -69,7 +69,9 @@ stretches of time, holds each out in turn, trains on the rest less
 BLOCK_GUARD_S either side of the held-out stretch (neighbouring ticks are
 nearly the same picture), and reports every fold and the mean. Never a
 random split by tick. After the folds it trains once more on everything and
-exports that; its sidecar carries the fold numbers under "cv".
+exports that; its sidecar carries the fold numbers under "cv". --fold runs one
+piece of that alone (a block, or the final model), which is how
+tools/retrain.py trains them all at once, one process each.
 
 Three inputs are always in the graph, so the runtime has one code path:
 x (the frame, as policy.encode_input() builds it), prev (the last decision,
@@ -755,6 +757,12 @@ def main(argv=None):
                          f"(default {MODE_SWITCH_WEIGHT})")
     ap.add_argument("--model-name", default=None,
                     help="family name for the sidecar, e.g. kblock")
+    ap.add_argument("--fold", default=None, metavar="K|final",
+                    help="with --blocks N, one piece of it: K (1..N) trains and grades "
+                         "only block K and writes that fold model, its scores in the "
+                         "sidecar's \"fold\"; final trains only the model on everything, "
+                         "with no train fit. "
+                         "tools/retrain.py runs each piece in its own process")
     # Kept only to say why it is gone: a release number is earned through
     # tools/models.py promote, never stamped at training time.
     ap.add_argument("--model-version", default=None, help=argparse.SUPPRESS)
@@ -765,6 +773,11 @@ def main(argv=None):
     if args.model_version is not None:
         print("--model-version is gone: a model gets a number only from "
               "tools/models.py promote, once it beats the latest release")
+        return 2
+    if args.fold is not None and not (
+            args.blocks and (args.fold == "final"
+                             or (args.fold.isdigit() and 1 <= int(args.fold) <= args.blocks))):
+        print(f"--fold is final or a block 1..N of --blocks N, not {args.fold!r}")
         return 2
 
     data = pe.load(args.data)
@@ -807,12 +820,14 @@ def main(argv=None):
                imu_tilt=args.imu_tilt, steer_head=args.steer_head,
                straight_band=args.straight_band, takeover_weight=args.takeover_weight,
                uses_lidar=args.lidar, lidar_dropout=args.lidar_dropout)
-    tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
+    tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
-    if args.blocks:
+    if args.blocks and args.fold != "final":
         folds = []
         for k, (held, guard) in enumerate(time_blocks(data, args.blocks)):
+            if args.fold is not None and k + 1 != int(args.fold):
+                continue
             mask = training_mask(data, guard, labelled)
             model, _ = train(data, train_mask=mask, **fit)
             with torch.no_grad():
@@ -825,6 +840,13 @@ def main(argv=None):
             print(f"--- block {k + 1} of {args.blocks}: {int(graded.sum())} ticks held out, "
                   f"{int(mask.sum())} trained")
             print(pe.format_scores(s))
+            if args.fold is not None:
+                write_sidecar(args.out, {**_base_meta(meta_in, args, [], []),
+                                         **mode_meta(args.switch_weight),
+                                         "fold": {"block": k + 1, "blocks": args.blocks,
+                                                  "guard_s": BLOCK_GUARD_S,
+                                                  "trained": int(mask.sum()), "scores": s}})
+                return 0
         for ext in (".onnx", ".json"):
             try:
                 os.remove(os.path.splitext(tmp)[0] + ext)
@@ -834,6 +856,11 @@ def main(argv=None):
               "mean": _mean_scores(folds), "folds": folds}
         print(f"--- mean over {args.blocks} blocks")
         print(pe.format_scores(cv["mean"]))
+        val_names, val_ids = [], []
+        in_val = np.zeros(len(data["t_ns"]), dtype=bool)
+    elif args.blocks:
+        # --fold final: the folds are other processes, and the caller puts
+        # their numbers under "cv" once they are in.
         val_names, val_ids = [], []
         in_val = np.zeros(len(data["t_ns"]), dtype=bool)
     else:
@@ -889,16 +916,20 @@ def main(argv=None):
     model_rt = pl.PolicyModel(args.out)
     if cv is not None:
         meta["cv"] = cv
+    # --fold final has no train fit: the caller has the folds, and grading
+    # every training tick one at a time takes longer than the training did.
+    if args.blocks and args.fold != "final":
         # Graded on what it was trained on: a check the export works, not a score.
         meta["train_fit"] = pe.score_ticks(
             model_rt, data, np.flatnonzero(train_mask), args.labels,
             pe.median_training_magnitude(data, train_mask))
-    else:
+    elif not args.blocks:
         meta["val"] = pe.score(model_rt, data, val_ids, args.labels, train_mask)
     write_sidecar(args.out, meta)
     print(f"{args.representation}: {params} parameters, "
           f"{os.path.getsize(args.out)} bytes, {int(train_mask.sum())} training decisions")
-    print(pe.format_scores(meta["val"] if cv is None else meta["train_fit"]))
+    if args.fold != "final":
+        print(pe.format_scores(meta["train_fit"] if args.blocks else meta["val"]))
     return 0
 
 

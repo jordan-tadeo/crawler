@@ -85,7 +85,8 @@ driving, and a restart under it is a restart at speed. After the restart it
 checks the service is active, has not crash-looped (NRestarts), is listening
 on 8765, is still at neutral, and has written no Traceback since the restart.
 --dry-run does only the read-only half and prints the rest. A candidate goes
-through exactly the same steps.
+through exactly the same steps. Once the links point at it, the registry's
+"deployed" says which model that was and when.
 
 The car is CRAWLER_HOST, else jt@jtpi.local, the same as pull_mcaps.py: by name,
 because the DHCP lease moves (tests/test_car_address.py).
@@ -1104,6 +1105,7 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
     kv = parse_kv(text)
     restart_at = int(kv.get("restart_at", "0") or 0)
     out(f"policy.onnx -> {entry['onnx']}; restarted {SERVICE}")
+    mark_deployed(registry, entry, models_dir)
 
     deadline = clock() + wait_s
     while True:
@@ -1125,6 +1127,14 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
     if "tag" in entry:
         out(f"A test drive: promote {entry['tag']} --approved-on-car once it drove well.")
     return 0
+
+
+def mark_deployed(registry, entry, models_dir=MODELS_DIR, now=None):
+    """Write down which model the car was last pointed at, so the registry
+    can say without an ssh (tools/retrain.py grades against it)."""
+    registry["deployed"] = {"label": entry["label"], "onnx": entry["onnx"],
+                            "onnx_sha256": entry["onnx_sha256"], "date": stamp(now)}
+    save_registry(registry, models_dir)
 
 
 def rollback_entry(registry, car):

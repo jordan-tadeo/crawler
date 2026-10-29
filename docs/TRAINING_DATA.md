@@ -359,7 +359,22 @@ frames as `DIR/<log_time_ns>.npy`.
 
 ## Training a model
 
-On the laptop, in `~/crawler-train` (see the README):
+The whole loop in one command, on the laptop:
+
+```sh
+./scripts/retrain.sh                # pull, decode the new recordings, train, grade, register
+./scripts/retrain.sh --no-pull -- --lidar   # after --: flags for policy_train.py
+```
+
+It decodes each recording once into `~/crawler-data/cache` (again only when
+the file or the decode code changes), drops the junk sessions and says why,
+trains the five held-out folds and the final model at once, grades the
+model the car runs on the same folds, and registers the new one as a
+candidate with that table in its note. It never deploys. A run with nothing
+new takes about 16 s, against about 5 min for the commands below by hand.
+`tools/retrain.py`'s docstring has the details.
+
+By hand, in `~/crawler-train` (see the README):
 
 ```sh
 python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/crawler-record-*.mcap

@@ -466,15 +466,17 @@ def _rear_off_pair(cmd):
     return not _is_split(cmd) and abs(cmd.rear - rear) > 0.02
 
 
-def _connected_at(connected, t_ns):
+def _connected_at(connected, t_ns, times=None):
     """The pad's state at t, from the newest /controller sample before it.
+    `times` is [c[0] for c in connected], made once by a caller asking for
+    every tick.
 
     No sample at all reads as connected: a legacy file with the channel
     missing should not lose every tick to a field it never had.
     """
     if not connected:
         return True
-    i = bisect.bisect_right([c[0] for c in connected], t_ns) - 1
+    i = bisect.bisect_right(times or [c[0] for c in connected], t_ns) - 1
     return connected[i][1] if i >= 0 else connected[0][1]
 
 
@@ -601,6 +603,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     errors = []
     ticks = []
     frame_times = [f.t_ns for f in session.frames]
+    connected_times = [c[0] for c in session.connected]
     seq_index = {f.seq: i for i, f in enumerate(session.frames)} if session.by_seq else {}
 
     commands = session.commands if session.by_seq else sample_ticks(session.commands)
@@ -650,7 +653,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         if age > max_age_ms:
             drops["stale"] += 1
             continue
-        if not _connected_at(session.connected, cmd.t_ns):
+        if not _connected_at(session.connected, cmd.t_ns, connected_times):
             drops["pad"] += 1
             continue
         if not all(math.isfinite(v) for v in (cmd.throttle, cmd.front, cmd.rear)):
@@ -1047,6 +1050,9 @@ def main(argv=None):
                     help="comma list of recorded modes to label from "
                          "(default: auto for legacy files, record for new ones)")
     ap.add_argument("--max-age-ms", type=float, default=None)
+    ap.add_argument("--uncompressed", action="store_true",
+                    help="write the .npz without zlib: about twice the disk, and "
+                         "written in a second instead of fifteen (tools/retrain.py's cache)")
     ap.add_argument("--include-other-caps", action="store_true",
                     help="keep sessions recorded at speed caps other than the "
                          "runtime's (%+.3f/%+.3f)" % pa.RUNTIME_CAPS)
@@ -1214,7 +1220,8 @@ def main(argv=None):
         "alignment_ms_histogram": {"edges": hist_edges[:-1], "counts": hist},
         "report": report,
     }
-    np.savez_compressed(args.out, meta=json.dumps(meta), **arrays)
+    (np.savez if args.uncompressed else np.savez_compressed)(
+        args.out, meta=json.dumps(meta), **arrays)
     counts = Counter(pl.ACTIONS[a] for a in arrays["action"][arrays["decision"]])
     src = arrays["source"]
     labelled = arrays["steer_label"] | arrays["throttle_label"]
