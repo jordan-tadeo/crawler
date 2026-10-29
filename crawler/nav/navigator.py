@@ -3,7 +3,13 @@
 Two ways to have a goal:
 
   goto   a spot, clicked in Foxglove (click.py) or handed over by anything
-         else. Arrives within ARRIVE_M and stops.
+         else. Arrives within ARRIVE_M and stops, and holds there. A spot it
+         cannot stand on or get to (inside a wall, in unknown, shut off) is
+         the reachable point nearest it instead, by path cost among the
+         nearest few, AIM_CLEAR_M clear of anything (_aim); held there as
+         "closest". While driving to one the closest point is looked for
+         again every CLOSEST_REFRESH_S, and on getting there once more, as
+         the map has grown: a better one by CLOSEST_GAIN_M goes on.
   rove   no spot: the best frontier (frontier.py), then the next, for as long
          as auto runs. When the map has no reachable frontier left it patrols
          the place it has been least.
@@ -15,7 +21,10 @@ Every decision (tick), in order:
      which only holds the last few seconds of scans and so cannot have been
      smeared by a pose that has drifted. A goal past the local window is
      steered for: the reachable point in the window nearest it. Nothing else
-     changes between the two, so indoors and out are one mode.
+     changes between the two, so indoors and out are one mode. No view at
+     all (the SLAM lost, or not started) is a stop with the path dropped:
+     a path from before cannot be trusted against a pose after, so the
+     goal is planned afresh once there is a view again.
   2. The cost map, rebuilt when the map changed (its version) or the truck
      has moved off the window it was built for.
   3. Arrived? Then stop.
@@ -29,9 +38,12 @@ Every decision (tick), in order:
      between tries it waits WAIT_S, which is what a person standing in a
      doorway needs. A goal the truck makes no progress toward for
      PROGRESS_S while driving is a wait first (WAIT_S stopped, then a fresh
-     plan), and after that asks for the back-out (`recover`), which is the
-     driver's own -- the same one STUCK runs -- and after MAX_RECOVERS of
-     those with no progress between them it is given up.
+     plan), and after that a fresh plan again from where it stands, and
+     after MAX_RECOVERS of those with no progress between them it is given
+     up. There is no back-out: the map is the way out, and what the
+     forward floor or a STUCK stopped the truck on goes into the cost map
+     (blocked_ahead) for the next plan to go round. Params.backout puts the
+     old reverse at lock back, for the simulator to compare against.
   6. Follow: the follower's command for this pose. A cusp, where the path
      changes direction, is CUSP_STOP_DECISIONS of standing still first.
   7. Look ahead: the command is run forward FORECAST_S at the speed the
@@ -74,10 +86,12 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 
+from crawler.autopilot import driver as dv
 from crawler.nav import costmap as cmod
 from crawler.nav import follower as fl
 from crawler.nav import frontier as fr
 from crawler.nav import planner as pl
+from crawler.nav import truck as tk
 
 IDLE = "idle"
 GOTO = "goto"
@@ -94,6 +108,13 @@ ST_NO_MAP = "no map"
 ST_RECOVER = "recover"
 ST_CUSP = "cusp"
 ST_WAIT = "wait"
+# Point navigation's two more: holding at the reachable point nearest a goal
+# that cannot be reached itself, and my hand on the pad (driver.NavDriver).
+ST_CLOSEST = "closest"
+ST_HAND = "takeover"
+# What a stopped goto holds at until the next goal: it never moves on its own
+# from any of these.
+HELD = (ST_ARRIVED, ST_CLOSEST, ST_FAILED)
 
 CONFIDENCE_MIN = 0.35
 ARRIVE_M = 0.25
@@ -106,11 +127,31 @@ PROGRESS_S = 6.0
 PROGRESS_M = 0.15
 MAX_RECOVERS = 3
 CUSP_STOP_DECISIONS = 3
-GOAL_SNAP_M = 0.6
 COSTMAP_MAX_AGE_S = 1.0
 WAIT_S = 2.0
 BLACKLIST_S = 60.0
 SWITCH_BONUS_M = 1.0
+# A goal the truck cannot stand on or get to is driven to the reachable point
+# nearest it (_aim). While it drives there that point is looked for again
+# every CLOSEST_REFRESH_S, because the map grows as it goes, and a new one is
+# only taken if it is CLOSEST_SWITCH_M nearer the goal. At the point, one more
+# search: a point CLOSEST_GAIN_M nearer the goal than the truck already is is
+# driven to; anything less and it holds there, "closest".
+CLOSEST_REFRESH_S = 2.0
+CLOSEST_SWITCH_M = 0.1
+CLOSEST_GAIN_M = 0.3
+# How clear of anything a goto's point has to be (_aim). The forward floor
+# holds a forward FORWARD_FLOOR_MM (363 mm) off the bumper, which is FRONT_M
+# ahead of the pose, so head on to a wall the pose stops about 0.63 m off it,
+# and a point nearer the wall than ARRIVE_M inside that could never be
+# arrived at that way; 7 cm more for the brake and the pose's noise. 0.45 m.
+AIM_CLEAR_M = tk.FRONT_M + dv.FORWARD_FLOOR_MM / 1000.0 - ARRIVE_M + 0.07
+# A forward the camera's floor held off for driver.STANDOFF_S is something
+# the lidar map does not have (a shoe under the lidar's plane): a disc of
+# BLOCK_R_M is put there in the cost map for BLOCK_S and the path planned
+# round it. Never a back-out (Params.backout).
+BLOCK_R_M = 0.12
+BLOCK_S = 20.0
 # The wall-clock budget for one search on the car's planning thread. The
 # truck stands still while it has no path, so a long budget costs time and
 # nothing else; the hard searches (a three-point turn out of a hallway) are
@@ -149,6 +190,10 @@ class Params(NamedTuple):
     plan_budget_s: Optional[float] = PLAN_BUDGET_S
     forecast_s: float = FORECAST_S
     delay_s: float = fl.DELAY_S
+    # No progress asks for the driver's back-out (Output.recover) when True.
+    # False, the default: it plans again from where it is instead, because
+    # the escape is a path on the map and never a hand-written manoeuvre.
+    backout: bool = False
 
 
 class Output(NamedTuple):
@@ -171,13 +216,19 @@ STOP = Output(0, 0.0, 0.0)
 
 class PlanResult(NamedTuple):
     """What one search came back with. `target` is what the path is to
-    (None: nothing to go to); `fail` is why there is no path, or ""."""
+    (None: nothing to go to); `fail` is why there is no path, or "".
+    For a goto, `aim` is the point the path ends at and `closest` whether
+    that is the reachable point nearest a goal the truck cannot get to;
+    `start` is the pose the search was from."""
     why: str
     target: Optional[tuple]
     path: Optional[pl.Path]
     fail: str = ""
     note: str = ""
     explored: bool = False
+    aim: Optional[tuple] = None
+    closest: bool = False
+    start: Optional[tuple] = None
 
 
 class InlinePlanner:
@@ -315,6 +366,11 @@ class Navigator:
         self.last_plan_ms = 0.0
         self.local = False
         self.events = []            # (time, what) for the simulator's log
+        self.aim = None             # the point a goto's path ends at
+        self.closest = False        # the aim is the nearest to a goal it cannot reach
+        self._confirm = False       # at a closest aim: one more search first
+        self.blocks = []            # (x, y, until): the floor's holds, see BLOCK_S
+        self.reason = ""            # the last Output's reason
 
     # ---- the goal -------------------------------------------------------
 
@@ -323,6 +379,47 @@ class Navigator:
         self.goal = (float(x), float(y), None if yaw is None else float(yaw))
         self._new_target(self.goal)
         self.status = ST_PLANNING
+
+    @property
+    def holding(self):
+        """A goto that has stopped for good: arrived, at the closest point,
+        or given up. It stays stopped until set_goal() or stop()."""
+        return self.mode == IDLE and self.status in HELD
+
+    def hand(self, now):
+        """My hand is on the pad. Whatever path there was is not where the
+        truck will be when I let go, so it is dropped, and the progress clock
+        stops; the next tick without the hand plans from where I left it. A
+        held goto stays held."""
+        if self.mode == IDLE:
+            return
+        self._drop_path()
+        self._progress_at = None
+        self._wait_until = -math.inf
+        self._cusp_wait = 0
+        self._last_dir = 0
+        self.status = ST_HAND
+        self.reason = "takeover"
+
+    def blocked_ahead(self, now, pose, ahead_m):
+        """The floor has held a forward: something `ahead_m` past the pose's
+        front bumper that the map may not have. Planned round for BLOCK_S."""
+        x, y, yaw = (float(v) for v in pose[:3])
+        d = float(ahead_m) + BLOCK_R_M
+        self.blocks = [b for b in self.blocks if b[2] > now]
+        self.blocks.append((x + d * math.cos(yaw), y + d * math.sin(yaw),
+                            now + BLOCK_S))
+        self.events.append((now, "floor block"))
+        self._cm_key = None             # the cost map is rebuilt with it
+        self._drop_path()
+        self._planned_at = -math.inf
+
+    def _drop_path(self):
+        """No path, and any search in flight thrown away when it lands."""
+        self._gen += 1
+        self.path = None
+        self.follower.set_path(None)
+        self._confirm = False
 
     def rove(self):
         self.mode = ROVE
@@ -349,6 +446,9 @@ class Navigator:
         self._progress_at = None
         self._progress_best = math.inf
         self._cusp_wait = 0
+        self.aim = None
+        self.closest = False
+        self._confirm = False
 
     def recovered(self, now):
         """The driver's back-out has handed the wheels back. Plan afresh
@@ -366,8 +466,9 @@ class Navigator:
         """One decision. `speed_m_s` is the truck's ground speed if the
         caller knows it; None estimates it off the poses."""
         if self.mode == IDLE:
-            self.status = ST_IDLE
-            return STOP
+            if self.status not in HELD:
+                self.status = ST_IDLE
+            return self._stop("holding" if self.status in HELD else "no goal")
         pose = None
         use = view
         self.local = False
@@ -380,7 +481,13 @@ class Navigator:
                 use = local_map.view(pose, 0.0 if view is None else view.confidence)
                 self.local = True
         if use is None:
+            # No pose to trust: stop, and the path goes with it. It was
+            # planned from a pose that is now in doubt, and the truck is
+            # never driven on it again; once there is a pose, a fresh plan.
             self.status = ST_NO_MAP
+            self._drop_path()
+            self._progress_at = None
+            self._last_pose = None
             return self._stop("no map")
         pose = use.pose
         self._visit(pose)
@@ -393,7 +500,17 @@ class Navigator:
             self.status = ST_ARRIVED
             self.events.append((now, "arrived"))
             self.mode = IDLE
+            self._drop_path()
             return self._stop("arrived")
+        if (self.mode == GOTO and self.closest and self.aim is not None
+                and not self._confirm
+                and math.hypot(self.aim[0] - pose[0],
+                               self.aim[1] - pose[1]) <= self.p.arrive):
+            # At the closest point. The map has grown on the way; one more
+            # search says whether there is anywhere nearer now.
+            self._drop_path()
+            self._confirm = True
+            self._planned_at = -math.inf
 
         self._costmap(now, use)
         cm = self.cm
@@ -403,6 +520,8 @@ class Navigator:
             out = self._apply(now, cm, *done)
             if out is not None:
                 return out
+            if self.holding:
+                return self._stop(self.reason)
 
         if now < self._wait_until:
             self.status = ST_WAIT
@@ -425,6 +544,8 @@ class Navigator:
                 out = self._apply(now, cm, *done)
                 if out is not None:
                     return out
+                if self.holding:
+                    return self._stop(self.reason)
         if self.path is None:
             if self.status not in (ST_EXPLORED,):
                 self.status = ST_PLANNING
@@ -451,8 +572,14 @@ class Navigator:
                 self.status = ST_PLANNING
                 return self._stop("frontier reached")
             # goto: the path ends inside goal_tol but not inside arrive; plan
-            # the last bit again.
+            # the last bit again. At a closest point that search is the
+            # confirming one.
             self._planned_at = -math.inf
+            if self.closest and self.aim is not None and math.hypot(
+                    self.aim[0] - pose[0], self.aim[1] - pose[1]) <= 2 * self.p.arrive:
+                # The end of a path to the closest point, near it: as far as
+                # the follower goes (a head-on stop can end it short).
+                self._confirm = True
             return self._stop("path end")
         if cmd.cusp:
             self._cusp_wait = CUSP_STOP_DECISIONS - 1
@@ -473,6 +600,7 @@ class Navigator:
             return self._stop("command would hit")
         self._last_dir = cmd.direction
         self.status = ST_DRIVING
+        self.reason = "follow"
         return Output(cmd.direction, cmd.speed, cmd.curvature, False,
                       ST_DRIVING, "follow", self.local, self.target)
 
@@ -480,6 +608,7 @@ class Navigator:
 
     def _stop(self, reason):
         self._last_dir = 0
+        self.reason = reason
         return Output(0, 0.0, 0.0, False, self.status, reason, self.local,
                       self.target)
 
@@ -501,12 +630,20 @@ class Navigator:
         self._progress_at = now
         if self.recovers > self.p.max_recovers:
             return self._give_up(now, "no progress")
+        if not self.p.backout:
+            # A fresh plan from where it is, greedier, which finds a
+            # different way sooner: the map is the way out.
+            self._planned_at = -math.inf
+            self.status = ST_PLANNING
+            return self._stop("no progress: plan again")
         self.status = ST_RECOVER
+        self.reason = "no progress"
         return Output(0, 0.0, 0.0, True, ST_RECOVER, "no progress",
                       self.local, self.target)
 
     def _give_up(self, now, why):
         self.events.append((now, f"gave up: {why}"))
+        self._drop_path()
         if self.mode == ROVE:
             if self.target is not None:
                 self.blacklist.append((self.target[0], self.target[1], now))
@@ -518,7 +655,8 @@ class Navigator:
         return self._stop(f"gave up: {why}")
 
     def _costmap(self, now, view):
-        key = (view.version, view.local)
+        self.blocks = [b for b in self.blocks if b[2] > now]
+        key = (view.version, view.local, len(self.blocks))
         moved = (self._cm_pose is None
                  or math.hypot(view.pose[0] - self._cm_pose[0],
                                view.pose[1] - self._cm_pose[1]) > 1.0)
@@ -531,10 +669,15 @@ class Navigator:
             if self.mode == GOTO and self.goal is not None:
                 pts.append(self.goal[:2])
             crop = _union(cmod.window(view, pts), _known_box(view))
+        if self.blocks:
+            view = view._replace(layers=tuple(view.layers) + (
+                _discs(view, [b[:2] for b in self.blocks], BLOCK_R_M),))
         self.cm = cmod.build(view, margin=self.p.margin, crop=crop)
         self._cm_key, self._cm_at, self._cm_pose = key, now, view.pose
 
     def _needs_plan(self, now, cm, pose):
+        if self._confirm and self.path is None:
+            return "confirm"
         if self.target is None or self.path is None:
             return "new"
         clear = pl.path_clearance(cm, self.path, self.follower.index,
@@ -542,6 +685,9 @@ class Navigator:
         if clear < cm.margin * 0.5:
             return "blocked"
         if self.mode == ROVE and now - self._planned_at >= ROVE_REPLAN_S:
+            return "refresh"
+        if (self.mode == GOTO and self.closest
+                and now - self._planned_at >= CLOSEST_REFRESH_S):
             return "refresh"
         return ""
 
@@ -557,6 +703,11 @@ class Navigator:
         budget = self.p.plan_budget_s
         local = self.local
         params = self.p.planner
+        # A confirm asks whether anywhere is nearer than where the truck is
+        # now, which is the closest point it was driving to, give or take
+        # the arrival tolerance and the pose's noise.
+        here = self.aim if why == "confirm" else None
+        keep = self.aim if self.closest else None
         if self.p.adaptive_gain:
             # A surface that gives back less of the steering gets a wider plan:
             # the plan radius is the measured one over the learned gain.
@@ -568,11 +719,12 @@ class Navigator:
         def job():
             deadline = None if budget is None else time.perf_counter() + budget
             return self._search(cm, pose, why, mode, target, goal, blacklist,
-                                last_dir, visits, deadline, local, params)
+                                last_dir, visits, deadline, local, params, here,
+                                keep)
         self.planner.submit(now, job)
 
     def _search(self, cm, pose, why, mode, target, goal, blacklist, last_dir,
-                visits, deadline, local, params):
+                visits, deadline, local, params, here=None, keep=None):
         """The planning job: a target (rove), the goal snapped (goto), the
         plan. Reads only its arguments and the navigator's constants."""
         note, explored = "", False
@@ -598,18 +750,36 @@ class Navigator:
                 return PlanResult(why, None, None, fail="nothing to explore",
                                   explored=True)
             aim = target
-        else:
-            aim = self._reachable_goal(cm, pose, goal, local)
-            if aim is None:
-                return PlanResult(why, target, None, fail="goal blocked")
+        closest = False
+        start = tuple(float(v) for v in pose[:3])
+        if mode != ROVE:
+            found = self._aim(cm, pose, goal, local, keep)
+            if found is None:
+                return PlanResult(why, target, None, fail="goal blocked",
+                                  start=start)
+            aim, closest = found
+            now_off = math.hypot(goal[0] - pose[0], goal[1] - pose[1])
+            if here is not None:
+                now_off = min(now_off, math.hypot(goal[0] - here[0],
+                                                  goal[1] - here[1]))
+            if closest and why == "confirm" and (
+                    now_off - math.hypot(goal[0] - aim[0], goal[1] - aim[1])
+                    < CLOSEST_GAIN_M):
+                # Nowhere reachable is worth the drive: this is the closest.
+                return PlanResult(why, target, None, aim=aim, closest=True,
+                                  start=start)
         path = pl.plan(cm, pose, aim[:2], params=params,
                        start_dir=last_dir, deadline=deadline)
         if path is None:
             over = deadline is not None and time.perf_counter() > deadline
             return PlanResult(why, target, None,
                               fail="over budget" if over else "no path",
-                              note=note, explored=explored)
-        return PlanResult(why, target, path, note=note, explored=explored)
+                              note=note, explored=explored,
+                              aim=aim if mode != ROVE else None,
+                              closest=closest, start=start)
+        return PlanResult(why, target, path, note=note, explored=explored,
+                          aim=aim if mode != ROVE else None, closest=closest,
+                          start=start)
 
     def _apply(self, now, cm, res, ms):
         """A search has come back: use it, unless it is stale."""
@@ -627,6 +797,18 @@ class Navigator:
                 self.events.append((now, res.note))
             if res.explored:
                 self.status = ST_EXPLORED
+        if self.mode == GOTO and res.why == "confirm":
+            self._confirm = False
+            if res.path is None and (res.closest or res.fail):
+                # At the closest point, and nowhere nearer to go to (or no
+                # way to get there from here): hold.
+                return self._hold_closest(now, res)
+        if (self.mode == GOTO and res.why == "refresh" and self.path is not None
+                and res.closest and self.aim is not None
+                and math.hypot(self.goal[0] - res.aim[0], self.goal[1] - res.aim[1])
+                > math.hypot(self.goal[0] - self.aim[0], self.goal[1] - self.aim[1])
+                - CLOSEST_SWITCH_M):
+            return None         # no nearer than the point it is going to
         if res.fail:
             if res.fail == "nothing to explore":
                 self.path = None
@@ -643,9 +825,24 @@ class Navigator:
         self.plan_fails = 0
         self.path = path
         self.follower.set_path(path)
+        if self.mode == GOTO:
+            if res.closest and not self.closest:
+                self.events.append((now, "goal unreachable: closest "
+                                         f"({res.aim[0]:.2f}, {res.aim[1]:.2f})"))
+            self.aim, self.closest = res.aim, bool(res.closest)
         self.events.append((now, f"plan {res.why} {path.length:.1f} m "
                                  f"{path.reverses} rev {ms:.0f} ms"))
         return None
+
+    def _hold_closest(self, now, res):
+        self.mode = IDLE
+        self.status = ST_CLOSEST
+        # The point it drove to and is at, not the search's: that is no
+        # nearer, and can be as near the other side of the wall.
+        self.aim = self.aim if self.aim is not None else res.aim
+        self.events.append((now, "closest"))
+        self._drop_path()
+        return self._stop("closest reachable")
 
     def _fail_plan(self, now, why):
         self.plan_fails += 1
@@ -683,39 +880,69 @@ class Navigator:
         here = float(cm.footprint_clearance(x, y, th))
         return ahead < min(FORECAST_CLEAR_M, here - 0.01)
 
-    def _reachable_goal(self, cm, pose, goal, local=False):
-        """The goal, or the nearest point to it the truck can stand on. On
-        the local map, a goal past the window is the reachable point in it
-        nearest the goal."""
-        gx, gy = goal[0], goal[1]
-        ix, iy = cm.world_to_cell(gx, gy)
-        inside = bool(cm.inside(ix, iy))
+    def _aim(self, cm, pose, goal, local=False, keep=None):
+        """(point, closest) for a goto: the goal itself when the truck can
+        stand on it and get to it from here; otherwise the reachable point
+        nearest the goal (closest True), and of those within a cell of the
+        nearest, the one the shortest drive away. None when nothing at all
+        is reachable.
+
+        Reachable is over known floor (planner.grid_distances, known_only):
+        a goal inside a wall, in the unknown or in a room with no way into it
+        is aimed at the nearest known floor the truck can drive to. On the
+        local map, which is only the last few seconds of scans, unknown
+        counts as passable, as it always has there.
+
+        A goal the footprint fits on is the goal however near a wall. A
+        point instead of the goal is one AIM_CLEAR_M clear of anything where
+        there is one (the footprint's clearance where there is not): facing
+        a wall the forward floor stops the truck with its pose about 0.63 m
+        off it, and a point nearer the wall than that could not be arrived
+        at head on. `keep`, the point a closest goto is
+        already going to, stays the point while it can still be stood on and
+        reached and is within CLOSEST_SWITCH_M of the nearest."""
+        gx, gy = float(goal[0]), float(goal[1])
         need = cm.inscribed + 0.02
-        if inside and cm.dist[ix, iy] >= need:
-            return (gx, gy)
-        if inside:
-            r = int(math.ceil(GOAL_SNAP_M / cm.res))
-            x0, x1 = max(ix - r, 0), min(ix + r + 1, cm.shape[0])
-            y0, y1 = max(iy - r, 0), min(iy + r + 1, cm.shape[1])
-            win = cm.dist[x0:x1, y0:y1] >= need
-            ii, jj = np.nonzero(win)
-            if len(ii):
-                d2 = (ii + x0 - ix) ** 2 + (jj + y0 - iy) ** 2
-                k = int(np.argmin(d2))
-                if d2[k] <= r * r:
-                    return tuple(float(v) for v in cm.cell_to_world(ii[k] + x0, jj[k] + y0))
-            if not local:
-                return None
-        # Outside the window (or blocked inside a local one): head for it.
-        reach = pl.grid_distances(cm, [pose[:2]], known_only=False)
-        ok = np.isfinite(reach.dist)
-        if not ok.any():
+        clear = max(need, AIM_CLEAR_M)
+        reach = pl.grid_distances(cm, [pose[:2]], known_only=not local,
+                                  clearance=need)
+        # The coarse distances onto the cost map's own cells.
+        k = max(1, int(round(reach.res / cm.res)))
+        nx, ny = cm.shape
+        cost = np.repeat(np.repeat(reach.dist, k, 0), k, 1)[:nx, :ny]
+        stand = np.isfinite(cost) & (cm.dist >= need)
+        if not local:
+            stand &= cm.known
+        if not stand.any():
             return None
+        ix, iy = (int(v) for v in cm.world_to_cell(gx, gy))
+        if cm.inside(ix, iy) and stand[ix, iy]:
+            # A goal it can stand on and get to is the goal, however near a
+            # wall: ARRIVE_M round it is what it has to get inside.
+            return (gx, gy), False
+        ok = stand & (cm.dist >= clear)
+        if not ok.any():
+            ok = stand
         ii, jj = np.nonzero(ok)
-        wx = reach.origin[0] + (ii + 0.5) * reach.res
-        wy = reach.origin[1] + (jj + 0.5) * reach.res
-        k = int(np.argmin(np.hypot(wx - gx, wy - gy)))
-        return float(wx[k]), float(wy[k])
+        wx = cm.origin[0] + (ii + 0.5) * cm.res
+        wy = cm.origin[1] + (jj + 0.5) * cm.res
+        d = np.hypot(wx - gx, wy - gy)
+        if keep is not None:
+            # The point it is already going to, while it can still stand
+            # there and get there (not held to AIM_CLEAR_M again, which a
+            # cell of new scan can tip): a fresh plan from a pose further on
+            # is no reason to swap it for one as near the other side of a
+            # wall.
+            kx, ky = (int(v) for v in cm.world_to_cell(keep[0], keep[1]))
+            if (cm.inside(kx, ky) and stand[kx, ky]
+                    and math.hypot(keep[0] - gx, keep[1] - gy)
+                    <= float(d.min()) + CLOSEST_SWITCH_M):
+                return (float(keep[0]), float(keep[1])), True
+        # Nearest the goal; between points as near as each other to half a
+        # cell (either side of a pillar), the one that is the shorter drive.
+        near = d <= float(d.min()) + 0.5 * cm.res
+        m = int(np.argmin(np.where(near, cost[ii, jj], np.inf)))
+        return (float(wx[m]), float(wy[m])), True
 
     def _visit(self, pose):
         k = (int(math.floor(pose[0] / VISIT_CELL_M)),
@@ -737,6 +964,21 @@ class Navigator:
         low = np.nonzero(visits == visits.min())[0]
         k = int(self._rng.choice(low))
         return float(wx[k]), float(wy[k])
+
+
+def _discs(view, points, r_m):
+    """bool [view.shape]: discs of r_m round map points, for MapView.layers."""
+    out = np.zeros(view.shape, bool)
+    n = int(math.ceil(r_m / view.res))
+    for x, y in points:
+        ix, iy = (int(v) for v in view.world_to_cell(x, y))
+        i0, i1 = max(ix - n, 0), min(ix + n + 1, out.shape[0])
+        j0, j1 = max(iy - n, 0), min(iy + n + 1, out.shape[1])
+        if i1 <= i0 or j1 <= j0:
+            continue
+        gi, gj = np.mgrid[i0:i1, j0:j1]
+        out[i0:i1, j0:j1] |= (gi - ix) ** 2 + (gj - iy) ** 2 <= n * n
+    return out
 
 
 def _known_box(view, pad_m=1.0):

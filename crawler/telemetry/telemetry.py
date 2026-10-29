@@ -138,6 +138,10 @@ INTERVALS = {
     # change slowly.
     "voxel_points": 2.0,
     "voxel_low": 2.0,
+    # With --nav (nav/pointnav.py): the status twice a second, the path the
+    # navigator is following once a second.
+    "nav_status": 0.5,
+    "nav_path": 1.0,
 }
 
 # What the map channels (/map, /slam/path, /voxel/points, /voxel/low) may
@@ -530,6 +534,20 @@ JSON_SCHEMAS = {
         # mapper was behind, and steps that raised.
         "scans": _INT, "dropped": _INT, "errors": _INT,
     }),
+    # Point navigation, with --nav: nav/pointnav.PointNavDriver.nav_status().
+    # state is idle / planning / driving / arrived / closest / paused /
+    # failed, reason why (a pause says the SLAM's why), driving who has the
+    # wheels (nav, policy or rules). The goal and the aim (the point the
+    # path ends at: the reachable one nearest a goal that cannot be reached
+    # when closest) in the map frame; distance_m from the truck to the goal
+    # and path_m of path left, -1 for none.
+    "nav_status": _schema("crawler.NavStatus", {
+        "state": _STR, "reason": _STR, "status": _STR, "driving": _STR,
+        "has_goal": _BOOL, "goal_x": _NUM, "goal_y": _NUM,
+        "has_aim": _BOOL, "aim_x": _NUM, "aim_y": _NUM, "closest": _BOOL,
+        "distance_m": _NUM, "path_m": _NUM, "local_map": _BOOL,
+        "plans": _INT, "plan_ms": _NUM, "goals": _INT, "dropped": _INT,
+    }),
 }
 
 # The image channels, which do get a well-known schema: foxglove.CompressedImage,
@@ -577,6 +595,7 @@ JSON_TOPICS = {
     "footprint": "/footprint",
     "lidar": "/lidar",
     "slam_status": "/slam/status",
+    "nav_status": "/nav/status",
 }
 
 # Raw depth: the uint16 millimetres exactly as the driver scans them, as a
@@ -631,9 +650,16 @@ VOXEL_CHANNELS = {
     "voxel_low": "/voxel/low",
 }
 
+# The navigator's path, goal and aim with --nav, as a SceneUpdate in "map":
+# nav_view.py, built on the publisher thread off pointnav.PointNavDriver.nav_path().
+NAV_CHANNELS = {
+    "nav_path": "/nav/path",
+}
+
 ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
             + tuple(RAW_DEPTH_CHANNELS) + tuple(LIDAR_VIEW_CHANNELS)
-            + tuple(SLAM_CHANNELS) + tuple(VOXEL_CHANNELS))
+            + tuple(SLAM_CHANNELS) + tuple(VOXEL_CHANNELS)
+            + tuple(NAV_CHANNELS))
 
 # Everything the camera produces, which is what stops being written while
 # there is no pad: a file of nothing but pictures and IMU has no driving in it
@@ -793,6 +819,9 @@ class Telemetry:
                           "slam_path": SceneUpdateChannel}
             for key, topic in SLAM_CHANNELS.items():
                 self._channels[key] = slam_kinds[key](topic=topic)
+
+            for key, topic in NAV_CHANNELS.items():
+                self._channels[key] = SceneUpdateChannel(topic=topic)
 
             from foxglove.channels import PointCloudChannel
             voxel_kinds = {"voxel_points": PointCloudChannel,
@@ -1115,7 +1144,7 @@ class Telemetry:
             return
 
         if (key in LIDAR_VIEW_CHANNELS or key in SLAM_CHANNELS
-                or key in VOXEL_CHANNELS):
+                or key in VOXEL_CHANNELS or key in NAV_CHANNELS):
             message = self.lidar_view_message(key, payload, log_time)
             if message is not None:
                 channel.log(message, log_time=log_time)
@@ -1177,6 +1206,9 @@ class Telemetry:
         if key == "voxel_points":
             from crawler.telemetry import voxel_view
             return voxel_view.points_message(payload, log_time)
+        if key == "nav_path":
+            from crawler.telemetry import nav_view
+            return nav_view.path_scene(payload, log_time)
         if key == "voxel_low":
             from crawler.telemetry import voxel_view
             return voxel_view.low_message(payload, log_time)

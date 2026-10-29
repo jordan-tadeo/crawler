@@ -110,6 +110,9 @@ AUTO_VIEW = "auto"
 
 LOOP_INTERVAL = 0.01
 AUTO_TICK_INTERVAL = 0.1
+# The interpreter's GIL switch interval with --nav (see main()): CPython's
+# default is 5 ms.
+NAV_SWITCH_INTERVAL_S = 0.001
 STEERING_LIMIT_PERC = 70
 
 # The steering sticks' deadzone, in raw axis units, before STEERING_LIMIT_PERC.
@@ -904,13 +907,29 @@ class AutoPilot:
         that will not open -- never a quiet fall back to the autopilot. I asked
         for the model, and a car that drives on something else without saying
         so is a test I cannot read.
+
+        With --nav, that driver drives until a goal is clicked, and the
+        navigator from then on (nav/pointnav.py), on the same command.
         """
         if self.nav:
             # Raises with no map source, which resume() logs as auto
-            # unavailable: --nav never falls back to the rules quietly.
+            # unavailable: --nav never falls back to driving without a map
+            # quietly. Built first, so a missing map costs no model load.
             from crawler.nav.driver import NavDriver
-            return NavDriver(self.command, view, self.map_source,
-                             lidar=self.lidar, goals=self.goals)
+            from crawler.nav.pointnav import PointNavDriver
+            nav = NavDriver(self.command, view, self.map_source, lidar=self.lidar)
+            try:
+                free = self._build_free(view)
+            except Exception:
+                nav.close()
+                raise
+            self.logger.log("info", "Mode", "Auto drives to a goal clicked in "
+                            "Foxglove, and as before until there is one")
+            return PointNavDriver(free, nav, self.goals)
+        return self._build_free(view)
+
+    def _build_free(self, view):
+        """The auto driver without the navigator: the rules, or the policy."""
         if self.policy_path is None:
             from crawler.autopilot.driver import Driver
             return Driver(self.command, view, lidar=self.lidar)
@@ -1487,6 +1506,17 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     "readback_age_s": readback_age,
                 }, now)
 
+            # The goto: what it is doing and why, and the path it is on.
+            # Only a --nav driver has them; built from what the navigator
+            # already holds, nothing planned for them.
+            nav_driver = getattr(autopilot, "driver", None)
+            if (getattr(nav_driver, "nav_status", None) is not None
+                    and tele.wants("nav_status", now)):
+                tele.offer("nav_status", nav_driver.nav_status(), now)
+            if (getattr(nav_driver, "nav_path", None) is not None
+                    and tele.wants("nav_path", now)):
+                tele.offer("nav_path", nav_driver.nav_path(), now)
+
             if tele.wants("diagnostics", now):
                 elapsed = now - window_started
                 tele.offer("diagnostics", {
@@ -1769,19 +1799,20 @@ def parse_args(argv=None):
              "lidar (needs --slam); shown in Foxglove on /voxel/points and "
              "/voxel/low. Off unless given",
     )
-    # Off unless named. With it, START hands the wheels to the navigator
-    # (crawler/nav/), which drives to the newest goal clicked in Foxglove
-    # (/move_base_simple/goal) on the live SLAM map (nav/live.py) and stands
-    # still with none, or with a pose it does not trust. Needs --slam;
-    # without it --nav is auto unavailable, said in the journal -- never a
-    # truck driving on no map. Every safety layer is under it either way
-    # (nav/driver.py).
+    # Off unless named. Point navigation (nav/pointnav.py): auto drives as it
+    # would without this (the --policy model, else the rules) until a goal is
+    # clicked in Foxglove (/move_base_simple/goal); then the navigator
+    # (crawler/nav/) drives there on the live SLAM map (nav/live.py), or to
+    # the reachable point nearest it, and holds neutral until the next goal.
+    # It pauses neutral on a pose it does not trust. Needs --slam; without
+    # it --nav is auto unavailable, said in the journal -- never a truck
+    # driving on no map. The safety layer is under both (nav/driver.py).
     parser.add_argument(
         "--nav",
         action="store_true",
-        help="drive auto with the map navigator to goals clicked in Foxglove "
-             "instead of the hand-written autopilot (needs --slam; off "
-             "unless given)",
+        help="drive auto to goals clicked in Foxglove on the SLAM map, and "
+             "hold there; until the first goal auto drives as without it "
+             "(needs --slam; off unless given)",
     )
     # Off unless named. The OAK-D's low obstacles (--voxel-map) as extra
     # solid cells in the navigator's map, never clearing a lidar cell. Off
@@ -1947,6 +1978,13 @@ def main(argv=None):
         hub.depth_listeners.append(voxels.on_depth)
         hub.imu_listeners.append(voxels.on_imu)
         log.log("info", "Voxel", "Mapping the OAK-D's depth")
+    if args.nav:
+        # The navigator plans on a thread of this process (ThreadPlanner),
+        # and a search is pure Python for seconds on the Pi, so it holds the
+        # GIL against this 100 Hz loop. Measured on the Pi, a pass woke 22 ms
+        # late at p99 during a plan at the default 5 ms switch interval and
+        # 12 ms at 1 ms, with the plans no slower.
+        sys.setswitchinterval(NAV_SWITCH_INTERVAL_S)
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           fallback_path=args.fallback_policy,
                           lidar=lidar, slam=slam, nav=args.nav,

@@ -83,6 +83,9 @@
         "/slam/path": {
           "visible": true
         },
+        "/nav/path": {
+          "visible": true
+        },
         "/lidar/scan": {
           "visible": true,
           "pointShape": "circle",
@@ -216,6 +219,14 @@
         }
       },
       "foxglovePanelTitle": "Live lidar, front is up (/lidar/scan, 0.5 m grid)"
+    },
+    "RawMessages!nav": {
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "topicPath": "/nav/status",
+      "foxglovePanelTitle": "Goto"
     }
   },
   "layout": {
@@ -234,7 +245,12 @@
     "second": {
       "direction": "row",
       "first": "3D!slam",
-      "second": "3D!lidar",
+      "second": {
+        "direction": "column",
+        "first": "3D!lidar",
+        "second": "RawMessages!nav",
+        "splitPercentage": 70
+      },
       "splitPercentage": 62
     },
     "splitPercentage": 26

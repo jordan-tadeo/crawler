@@ -350,7 +350,13 @@ def test_the_drive_layout_has_the_lidar_from_above_beside_the_map():
     names = panels(layout["layout"])
     assert set(names) == set(layout["configById"])
     right = layout["layout"]["second"]
-    assert (right["first"], right["second"]) == ("3D!slam", "3D!lidar")
+    beside = right["second"]
+    # The lidar may share its column with a small panel under it (the goto
+    # status), but it is the top of it.
+    if isinstance(beside, dict):
+        assert beside["direction"] == "column"
+        beside = beside["first"]
+    assert (right["first"], beside) == ("3D!slam", "3D!lidar")
 
     cfg = layout["configById"]["3D!lidar"]
     assert cfg["followTf"] == "base_link"

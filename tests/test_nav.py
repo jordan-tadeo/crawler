@@ -24,6 +24,7 @@ from crawler.nav import frontier as fr
 from crawler.nav import mapview as mv
 from crawler.nav import navigator as nv
 from crawler.nav import planner as pl
+from crawler.nav import pointnav as pn
 from crawler.nav import truck as tk
 from crawler.telemetry import telemetry as tm
 
@@ -274,41 +275,65 @@ def test_a_path_that_becomes_blocked_is_planned_again_round_the_block():
     assert abs(nav.path.poses[:, 1] - 2.0).max() > 0.5
 
 
-def test_a_goal_with_no_way_to_it_is_given_up_after_a_bounded_number_of_tries():
+def test_a_goal_with_no_way_to_it_is_driven_to_the_closest_point_and_held():
+    # A wall right across at x = 3 m; the goal is behind it.
     occ = walled(120, 100)
     occ[59:61, :] = True
-    nav = nv.Navigator(nv.Params(planner=pl.Params(max_expansions=1500)))
+    nav = nv.Navigator(nv.Params(planner=pl.Params(max_expansions=4000)))
     nav.set_goal(5.0, 1.0)
     for i in range(20):
         out = nav.tick(T0 + i, view_of(occ, (1.0, 1.0, 0.0), version=1))
-        assert out.direction == 0
-        if nav.status == nv.ST_FAILED:
+        if nav.path is not None:
             break
-    assert nav.status == nv.ST_FAILED
+    assert nav.closest and nav.status == nv.ST_DRIVING
+    assert out.direction == 1
+    # On this side of the wall, AIM_CLEAR_M off it (the cost map's distances
+    # are to the wall cell's centre, 2.975 m), level with the goal.
+    ax, ay = nav.aim
+    assert 2.975 - nv.AIM_CLEAR_M - 0.06 <= ax <= 2.975 - nv.AIM_CLEAR_M + 0.01
+    assert abs(ay - 1.0) < 0.15
+    # Standing there it is held, as the closest, not given up or arrived.
+    for i in range(30):
+        out = nav.tick(T0 + 30 + 0.1 * i,
+                       view_of(occ, (ax, ay, 0.0), version=1))
+    assert nav.status == nv.ST_CLOSEST and nav.holding
+    assert out.direction == 0
     assert nav.mode == nv.IDLE
 
 
-def test_no_progress_is_a_wait_then_the_back_out_then_it_gives_up():
+def test_a_wall_of_unknown_is_driven_to_the_closest_known_point():
+    occ = walled(120, 100)
+    known = np.ones_like(occ)
+    known[70:, :] = False                   # nothing seen past x = 3.5 m
+    nav = nv.Navigator(nv.Params(planner=pl.Params(max_expansions=4000)))
+    nav.set_goal(5.0, 2.0)
+    for i in range(20):
+        nav.tick(T0 + i, view_of(occ, (1.0, 2.0, 0.0), known=known, version=1))
+        if nav.path is not None:
+            break
+    assert nav.closest
+    assert 3.0 <= nav.aim[0] < 3.5 and abs(nav.aim[1] - 2.0) < 0.15
+
+
+def test_no_progress_is_a_wait_then_a_fresh_plan_never_a_back_out():
     occ = walled(160, 80)
     nav = nv.Navigator()
     nav.set_goal(7.0, 2.0)
     pose = (1.0, 2.0, 0.0)
-    recovers = 0
-    first_wait = first_recover = None
+    first_wait = first_again = None
     for i in range(400):            # 40 s of a truck that never moves
         now = T0 + 0.1 * i
         out = nav.tick(now, view_of(occ, pose, version=1))
+        assert not out.recover
         if nav.status == nv.ST_WAIT and first_wait is None:
             first_wait = now
-        if out.recover:
-            recovers += 1
-            first_recover = now if first_recover is None else first_recover
-            nav.recovered(now)
+        if out.reason == "no progress: plan again" and first_again is None:
+            first_again = now
         if nav.status == nv.ST_FAILED:
             break
-    assert first_wait is not None and first_recover is not None
-    assert first_wait < first_recover
-    assert recovers == nv.MAX_RECOVERS
+    assert first_wait is not None and first_again is not None
+    assert first_wait < first_again
+    assert sum(e == "no progress" for _, e in nav.events) == nv.MAX_RECOVERS + 1
     assert nav.status == nv.ST_FAILED
 
 
@@ -683,15 +708,19 @@ def test_the_floor_still_holds_a_navigator_forward():
     assert d.floor_held
 
 
-def test_a_floor_held_that_long_is_the_back_out():
+def test_a_floor_held_that_long_goes_in_the_cost_map_and_is_no_back_out():
     depth = clear_depth()
     depth[:, 300:340] = 150
     d = nav_driver(depth)
     for i in range(int(nd.STANDOFF_S / 0.1) + 2):
         d.tick(T0 + 0.1 * i)
-        if d._phase is not None:
-            break
-    assert d._phase is not None
+        assert d._phase is None
+        assert all(t >= 0 for t in d.controller.throttles)
+    assert len(d.nav.blocks) == 1
+    # Ahead of the truck, past the bumper, where the floor saw it.
+    bx, by = d.nav.blocks[0][:2]
+    assert bx > d.last_pose[0] + tk.FRONT_M
+    assert abs(by - d.last_pose[1]) < 0.05
 
 
 class RearLidar:
@@ -773,5 +802,10 @@ def test_nav_with_a_map_builds_the_nav_driver_on_the_held_command():
     pilot = mn.AutoPilot(FakeController(), Log(), hub=ReadyHub(), nav=True,
                          map_source=FixedMap(view_of(occ)))
     assert pilot.resume() is True
-    assert isinstance(pilot.driver, nd.NavDriver)
-    assert pilot.driver.controller is pilot.command
+    d = pilot.driver
+    assert isinstance(d, pn.PointNavDriver)
+    assert isinstance(d.nav, nd.NavDriver)
+    # Until a goal, the auto driver it would have without --nav.
+    assert type(d.free) is dv.Driver and d.active is d.free
+    assert d.nav.controller is pilot.command
+    assert d.free.controller is pilot.command

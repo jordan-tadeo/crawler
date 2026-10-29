@@ -22,6 +22,7 @@ from crawler.nav import click as ck
 from crawler.nav import driver as nd
 from crawler.nav import live
 from crawler.nav import navigator as nv
+from crawler.nav import pointnav as pn
 
 from conftest import FakeController
 from test_nav import Log, ReadyHub, clear_depth, pose_in_frame, walled
@@ -214,13 +215,19 @@ def test_a_click_on_the_live_map_is_a_plan_and_a_forward_and_a_lost_map_is_neutr
                          map_source=src, goals=goals)
     assert pilot.resume() is True
     d = pilot.driver
-    assert isinstance(d, nd.NavDriver)
+    assert isinstance(d, pn.PointNavDriver)
+    assert isinstance(d.nav, nd.NavDriver)
+    n = d.nav.nav
     d.camera.depth = clear_depth()
     try:
-        # No click yet: it stands still.
+        # A click made before auto started is no goal.
+        goals.on_message_data(advertise(goals), 1, pose_in_frame(3.0, 2.0))
+        # No goal: the auto driver it has without --nav drives.
         d.tick(clk.t)
-        assert d.nav.mode == nv.IDLE
-        assert d.last_request[0] == 0.0
+        assert d.active is d.free and d.driving == "rules"
+        assert d.goals_dropped == 1 and d.goals_received == 0
+        assert n.mode == nv.IDLE
+        assert d.nav_status()["state"] == pn.IDLE
 
         goals.on_message_data(advertise(goals), 1, pose_in_frame(6.5, 2.0))
         moved = None
@@ -232,12 +239,15 @@ def test_a_click_on_the_live_map_is_a_plan_and_a_forward_and_a_lost_map_is_neutr
                 moved = i
                 break
             time.sleep(0.02)
-        assert d.goals_taken == 1
-        assert d.nav.goal[:2] == (6.5, 2.0)
-        assert moved is not None, d.nav.status
-        assert d.nav.path is not None
+        assert d.active is d.nav and d.goals_received == 1
+        assert n.goal[:2] == (6.5, 2.0)
+        assert moved is not None, n.status
+        assert n.path is not None
         assert d.last_output.direction == 1
         assert pilot.command.throttle > 0.0
+        status = d.nav_status()
+        assert status["state"] == pn.DRIVING and status["driving"] == "nav"
+        assert d.nav_path()["path"] and d.nav_path()["goal"] == (6.5, 2.0)
 
         # The mapper loses the room: the next decision is neutral, and it
         # stays there for as long as it is lost.
@@ -247,7 +257,8 @@ def test_a_click_on_the_live_map_is_a_plan_and_a_forward_and_a_lost_map_is_neutr
             d.tick(clk.t)
             assert d.last_request[0] == 0.0
             assert pilot.command.throttle == 0.0
-            assert d.nav.status == nv.ST_NO_MAP
+            assert n.status == nv.ST_NO_MAP and n.path is None
+            assert d.nav_status()["state"] == pn.PAUSED
         # And a tracking pose that just stops coming is the same.
         slam.fresh()
         clk.t += 1.0

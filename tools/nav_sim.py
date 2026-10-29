@@ -46,6 +46,7 @@ import time
 from multiprocessing import Pool
 
 import numpy as np
+from scipy import ndimage
 
 from crawler.autopilot import driver as dv
 from crawler.nav import costmap as cmod
@@ -77,7 +78,22 @@ SETTLE_S = dv.SETTLE_SECONDS
 PI_SLOWDOWN = 3.0
 
 LEVELS = ("ideal", "measured", "harsh", "axle60")
-SCENARIOS = ("goto", "goto_blank", "rove")
+SCENARIOS = ("goto", "goto_blank", "goto_wall", "rove")
+# Scenarios on a house already mapped. goto_wall: the goal is a click inside
+# something solid near the floor (a wall, furniture), and the right answer
+# is the reachable point nearest it.
+MAPPED = ("goto", "goto_wall")
+# A moving decision whose front command is this far from the last moving
+# one's: a jerk of the wheels, half the lock or more in a tenth of a second.
+HARSH_STEER = 0.3
+# The ESC's drag brake stops the truck in about 0.3 s; what moves after this
+# much of a hold is the hold not holding.
+HOLD_SETTLE_S = 0.5
+# A closest hold is right when it ends no more than this further from the
+# goal than the true closest reachable point is: the arrival tolerance, the
+# AIM_CLEAR_M the aim keeps off a wall beyond the footprint's own, and 0.1 m
+# for the measured pose error and a cost-map cell.
+CLOSEST_OK_M = nv.ARRIVE_M + nv.AIM_CLEAR_M - (cmod.INSCRIBED_M + 0.02) + 0.1
 
 
 def _probe_box(length):
@@ -166,28 +182,45 @@ class Safety:
 
 def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
                 max_s=None, rove_s=300.0, params=nv.Params(), trace=False,
-                response=None):
+                response=None, extra_goals=(), lost=None, hold_s=0.0,
+                backout=False, expect=None, slowdown=None):
+    """One episode. A goto ends once the navigator has held (arrived, at
+    the closest point, or given up) for `hold_s`; `extra_goals` are clicked
+    one at a time after each hold, the next only once the last is held.
+    `lost` (t0, t1) is a SLAM that is lost over that window: no view and
+    nothing written. `backout` is the old safety layer (the reverse at lock
+    on STUCK and a floor standoff); off, as on the car, they mark the spot
+    and plan again. `expect` is the point a closest hold should be at, for
+    closest_err_m."""
     rng = np.random.default_rng(seed)
     resp = response if response is not None else nw.Response.level(level)
     truck = nw.Truck(world, start, resp, rng, DT)
     lidar = nw.Lidar(world, rng)
     smap = nw.SimMap(world.size_m)
-    if scenario == "goto":
+    if scenario in MAPPED:
         smap.fill_from(world)
     perr = nw.PoseError(rng)
     local = mv.LocalMap()
+    # The Pi's plan latency: each plan lands `slowdown` times what it took
+    # here later, against a budget cut by as much. 0 is every plan at once
+    # with no budget, which is the same drive however loaded this machine
+    # is: the tests' setting.
+    slow = PI_SLOWDOWN if slowdown is None else float(slowdown)
     budget = params.plan_budget_s
     nav = nv.Navigator(params._replace(
-        plan_budget_s=None if budget is None else budget / PI_SLOWDOWN),
-        seed=seed, planner=nv.InlinePlanner(PI_SLOWDOWN))
+        plan_budget_s=None if budget is None or slow <= 0 else budget / slow),
+        seed=seed, planner=nv.InlinePlanner(slow))
     if scenario == "rove":
         nav.rove()
         max_s = rove_s if max_s is None else max_s
     else:
         nav.set_goal(goal[0], goal[1])
         if max_s is None:
-            d = math.hypot(goal[0] - start[0], goal[1] - start[1])
-            max_s = max(60.0, 12.0 * d)
+            legs = [start[:2], goal[:2]] + [g[:2] for g in extra_goals]
+            d = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                    for a, b in zip(legs, legs[1:]))
+            max_s = (max(60.0, 12.0 * d) + (len(legs) - 1) * hold_s
+                     + (0.0 if lost is None else lost[1] - lost[0]))
     safety = Safety()
     throttle, front, rear_cmd = 0.0, 0.0, 0.0
     steps = int(max_s / DT)
@@ -204,13 +237,25 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
     outcome = "timeout"
     events = []
     t0 = time.perf_counter()
+    pending = [tuple(g) for g in extra_goals]
+    held_at = None              # when the current goal was first held
+    holds = []                  # one per goal: (status, time held, metres off)
+    hold_travel = 0.0           # metres moved more than HOLD_SETTLE_S into a hold
+    hold_drive = 0              # decisions with a throttle while holding
+    lost_drive = 0              # decisions with a throttle while the map was lost
+    lost_ticks = 0
+    steer_moves = harsh_steer = 0
+    last_front = None
     for step in range(steps):
         now = step * DT
         if step % DECIDE_EVERY == 0:
+            map_lost = lost is not None and lost[0] <= now < lost[1]
             ranges = lidar.scan(truck.pose)
             est = perr.apply(truck.pose)
-            pts = smap.integrate(est, ranges, lidar.angles)
-            local.add(now, est[:2], pts)
+            if not map_lost:
+                # The live SLAM writes nothing while it is lost.
+                pts = smap.integrate(est, ranges, lidar.angles)
+                local.add(now, est[:2], pts)
             rear = lidar.rear_clearance(ranges)
             min_clear = min(min_clear, truck.clearance())
             backing = safety.recovering(now, world, truck.pose, rear)
@@ -220,7 +265,7 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
                 throttle, front = backing
                 safety.fwd_since = None
             else:
-                view = smap.view(est, 1.0)
+                view = None if map_lost else smap.view(est, 1.0)
                 plans_before = nav.plans
                 out = nav.tick(now, view, local)
                 if nav.plans != plans_before:
@@ -230,12 +275,24 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
                 if out.recover:
                     safety.begin(now, "nav")
                     throttle, front = 0.0, 0.0
-                elif nav.status in (nv.ST_ARRIVED, nv.ST_FAILED):
+                elif nav.holding:
                     throttle, front = 0.0, 0.0
-                    done_t = now
-                    outcome = "arrived" if nav.status == nv.ST_ARRIVED else "gave up"
-                    break
+                    last_front = None
+                    if held_at is None:
+                        held_at = now
+                        holds.append((nav.status, round(now, 2), round(math.hypot(
+                            truck.x - goal[0], truck.y - goal[1]), 3)))
+                    if now - held_at >= hold_s - 1e-9:
+                        if not pending:
+                            done_t = now
+                            outcome = {nv.ST_ARRIVED: "arrived",
+                                       nv.ST_CLOSEST: "closest"}.get(nav.status, "gave up")
+                            break
+                        goal = pending.pop(0)
+                        nav.set_goal(goal[0], goal[1])
+                        held_at = None
                 else:
+                    held_at = None
                     throttle, front, _ = nd.request_for(out, FORWARD_SPEED)
                     if throttle > 0 and _box_solid(world, truck.pose, _FLOOR_BOX):
                         throttle = 0.0
@@ -244,7 +301,11 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
                             safety.standoff_since = now
                         elif now - safety.standoff_since >= nd.STANDOFF_S - 1e-6:
                             safety.standoff_since = None
-                            safety.begin(now, "standoff")
+                            if backout:
+                                safety.begin(now, "standoff")
+                            else:
+                                safety.causes["standoff"] += 1
+                                nav.blocked_ahead(now, est, tk.FRONT_M + nd.FLOOR_AHEAD_M)
                     else:
                         safety.standoff_since = None
                     if throttle < 0 and rear is not None and rear < dv.REAR_STOP_CLEAR_MM:
@@ -263,24 +324,49 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
                                 and safety.still_since is not None
                                 and now - safety.still_since >= STUCK_S
                                 and now - safety.last_recovery >= RECOVERY_COOLDOWN_S):
-                            safety.begin(now, "stuck")
+                            if backout:
+                                safety.begin(now, "stuck")
+                            else:
+                                # NavDriver: neutral, the spot marked, a fresh plan.
+                                safety.causes["stuck"] += 1
+                                safety.last_recovery = now
+                                nav.blocked_ahead(now, est, tk.FRONT_M)
+                                throttle, front = 0.0, 0.0
                             nav.recovered(now)
                     else:
                         safety.fwd_since = None
                         safety.still_since = None
                     if throttle > 0:
                         safety.last_front = front
+                    if throttle != 0.0:
+                        if last_front is not None:
+                            steer_moves += 1
+                            harsh_steer += abs(front - last_front) > HARSH_STEER
+                        last_front = front
+                    else:
+                        last_front = None
+                if nav.holding and throttle != 0.0:
+                    hold_drive += 1
+                if map_lost:
+                    lost_ticks += 1
+                    lost_drive += throttle != 0.0
             if scenario == "rove" and step % 500 == 0:
                 coverage.append((now, _covered_m2(smap, world, reach)))
             if trace:
                 est_track.append(est)
+        x0, y0 = truck.x, truck.y
         truck.step(throttle, front)
+        if held_at is not None and now - held_at >= HOLD_SETTLE_S:
+            hold_travel += math.hypot(truck.x - x0, truck.y - y0)
         if trace and step % 5 == 0:
             track.append(truck.pose)
     else:
         done_t = max_s
         if scenario == "rove":
             outcome = "rove"
+        elif held_at is not None:
+            outcome = {nv.ST_ARRIVED: "arrived",
+                       nv.ST_CLOSEST: "closest"}.get(nav.status, "gave up")
     if scenario == "rove":
         coverage.append((done_t, _covered_m2(smap, world, reach)))
     wall_s = time.perf_counter() - t0
@@ -302,6 +388,12 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
         "plan_ms": [round(float(v), 1) for v in plan_ms],
         "final_err_m": None if goal is None else round(math.hypot(
             truck.x - goal[0], truck.y - goal[1]), 3),
+        "closest_err_m": None if expect is None or goal is None else round(
+            math.hypot(truck.x - goal[0], truck.y - goal[1])
+            - math.hypot(expect[0] - goal[0], expect[1] - goal[1]), 3),
+        "holds": holds, "hold_travel_m": round(hold_travel, 3),
+        "hold_drive": hold_drive, "lost_ticks": lost_ticks, "lost_drive": lost_drive,
+        "steer_moves": steer_moves, "harsh_steer": harsh_steer,
         "wall_s": round(wall_s, 1),
     }
     if scenario == "rove":
@@ -350,8 +442,43 @@ def pick_pair(world, rng, min_d=1.5, max_d=12.0, tries=200):
     return None
 
 
+def closest_reachable(world, start, goal):
+    """The reachable floor point nearest `goal`, by the truck's own rule (a
+    disc of the cost map's inscribed radius from `start`), or None."""
+    mask = nw.reachable_mask(world, start[0], start[1], cmod.INSCRIBED_M + 0.02)
+    ii, jj = np.nonzero(mask)
+    if not len(ii):
+        return None
+    x = (ii + 0.5) * world.res
+    y = (jj + 0.5) * world.res
+    k = int(np.argmin(np.hypot(x - goal[0], y - goal[1])))
+    return float(x[k]), float(y[k])
+
+
+def pick_wall_goal(world, rng, start, min_off=0.15, max_off=0.8, min_d=1.5,
+                   max_d=12.0, tries=400):
+    """(goal, expect): a goal inside something solid, min_off-max_off from
+    the nearest point the truck can reach from `start`, and that point."""
+    mask = nw.reachable_mask(world, start[0], start[1], cmod.INSCRIBED_M + 0.02)
+    if not mask.any():
+        return None
+    reach_d = ndimage.distance_transform_edt(~mask) * world.res
+    ok = world.solid & (reach_d >= min_off) & (reach_d <= max_off)
+    ii, jj = np.nonzero(ok)
+    for _ in range(tries if len(ii) else 0):
+        k = int(rng.integers(len(ii)))
+        g = ((ii[k] + 0.5) * world.res, (jj[k] + 0.5) * world.res)
+        if min_d <= math.hypot(g[0] - start[0], g[1] - start[1]) <= max_d:
+            return g, closest_reachable(world, start, g)
+    return None
+
+
 def jobs_for(maps, episodes, rove, levels, seed, scenarios):
+    """(map, scenario, start, goal, level, seed, expect) per episode. The
+    goto and goto_blank pairs are the same with or without goto_wall: its
+    goals come off a stream of their own."""
     rng = np.random.default_rng(seed)
+    wall_rng = np.random.default_rng(seed + 7919)
     jobs = []
     worlds = {m: nw.load_map(m) for m in maps}
     for i in range(episodes):
@@ -363,34 +490,43 @@ def jobs_for(maps, episodes, rove, levels, seed, scenarios):
         for sc in scenarios:
             if sc == "rove":
                 continue
+            goal, expect = g, None
+            if sc == "goto_wall":
+                found = pick_wall_goal(worlds[m], wall_rng, s)
+                if found is None:
+                    continue
+                goal, expect = found
             for lv in levels:
-                jobs.append((m, sc, s, g, lv, int(rng.integers(1 << 30))))
+                jobs.append((m, sc, s, goal, lv, int(rng.integers(1 << 30)), expect))
     if "rove" in scenarios:
         for i in range(rove):
             m = maps[i % len(maps)]
             s = nw.sample_poses(worlds[m], rng, 1, clearance=0.45)[0]
             for lv in levels:
-                jobs.append((m, "rove", s, None, lv, int(rng.integers(1 << 30))))
+                jobs.append((m, "rove", s, None, lv, int(rng.integers(1 << 30)), None))
     return jobs
 
 
 _WORLDS = {}
 _PARAMS = nv.Params()
 _ROVE_S = 300.0
+_BACKOUT = False
+_HOLD_S = 3.0
 
 
-def _init(params, rove_s):
-    global _PARAMS, _ROVE_S
-    _PARAMS, _ROVE_S = params, rove_s
+def _init(params, rove_s, backout=False, hold_s=3.0):
+    global _PARAMS, _ROVE_S, _BACKOUT, _HOLD_S
+    _PARAMS, _ROVE_S, _BACKOUT, _HOLD_S = params, rove_s, backout, hold_s
 
 
 def _run(job):
-    m, sc, s, g, lv, seed = job
+    m, sc, s, g, lv, seed, expect = job
     if m not in _WORLDS:
         _WORLDS[m] = nw.load_map(m)
     try:
         return run_episode(_WORLDS[m], sc, s, g, lv, seed, params=_PARAMS,
-                           rove_s=_ROVE_S)
+                           rove_s=_ROVE_S, expect=expect, backout=_BACKOUT,
+                           hold_s=_HOLD_S)
     except Exception as e:
         return {"scenario": sc, "level": lv, "seed": seed, "outcome": "error",
                 "error": repr(e)}
@@ -413,13 +549,30 @@ def summarise(rows):
                                float(np.mean(frac)) if frac else 0.0)
             out[k] = {"n": n, "coverage": cov}
         else:
-            ok = [r for r in rs if r["outcome"] == "arrived"]
+            if k[0] == "goto_wall":
+                # Right is holding at the closest point, within the arrival
+                # tolerance and a cell of it.
+                ok = [r for r in rs if r["outcome"] in ("closest", "arrived")
+                      and r.get("closest_err_m") is not None
+                      and r["closest_err_m"] <= CLOSEST_OK_M]
+                errs = [r["closest_err_m"] for r in ok]
+            else:
+                ok = [r for r in rs if r["outcome"] == "arrived"]
+                errs = [r["final_err_m"] for r in ok]
             out[k] = {"n": n, "success": len(ok) / n if n else 0.0,
                       "time_med": float(np.median([r["time_s"] for r in ok])) if ok else math.nan,
                       "gave_up": sum(r["outcome"] == "gave up" for r in rs) / max(n, 1),
+                      "closest": sum(r["outcome"] == "closest" for r in rs) / max(n, 1),
                       "timeout": sum(r["outcome"] == "timeout" for r in rs) / max(n, 1),
-                      "errors": sum(r["outcome"] == "error" for r in rs)}
+                      "errors": sum(r["outcome"] == "error" for r in rs),
+                      "err_med": float(np.median(errs)) if errs else math.nan,
+                      "err_p90": float(np.percentile(errs, 90)) if errs else math.nan}
         good = [r for r in rs if r["outcome"] != "error"]
+        moves = sum(r.get("steer_moves", 0) for r in good)
+        out[k]["harsh_steer"] = (sum(r.get("harsh_steer", 0) for r in good) / moves
+                                 if moves else math.nan)
+        out[k]["hold_travel_max"] = max([r.get("hold_travel_m", 0.0) for r in good] or [0.0])
+        out[k]["hold_drive"] = sum(r.get("hold_drive", 0) for r in good)
         out[k].update({
             "collisions_per_ep": float(np.mean([r["collisions"] for r in good])) if good else 0,
             "eps_with_collision": float(np.mean([r["collisions"] > 0 for r in good])) if good else 0,
@@ -446,16 +599,20 @@ def _cov_at(r, t):
 
 def table(summary):
     lines = []
-    lines.append("| scenario | level | n | success | time med s | gave up | timeout | "
-                 "collision eps | collisions/ep | back-outs/ep | STUCK/ep | "
+    lines.append("| scenario | level | n | success | time med s | err med / p90 cm | "
+                 "gave up | closest | timeout | harsh steer | hold moved max cm | "
+                 "collision eps | collisions/ep | STUCK+standoff/ep | STUCK/ep | "
                  "min clear p05 / med cm | plan ms p50 / p90 / max |")
-    lines.append("|" + "---|" * 14)
+    lines.append("|" + "---|" * 18)
     for (sc, lv), s in summary.items():
         if sc == "rove":
             continue
         lines.append(
             f"| {sc} | {lv} | {s['n']} | {100 * s['success']:.1f}% | {s['time_med']:.1f} | "
-            f"{100 * s['gave_up']:.1f}% | {100 * s['timeout']:.1f}% | "
+            f"{100 * s['err_med']:.0f} / {100 * s['err_p90']:.0f} | "
+            f"{100 * s['gave_up']:.1f}% | {100 * s['closest']:.1f}% | "
+            f"{100 * s['timeout']:.1f}% | {100 * s['harsh_steer']:.1f}% | "
+            f"{100 * s['hold_travel_max']:.1f} | "
             f"{100 * s['eps_with_collision']:.1f}% | {s['collisions_per_ep']:.2f} | "
             f"{s['backouts_per_ep']:.2f} | {s['stuck_per_ep']:.2f} | "
             f"{100 * s['min_clear_p05']:.1f} / {100 * s['min_clear_med']:.1f} | "
@@ -571,6 +728,12 @@ def main(argv=None):
     one.add_argument("--png")
     one.add_argument("--params")
     b = sub.add_parser("batch")
+    for p in (one, b):
+        p.add_argument("--backout", action="store_true",
+                       help="the old safety layer: a reverse at lock on STUCK "
+                            "and on a floor standoff (off on the car)")
+        p.add_argument("--hold-s", type=float, default=3.0,
+                       help="seconds an episode goes on holding at its goal")
     b.add_argument("--maps", nargs="+", required=True)
     b.add_argument("--episodes", type=int, default=100)
     b.add_argument("--rove", type=int, default=8)
@@ -594,9 +757,13 @@ def main(argv=None):
             g = None
         else:
             s, g = pick_pair(world, rng)
+        expect = None
+        if args.scenario == "goto_wall":
+            g, expect = pick_wall_goal(world, rng, s)
         r = run_episode(world, args.scenario, s, g, args.level, args.seed,
                         rove_s=args.rove_minutes * 60, params=params,
-                        trace=bool(args.png))
+                        trace=bool(args.png), expect=expect,
+                        backout=args.backout, hold_s=args.hold_s)
         if args.png:
             draw(world, r, args.png)
         r.pop("_trace", None)
@@ -615,7 +782,8 @@ def main(argv=None):
     rows = []
     out_path = os.path.join(args.out, f"{args.tag}.jsonl")
     with open(out_path, "w") as f, Pool(args.jobs, initializer=_init,
-                                        initargs=(params, args.rove_minutes * 60)) as pool:
+                                        initargs=(params, args.rove_minutes * 60,
+                                                  args.backout, args.hold_s)) as pool:
         for i, r in enumerate(pool.imap_unordered(_run, jobs, chunksize=1)):
             rows.append(r)
             f.write(json.dumps(r) + "\n")
@@ -639,7 +807,8 @@ def main(argv=None):
         m = job[0]
         worlds.setdefault(m, nw.load_map(m))
         rr = run_episode(worlds[m], job[1], job[2], job[3], job[4], job[5],
-                         params=params, rove_s=args.rove_minutes * 60, trace=True)
+                         params=params, rove_s=args.rove_minutes * 60, trace=True,
+                         expect=job[6], backout=args.backout, hold_s=args.hold_s)
         draw(worlds[m], rr, os.path.join(args.out, f"{args.tag}_{k:02d}_{rr['scenario']}_"
                                                     f"{rr['level']}_{rr['outcome'].replace(' ', '_')}.png"))
     print(f"done in {time.time() - t0:.0f} s -> {out_path}", file=sys.stderr)

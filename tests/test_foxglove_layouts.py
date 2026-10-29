@@ -20,7 +20,8 @@ LAYOUTS = sorted(glob.glob(os.path.join(ROOT, "deploy", "foxglove-*.json")))
 PUBLISHED = (set(tm.JSON_TOPICS.values()) | set(tm.IMAGE_CHANNELS.values())
              | set(tm.RAW_DEPTH_CHANNELS.values())
              | set(tm.LIDAR_VIEW_CHANNELS.values())
-             | set(tm.SLAM_CHANNELS.values()) | set(tm.VOXEL_CHANNELS.values()))
+             | set(tm.SLAM_CHANNELS.values()) | set(tm.VOXEL_CHANNELS.values())
+             | set(tm.NAV_CHANNELS.values()))
 
 # The one topic Foxglove publishes to the car: a goal from the 3D panel's
 # pose tool, which nav/click.py listens for.
@@ -90,8 +91,10 @@ def test_the_drive_layout_is_pictures_and_the_telemetry_one_is_not():
     cams = set(tm.IMAGE_CHANNELS.values())
     assert {cfg["imageMode"]["imageTopic"] for k, cfg in drive.items()
             if k.startswith("Image!")} == cams
-    assert {"/map", "/lidar/scan", "/voxel/points", "/voxel/low"} <= set(
-        drive["3D!slam"]["topics"])
+    assert {"/map", "/lidar/scan", "/voxel/points", "/voxel/low",
+            "/nav/path"} <= set(drive["3D!slam"]["topics"])
+    # A click on the map says what the goto made of it.
+    assert any(cfg.get("topicPath") == "/nav/status" for cfg in drive.values())
     assert not any(k.startswith(("Image!", "3D!")) for k in tele)
     read = {t for cfg in tele.values() for t, _ in topics_read(cfg)}
     assert read == {"/vehicle", "/controller", "/imu", "/diagnostics",

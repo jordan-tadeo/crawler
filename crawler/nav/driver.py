@@ -1,26 +1,33 @@
 """NavDriver: the autopilot chassis, with the navigator choosing the command.
 
-It is driver.Driver underneath, the way policy.PolicyDriver is, so every
-safety layer the rules and the learned policy sit on is under this too, in
-the same order and off the same code:
+It is driver.Driver underneath, the way policy.PolicyDriver is, so the
+safety layer the rules and the learned policy sit on is under this too, off
+the same code:
 
-  the back-out    Driver.recovering() runs first, every decision; while it
-                  runs the navigator is not asked anything
   STUCK           Driver.stuck() off the IMU, on a forward this driver
-                  commanded: the back-out
+                  commanded: neutral, and a fresh plan with the spot marked
+                  solid in front of the bumper (Navigator.blocked_ahead)
   the floor       driver.ForwardFloorVeto off the camera's footprint scan:
                   a forward inside FORWARD_FLOOR_MM is held at 0 (the 200 mm
                   floor pushed out by the picture's age); held STANDOFF_S
-                  in a row, the back-out
+                  in a row, the spot is marked solid and the path planned
+                  round it
   the rear stop   driver.rear_blocked() off the roof lidar: a reverse with
                   something inside REAR_STOP_CLEAR_MM of the bumper is
                   neutral, never just not commanded
   reverse speed   every reverse goes out through auto_reverse_throttle(),
                   so at ESCAPE_SPEED
+  no frame        neutral
 
-The navigator's own "no progress" asks for the same back-out, and when a
-back-out ends the navigator is told (Navigator.recovered) and plans again
-from wherever it left the truck.
+No back-out. The way out of a spot is a path on the map, planned forward
+and reverse (a three-point turn is a plan), never the hand-written reverse
+at lock: the navigator's "no progress" plans again rather than asking for
+one (navigator.Params.backout). One that is running anyway -- the policy's,
+handed over mid-way by pointnav -- still runs to its end first.
+
+My hand. With either group on the pad the navigator is not followed: its
+path is dropped (Navigator.hand), its own groups are neutral, and the tick
+after I let go plans from wherever I left the truck. A held goal stays held.
 
 What it writes is a request into the controller it is handed -- on the car,
 main.DriverCommand, which AutoPilot.step() mixes with my hand and writes at
@@ -28,15 +35,14 @@ most once a pass. Nothing here touches pigpio.
 
 The map comes from `map_source`, anything with view() -> MapView or None
 (on the car nav/live.SlamMap, the live SLAM), and optionally local() ->
-LocalMap. Goals come from `goals`, anything with take() -> click.ClickGoal. No map source is
-no NavDriver: the constructor refuses, so --nav without a map is auto
-unavailable, never a truck driving blind.
+LocalMap. Goals come from `goals`, anything with take() -> click.ClickGoal,
+or from set_goal() (pointnav.PointNavDriver hands them over that way). No map
+source is no NavDriver: the constructor refuses, so --nav without a map is
+auto unavailable, never a truck driving blind.
 """
 
 import math
 import time
-
-import numpy as np
 
 from crawler.autopilot import driver as dv
 from crawler.nav import navigator as nv
@@ -47,6 +53,9 @@ from crawler.nav import truck as tk
 # 0.25 is 0.22 m/s and always moves.
 MIN_FORWARD = 0.25
 STANDOFF_S = 1.0
+# Where the floor's hold is marked: the forward floor's own distance past
+# the bumper.
+FLOOR_AHEAD_M = dv.FORWARD_FLOOR_MM / 1000.0
 
 
 def request_for(out, forward_speed, max_turn=tk.MAX_TURN):
@@ -89,11 +98,16 @@ class NavDriver(dv.Driver):
         self.floor_veto = dv.ForwardFloorVeto(self.forward_speed)
         self.last_output = None
         self.last_request = (0.0, 0.0, 0.0)
+        self.last_pose = None
         self.floor_held = False
         self._standoff_since = None
         self._was_recovering = False
         self.human_steering = False
         self.pad_split = None
+
+    def set_goal(self, x, y, yaw=None):
+        self.nav.set_goal(x, y, yaw)
+        self.goals_taken += 1
 
     def _take_goal(self, view):
         """The newest Foxglove click, if one came, as the navigator's goal.
@@ -114,9 +128,15 @@ class NavDriver(dv.Driver):
                   "no pose to place it by")
             return
         x, y, yaw = placed
-        self.nav.set_goal(x, y, yaw)
-        self.goals_taken += 1
+        self.set_goal(x, y, yaw)
         print(f"[nav] goal ({x:.2f}, {y:.2f}) in the map")
+
+    def abort(self):
+        """Driver's abort, and the navigator forgets its goal."""
+        super().abort()
+        self.nav.stop()
+        self._standoff_since = None
+        self.last_request = (0.0, 0.0, 0.0)
 
     def close(self):
         """Stop the planner's thread. Never raises."""
@@ -134,6 +154,7 @@ class NavDriver(dv.Driver):
             self.controller.set_steering(0, 0)
         except Exception:
             pass
+        self.last_request = (0.0, 0.0, 0.0)
         self._clear_motion_evidence()
 
     def tick(self, now=None):
@@ -166,29 +187,53 @@ class NavDriver(dv.Driver):
         self.floor_veto.forward_speed = self.forward_speed
         self.floor_veto.observe(scan, now)
 
-        if self.human_throttle:
-            self._throttle_since = None
-            self._still_samples = 0
-        elif self.stuck(imu, now):
-            self.last_recovery_time = now
-            print("STUCK - backing up to recover.")
-            self.begin_recover(now, dv.BACKOUT_STUCK)
-            return
-
         try:
             view = self.map_source.view()
         except Exception:
             view = None
+        if view is not None:
+            self.last_pose = view.pose
         self._take_goal(view)
+
+        if self.human_throttle or self.human_steering:
+            # My hand: the navigator waits, and plans afresh when I let go.
+            self._throttle_since = None
+            self._still_samples = 0
+            self._standoff_since = None
+            self.nav.hand(now)
+            self.last_output = nv.Output(0, 0.0, 0.0, False, self.nav.status,
+                                         self.nav.reason)
+            self._neutral()
+            self.floor_veto.note_throttle(0.0, now)
+            return
+        if self.stuck(imu, now):
+            self.last_recovery_time = now
+            print("STUCK - neutral, and a fresh plan round it.")
+            if self.last_request[0] > 0.0 and self.last_pose is not None:
+                self.nav.blocked_ahead(now, self.last_pose, tk.FRONT_M)
+            self.nav.recovered(now)
+            self._neutral()
+            self.floor_veto.note_throttle(0.0, now)
+            return
+
         local = getattr(self.map_source, "local", None)
         local = local() if callable(local) else None
         out = self.nav.tick(now, view, local)
         self.last_output = out
 
         if out.recover:
+            # Only with navigator.Params(backout=True); off by default.
             self.last_recovery_time = now
             print("No progress - backing up to recover.")
             self.begin_recover(now, dv.BACKOUT_STUCK)
+            return
+        if out.direction == 0 and (self.nav.holding or out.status in (
+                nv.ST_IDLE, nv.ST_NO_MAP)):
+            # Holding at a goal, no goal, or no pose to trust: neutral, the
+            # steering centred too, for as long as it lasts.
+            self._standoff_since = None
+            self._neutral()
+            self.floor_veto.note_throttle(0.0, now)
             return
 
         throttle, front, rear = request_for(out, self.forward_speed, self.max_turn)
@@ -196,18 +241,18 @@ class NavDriver(dv.Driver):
         if throttle > 0.0 and self.floor_veto.vetoes():
             throttle = 0.0
             self.floor_held = True
-            if not self.human_throttle:
-                if self._standoff_since is None:
-                    self._standoff_since = now
-                if now - self._standoff_since >= STANDOFF_S - 1e-3:
-                    self._standoff_since = None
-                    print("Standoff with the floor - backing up to recover.")
-                    self.begin_recover(now, dv.BACKOUT_STANDOFF)
-                    return
+            if self._standoff_since is None:
+                self._standoff_since = now
+            if now - self._standoff_since >= STANDOFF_S - 1e-3:
+                self._standoff_since = None
+                print("Standoff with the floor - planning round it.")
+                if self.last_pose is not None:
+                    self.nav.blocked_ahead(now, self.last_pose,
+                                           tk.FRONT_M + FLOOR_AHEAD_M)
         else:
             self._standoff_since = None
 
-        if throttle < 0.0 and not self.human_throttle and dv.rear_blocked(self.rear_clearance):
+        if throttle < 0.0 and dv.rear_blocked(self.rear_clearance):
             print(f"Rear stop - {self.rear_clearance:.0f} mm behind me, "
                   "cutting the reverse.")
             self.rear_stop = True
