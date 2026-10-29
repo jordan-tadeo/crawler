@@ -29,6 +29,7 @@ import numpy as np
 from crawler.autopilot import driver as dv
 from crawler.autopilot import policy as pl
 from crawler.autopilot import policy_imu as pimu
+from crawler.autopilot import policy_lidar as pli
 
 # ---- legacy recordings -----------------------------------------------------
 
@@ -58,6 +59,9 @@ FOOTPRINT_TOPICS = {
     # shows, since manual writes no /footprint rows. Read for the mode and
     # the command only (FOOTPRINT_VEHICLE).
     "vehicle": "/vehicle",
+    # One row per revolution of the roof lidar (--lidar), off the tick: the
+    # policy's lidar input, paired with a tick by policy_lidar.scan_at.
+    "lidar": "/lidar",
 }
 FOOTPRINT_VEHICLE = {
     "mode": "mode",
@@ -261,6 +265,7 @@ class Session(NamedTuple):
     label_modes: tuple
     by_seq: bool          # frames and commands share a seq
     vehicle: tuple = ()   # [(t_ns, mode, throttle, front)] off /vehicle; footprint files only
+    lidar: tuple = ()     # [(t_ns, (BINS,) uint16 mm)] off /lidar, by time; footprint files only
 
 
 def _f(value, fallback=float("nan")):
@@ -491,7 +496,9 @@ class FootprintAdapter:
         self.label_modes = tuple(label_modes)
         self.commands, self.frames, self.connected, self.marks = [], [], [], []
         self.vehicle = []
+        self.lidar = []
         self.bad_frames = 0
+        self.bad_lidar = 0
 
     def feed(self, topic, t_ns, payload):
         if topic == FOOTPRINT_TOPICS["row"]:
@@ -530,13 +537,33 @@ class FootprintAdapter:
             self.vehicle.append((int(t_ns), str(payload.get(v["mode"], "")),
                                  _f(payload.get(v["throttle"]), 0.0),
                                  _f(payload.get(v["front"]), 0.0)))
+        elif topic == FOOTPRINT_TOPICS["lidar"]:
+            bins = decode_lidar_bins(payload)
+            if bins is None:
+                self.bad_lidar += 1
+                return
+            self.lidar.append((int(t_ns), bins))
 
     def finish(self):
         by_seq = bool(self.frames) and all(f.seq >= 0 for f in self.frames)
         return Session(self.session_name, self.name, self.contract,
                        sorted(self.commands), sorted(self.frames, key=lambda f: f.t_ns),
                        sorted(self.connected), sorted(self.marks, key=lambda m: m[0]),
-                       self.label_modes, by_seq, tuple(sorted(self.vehicle)))
+                       self.label_modes, by_seq, tuple(sorted(self.vehicle)),
+                       tuple(sorted(self.lidar, key=lambda r: r[0])))
+
+
+def decode_lidar_bins(payload):
+    """A /lidar row's bins as (BINS,) uint16 mm, or None for a row that is
+    not policy_lidar's layout (another bin count, a value out of range)."""
+    try:
+        bins = np.asarray(payload.get("bins"), dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if bins.shape != (pli.BINS,) or not np.isfinite(bins).all() \
+            or (bins < 0).any() or (bins > 65535).any():
+        return None
+    return bins.astype(np.uint16)
 
 
 ADAPTERS = {LegacyAdapter.name: LegacyAdapter, FootprintAdapter.name: FootprintAdapter}

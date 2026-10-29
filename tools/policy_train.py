@@ -90,6 +90,17 @@ left and right steering classes (flip_steer_labels). A graph without
 --imu-no-yaw is --imu without the yaw rate: the dataset's imu_no_yaw array
 (policy_imu.NO_YAW_FEATURES, built by the same ImuFeatures with yaw=False,
 as the car builds it), and imu_yaw false in the sidecar.
+
+--lidar adds a fifth input, `lidar` (after `imu` when both are used): the
+roof lidar scan each tick read, policy_lidar.encode_many over the dataset's
+lidar_bins and lidar_present, as policy_lidar.encode() makes it on the car.
+A small branch of its own reads it (build_model's LidarBranch), gated by the
+present flag. Most sessions predate the lidar and go in as no scan; on the
+ones that have it, LIDAR_DROPOUT of the ticks are fed no scan instead, fresh
+every batch, so that "a scan is there" cannot become a tell for which
+session this is, and the model learns to drive with the lidar gone. Only in
+training: the car never blanks a scan it has. The flip mirrors the scan
+(policy_lidar.MIRROR). The sidecar says uses_lidar and lidar_layout.
 """
 
 import argparse
@@ -110,6 +121,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from crawler.autopilot import column_profile as cp  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
+from crawler.autopilot import policy_lidar as pli  # noqa: E402
 import policy_eval as pe  # noqa: E402
 
 GOOD_WEIGHT = 2.0
@@ -164,7 +176,15 @@ def output_names(steer_head=pl.STEER_REGRESSION):
     return ["logits", "throttle", *steer, pl.MODE_OUTPUT]
 
 
-def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION):
+# The lidar branch's output width, before the present flag joins it.
+LIDAR_FEATURES = 16
+# Sensor dropout: the share of training ticks with a real scan that are fed
+# no scan instead, fresh every batch. Training only; the car never blanks.
+LIDAR_DROPOUT = 0.3
+
+
+def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION,
+                uses_lidar=False):
     import torch
     from torch import nn
 
@@ -172,6 +192,31 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
         raise ValueError(f"steer head {steer_head!r}: one of {pl.STEER_HEADS}")
     direction = steer_head == pl.STEER_DIRECTION
     imu_width = pimu.size(imu_yaw) if uses_imu else 0
+    lidar_width = LIDAR_FEATURES + 1 if uses_lidar else 0
+
+    class LidarBranch(nn.Module):
+        """(N, pli.SIZE) -> (N, LIDAR_FEATURES + 1).
+
+        The ranges and the returns as two channels round the car, padded
+        circularly (bin 71 is next to bin 0), one strided conv, a max over
+        each 15 degrees, then a small linear layer. Its output is multiplied
+        by present, so no scan is exactly no lidar features, and present
+        itself goes on to the trunk: a model with the lidar missing is the
+        camera model it was trained to be on every session without one.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Sequential(nn.Conv1d(2, 8, 5, stride=2), nn.ReLU(),
+                                      nn.MaxPool1d(3))
+            self.fc = nn.Sequential(nn.Linear(8 * (pli.BINS // 6), LIDAR_FEATURES), nn.ReLU())
+
+        def forward(self, lidar):
+            present = lidar[:, pli.PRESENT:pli.PRESENT + 1]
+            x = torch.stack([lidar[:, pli.RANGES], lidar[:, pli.RETURNS]], dim=1)
+            x = torch.cat([x[..., -2:], x, x[..., :2]], dim=-1)
+            h = self.fc(self.conv(x).flatten(1)) * present
+            return torch.cat([h, present], dim=1)
 
     class Heads(nn.Module):
         def __init__(self, width):
@@ -181,7 +226,9 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             # and its weights there never see a gradient. The IMU is only
             # wired in when it is used, so an old graph stays an old graph.
             self.trunk = nn.Sequential(
-                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width, 64), nn.ReLU())
+                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width + lidar_width, 64),
+                nn.ReLU())
+            self.lidar = LidarBranch() if lidar_width else None
             self.logits = nn.Linear(64, len(pl.ACTIONS))
             self.throttle = nn.Linear(64, 1)
             if direction:
@@ -194,8 +241,15 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             # weight, and the trunk only has to learn when not to.
             self.mode_skip = nn.Linear(pl.MODE_SIZE, pl.MODE_SIZE, bias=False)
 
-        def forward(self, features, prev, mode, imu=None):
+        def forward(self, features, prev, mode, *extra):
+            # extra: imu if the model takes it, then lidar if it takes that,
+            # in the graph's input order.
+            extra = list(extra)
+            imu = extra.pop(0) if imu_width else None
+            lidar = extra.pop(0) if lidar_width else None
             parts = [features, prev, mode] + ([imu] if imu_width else [])
+            if lidar_width:
+                parts.append(self.lidar(lidar))
             h = self.trunk(torch.cat(parts, dim=1))
             steer = ((self.steer_dir(h), torch.sigmoid(self.steer_mag(h))) if direction
                      else (torch.tanh(self.steer(h)),))
@@ -215,8 +269,8 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
                 nn.Flatten())
             self.heads = Heads(16 * 4 * 5)
 
-        def forward(self, x, prev, mode, imu=None):
-            return self.heads(self.features(x), prev, mode, imu)
+        def forward(self, x, prev, mode, *extra):
+            return self.heads(self.features(x), prev, mode, *extra)
 
     class ProfileNet(nn.Module):
         """(1, 3, 32) -> two 1-D convs along the columns -> the heads."""
@@ -229,11 +283,12 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
                 nn.Flatten())
             self.heads = Heads(16 * (cp.PROFILE_COLUMNS // 2))
 
-        def forward(self, x, prev, mode, imu=None):
-            return self.heads(self.features(x), prev, mode, imu)
+        def forward(self, x, prev, mode, *extra):
+            return self.heads(self.features(x), prev, mode, *extra)
 
     model = ImageNet() if representation == pl.IMAGE else ProfileNet()
     model.uses_imu = bool(uses_imu)
+    model.uses_lidar = bool(uses_lidar)
     model.imu_yaw = bool(imu_yaw)
     model.steer_head = steer_head
     return model
@@ -250,17 +305,20 @@ def encode_modes(mode_in):
     return out
 
 
-def flip(x, prev, imu=None, imu_yaw=True):
+def flip(x, prev, imu=None, imu_yaw=True, lidar=None):
     """Mirror left-right: the frame's last axis, and every steering sign.
     The steering mode has no side, so it goes through as it is. The IMU's
     lateral parts flip sign (policy_imu.mirror_of: MIRROR, or its no-yaw
-    columns)."""
+    columns). The lidar's bins swap sides (policy_lidar.MIRROR). Returns
+    (x, prev, imu) without a lidar, (x, prev, imu, lidar) with one."""
     import torch
 
     prev = prev.clone()
     prev[:, -1] = -prev[:, -1]
     if imu is not None:
         imu = imu * torch.from_numpy(pimu.mirror_of(imu_yaw))
+    if lidar is not None:
+        return torch.flip(x, dims=[-1]), prev, imu, pli.mirror(lidar)
     return torch.flip(x, dims=[-1]), prev, imu
 
 
@@ -276,6 +334,21 @@ def imu_inputs(data, tilt, yaw=True):
         raise ValueError(f"the dataset's {key!r} is {feats.shape[-1]} wide, "
                          f"not {pimu.size(yaw)}: rebuild it with policy_dataset.py")
     return feats if tilt else pimu.without_tilt(feats)
+
+
+def lidar_inputs(data):
+    """The dataset's lidar scans as the model is fed them: policy_lidar's
+    encode_many, the function the car's encode() runs, over every tick."""
+    if "lidar_bins" not in data or "lidar_present" not in data:
+        raise ValueError("the dataset has no lidar arrays: rebuild it with policy_dataset.py")
+    return pli.encode_many(data["lidar_bins"], data["lidar_present"])
+
+
+def lidar_blanks(present, rate, rng):
+    """Which ticks of a batch the sensor dropout feeds no scan: a share
+    `rate` of the ones with a scan, drawn fresh. A tick with none already
+    has none."""
+    return present & (rng.random(len(present)) < rate)
 
 
 def dataset_has_tilt(data):
@@ -396,13 +469,15 @@ def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
 def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False,
           imu_yaw=True, imu_tilt=False, steer_head=pl.STEER_REGRESSION,
-          straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT):
+          straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT,
+          uses_lidar=False, lidar_dropout=LIDAR_DROPOUT):
     import torch
     from torch import nn
 
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = build_model(representation, uses_imu, imu_yaw, steer_head)
+    rng = np.random.default_rng(seed)
+    model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar)
     direction = steer_head == pl.STEER_DIRECTION
 
     idx = np.flatnonzero(train_mask)
@@ -413,6 +488,9 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     mode_in = torch.from_numpy(encode_modes(data["mode_in"][idx]))
     imu = (torch.from_numpy(imu_inputs(data, imu_tilt, imu_yaw)[idx])
            if uses_imu else None)
+    lidar = torch.from_numpy(lidar_inputs(data)[idx]) if uses_lidar else None
+    lidar_on = (np.asarray(data["lidar_present"], dtype=bool)[idx] if uses_lidar
+                else np.zeros(len(idx), dtype=bool))
     mode = torch.from_numpy(data["steer_mode"][idx].astype(np.int64))
     action = torch.from_numpy(data["action"][idx].astype(np.int64))
     mag = torch.from_numpy(data["magnitude"][idx])
@@ -448,11 +526,20 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
             b = order[start:start + batch]
             xb, pb = x[b], prev[b]
             ib = imu[b] if imu is not None else None
+            lb = None
+            if lidar is not None:
+                blank = lidar_blanks(lidar_on[b.numpy()], lidar_dropout, rng)
+                lb = torch.where(torch.from_numpy(blank)[:, None],
+                                 torch.zeros(()), lidar[b])
             sb, db = steer[b], steer_dir[b]
             if torch.rand(1).item() < 0.5:
-                xb, pb, ib = flip(xb, pb, ib, imu_yaw)
+                if lb is not None:
+                    xb, pb, ib, lb = flip(xb, pb, ib, imu_yaw, lb)
+                else:
+                    xb, pb, ib = flip(xb, pb, ib, imu_yaw)
                 sb, db = flip_steer_labels(sb, db)
-            out = model(xb, pb, mode_in[b], ib)
+            extra = [v for v in (ib, lb) if v is not None]
+            out = model(xb, pb, mode_in[b], *extra)
             logits, t_out, m_out = out[0], out[1], out[-1]
             tok, sok = throttle_ok[b], steer_ok[b]
             wb = w_all[b]
@@ -495,6 +582,9 @@ def export(model, representation, out_path, meta):
     if getattr(model, "uses_imu", False):
         args += (torch.zeros((1, pimu.size(getattr(model, "imu_yaw", True)))),)
         names.append(pl.IMU_INPUT)
+    if getattr(model, "uses_lidar", False):
+        args += (torch.zeros((1, pli.SIZE)),)
+        names.append(pl.LIDAR_INPUT)
     torch.onnx.export(
         model, args, out_path,
         input_names=names,
@@ -512,6 +602,15 @@ def imu_meta(uses_imu, tilt, yaw=True):
             "imu_scales": {"gyro_rad_s": pimu.GYRO_SCALE,
                            "accel_m_s2": pimu.ACCEL_SCALE, "clip": pimu.CLIP,
                            "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.GAP_S}}
+
+
+def lidar_meta(uses_lidar, dropout=LIDAR_DROPOUT):
+    """The lidar half of the sidecar: what policy.check_lidar reads, and the
+    dropout it was trained with (a note; the car never blanks)."""
+    if not uses_lidar:
+        return {}
+    return {**pli.meta(), "lidar_dropout": float(dropout),
+            "lidar_features": LIDAR_FEATURES}
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -630,6 +729,12 @@ def main(argv=None):
     ap.add_argument("--imu-tilt", action="store_true",
                     help="--imu with the up vector fed in (zeros and tilt_valid 0 "
                          "on sessions without one); refused on a dataset with none")
+    ap.add_argument("--lidar", action="store_true",
+                    help="feed the roof lidar scan in as an input of its own "
+                         "(policy_lidar), with sensor dropout in training")
+    ap.add_argument("--lidar-dropout", type=float, default=LIDAR_DROPOUT,
+                    help="with --lidar: the share of training ticks with a scan fed "
+                         f"none instead, fresh every batch (default {LIDAR_DROPOUT})")
     ap.add_argument("--steer-head", choices=pl.STEER_HEADS, default=pl.STEER_REGRESSION,
                     help="regression: one tanh steer. direction: left/straight/right "
                          "plus how far, which cannot average two hard turns into straight")
@@ -678,6 +783,12 @@ def main(argv=None):
         print(f"{args.data} has no {pimu.DATASET_KEY[not args.imu_no_yaw]} IMU features: "
               f"rebuild it with policy_dataset.py")
         return 1
+    if args.lidar and "lidar_bins" not in data:
+        print(f"{args.data} has no lidar arrays: rebuild it with policy_dataset.py")
+        return 1
+    if args.lidar and not np.asarray(data["lidar_present"]).any():
+        print(f"{args.data}: --lidar, but no tick in it has a lidar scan")
+        return 1
     try:
         tilt_of(args.imu_tilt, meta_in)
     except ValueError as e:
@@ -694,7 +805,8 @@ def main(argv=None):
                good_weight=args.good_weight, switch_weight=args.switch_weight,
                uses_imu=args.imu, imu_yaw=not args.imu_no_yaw,
                imu_tilt=args.imu_tilt, steer_head=args.steer_head,
-               straight_band=args.straight_band, takeover_weight=args.takeover_weight)
+               straight_band=args.straight_band, takeover_weight=args.takeover_weight,
+               uses_lidar=args.lidar, lidar_dropout=args.lidar_dropout)
     tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -749,6 +861,10 @@ def main(argv=None):
         tilt_col = pimu.FEATURES.index("tilt_valid")
         tilt_ticks = int((train_mask & (data["imu"][:, tilt_col] > 0)).sum())
         print(f"tilt: an up vector on {tilt_ticks} of {int(train_mask.sum())} training ticks")
+    if args.lidar:
+        print(f"lidar: a scan on {int((train_mask & data['lidar_present']).sum())} of "
+              f"{int(train_mask.sum())} training ticks, {args.lidar_dropout:.0%} of them "
+              f"blanked each batch")
     model, weights = train(data, train_mask=train_mask, **fit)
     params = int(sum(p.numel() for p in model.parameters()))
     shares = loss_shares(data, train_mask, args.labels, args.good_weight,
@@ -764,6 +880,8 @@ def main(argv=None):
             "intervention_loss_share": {head: share for head, (_, _, share) in shares.items()},
             "parameters": params,
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
+            **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
+               if args.lidar else {}),
             **provenance_meta(argv, args.model_name)}
     with torch.no_grad():
         export(model, args.representation, args.out, meta)
@@ -794,6 +912,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
         **imu_meta(getattr(args, "imu", False),
                    tilt_of(getattr(args, "imu_tilt", False), meta_in),
                    not getattr(args, "imu_no_yaw", False)),
+        **lidar_meta(getattr(args, "lidar", False),
+                     getattr(args, "lidar_dropout", LIDAR_DROPOUT)),
         **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
                      getattr(args, "straight_band", STRAIGHT_BAND)),
         "steer_scale": pl.STEER_SCALE,

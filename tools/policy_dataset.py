@@ -102,6 +102,16 @@ them. A session that recorded no caps at all (auto with nobody on the
 triggers) is kept with a warning: its throttle is the autopilot's, never a
 label, and its magnitudes are measured against the legacy caps.
 
+The lidar
+---------
+Every tick carries the roof lidar scan it would have read on the car
+(policy_lidar.scan_at over the session's /lidar rows: the newest at or
+before the tick, none past lidar.STALE_S): `lidar_bins` (N, 72) uint16 mm,
+`lidar_present` and `lidar_age_ms` (-1 with none). A session recorded
+without --lidar, which is every one before 2026-10-29, is all not present
+and all zeros, never a made-up scan. The trainer encodes them with
+policy_lidar.encode_many, the function the car's encode() runs.
+
 Needs `mcap` and `mcap-protobuf-support`, which are tools for the laptop and
 not dependencies of the car. The alignment below needs neither and is what
 the tests exercise.
@@ -128,6 +138,7 @@ from crawler.autopilot import driver as dv  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
+from crawler.autopilot import policy_lidar as pli  # noqa: E402
 
 TICK_S = 0.1
 # Slack on the 10 Hz sampling of a 20 Hz channel, so jitter in /vehicle does
@@ -242,6 +253,8 @@ class Tick(NamedTuple):
     imu: object = None          # (pimu.IMU_SIZE,) float32, the policy's IMU input
     imu_no_yaw: object = None   # (pimu.NO_YAW_SIZE,) float32, the same without yaw
     source: str = SOURCE_RECORD  # one of SOURCES
+    lidar: object = None        # (pli.BINS,) uint16 mm, the scan scan_at() pairs; None with none
+    lidar_age_ms: float = -1.0  # that scan's age at the tick; -1 with none
 
 
 def _is_split(cmd):
@@ -596,6 +609,8 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     prev_was_reverse = False
     prev_t = None
     modes = mode_labels(commands)
+    lidar_rows = getattr(session, "lidar", ()) or ()
+    lidar_times = [r[0] for r in lidar_rows]
     imus = imu_features(commands)
     imus_no_yaw = imu_features(commands, yaw=False)
     # Interventions, off the whole stream before any tick is dropped: a
@@ -690,6 +705,9 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         # throttle is measured against the auto caps it just left: the same
         # speed is the same label, and anything past auto's cap is 1.0.
         caps = fallback if manual else (cmd.forward_cap, cmd.reverse_cap)
+        li = pli.scan_at(lidar_times, cmd.t_ns) if lidar_times else -1
+        scan = lidar_rows[li][1] if li >= 0 else None
+        scan_age = (cmd.t_ns - lidar_times[li]) / 1e6 if li >= 0 else -1.0
         ticks.append(Tick(
             cmd.t_ns, fi, age, action,
             pa.magnitude_of(label_throttle, *caps, fallback),
@@ -698,7 +716,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
             steer_label, throttle_label,
             float(cmd.throttle), float(cmd.front), float(cmd.accel), float(cmd.gyro),
             cmd.autopilot == pa.AUTOPILOT_POLICY, mode_in, steer_mode, mode_switch,
-            imu, imu_no_yaw, source))
+            imu, imu_no_yaw, source, scan, float(scan_age)))
         errors.append(age)
 
     if rules is not None:
@@ -838,6 +856,14 @@ def to_arrays(sessions_ticks):
                                  else np.zeros(pimu.NO_YAW_SIZE, np.float32) for r in rows])
                        .astype(np.float32) if n
                        else np.zeros((0, pimu.NO_YAW_SIZE), np.float32)),
+        # The lidar scan each tick would have read (policy_lidar.scan_at),
+        # zeros and not present where there was none.
+        "lidar_bins": (np.stack([r[2].lidar if r[2].lidar is not None
+                                 else np.zeros(pli.BINS, np.uint16) for r in rows])
+                       .astype(np.uint16) if n
+                       else np.zeros((0, pli.BINS), np.uint16)),
+        "lidar_present": np.array([r[2].lidar is not None for r in rows], dtype=bool),
+        "lidar_age_ms": np.array([r[2].lidar_age_ms for r in rows], dtype=np.float32),
     }
     return a
 
@@ -1104,6 +1130,10 @@ def main(argv=None):
         line += (f"\n    imu: a real sample on {sum(bool(t.imu[vi]) for t in ticks)} of "
                  f"{len(ticks)} kept ticks, an up vector on "
                  f"{sum(bool(t.imu[ti]) for t in ticks)}")
+        ages = [t.lidar_age_ms for t in ticks if t.lidar is not None]
+        line += (f"\n    lidar: {len(getattr(session, 'lidar', ()) or ())} /lidar rows, a scan on "
+                 f"{len(ages)} of {len(ticks)} kept ticks"
+                 + (f" (age ms p50 {_pct(ages, 50):.0f} max {max(ages):.0f})" if ages else ""))
         flags = mark_flags(ticks, session.marks)
         kinds = Counter(str(m.get("kind", "?")).lower() for _, m in session.marks)
         line += (f"\n    marks: {kinds.get('good', 0)} good, {kinds.get('bad', 0)} bad; "
@@ -1174,6 +1204,13 @@ def main(argv=None):
                        if any(t.source != SOURCE_RECORD for t in ticks)],
         "imu_tilt": bool(len(arrays["imu"])
                          and arrays["imu"][:, pimu.FEATURES.index("tilt_valid")].any()),
+        # The lidar input: the layout of "lidar_bins", and how many ticks
+        # had a scan (0 for every session recorded before --lidar).
+        "lidar_layout": pli.LAYOUT,
+        "lidar_stale_s": pli.STALE_S,
+        "lidar_ticks": int(arrays["lidar_present"].sum()),
+        "lidar_sessions": sorted({s.name for s, ticks in kept
+                                  if any(t.lidar is not None for t in ticks)}),
         "alignment_ms_histogram": {"edges": hist_edges[:-1], "counts": hist},
         "report": report,
     }

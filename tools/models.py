@@ -155,6 +155,10 @@ CONTRACT_KEYS = {
     # How the steering is read (policy.decode_steer): one tanh, or a
     # left/straight/right class and a magnitude. Before the key, a regression.
     "steer_head": "regression",
+    # The roof lidar as an input (policy_lidar), and the binning it was
+    # trained on. Before the key, no lidar.
+    "uses_lidar": False,
+    "lidar_layout": None,
 }
 
 # The scores list shows, off the CV mean or the held-out sessions.
@@ -222,6 +226,8 @@ def contract_of(meta):
         # Without the IMU input the IMU details mean nothing.
         out["imu_features"] = out["imu_window"] = None
         out["imu_tilt"] = out["imu_yaw"] = False
+    if not out["uses_lidar"]:
+        out["lidar_layout"] = None
     return out
 
 

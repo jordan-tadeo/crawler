@@ -197,6 +197,18 @@ says imu_yaw false: a model trained without the yaw rate (policy_imu,
 every model before this, the deployed one included -- has no `imu` input
 and is never fed one.
 
+The lidar
+---------
+A model whose sidecar says uses_lidar has an input `lidar`: the roof lidar's
+newest scan as policy_lidar.encode() makes it, the 72 bins plus a present
+flag. PolicyDriver reads it each decision off the LidarReader it was handed
+(the one the rear stop reads), and feeds no scan -- present 0 -- whenever
+there is none fresh: no --lidar, a scan older than lidar.STALE_S, a reader
+that throws. The model was trained with that, so it drives on the camera.
+check_lidar() refuses a sidecar with another lidar_layout, and every graph
+with an input this runtime does not know (KNOWN_INPUTS). /footprint's
+policy_lidar_present says whether a scan went in.
+
 numpy only at import. onnxruntime is imported when a model is loaded, so this
 file imports on a laptop and in every test without it.
 """
@@ -215,6 +227,7 @@ from crawler.autopilot import column_profile as cp
 from crawler.autopilot import driver as dv
 from crawler.autopilot import goal as gl
 from crawler.autopilot import policy_imu as pimu
+from crawler.autopilot import policy_lidar as pli
 
 # ---- the frame the model sees ----------------------------------------------
 
@@ -312,6 +325,12 @@ MODE_OUTPUT = "mode_logits"
 # The IMU input, for a model whose sidecar says uses_imu: (1, pimu.IMU_SIZE),
 # built by policy_imu.ImuFeatures off the same columns /footprint records.
 IMU_INPUT = "imu"
+# The lidar input, for a model whose sidecar says uses_lidar: (1, pli.SIZE),
+# built by policy_lidar.encode off LidarReader.latest().
+LIDAR_INPUT = "lidar"
+# Every input this runtime knows how to feed. A graph wanting any other is
+# a model from newer code, and is refused rather than run on a guess.
+KNOWN_INPUTS = ("x", "prev", MODE_INPUT, IMU_INPUT, LIDAR_INPUT)
 
 # The mode latch. 0.7 for 0.5 s: six ticks in a row at 10 Hz of a head that
 # clearly wants the other mode, not one tick of a coin flip. 2 s between
@@ -524,6 +543,42 @@ def check_imu(meta, inputs, where="sidecar"):
     if window != pimu.WINDOW:
         raise ValueError(f"{where}: imu_window {window!r} != {pimu.WINDOW}")
     return True, bool(meta.get("imu_tilt", False)), yaw
+
+
+def check_lidar(meta, inputs, where="sidecar"):
+    """The lidar half of the contract -> uses_lidar. ValueError when the
+    sidecar and the graph disagree, or the scan it was trained on is not
+    what policy_lidar builds.
+
+    A sidecar with no uses_lidar (every model before the lidar input) needs
+    a graph with no LIDAR_INPUT, and is never fed one. One with uses_lidar
+    true needs the input, and lidar_layout, lidar_size and lidar_clip_mm
+    equal to policy_lidar's: a model trained on another binning or another
+    scale would be fed numbers that mean something else to it.
+    """
+    inputs = set(inputs)
+    unknown = sorted(inputs - set(KNOWN_INPUTS))
+    if unknown:
+        raise ValueError(f"{where}: the graph wants inputs {unknown} this car does "
+                         f"not know how to feed")
+    if not meta.get("uses_lidar", False):
+        if LIDAR_INPUT in inputs:
+            raise ValueError(f"{where}: the graph has a {LIDAR_INPUT!r} input the "
+                             f"sidecar does not declare (no uses_lidar)")
+        return False
+    if LIDAR_INPUT not in inputs:
+        raise ValueError(f"{where}: uses_lidar declared but the graph has no "
+                         f"{LIDAR_INPUT!r} input")
+    layout = meta.get("lidar_layout")
+    if layout != pli.LAYOUT:
+        raise ValueError(f"{where}: lidar_layout {layout!r} != {pli.LAYOUT!r}: "
+                         f"this car cannot feed it")
+    if meta.get("lidar_size") != pli.SIZE:
+        raise ValueError(f"{where}: lidar_size {meta.get('lidar_size')!r} != {pli.SIZE}")
+    clip = meta.get("lidar_clip_mm")
+    if not isinstance(clip, (int, float)) or abs(float(clip) - pli.CLIP_MM) > 1e-6:
+        raise ValueError(f"{where}: lidar_clip_mm {clip!r} != {pli.CLIP_MM}")
+    return True
 
 
 def read_mode(outputs):
@@ -918,15 +973,19 @@ class PolicyModel:
         # never fed one, and runs exactly as it did.
         self.uses_imu, self.imu_tilt, self.imu_yaw = check_imu(
             self.meta, input_names, meta_path)
+        # False for every model before the lidar input: never fed one.
+        self.uses_lidar = check_lidar(self.meta, input_names, meta_path)
         self.path = path
 
-    def run(self, x, prev, mode=None, imu=None):
+    def run(self, x, prev, mode=None, imu=None, lidar=None):
         feed = {"x": x, "prev": prev}
         if self.has_mode:
             feed[MODE_INPUT] = mode if mode is not None else encode_mode(False)
         if self.uses_imu:
             feed[IMU_INPUT] = (imu if imu is not None
                                else np.zeros((1, pimu.size(self.imu_yaw)), dtype=np.float32))
+        if self.uses_lidar:
+            feed[LIDAR_INPUT] = lidar if lidar is not None else pli.missing()
         values = self.session.run(self.output_names, feed)
         return dict(zip(self.output_names, values))
 
@@ -986,6 +1045,10 @@ class PolicyDriver(dv.Driver):
         self._imu_sample = None
         self._imu_at = 0.0
         self.last_imu = None        # the features fed on the last model run
+        # The lidar input: the roof lidar's newest fresh scan each decision
+        # (policy_lidar.live_bins off self.lidar), or no scan.
+        self.uses_lidar = bool(getattr(model, "uses_lidar", False))
+        self.last_lidar_present = False  # a real scan went into this tick's model run
         # How sure the model is of what it commits, and the speed scale off
         # it. Reset with the latch, whenever auto stops.
         self.confidence = ConfidenceScale()
@@ -1152,6 +1215,9 @@ class PolicyDriver(dv.Driver):
             # The direction head's [left, straight, right] on its last
             # answer; all -1 for a regression head.
             "policy_steer_dir_p": [float(v) for v in self.last_steer_dir_p],
+            # Whether a lidar model was fed a real scan this decision; false
+            # on a tick the model did not run, and for a model with no lidar.
+            "policy_lidar_present": bool(self.uses_lidar and self.last_lidar_present),
         }
 
     def _recover(self, now, reason):
@@ -1187,6 +1253,8 @@ class PolicyDriver(dv.Driver):
         # Only a tick that commits a model action says how sure it was.
         self.confidence.raw = -1.0
         self.rear_stop = False
+        # Only a tick that runs the model says whether a scan went in.
+        self.last_lidar_present = False
         self.reverse_refractory = False
         # First, so every row says it, whichever path the tick takes. A goal
         # that raises is the exception path: neutral, and auto parks.
@@ -1262,10 +1330,19 @@ class PolicyDriver(dv.Driver):
         prev = (encode_prev(*self._prev) if self.model.uses_prev
                 else np.zeros((1, PREV_SIZE), dtype=np.float32))
         mode = encode_mode(self.mode.split) if self.has_mode else None
-        started = time.perf_counter()
+        extra = {}
         if self.uses_imu:
             self.last_imu = encode_imu(imu_x)
-            outputs = self.model.run(x, prev, mode, imu=self.last_imu)
+            extra["imu"] = self.last_imu
+        if self.uses_lidar:
+            # Missing when there is no --lidar, no fresh scan or a reader
+            # that throws: the model drives on the camera, as trained to.
+            bins = pli.live_bins(self.lidar)
+            self.last_lidar_present = bins is not None
+            extra["lidar"] = pli.encode(bins)
+        started = time.perf_counter()
+        if extra:
+            outputs = self.model.run(x, prev, mode, **extra)
         elif self.has_mode:
             outputs = self.model.run(x, prev, mode)
         else:

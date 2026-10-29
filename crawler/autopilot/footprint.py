@@ -101,6 +101,8 @@ AUTOPILOT_FIELDS = {
     "standoff_ticks": 0,         # decisions in a row the floor held a model forward
     # The direction head's [left, straight, right]; all -1 for a regression head.
     "policy_steer_dir_p": [0.0, 0.0, 0.0],
+    # A lidar model was fed a real roof lidar scan this decision (policy_lidar).
+    "policy_lidar_present": False,
     # The back-out (driver.Driver.begin_recover), for either autopilot.
     "backout_phase": "",         # reverse / settle / handback, "" with none
     "backout_reason": "",        # stuck / standoff / obstacle: what started it

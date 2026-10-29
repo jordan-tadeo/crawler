@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from crawler.autopilot import policy as pl  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
+from crawler.autopilot import policy_lidar as pli  # noqa: E402
 
 FWD = pl.ACTIONS.index(pl.FORWARD)
 STOP = pl.ACTIONS.index(pl.STOP)
@@ -77,6 +78,15 @@ def imu_input(model, data, i):
     return pl.encode_imu(feats)
 
 
+def lidar_input(data, i):
+    """Tick i's lidar input for a model that takes one: its scan through
+    policy_lidar.encode, the car's own function, or no scan where the tick
+    had none (and in a dataset from before the lidar)."""
+    if "lidar_present" not in data or not bool(data["lidar_present"][i]):
+        return pli.encode(None)
+    return pli.encode(data["lidar_bins"][i])
+
+
 def _run(model, data, i, split=None):
     """One tick through the model. A mode head is fed `split`, or the
     recorded mode going into the tick when that is None."""
@@ -88,8 +98,13 @@ def _run(model, data, i, split=None):
         if split is None:
             split = int(data["mode_in"][i]) == pl.STEER_MODES.index(pl.SPLIT)
         mode = pl.encode_mode(split)
+    extra = {}
     if getattr(model, "uses_imu", False):
-        return model.run(x, prev, mode, imu=imu_input(model, data, i))
+        extra["imu"] = imu_input(model, data, i)
+    if getattr(model, "uses_lidar", False):
+        extra["lidar"] = lidar_input(data, i)
+    if extra:
+        return model.run(x, prev, mode, **extra)
     if mode is None:
         return model.run(x, prev)
     return model.run(x, prev, mode)

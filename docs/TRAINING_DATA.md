@@ -138,6 +138,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `policy_steering_front` | float | the model's front steering, in manual's units (full lock 0.7) |
 | `policy_reason` | string | why it did that: `model`, `model floor` (a forward held by `driver.ForwardFloorVeto`: something under `FORWARD_FLOOR_MM`, or a probe that went blind on the way in), `model commit` (a fresh reverse held by the reverse commit), `standoff` (the floor held a forward for `policy.STANDOFF_S`, so the driver backed out), `rear bumper`, `blind`, `stuck`, ... |
 | `policy_infer_ms` | float | the model's inference time that tick |
+| `policy_lidar_present` | bool | a lidar model was fed a real scan this decision (one no older than `lidar.STALE_S`); false when it ran on no scan, on a tick the model did not run, and for every model without the lidar input. Absent in rows from before the lidar input |
 | `policy_steer_mode` | string | the steering mode the model drove with, `unified` or `split` (`policy.ModeLatch`); always `unified` for a model with no mode head. Not the row's `steering_mode`, which is the pad's |
 | `policy_steer_mode_p` | float | the mode head's probability of `policy_steer_mode` on its last answer, low while it wants to switch; -1 with no head |
 | `reverse_commit` | bool | a reverse commit held this tick: a fresh model reverse kept for `policy.REVERSE_COMMIT_S` at `policy.REVERSE_STEER`, whatever the model said. `policy_action` is still the model's own pick |
@@ -258,6 +259,34 @@ over pitch and roll only) in place of `gyro_peak`. The dataset stores them as
 builds them with, and the sidecar says `imu_yaw: false` with that list as
 `imu_features`. A car on code from before `imu_yaw` refuses such a model.
 
+## The lidar as a policy input
+
+`crawler/autopilot/policy_lidar.py` is the one place a scan becomes the
+policy's `lidar` input, on the car and in training. The input is 145 floats:
+the 72 bins of `/lidar` over `policy_lidar.CLIP_MM` (4 m, and anything past it
+is 4 m), then 72 flags for "this bin had a return" (a 0 bin reads as nothing
+there, not as touching), then one `present` flag. No scan is all zeros,
+`present` included.
+
+The dataset pairs each tick with the newest `/lidar` row at or before it, and
+no row when that one is more than `lidar.STALE_S` (0.3 s) old: the same rule
+as `LidarReader.latest()`, which is what the car feeds. A `/lidar` row in
+another binning counts as no scan. `policy_dataset.py` stores `lidar_bins`
+(the raw mm), `lidar_present` and `lidar_age_ms` (-1 with no scan) per tick,
+and says how many kept ticks had one. Recordings from before the lidar have
+none, and train as no scan.
+
+A model trained with `policy_train.py --lidar` declares `uses_lidar` and
+`lidar_layout` (`bins72_5deg`), and the car refuses one whose layout, size or
+clip is not its own, a graph with a `lidar` input the sidecar does not
+declare, and any graph input it does not know how to feed. It trains with
+sensor dropout (`--lidar-dropout`, 0.3 by default): that share of the ticks
+with a scan train as no scan, so the model still drives on the camera when the
+lidar is gone, stale or unplugged. The left-right flip mirrors the scan with
+it (bin `i` to bin `(72 - i) % 72`). A lidar model is a new contract, so its
+first release is a major version. A car on code from before the lidar input
+loads one and then fails on its first decision for the missing input.
+
 ## The steering mode as a label
 
 Unified drives both axles off the left stick, the rear counter-phase through
@@ -338,6 +367,7 @@ python tools/policy_train.py data.npz models/policy.onnx --val <one session name
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one session: time blocks
 python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu --prev   # + IMU, + last decision
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw    # + IMU without the yaw rate
+python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --lidar         # + the roof lidar
 python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu-no-yaw --imu-tilt   # + which way is up
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --steer-head direction   # left/straight/right + how far
 python tools/policy_eval.py data.npz models/policy.onnx --out report.md

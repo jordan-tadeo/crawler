@@ -417,6 +417,9 @@ JSON_SCHEMAS = {
         # A direction-head model's [left, straight, right] probabilities on
         # its last answer; all -1 for a regression head, 0 when no policy drives.
         "policy_steer_dir_p": {"type": "array", "items": _NUM, "minItems": 3, "maxItems": 3},
+        # Whether a lidar model was fed a real roof lidar scan this
+        # decision (policy_lidar); false for every other model and tick.
+        "policy_lidar_present": _BOOL,
         # The back-out, either autopilot (driver.Driver.backout_fields): its
         # phase (reverse / settle / handback, "" with none), what started it,
         # why its reverse ended, time since it began, how long the reverse
