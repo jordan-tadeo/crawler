@@ -410,6 +410,9 @@ JSON_SCHEMAS = {
         # and how many decisions in a row the floor has held a model forward
         # (policy.STANDOFF_S runs the recover).
         "reverse_commit": _BOOL,
+        # A fresh model reverse inside policy.REVERSE_REFRACTORY_S of the
+        # last one, driven as a forward instead.
+        "reverse_refractory": _BOOL,
         "standoff_ticks": _INT,
         # A direction-head model's [left, straight, right] probabilities on
         # its last answer; all -1 for a regression head, 0 when no policy drives.
@@ -426,6 +429,11 @@ JSON_SCHEMAS = {
         "backout_side": _NUM,
         "backout_speed": _NUM,
         "backout_level": _INT,
+        # The rear stop off the roof lidar (driver.py): rear bumper to the
+        # nearest return behind, mm, -1 with none or no fresh scan; and
+        # whether it ended or refused a reverse this decision.
+        "rear_clearance_mm": _NUM,
+        "rear_stop": _BOOL,
     }),
     # One revolution of the roof lidar, see crawler/hardware/lidar.py. bins
     # is lidar.BINS nearest ranges in mm from the middle of the car, bin i

@@ -1,6 +1,7 @@
 """The 2D lidar on the roof: an LDRobot STL-19P (the D500 kit), read off a UART.
 
-Off unless `--lidar` is given, and nothing in the control loop reads it yet.
+Off unless `--lidar` is given. The one thing in the control loop that reads
+it is the autopilot's rear stop (driver.py, "The rear stop"), via latest().
 What this file does is turn the sensor's byte stream into a full 360 degree
 scan in the car's own frame, on a thread of its own, and keep the newest one
 where anything can pick it up without waiting.

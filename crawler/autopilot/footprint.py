@@ -97,6 +97,7 @@ AUTOPILOT_FIELDS = {
     "policy_steer_mode": "",     # unified / split: the mode the model drove with
     "policy_steer_mode_p": 0.0,  # the mode head's p of that mode; -1 with no head
     "reverse_commit": False,     # a fresh model reverse was being held this tick
+    "reverse_refractory": False, # a fresh model reverse, too soon after the last, driven forward
     "standoff_ticks": 0,         # decisions in a row the floor held a model forward
     # The direction head's [left, straight, right]; all -1 for a regression head.
     "policy_steer_dir_p": [0.0, 0.0, 0.0],
@@ -109,6 +110,9 @@ AUTOPILOT_FIELDS = {
     "backout_side": 0.0,         # the side it reversed on, -1 left, +1 right
     "backout_speed": 0.0,        # what it put on the throttle this decision
     "backout_level": 0,          # escalation: 0, then 1, 2... at the same spot
+    # The rear stop off the roof lidar (driver.py, "The rear stop").
+    "rear_clearance_mm": -1.0,   # rear bumper to the nearest return behind; -1 none / no fresh scan
+    "rear_stop": False,          # the rear stop ended or refused a reverse this decision
 }
 
 
@@ -120,6 +124,9 @@ def _driver_fields(driver, now):
     backout = getattr(driver, "backout_fields", None)
     if backout is not None:
         out.update(backout(now))
+    rear = getattr(driver, "rear_fields", None)
+    if rear is not None:
+        out.update(rear())
     policy = getattr(driver, "policy_fields", None)
     if policy is not None:
         out.update(policy())

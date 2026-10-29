@@ -794,7 +794,7 @@ class AutoPilot:
     comparison.
     """
 
-    def __init__(self, vecon, logger, hub=None, policy_path=None):
+    def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -811,6 +811,9 @@ class AutoPilot:
         # Whether the car has arrived, for a learned driver's stop (goal.py).
         # Never set yet; a person follower sets it on this object.
         self.goal = goal.Goal()
+        # The roof lidar's reader with --lidar, else None: handed to the
+        # driver for its rear stop, which only ever asks it latest().
+        self.lidar = lidar
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -889,7 +892,7 @@ class AutoPilot:
         """
         if self.policy_path is None:
             from crawler.autopilot.driver import Driver
-            return Driver(self.command, view)
+            return Driver(self.command, view, lidar=self.lidar)
         from crawler.autopilot import policy
         model = policy.PolicyModel(self.policy_path)
         self.logger.log("info", "Mode",
@@ -897,7 +900,8 @@ class AutoPilot:
                         f"({model.representation}, {model.contract}, "
                         f"sha256 {model.sha256[:12]})")
         print(f"[auto] policy {model.label} sha256 {model.sha256}", file=sys.stderr)
-        return policy.PolicyDriver(self.command, view, model, goal=self.goal)
+        return policy.PolicyDriver(self.command, view, model, goal=self.goal,
+                                   lidar=self.lidar)
 
     def step(self, now, takeover=None, split=False):
         """One pass of auto mode. False means hand the wheels back to manual.
@@ -1783,7 +1787,8 @@ def main(argv=None):
         lidar = ld.LidarReader(device=args.lidar, logger=log,
                                tele=tele if channels_live else None)
         lidar.start()
-    autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy)
+    autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
+                          lidar=lidar)
 
     # Who gets the device opened at startup, and who waits for it:
     #

@@ -37,6 +37,13 @@ REVERSE_SPEED): slow, on the side my own reversing picks, ended when the way
 forward has opened rather than after a fixed two seconds, and handed back
 leaning toward the side that opened. A back-out soon after the last one is
 the same spot, and it escalates instead of repeating.
+
+And, with --lidar, it reads the roof lidar behind it (the block below the
+back-out, "The rear stop"): a fresh scan with something inside
+REAR_STOP_CLEAR_MM of the rear bumper ends the reverse before the gyro
+would have to feel it. Without a fresh scan the gyro is the stop, as before.
+Every reverse auto chooses goes out at ESCAPE_SPEED (auto_reverse_throttle),
+and none of this touches my trigger under takeover.
 """
 
 import math
@@ -44,6 +51,8 @@ import time
 from typing import NamedTuple
 
 import numpy as np
+
+from crawler.hardware import lidar as _lidar
 
 # Recover phases, in order.
 _PHASE_REVERSE = "reverse"
@@ -1147,6 +1156,109 @@ ESCAPE_SPEED = -0.45
 # the exit would be stopping, and the exit is a stop anyway.
 ESCAPE_RAMP_DECISIONS = 2
 
+
+def auto_reverse_throttle(throttle) -> float:
+    """A reverse the autopilot chose, as it goes on the wheels. Pure.
+
+    Every reverse auto commands on its own goes through here -- the policy's
+    tick-by-tick reverses and its reverse commit; the back-out is already at
+    ESCAPE_SPEED -- so "auto reverses slowly" is one line. ESCAPE_SPEED is
+    the cap: the model's reverses used to go out at up to reverse_speed,
+    -1.0, median |throttle| 0.60 over 812 commits. And it never goes out
+    under REVERSE_MOVING_FLOOR: one that would (the model asked for a little)
+    is raised to ESCAPE_SPEED, not to the floor, because 0.40 is the top of a
+    bracket and was never seen to move the car at lock, where a commit is.
+    So in practice every autonomous reverse is ESCAPE_SPEED.
+
+    My trigger under takeover never comes through here: AutoPilot writes it
+    over the driver's throttle (main.AutoPilot._pad_throttle), scaled by
+    reverse_speed, which stays -1.0 for that. A forward or a 0 passes
+    unchanged; anything not a finite number is 0.
+    """
+    try:
+        t = float(throttle)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(t):
+        return 0.0
+    if t >= 0.0:
+        return t
+    if -t < REVERSE_MOVING_FLOOR:
+        return float(ESCAPE_SPEED)
+    return max(t, float(ESCAPE_SPEED))
+
+
+# ---------------------------------------------------------------------------
+# The rear stop: the roof lidar, looking where the car is backing
+# ---------------------------------------------------------------------------
+#
+# The camera cannot see behind, and until the lidar the only thing that ended
+# a reverse at an obstacle was the gyro going quiet -- which is to say after
+# the car had hit it. The roof lidar (crawler/hardware/lidar.py) sees behind.
+# Any reverse auto commands is ended with neutral when a fresh scan puts the
+# nearest return behind the car inside REAR_STOP_CLEAR_MM of the rear bumper.
+# No lidar, a stale scan or nothing in the sector is exactly the old car: the
+# gyro bumper is still there, and is the only stop without a scan.
+#
+# The sector is narrow on purpose. The lidar is on the cab roof at the car's
+# middle; the rear wheels sit at about x -200, y +-150 (ESTIMATED off the
+# bumper and a ~300 mm width guess, HALF_WIDTH_MM is unmeasured), which is
+# bearing 180 -+ 37 at a range of 250, and the stock quadrant ("rear", +-45)
+# would take them in if the scan plane ever came down to them. +-20 degrees
+# (nine 5-degree bins, so +-22.5 at the bin edges) holds the car's own width
+# at the bumper (+-150 mm is +-29 degrees at 270 mm, so most of it) and all
+# of the path behind it from about 400 mm out, and stops short of the
+# wheels. It is the swept path of a straight reverse; a reverse at lock
+# swings the tail wider, and what is beside the tail is not in it. The width
+# is mine to judge on the floor.
+REAR_STOP_SECTOR = (180.0, 20.0)
+
+# Anything nearer than the rear bumper, measured from the middle where the
+# lidar is, is inside the car -- the roof mount, a cable, the bed's rails if
+# the plane catches them -- and never an obstacle, because nothing outside
+# can be nearer than the bodywork. Those returns are dropped before the
+# nearest is taken. Inside the sector the bodywork reaches 270-292 mm (270 /
+# cos 22.5); only 270 is inside on every bearing, so that is the line, and a
+# part of the car at 270-292 off-centre would read as an obstacle at the
+# bumper. REAR_BUMPER_X_MM is the owner's description, not a measurement.
+REAR_SELF_MM = abs(_lidar.REAR_BUMPER_X_MM)
+
+# How near the bumper is too near: the 120 mm of margin I asked for, plus how
+# far the car goes before the stop takes, ESTIMATED. At ESCAPE_SPEED -0.45
+# the ground speed is ESTIMATED 74 mm/s (REVERSE_CREDIT_MM_S x 0.45, never
+# measured). The return can be a revolution old (0.1 s at 10 Hz) and the
+# decision a tick late (0.1 s) before the neutral goes out, the revolution
+# itself takes 0.1 s, and the car coasts a little after: call it 0.5 s,
+# 37 mm, rounded up to 40. It is the one number, mine to judge on the floor.
+REAR_STOP_CLEAR_MM = 160.0
+
+
+def rear_clearance_mm(bins):
+    """mm from the rear bumper to the nearest return behind, or None. Pure.
+
+    `bins` is a lidar Scan's car-frame bins (range from the middle of the
+    car, 0 for no return). Only REAR_STOP_SECTOR is read, and returns nearer
+    than REAR_SELF_MM are the car itself and dropped. None when there is
+    nothing past the bumper in the sector, or the bins are not numbers.
+    """
+    try:
+        b = np.asarray(bins, dtype=np.float64)
+        if b.ndim != 1 or b.size == 0:
+            return None
+        b = np.where(np.isfinite(b) & (b >= REAR_SELF_MM), b, 0.0)
+        nearest = _lidar.nearest_in_sector(b, REAR_STOP_SECTOR)
+    except Exception:
+        return None
+    if nearest <= 0:
+        return None
+    return float(nearest - REAR_SELF_MM)
+
+
+def rear_blocked(clearance) -> bool:
+    """True when a clearance (rear_clearance_mm) is inside REAR_STOP_CLEAR_MM.
+    None -- no fresh scan, or nothing behind -- is never blocked."""
+    return clearance is not None and clearance < REAR_STOP_CLEAR_MM
+
 # How open "open" is. The rules reverse on anything inside CLEARANCE_MM and
 # the policy's floor holds at FORWARD_FLOOR_MM, so a back-out that ended the
 # moment the fan cleared 400 mm would hand back a car one tick from reversing
@@ -1205,6 +1317,7 @@ REVERSE_DEFAULT_SIDE = -1.0  # with no turn to go on: left, as I did 15 of 19 ti
 
 # Why a back-out's reverse ended.
 EXIT_OPENED = "opened"
+EXIT_REAR = "rear"
 EXIT_BUMPER = "bumper"
 EXIT_CAP = "cap"
 EXIT_NO_FRAME = "no frame"
@@ -1579,9 +1692,18 @@ class ForwardFloorVeto:
 
 
 class Driver:
-    def __init__(self, controller, oakd):
+    def __init__(self, controller, oakd, lidar=None):
         self.controller = controller
         self.camera = oakd
+        # The roof lidar (hardware.lidar.LidarReader), or None without
+        # --lidar. Only ever asked latest(), one attribute read and an age
+        # check, never anything that waits. See "The rear stop".
+        self.lidar = lidar
+        # This decision's rear clearance (rear_clearance_mm, None with no
+        # fresh scan or nothing behind), and whether the rear stop ended or
+        # refused a reverse on it. Read-only bookkeeping for /footprint.
+        self.rear_clearance = None
+        self.rear_stop = False
 
         self.last_recovery_time = 0.0
         self.recovery_cooldown = 5.0  # seconds before the stuck check re-arms
@@ -1935,13 +2057,46 @@ class Driver:
         # which at a slow speed is a car that does not turn.
         self._turn_dir = side * self.max_turn
         self.controller.set_steering(*steering_pair(self._turn_dir))
-        self._backout_drive()
 
         self._phase = _PHASE_REVERSE
         self._phase_until = now + cap
         self._clear_motion_evidence()
         # Whatever the car was steering around, it is behind the decision now.
         self._clear_evade()
+        # Something already that near behind: no reverse at all, straight to
+        # the settle at 0. The first ease-in step would not move the car, but
+        # a stop is a stop.
+        if rear_blocked(self.read_rear()):
+            self.rear_stop = True
+            self._end_reverse(now, EXIT_REAR)
+            return
+        self._backout_drive()
+
+    def read_rear(self):
+        """This decision's rear clearance off the newest fresh lidar scan,
+        remembered for /footprint: mm past the bumper, or None. Never raises,
+        never waits: no lidar, no scan, a stale one or a reader that throws
+        are all None, which is the car without a lidar."""
+        clearance = None
+        lidar = self.lidar
+        if lidar is not None:
+            try:
+                scan = lidar.latest()
+                bins = getattr(scan, "bins", None) if scan is not None else None
+                if bins is not None:
+                    clearance = rear_clearance_mm(bins)
+            except Exception:
+                clearance = None
+        self.rear_clearance = clearance
+        return clearance
+
+    def rear_fields(self):
+        """What /footprint records about the rear stop on this decision."""
+        c = self.rear_clearance
+        return {
+            "rear_clearance_mm": float(c) if c is not None else -1.0,
+            "rear_stop": bool(self.rear_stop),
+        }
 
     def _backout_drive(self):
         """One decision's reverse throttle, on the ease-in. Never non-finite:
@@ -2029,7 +2184,11 @@ class Driver:
 
           no usable depth frame     EXIT_NO_FRAME: stop, a car that cannot
                                     see is not a car that decides
-          the rear bumper           EXIT_BUMPER
+          the rear stop             EXIT_REAR: a fresh lidar scan has
+                                    something inside REAR_STOP_CLEAR_MM of
+                                    the rear bumper
+          the rear bumper           EXIT_BUMPER: the gyro, which is all
+                                    there is with no fresh scan
           past the cap              EXIT_CAP (REVERSE_SECONDS, or
                                     ESCALATED_REVERSE_SECONDS)
           open BACKOUT_OPEN_DECISIONS
@@ -2047,6 +2206,7 @@ class Driver:
             # reverse, because it is accumulating evidence.
             hit = self._rear_bumper_hit()
             scan = self._backout_scan()
+            rear = rear_blocked(self.read_rear())
             elapsed = now - self._backout_since
             if scan is not None and backout_opened(scan, -self._backout_side):
                 self._backout_open += 1
@@ -2055,6 +2215,11 @@ class Driver:
 
             if scan is None:
                 exit_reason = EXIT_NO_FRAME
+            elif rear:
+                # The lidar sees it before the gyro feels it; the gyro is
+                # what is left with no fresh scan.
+                self.rear_stop = True
+                exit_reason = EXIT_REAR
             elif hit:
                 exit_reason = EXIT_BUMPER
             elif now >= self._phase_until:
@@ -2112,6 +2277,9 @@ class Driver:
         self._backout_reverse_s = max(0.0, now - self._backout_since)
         if exit_reason == EXIT_BUMPER:
             print("Rear bumper - something behind me, cutting the reverse.")
+        elif exit_reason == EXIT_REAR:
+            print(f"Rear stop - {self.rear_clearance:.0f} mm behind me, "
+                  "cutting the reverse.")
         print(f"[Driver] back-out {exit_reason} after "
               f"{self._backout_reverse_s:.1f} s ({self._backout_reason}, "
               f"level {self._backout_level})")
@@ -2290,8 +2458,12 @@ class Driver:
         if now is None:
             now = time.monotonic()
 
+        self.rear_stop = False
         if self.recovering(now):
             return
+        # The rules only reverse through the back-out, which reads it itself;
+        # this is for the row.
+        self.read_rear()
 
         depth = self.camera.get_depth_frame()
         if depth is None:

@@ -141,15 +141,18 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `policy_steer_mode` | string | the steering mode the model drove with, `unified` or `split` (`policy.ModeLatch`); always `unified` for a model with no mode head. Not the row's `steering_mode`, which is the pad's |
 | `policy_steer_mode_p` | float | the mode head's probability of `policy_steer_mode` on its last answer, low while it wants to switch; -1 with no head |
 | `reverse_commit` | bool | a reverse commit held this tick: a fresh model reverse kept for `policy.REVERSE_COMMIT_S` at `policy.REVERSE_STEER`, whatever the model said. `policy_action` is still the model's own pick |
+| `reverse_refractory` | bool | a fresh model reverse came inside `policy.REVERSE_REFRACTORY_S` of the last autonomous reverse, with the floor not holding, and was driven as a forward. `policy_action` is still the model's own pick. Absent in rows from before the refractory |
 | `standoff_ticks` | int | decisions in a row the floor has held a model forward; 0 otherwise |
 | `backout_phase` | string | the driver's back-out this tick: `reverse`, `settle`, `handback` (the model or the rules drive again, `driver.HANDBACK_S` of steering lean still on), or `""`. The fields below describe the current back-out, or the last one once it is over. Absent in rows from before the back-out |
 | `backout_reason` | string | why it started: `stuck`, `standoff` or `obstacle`; `""` before the first |
-| `backout_exit` | string | how the last reverse ended: `opened` (the way forward cleared for `driver.BACKOUT_OPEN_DECISIONS` decisions), `bumper`, `cap`, `no frame` or `abort`; `""` while it still reverses |
+| `backout_exit` | string | how the last reverse ended: `opened` (the way forward cleared for `driver.BACKOUT_OPEN_DECISIONS` decisions), `rear` (the lidar rear stop), `bumper`, `cap`, `no frame` or `abort`; `""` while it still reverses |
 | `backout_elapsed_s` | float | seconds since this back-out started; 0 when `backout_phase` is `""` |
 | `backout_reverse_s` | float | how long its reverse ran, once it ended; 0 before |
 | `backout_side` | float | the side it reversed toward, -1 or 1 (front steering sign) |
 | `backout_speed` | float | the throttle it commanded this tick, never further back than `driver.ESCAPE_SPEED`; 0 outside a reverse |
 | `backout_level` | int | 0, or how many back-outs in a row hit the same spot within `driver.ESCALATE_WINDOW_S` |
+| `rear_clearance_mm` | float | the rear bumper to the nearest lidar return in `driver.REAR_STOP_SECTOR`, mm, returns inside the car dropped; -1 with nothing there, no fresh scan or no `--lidar`. Absent in rows from before the rear stop |
+| `rear_stop` | bool | the rear stop (`driver.REAR_STOP_CLEAR_MM`) ended or refused an autonomous reverse this decision |
 | `policy_steer_dir_p` | float[3] | a direction-head model's steering class probabilities on its last answer, `[left, straight, right]`; all -1 for a regression-head model, all 0 when no policy drives. Absent in rows from before the direction head |
 | `depth_small` | bool | a `/policy/depth_small` picture carries this row's log time |
 | `depth_raw` | bool | a `/camera/depth_raw` frame carries this row's log time |

@@ -186,7 +186,8 @@ def test_a_model_reverse_is_decided_again_every_tick_once_its_commit_is_up():
     d = policy_driver(model, clear())
     d.tick(T0)
     assert d._phase is None and not d.recovering(T0 + 0.1)
-    assert d.controller.throttles[-1] == pytest.approx(0.5 * d.reverse_speed)
+    # Slow, as every autonomous reverse is: the back-out's speed.
+    assert d.controller.throttles[-1] == pytest.approx(dv.ESCAPE_SPEED)
     assert d.controller.steerings[-1] == dv.steering_pair(pl.STEER_SCALE)
     # Past the commit, still reversing, it is the model's tick by tick: its
     # own steering, and it can change its mind at once.
@@ -291,16 +292,17 @@ def test_a_model_floor_lets_go_on_open_floor_and_on_backing_off():
     drive_through(d, [clear()], start=T0 + 0.2)
     assert d.last_decision.reason == "model"
 
-    # Latched again, then the model backs up at the cap while the probe stays
-    # blind: about 1.22 s of it lets go, and forward is the model's again.
+    # Latched again, then the model backs up -- at ESCAPE_SPEED, every
+    # autonomous reverse is -- while the probe stays blind: 200 mm at the
+    # ESTIMATED 74 mm/s is about 2.7 s of it, and forward is the model's again.
     d = policy_driver(StubModel(REVERSE), centre_band(190))
     drive_through(d, [centre_band(190), centre_band(0)])
-    drive_through(d, [centre_band(0) for _ in range(10)], start=T0 + 0.2)
-    assert d.floor_veto.vetoes()  # 1.1 s of reverse: 180 mm, not yet
-    drive_through(d, [centre_band(0) for _ in range(3)], start=T0 + 1.2)
-    assert not d.floor_veto.vetoes()  # 1.4 s: 230 mm
+    drive_through(d, [centre_band(0) for _ in range(24)], start=T0 + 0.2)
+    assert d.floor_veto.vetoes()  # 2.5 s of reverse: 177 mm, not yet
+    drive_through(d, [centre_band(0) for _ in range(4)], start=T0 + 2.6)
+    assert not d.floor_veto.vetoes()  # 2.9 s: 207 mm
     d.model.out["logits"] = np.array([FORWARD], dtype=np.float32)
-    drive_through(d, [centre_band(0)], start=T0 + 1.5)
+    drive_through(d, [centre_band(0)], start=T0 + 3.0)
     assert d.last_decision.reason == "model"
     assert d.controller.throttles[-1] == pytest.approx(d.forward_speed)
 
@@ -308,11 +310,11 @@ def test_a_model_floor_lets_go_on_open_floor_and_on_backing_off():
 def test_the_floor_never_holds_a_model_reverse():
     d = policy_driver(StubModel(REVERSE, throttle=1.0, steer=-0.4), chair_leg())
     d.tick(T0)
-    assert d.controller.throttles[-1] == pytest.approx(d.reverse_speed)
+    assert d.controller.throttles[-1] == pytest.approx(dv.ESCAPE_SPEED)
     assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(-pl.REVERSE_STEER))
     assert d.last_decision.reason == "model commit"
     d.tick(T0 + pl.REVERSE_COMMIT_S)
-    assert d.controller.throttles[-1] == pytest.approx(d.reverse_speed)
+    assert d.controller.throttles[-1] == pytest.approx(dv.ESCAPE_SPEED)
     assert d.last_decision.reason == "model"
 
 
@@ -661,7 +663,7 @@ def test_rows_under_the_rules_say_rules_and_record_rows_say_nobody():
     fields = fp.autopilot_fields(d)
     assert fields["autopilot"] == pl.AUTOPILOT_POLICY
     assert fields["policy_action"] == pl.REVERSE
-    assert fields["policy_throttle"] == pytest.approx(0.5 * d.reverse_speed)
+    assert fields["policy_throttle"] == pytest.approx(dv.ESCAPE_SPEED)
 
 
 # --- crawler/__main__.py: opt-in, and loud when it fails ----------------------------------
@@ -988,7 +990,10 @@ def test_a_sure_model_drives_its_throttle_unchanged(action, speed):
     d = policy_driver(StubModel(sure_of(0.95, action), throttle=0.75), clear())
     run_ticks(d, 10)
     assert d.confidence.scale == 1.0
-    assert d.controller.throttles[-1] == 0.75 * getattr(d, speed)
+    want = 0.75 * getattr(d, speed)
+    if action == pl.REVERSE:
+        want = dv.auto_reverse_throttle(want)   # slow, whatever the model says
+    assert d.controller.throttles[-1] == want
 
 
 def test_an_unsure_model_slows_to_the_speed_floor():
@@ -1338,7 +1343,7 @@ def test_the_commit_steers_in_the_mode_the_policy_is_in():
     assert d.controller.steerings[-1] == pytest.approx((pl.REVERSE_STEER, 0.0))
 
 
-def test_the_confidence_still_slows_the_commit():
+def test_the_commit_is_slow_whatever_the_confidence():
     model = StubModel(REVERSE, throttle=1.0)
     d = policy_driver(model, clear())
     d.tick(T0)
@@ -1347,8 +1352,9 @@ def test_the_confidence_still_slows_the_commit():
         d.tick(T0 + k * 0.1)
     assert d.reverse_commit
     assert d.confidence.scale < 1.0
-    assert d.controller.throttles[-1] == pytest.approx(
-        pl.slowed_throttle(d.reverse_speed, d.confidence.scale, pl.MOVING_FLOOR_REVERSE))
+    # The scale cannot take a reverse under MOVING_FLOOR_REVERSE, which is
+    # the cap, ESCAPE_SPEED: every commit goes at exactly that.
+    assert d.controller.throttles[-1] == pytest.approx(dv.ESCAPE_SPEED)
 
 
 class ReachedLater:
