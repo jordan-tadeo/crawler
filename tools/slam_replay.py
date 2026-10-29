@@ -450,7 +450,7 @@ def main(argv=None):
                  grid_MB=slam.grid.nbytes() / 1e6, retries=slam.retries,
                  recoveries=slam.recoveries, scrolls=slam.grid.scrolls,
                  grew=slam.grid.grew, dropped_scrolls=slam.grid.dropped,
-                 banded=slam.banded)
+                 banded=slam.banded, reseeds=slam.reseeds)
         with open(os.path.join(a.out, name + ".json"), "w") as f:
             json.dump(m, f, indent=1)
         with open(os.path.join(a.out, name + ".csv"), "w") as f:

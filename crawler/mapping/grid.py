@@ -133,6 +133,13 @@ class Grid:
     def nbytes(self):
         return sum(a.nbytes for a in (self.lo, self.fx, self.fy, self.cnt))
 
+    def clear(self):
+        """Everything back to unknown, in place: the window keeps its size
+        and origin, and the version moves on so a reader sees the change."""
+        for a in (self.lo, self.fx, self.fy, self.cnt):
+            a.fill(0)
+        self.version += 1
+
     # ---- reading -------------------------------------------------------
 
     def occupied(self):

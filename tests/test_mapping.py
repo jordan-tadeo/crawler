@@ -422,6 +422,169 @@ def test_a_rollover_freezes_the_pose_and_recovers_after():
     assert e_xy < 0.05 and e_yaw < math.radians(2)
 
 
+# ---- lost, found again, and never dropping the map ---------------------------
+
+def put_down(slam, imu, pose, scans, t0, gyro=0.0):
+    """`scans` revolutions with the truck standing still at `pose`, level;
+    the gyro reads `gyro` rad/s over the first of them (a turn while it was
+    carried) and nothing after."""
+    out = []
+    for k in range(scans):
+        t = t0 + (k + 1) * PERIOD
+        for j in range(10):
+            imu.add(t - PERIOD + (j + 1) * 0.01,
+                    (-(gyro if k == 0 else 0.0), 0.0, 0.0), LEVEL)
+        out.append(slam.step(t, scan_at(t, lambda tt: pose)))
+    return out
+
+
+def test_a_truck_set_down_metres_away_facing_elsewhere_is_found():
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    p0 = path_pose(6.0)
+    put = p0 + np.array([1.5, 0.5, math.radians(120)])
+    out = put_down(slam, imu, put, 40, 6.0)
+    found = next(k for k, r in enumerate(out) if r.state == sl.TRACKING
+                 and r.matched and k > 0 and out[k - 1].state == sl.LOST)
+    assert slam.recoveries == 1
+    # Every heading is searched in a second and a half of scans.
+    assert found <= 20, found
+    lost = [r for r in out if r.state == sl.LOST]
+    assert lost and not any(r.written for r in lost), "nothing written lost"
+    assert all(r.state == sl.TRACKING for r in out[found:])
+    e_xy, e_yaw = err_vs_truth(out[-1]._replace(t=0.0),
+                               pose_fn=lambda t: put if t == 0.0 else path_pose(t))
+    assert e_xy < 0.05 and e_yaw < math.radians(2)
+
+
+def test_the_jump_to_a_found_pose_is_not_taken_as_speed():
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    put = path_pose(6.0) + np.array([1.5, 0.5, math.radians(120)])
+    for k in range(40):
+        put_down(slam, imu, put, 1, 6.0 + k * PERIOD)
+        if slam.recoveries:
+            break
+    assert slam.recoveries == 1
+    # Standing still: what it carries into the next prediction is nothing,
+    # not the metres from the frozen pose over one scan.
+    v = slam.vel
+    assert math.hypot(v[0], v[1]) < 0.05 and abs(v[2]) < 0.05
+
+
+def test_a_fit_with_a_twin_is_not_taken_unless_the_gyro_settles_it():
+    from crawler.mapping import reloc as rl
+    room = gr.Grid(size=256)
+    s = rl.Search(room, 0.0, 0.0, 0.0)
+    one = (3.17, 0.0, math.radians(-138))
+    twin = (-2.17, 0.94, math.radians(42))
+    # The synthetic room's own pair: the true pose and its turned-round twin.
+    for f in [(0.81, one), (0.80, one), (0.79, twin), (0.4, (1.0, 1.0, 0.0))]:
+        s.add(*f)
+    assert s.pick(0.75) is None, "two answers, no guess"
+    for f in [(0.81, one), (0.79, twin)]:
+        s.add(*f)
+    assert s.pick(0.75, prior=math.radians(-130)) == one
+    for f in [(0.81, one), (0.79, twin)]:
+        s.add(*f)
+    assert s.pick(0.75, prior=math.radians(90)) is None, "near neither"
+    # One answer a clear margin ahead is taken, gyro or not.
+    for f in [(0.85, one), (0.84, one), (0.70, twin)]:
+        s.add(*f)
+    assert s.pick(0.75) == one
+    s.add(0.6, one)
+    assert s.pick(0.75) is None, "under the bar"
+    assert s.fits == [], "each circle starts its own list"
+
+
+def test_lost_too_long_starts_a_fresh_map_and_shelves_the_old_one():
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    old = slam.grid
+    v = old.version
+    cells = int((old.lo != 0).sum())
+    # Out of the search's reach (3.8 m from where it froze, its twin too).
+    put = np.array([3.5, 2.6, math.radians(-100)])
+    n = int(sl.RESEED_LOST_S / PERIOD) + 40
+    out = put_down(slam, imu, put, n, 6.0)
+    assert slam.reseeds == 1
+    assert [r.reseed for r in out if r.reseed] == ["lost"]
+    assert slam.grid is not old
+    assert slam._shelf is not None and slam._shelf[0] is old
+    assert old.version == v and int((old.lo != 0).sum()) == cells, \
+        "the shelved map is the old one as it was"
+    k = next(k for k, r in enumerate(out) if r.reseed)
+    assert all(r.state == sl.TRACKING for r in out[k + 1:])
+    assert sum(r.written for r in out[k:]) > 0.9 * len(out[k:])
+
+
+def test_a_fresh_map_is_merged_back_when_the_old_one_is_found():
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    old = slam.grid
+    # Started over off by half a metre and 20 degrees, as a fresh map after
+    # a long loss is: its frame is wherever the old pose had frozen.
+    slam._start_over(keep=True)
+    slam.pose = slam.pose + np.array([0.5, -0.3, math.radians(20)])
+    off = slam.pose.copy()
+    truth = path_pose(6.0)
+
+    def here(t):
+        return truth
+    out = []
+    for k in range(40):
+        t = 6.0 + (k + 1) * PERIOD
+        for j in range(10):
+            imu.add(t - PERIOD + (j + 1) * 0.01, (0.0, 0.0, 0.0), LEVEL)
+        out.append(slam.step(t, scan_at(t, here)))
+    assert [r.reseed for r in out if r.reseed] == ["merged"]
+    assert slam.merges == 1 and slam.grid is old and slam._shelf is None
+    e_xy, e_yaw = err_vs_truth(out[-1]._replace(t=6.0))
+    assert e_xy < 0.05 and e_yaw < math.radians(2), "back in the old frame"
+    assert not np.allclose(slam.pose, off)
+
+
+def test_a_map_that_does_not_fit_its_next_scan_is_started_again():
+    # 182749Z: the first scans were the truck at rest, then it was carried
+    # 1.7 m before the mapper's first result. The map was those scans and
+    # nothing later fitted it; lost for the rest of the drive.
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    a = path_pose(0.0)
+    put_down(slam, imu, a, 2, 0.0)
+    b = a + np.array([1.7, 0.4, math.radians(50)])
+    out = put_down(slam, imu, b, 60, 0.2)
+    assert "young" in [r.reseed for r in out]
+    assert slam.reseeds >= 1
+    assert all(r.state == sl.TRACKING for r in out[-40:])
+    assert sum(r.written for r in out[-40:]) == 40
+
+
+def test_the_runner_says_a_fresh_map_once_not_every_scan():
+    class Log:
+        said = []
+
+        def log(self, level, subject, message):
+            self.said.append((level, message))
+    now = [100.0]
+    r = rn.SlamRunner(logger=Log(), clock=lambda: now[0])
+    res = sl.Slam(imu=ImuTrack()).step(0.1, scan_at(0.1))
+    for k in range(5):
+        now[0] = 100.0 + 0.1 * k
+        r._take(("r", res._replace(reseed="young")))
+    now[0] = 100.0 + rn.RESEED_LOG_EVERY_S + 0.5
+    r._take(("r", res._replace(reseed="lost")))
+    r._take(("r", res._replace(reseed="merged")))
+    assert [lv for lv, _ in Log.said] == ["warning", "warning", "info"]
+    assert "4 more" in Log.said[1][1]
+    assert r.stats()["reseeds"] == 6
+    assert rn.status_row(res, r.stats())["reseeds"] == 6
+
+
 def test_the_synthetic_room_is_mapped_with_centimetre_pose_error():
     imu = ImuTrack()
     slam = sl.Slam(imu=imu)

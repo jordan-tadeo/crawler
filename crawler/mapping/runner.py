@@ -69,6 +69,11 @@ NAV_HALF_M = 8.0
 PATH_STEP_M = 0.10
 PATH_MAX = 2000
 
+# A fresh map (slam.py, Result.reseed) goes in the journal; more inside this
+# long of the last line are counted and said with the next one, so a truck
+# carried about at boot, a fresh map a scan, is one line and not fifty.
+RESEED_LOG_EVERY_S = 5.0
+
 # The lidar's own /tf (base_link -> lidar only) stands back while a SLAM
 # result has come in within this long, and takes over again if they stop.
 OWN_TF_S = 1.0
@@ -277,6 +282,9 @@ class SlamRunner:
         self.imu_samples = 0
         self.grid_grew = 0
         self.grid_dropped = 0
+        self.reseeds = 0
+        self._reseed_said_at = None
+        self._reseed_quiet = 0
         self._latest = None
         self._latest_at = None
         self._map = None
@@ -444,6 +452,7 @@ class SlamRunner:
                 "errors": self.errors, "imu_samples": self.imu_samples,
                 "grid_grew": self.grid_grew,
                 "grid_dropped": self.grid_dropped,
+                "reseeds": self.reseeds,
                 "alive": bool(w is not None and w.is_alive())}
 
     # ---- the pump --------------------------------------------------------------
@@ -471,6 +480,8 @@ class SlamRunner:
             with self._poses_lock:
                 self._poses.append(pose_stamp(res))
             self.results += 1
+            if getattr(res, "reseed", ""):
+                self._note_reseed(res.reseed, now)
             self._extend_path(res)
             self._offer_result(res, now)
         elif kind == "crop":
@@ -499,6 +510,25 @@ class SlamRunner:
                                     f"A scan failed to match: {item[1]}")
                 except Exception:
                     pass
+
+    def _note_reseed(self, why, now):
+        if why == "merged":
+            self._say("info", "Found my place on the old map again and "
+                      "merged the new one into it")
+            return
+        self.reseeds += 1
+        at = self._reseed_said_at
+        if at is not None and now - at < RESEED_LOG_EVERY_S:
+            self._reseed_quiet += 1
+            return
+        more = (f", {self._reseed_quiet} more since the last line"
+                if self._reseed_quiet else "")
+        self._reseed_said_at, self._reseed_quiet = now, 0
+        from crawler.mapping.slam import RESEED_LOST_S
+        self._say("warning", f"Lost my place for {RESEED_LOST_S:g} s, started "
+                  "a fresh map and kept the old one to find again" + more
+                  if why == "lost" else
+                  "The new map did not fit the next scan, started it again" + more)
 
     def _say(self, level, message):
         if self.logger is None:
@@ -602,6 +632,8 @@ def status_row(res, stats) -> dict:
         "pitch_deg": num(res.pitch_deg, 2), "roll_deg": num(res.roll_deg, 2),
         "held": int(res.held), "banded": bool(res.banded),
         "iters": int(res.iters), "ms": num(res.ms, 2),
+        "reseed": str(getattr(res, "reseed", "")),
+        "reseeds": int(stats.get("reseeds", 0)),
         "scans": int(stats.get("scans", 0)),
         "dropped": int(stats.get("dropped", 0)),
         "errors": int(stats.get("errors", 0)),

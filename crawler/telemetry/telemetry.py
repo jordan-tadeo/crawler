@@ -498,6 +498,11 @@ JSON_SCHEMAS = {
         # far from the prediction.
         "pitch_deg": _NUM, "roll_deg": _NUM, "held": _INT, "banded": _BOOL,
         "iters": _INT, "ms": _NUM,
+        # "young" or "lost" when this scan started a fresh map (a lost one's
+        # old map is shelved, not dropped), "merged" when it found its place
+        # on the shelved one again and merged the fresh one in (slam.py), ""
+        # otherwise; reseeds is how many fresh maps since boot.
+        "reseed": _STR, "reseeds": _INT,
         # The runner's counts since boot: scans offered, dropped because the
         # mapper was behind, and steps that raised.
         "scans": _INT, "dropped": _INT, "errors": _INT,

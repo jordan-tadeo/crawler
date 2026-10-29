@@ -39,9 +39,35 @@ The states (Result.state):
   rolled     past ROLL_DEG, upside down or on its side or in a hand: the pose
              is frozen and nothing is matched or written
   lost       MAX_FAILS fits in a row failed, or it just came back from
-             rolled. Nothing is written; every scan tries RECOVER_SEEDS
-             headings round the whole circle from the frozen pose until one
-             fits well (RECOVER_MIN_INLIERS), and then it is tracking again.
+             rolled. The pose is in doubt; the map is not. Nothing is
+             written, and every scan relocalizes against the map
+             (_relocalize): a correlative search (reloc.py) over x, y and
+             heading within reloc.SEARCH_R_M of the frozen pose, the
+             headings outwards from the heading the gyro has carried it to
+             since (projected on up, so through a rollover too), then ICP on
+             the best few. A fit over RECOVER_MIN_INLIERS is picked if no
+             different pose fits nearly as well (a room turned round can),
+             or if the gyro's heading settles which (reloc.Search.pick), and
+             believed once ICP from it fits as well on the next scan too;
+             then it is tracking again. Measured on the synthetic room: set
+             down in place after 4 s upside down, tracking on the 2nd scan;
+             1.5 m off and turned 120 degrees, on the 14th; 1.2-1.4 cm off.
+
+Never losing the map. A tilt, a knock or a rollover only ever makes the pose
+uncertain: the map stays as it was. Only lost for RESEED_LOST_S (counted from
+when it was last rolled, so the time in a hand does not count) is a fresh map
+started from the scan in hand (Result.reseed "lost"), and even then the old
+one is kept on the shelf: every SHELF_EVERY scans the truck is relocalized
+against it, round where the fresh map has the truck, and when that is found
+(twice running, the same way) the fresh map is merged into the old one and
+the old one is the map again (Result.reseed "merged").
+
+A map is young until it has had SEED_WRITES writes. A young map that a scan
+does not fit is started again from that scan (Result.reseed "young"), and
+nothing is shelved: one or two scans are no map to hold the truck to. On
+10-29 the truck was carried to the start after boot, the map was its first
+scan from where it had stood, and nothing after fitted it: lost from one
+second in, for the whole drive.
 
 With no IMU at all (the camera shut) it still runs: no heading prior, the
 de-skew rate from the last fits, and the level gate open, because there is
@@ -66,6 +92,7 @@ from scipy.spatial import cKDTree
 
 from crawler.mapping import grid as gr
 from crawler.mapping import matcher as mt
+from crawler.mapping import reloc as rl
 from crawler.mapping import scan as sc
 from crawler.mapping.imu import ImuTrack
 
@@ -125,10 +152,21 @@ TREE_WRITES = 5
 ROLL_DEG = 60.0
 # This many failed fits in a row and the pose is not believed any more.
 MAX_FAILS = 10
-# Lost: headings tried per scan, and how good a fit must be to end it.
-RECOVER_STEP_DEG = 10
-RECOVER_SEEDS = 8
+# Lost: how good a relocalized fit must be to end it.
 RECOVER_MIN_INLIERS = 0.75
+# A confirmed fit is one ICP from the candidate on the next scan agrees with
+# to within these.
+CONFIRM_M = 0.25
+CONFIRM_DEG = 8.0
+# Lost this long, in scan time, without a relocalization, and a fresh map is
+# started from the scan in hand, the old one shelved. The search covers the
+# whole circle every 3 scans, so this is the window searched 25 times over.
+RESEED_LOST_S = 8.0
+# A shelved map is searched for every this many scans of the fresh one.
+SHELF_EVERY = 5
+# Under this many writes since the map started a scan that does not fit
+# starts it again instead of failing.
+SEED_WRITES = 5
 
 # The revolution period when there is nothing better to go on: 0.1009 s
 # measured over the four drives.
@@ -165,6 +203,7 @@ class Result(NamedTuple):
     roll_deg: float = float("nan")
     held: int = 0             # directions the fit kept at the prediction
     banded: bool = False      # the fit landed outside the band and was refused
+    reseed: str = ""          # "young" / "lost": this scan started a fresh map
 
 
 class Slam:
@@ -189,7 +228,26 @@ class Slam:
         self.started = False
         self.fails = 0
         self.lost = False
-        self._seed = 0
+        # Scan time the pose stopped being believed (or the truck was last
+        # rolled); None while it is.
+        self._lost_since = None
+        # Writes since the map was last started, for SEED_WRITES.
+        self._map_writes = 0
+        self.reseeds = 0
+        self.merges = 0
+        self._reseed = ""
+        # The relocalization in progress while lost (reloc.Search), and a fit
+        # waiting to be confirmed on the next scan.
+        self._search = None
+        self._pending = None
+        # While lost: the heading the gyro has carried the truck to since the
+        # pose stopped being believed (map radians), or None once a gap in it
+        # means it is not known. It orders the search and settles a fit with
+        # a twin (reloc.Search.pick).
+        self._lost_yaw = None
+        # A map put aside by a reseed: [grid, writes, search, pending
+        # transform, scans since the last try].
+        self._shelf = None
         self._tree = None
         self._tgt = None
         self._tree_at = None
@@ -220,11 +278,22 @@ class Slam:
         tilt = imu.tilt(t)
         self._att = imu.pitch_roll(t)
         self._banded = False
+        self._reseed = ""
 
         if tilt > ROLL_DEG:
             # Frozen. Whatever the scan sees now is the floor, the ceiling or
-            # a hand; none of it is a wall to match.
+            # a hand; none of it is a wall to match. The map is kept. The
+            # gyro is projected on up (imu.py), so it still says how far the
+            # truck has turned about the vertical while it is over.
+            if not self.lost:
+                self._lost_yaw = float(self.pose[2])
+            self._carry_yaw(imu.rate_between(last_t, t, self.bias)
+                            if last_t is not None else None,
+                            t - last_t if last_t is not None else 0.0)
             self.lost = True
+            self._lost_since = t
+            self._search = None
+            self._pending = None
             self.vel[:] = 0.0
             self.last_t = t
             return self._result(t, ROLLED, False, False, "rolled", None,
@@ -258,20 +327,26 @@ class Slam:
             pred[2] = pose[2] + imu_rate * dt
 
         fit = None
+        recovered = False
         if not self.started:
             newpose, good = pose.copy(), True
             self.started = True
         elif self._tree is None:
             newpose, good = pred, False
         elif self.lost:
-            fit = self._recover(p, nrm, pred)
-            good = fit is not None
+            self._carry_yaw(imu_rate, dt)
+            fit, good = self._relocalize(p, nrm, pred, self._lost_yaw)
             newpose = np.array(fit.pose) if good else pose.copy()
             if good:
                 self.lost = False
+                self._lost_since = None
                 self.fails = 0
                 self.recoveries += 1
                 self.vel[:] = 0.0
+                recovered = True
+            elif (self._lost_since is not None
+                  and t - self._lost_since >= RESEED_LOST_S - 1e-9):
+                self._reseed = "lost"
         else:
             fit = self._match(p, nrm, pred, imu_rate is not None, dt)
             good = fit.converged and fit.inliers >= GOOD_INLIERS
@@ -288,18 +363,34 @@ class Slam:
                 newpose = pred
                 self._banded = True
                 self.banded += 1
+            if not good and self._map_writes < SEED_WRITES:
+                self._reseed = "young"
 
+        if self._reseed:
+            # A fresh map from this scan, at the pose the truck is believed
+            # to be at, heading off the IMU: written below as the first scan
+            # of a map is. A lost one's old map is shelved, never dropped.
+            self._start_over(keep=self._reseed == "lost")
+            newpose, good, fit = pred.copy(), True, None
         if self._tree is not None and not good and not self.lost:
             self.fails += 1
             self.vel *= 0.5
             if self.fails >= MAX_FAILS:
                 self.lost = True
+                self._lost_since = t
+                # The failing scans went on the IMU's heading (pred), so it
+                # is still the gyro's from here.
+                self._lost_yaw = (float(newpose[2]) if imu_rate is not None
+                                  else None)
                 self.vel[:] = 0.0
                 newpose = pose.copy()
         elif good:
             self.fails = 0
 
-        if last_t is not None and good and fit is not None:
+        # Not off a recovery: the jump from the frozen pose to the found one
+        # is no speed, and taken as one it carried the next scans' prediction
+        # off at metres a second (and the gyro's bias with it).
+        if last_t is not None and good and fit is not None and not recovered:
             d = max(dt, 1e-3)
             v_new = (newpose - pose) / d
             v_new[2] = ((newpose[2] - pose[2] + np.pi) % (2 * np.pi)
@@ -325,6 +416,9 @@ class Slam:
                 dropped = int((~keep).sum())
             self._write(self.pose, allp[keep], on_line[keep])
             written = True
+        if (self._shelf is not None and good and not self._reseed
+                and state in (TRACKING, TILTED) and self._try_shelf(p, nrm)):
+            self._reseed = "merged"
         self._refresh_target()
         self.last_t = t
         return self._result(t, state, good, written, why, fit, returns,
@@ -361,26 +455,140 @@ class Slam:
             seed[1] += dy
             yield seed
 
-    def _recover(self, p, nrm, pred):
-        """A few headings round the circle per scan, from the frozen pose."""
-        n = 360 // RECOVER_STEP_DEG
-        offsets = [0]
-        for k in range(1, n // 2 + 1):
-            offsets += [k * RECOVER_STEP_DEG, -k * RECOVER_STEP_DEG]
-        offsets = offsets[:n]
+    def _start_over(self, keep=False):
+        """A fresh map, from nothing: no tree, nothing lost or failing. With
+        `keep` the old one goes on the shelf (the bigger of it and whatever
+        is there already), else it is cleared in place. The pose is kept, so
+        the map frame goes on where it was."""
+        if keep:
+            if self._shelf is None or self._map_writes > self._shelf[1]:
+                self._shelf = [self.grid, self._map_writes, None, None, 0]
+            g = self.grid
+            self.grid = gr.Grid(size=g.size, res=g.res, l_max=g.l_max,
+                                x0=float(self.pose[0]), y0=float(self.pose[1]),
+                                max_size=g.max_size)
+        else:
+            self.grid.clear()
+        self._tree = None
+        self._tgt = None
+        self._tree_at = None
+        self.lost = False
+        self._lost_since = None
+        self._search = None
+        self._pending = None
+        self.fails = 0
+        self.vel[:] = 0.0
+        self._map_writes = 0
+        self.reseeds += 1
+
+    def _carry_yaw(self, rate, dt):
+        """Turn the lost heading on by the gyro's rate over dt; a scan with
+        no rate (a gap) leaves it unknown for the rest of the episode."""
+        if self._lost_yaw is None:
+            return
+        if rate is None:
+            self._lost_yaw = None
+        else:
+            self._lost_yaw = _wrap(self._lost_yaw + rate * dt)
+
+    def _candidates(self, search, p, nrm, tree, tgt, yaw_now, prior=None):
+        """ICP on the search's best candidates this scan, each kept on the
+        search. (the best Fit this scan or None, the pose the search picks
+        if this scan finished a circle, else None)."""
         best = None
-        for _ in range(RECOVER_SEEDS):
-            dyaw = offsets[self._seed % len(offsets)]
-            self._seed += 1
-            seed = self.pose.copy()
-            seed[2] = pred[2] + math.radians(dyaw)
-            c = mt.icp(p, nrm, self._tree, self._tgt, seed, iters=25)
-            if c.converged and (best is None or c.inliers > best.inliers):
-                best = c
-        if best is not None and best.inliers >= RECOVER_MIN_INLIERS:
-            self._seed = 0
-            return best
-        return None
+        for _, cand in search.step(p, yaw_now):
+            c = mt.icp(p, nrm, tree, tgt, cand, iters=25)
+            if c.converged:
+                search.add(c.inliers, c.pose)
+                if best is None or c.inliers > best.inliers:
+                    best = c
+        if search.swept:
+            picked = search.pick(RECOVER_MIN_INLIERS, prior=prior)
+        elif prior is not None:
+            picked = search.pick(RECOVER_MIN_INLIERS, prior=prior, early=True)
+        else:
+            picked = None
+        return best, picked
+
+    def _relocalize(self, p, nrm, pred, prior=None):
+        """One scan's worth of looking for the truck on the map it lost its
+        place on, `prior` the gyro's heading (or None). (best fit or None,
+        whether it ends lost). A pick (reloc.Search.pick) ends it only if
+        ICP from it on the next scan lands within CONFIRM_M / CONFIRM_DEG and
+        fits as well."""
+        if self._tree is None:
+            return None, False
+        best = None
+        if self._pending is not None:
+            c = mt.icp(p, nrm, self._tree, self._tgt, self._pending, iters=25)
+            pend, self._pending = self._pending, None
+            if (c.converged and c.inliers >= RECOVER_MIN_INLIERS
+                    and _close(c.pose, pend)):
+                self._search = None
+                return c, True
+            best = c if c.converged else None
+        if self._search is None:
+            self._search = rl.Search(self.grid, self.pose[0], self.pose[1],
+                                     self.pose[2])
+        c, picked = self._candidates(self._search, p, nrm, self._tree,
+                                     self._tgt,
+                                     pred[2] if prior is None else prior,
+                                     prior)
+        if c is not None and (best is None or c.inliers > best.inliers):
+            best = c
+        if picked is not None:
+            self._pending = np.array(picked)
+        # The best of a failed search still goes out, so /slam/status says
+        # how near it came.
+        return best, False
+
+    def _try_shelf(self, p, nrm):
+        """Every SHELF_EVERY scans on a fresh map: look for the truck on the
+        shelved one, round where the fresh map has it. Found twice running
+        with the same old-from-new transform and the fresh map is merged in
+        and the old one is the map again. True if it was."""
+        sh = self._shelf
+        sh[4] += 1
+        if sh[4] < SHELF_EVERY:
+            return False
+        sh[4] = 0
+        old = sh[0]
+        x, y, yaw = (float(v) for v in self.pose)
+        if sh[2] is None or math.hypot(sh[2].field.cx - x,
+                                       sh[2].field.cy - y) > 1.0:
+            sh[2] = rl.Search(old, x, y, yaw)
+        tgt = old.local_points(x, y, LOCAL_R_M + rl.SEARCH_R_M)
+        if len(tgt) < 50:
+            return False
+        tree = cKDTree(tgt)
+        _, picked = self._candidates(sh[2], p, nrm, tree, tgt, yaw)
+        if not sh[2].swept:
+            return False
+        if picked is None:
+            sh[3] = None
+            return False
+        # Picked off the circle: ICP from it on this scan, so the pose and
+        # the transform are this scan's.
+        c = mt.icp(p, nrm, tree, tgt, picked, iters=25)
+        if not (c.converged and c.inliers >= RECOVER_MIN_INLIERS):
+            sh[3] = None
+            return False
+        T = _between(c.pose, self.pose)
+        if sh[3] is None or not _close(T, sh[3]):
+            sh[3] = T
+            return False
+        # Found twice the same way: the fresh map into the old, and the old
+        # one is the map.
+        merge(old, self.grid, T)
+        self.grid = old
+        self.pose = np.array(c.pose, float)
+        self._shelf = None
+        self._map_writes = sh[1] + self._map_writes
+        self._tree = None
+        self._tree_at = None
+        self.vel[:] = 0.0
+        self.merges += 1
+        return True
 
     def _why_not(self, fit, good, state):
         if state == LOST:
@@ -420,6 +628,7 @@ class Slam:
         wp = points @ mt.rot(pose[2]).T + pose[:2]
         g.integrate(pose[0], pose[1], wp[:, 0], wp[:, 1], mean=on_line)
         self.writes += 1
+        self._map_writes += 1
 
     def _refresh_target(self):
         """Rebuild the matcher's tree once the truck has moved TREE_MOVE_M
@@ -457,4 +666,58 @@ class Slam:
             ms=(self._clock() - t0) * 1000.0,
             pitch_deg=float(self._att[0]), roll_deg=float(self._att[1]),
             held=int(getattr(fit, "held", 0)) if fit is not None else 0,
-            banded=bool(self._banded))
+            banded=bool(self._banded), reseed=self._reseed)
+
+
+# ---- poses and maps ---------------------------------------------------------
+
+def _wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _close(a, b, m=CONFIRM_M, deg=CONFIRM_DEG):
+    """Two (x, y, yaw) within m metres and deg degrees of each other."""
+    return (math.hypot(a[0] - b[0], a[1] - b[1]) <= m
+            and abs(_wrap(a[2] - b[2])) <= math.radians(deg))
+
+
+def _between(old_pose, new_pose):
+    """T with old_pose = T . new_pose: the old map's frame from the new's,
+    as (x, y, yaw)."""
+    dyaw = _wrap(old_pose[2] - new_pose[2])
+    R = mt.rot(dyaw)
+    t = np.asarray(old_pose[:2], float) - R @ np.asarray(new_pose[:2], float)
+    return (float(t[0]), float(t[1]), dyaw)
+
+
+def merge(old, new, T):
+    """Every cell `new` has seen, into `old` through T (old = T . new): the
+    log-odds added and clamped, and a hit mean carried over where `old` has
+    none. Cells that land outside `old`'s window are dropped (it is 100 m a
+    side; the fresh map is a few minutes of driving)."""
+    known = new.lo != 0
+    ii, jj = np.nonzero(known)
+    if not len(ii):
+        old.version += 1
+        return
+    lo = new.lo[ii, jj].astype(np.int16)
+    has = new.cnt[ii, jj] > 0
+    fx = np.where(has, (new.fx[ii, jj] + 0.5) / 256.0, 0.5)
+    fy = np.where(has, (new.fy[ii, jj] + 0.5) / 256.0, 0.5)
+    wx = (ii + new.ox + fx) * new.res
+    wy = (jj + new.oy + fy) * new.res
+    R = mt.rot(T[2])
+    q = np.stack([wx, wy], 1) @ R.T + (T[0], T[1])
+    gx = np.floor(q[:, 0] / old.res).astype(np.int64)
+    gy = np.floor(q[:, 1] / old.res).astype(np.int64)
+    hx, hy = gx - old.ox, gy - old.oy
+    n = old.size
+    ok = (hx >= 0) & (hx < n) & (hy >= 0) & (hy < n)
+    hx, hy, lo, has, q, gx, gy = hx[ok], hy[ok], lo[ok], has[ok], q[ok], gx[ok], gy[ok]
+    cur = old.lo[hx, hy].astype(np.int16)
+    old.lo[hx, hy] = np.clip(cur + lo, gr.L_MIN, old.l_max).astype(np.int8)
+    m = has & (old.cnt[hx, hy] == 0)
+    old.fx[hx[m], hy[m]] = np.clip((q[m, 0] / old.res - gx[m]) * 256.0, 0, 255).astype(np.uint8)
+    old.fy[hx[m], hy[m]] = np.clip((q[m, 1] / old.res - gy[m]) * 256.0, 0, 255).astype(np.uint8)
+    old.cnt[hx[m], hy[m]] = 1
+    old.version += 1
