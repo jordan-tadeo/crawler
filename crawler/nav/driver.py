@@ -27,7 +27,8 @@ main.DriverCommand, which AutoPilot.step() mixes with my hand and writes at
 most once a pass. Nothing here touches pigpio.
 
 The map comes from `map_source`, anything with view() -> MapView or None
-(the live SLAM, later), and optionally local() -> LocalMap. No map source is
+(on the car nav/live.SlamMap, the live SLAM), and optionally local() ->
+LocalMap. Goals come from `goals`, anything with take() -> click.ClickGoal. No map source is
 no NavDriver: the constructor refuses, so --nav without a map is auto
 unavailable, never a truck driving blind.
 """
@@ -72,11 +73,15 @@ class NavDriver(dv.Driver):
     """driver.Driver with the navigator deciding. See the module docstring."""
 
     def __init__(self, controller, oakd, map_source, navigator=None,
-                 lidar=None):
+                 lidar=None, goals=None):
         if map_source is None:
             raise ValueError("nav needs a map source, and there is none")
         super().__init__(controller, oakd, lidar=lidar)
         self.map_source = map_source
+        # Anything with take() -> click.ClickGoal or None: on the car,
+        # click.ClickGoals, the Foxglove listener. None, no clicks.
+        self.goals = goals
+        self.goals_taken = 0
         # The car plans on its own thread (navigator.ThreadPlanner), so a
         # search never holds up a decision.
         self.nav = (navigator if navigator is not None
@@ -89,6 +94,36 @@ class NavDriver(dv.Driver):
         self._was_recovering = False
         self.human_steering = False
         self.pad_split = None
+
+    def _take_goal(self, view):
+        """The newest Foxglove click, if one came, as the navigator's goal.
+        A click in base_link needs a pose to place it by; with none it is
+        dropped, said, and the truck keeps doing what it was."""
+        if self.goals is None:
+            return
+        try:
+            goal = self.goals.take()
+        except Exception:
+            goal = None
+        if goal is None:
+            return
+        from crawler.nav import click
+        placed = click.to_map(goal, None if view is None else view.pose)
+        if placed is None:
+            print(f"[nav] goal in frame {goal.frame_id!r} dropped: "
+                  "no pose to place it by")
+            return
+        x, y, yaw = placed
+        self.nav.set_goal(x, y, yaw)
+        self.goals_taken += 1
+        print(f"[nav] goal ({x:.2f}, {y:.2f}) in the map")
+
+    def close(self):
+        """Stop the planner's thread. Never raises."""
+        try:
+            self.nav.planner.close()
+        except Exception:
+            pass
 
     def _neutral(self):
         try:
@@ -144,6 +179,7 @@ class NavDriver(dv.Driver):
             view = self.map_source.view()
         except Exception:
             view = None
+        self._take_goal(view)
         local = getattr(self.map_source, "local", None)
         local = local() if callable(local) else None
         out = self.nav.tick(now, view, local)

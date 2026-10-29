@@ -795,7 +795,7 @@ class AutoPilot:
     """
 
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
-                 slam=None, nav=False, map_source=None):
+                 slam=None, nav=False, map_source=None, goals=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -822,6 +822,9 @@ class AutoPilot:
         # map in map_source. False, the default, never imports crawler.nav.
         self.nav = bool(nav)
         self.map_source = map_source
+        # Where the navigator's goals come from: click.ClickGoals, the
+        # Foxglove listener, with --nav. None, no goals, so it stands still.
+        self.goals = goals
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -903,7 +906,7 @@ class AutoPilot:
             # unavailable: --nav never falls back to the rules quietly.
             from crawler.nav.driver import NavDriver
             return NavDriver(self.command, view, self.map_source,
-                             lidar=self.lidar)
+                             lidar=self.lidar, goals=self.goals)
         if self.policy_path is None:
             from crawler.autopilot.driver import Driver
             return Driver(self.command, view, lidar=self.lidar)
@@ -1743,17 +1746,64 @@ def parse_args(argv=None):
              "/voxel/low. Off unless given",
     )
     # Off unless named. With it, START hands the wheels to the navigator
-    # (crawler/nav/): a clicked goal, or rove. It needs the live lidar map,
-    # and nothing in this process builds one yet, so for now --nav is auto
-    # unavailable with that said in the journal -- never a truck driving on
-    # no map. Every safety layer is under it either way (nav/driver.py).
+    # (crawler/nav/), which drives to the newest goal clicked in Foxglove
+    # (/move_base_simple/goal) on the live SLAM map (nav/live.py) and stands
+    # still with none, or with a pose it does not trust. Needs --slam;
+    # without it --nav is auto unavailable, said in the journal -- never a
+    # truck driving on no map. Every safety layer is under it either way
+    # (nav/driver.py).
     parser.add_argument(
         "--nav",
         action="store_true",
-        help="drive auto with the map navigator instead of the hand-written "
-             "autopilot (needs the live lidar map; off unless given)",
+        help="drive auto with the map navigator to goals clicked in Foxglove "
+             "instead of the hand-written autopilot (needs --slam; off "
+             "unless given)",
+    )
+    # Off unless named. The OAK-D's low obstacles (--voxel-map) as extra
+    # solid cells in the navigator's map, never clearing a lidar cell. Off
+    # because how often it sees things that are not there is not settled.
+    parser.add_argument(
+        "--nav-low-obstacles",
+        action="store_true",
+        help="with --nav and --voxel-map, keep the navigator off the low "
+             "obstacles the camera sees under the lidar (advisory; off "
+             "unless given)",
     )
     return parser.parse_args(argv)
+
+
+def nav_goals(args, log):
+    """(goals, server_options) for --nav: the Foxglove click listener and
+    the start_server() arguments that let a client publish to it. (None,
+    None) without --nav, or if the listener cannot be built -- then --nav
+    has no goals and stands still, which the journal says."""
+    if not getattr(args, "nav", False):
+        return None, None
+    try:
+        from crawler.nav import click
+        goals = click.ClickGoals()
+        return goals, goals.server_options()
+    except Exception as e:
+        log.log("warning", "Nav", f"No Foxglove goals: {e}")
+        return None, None
+
+
+def nav_map_source(args, slam, lidar, voxels, log):
+    """--nav's map: the live SLAM (nav/live.SlamMap), or None, which is auto
+    unavailable. The low-obstacle layer only with --nav-low-obstacles and a
+    --voxel-map to take it from."""
+    if not getattr(args, "nav", False):
+        return None
+    if slam is None:
+        log.log("warning", "Nav", "--nav needs --slam; auto will be unavailable")
+        return None
+    low = bool(getattr(args, "nav_low_obstacles", False))
+    if low and voxels is None:
+        log.log("warning", "Nav", "--nav-low-obstacles needs --voxel-map; "
+                "driving on the lidar map alone")
+        low = False
+    from crawler.nav import live
+    return live.SlamMap(slam, lidar=lidar, voxels=voxels, low_obstacles=low)
 
 
 def main(argv=None):
@@ -1813,8 +1863,11 @@ def main(argv=None):
             directory=args.record_dir or recording.DEFAULT_DIR,
         )
 
+    # --nav takes its goals off Foxglove's publish tool, so the server has
+    # to let a client publish. Without --nav the server is as it always was.
+    goals, server_options = nav_goals(args, log)
     tele = tm.Telemetry(logger=log, port=args.telemetry_port,
-                        recorder=recorder)
+                        recorder=recorder, server_options=server_options)
 
     # One thread for both jobs, so there is nothing to start if neither is
     # wanted: --no-telemetry --no-record is the old no-thread, no-socket,
@@ -1848,7 +1901,8 @@ def main(argv=None):
             from crawler.mapping import runner as slam_runner
             slam = slam_runner.SlamRunner(
                 mode=args.slam_worker, logger=log,
-                tele=tele if channels_live else None)
+                tele=tele if channels_live else None,
+                nav_half_m=slam_runner.NAV_HALF_M if args.nav else None)
             slam.start()
             hub.imu_listeners.append(slam.on_imu)
             log.log("info", "SLAM", f"Mapping on a {args.slam_worker}")
@@ -1870,7 +1924,9 @@ def main(argv=None):
         hub.imu_listeners.append(voxels.on_imu)
         log.log("info", "Voxel", "Mapping the OAK-D's depth")
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
-                          lidar=lidar, slam=slam, nav=args.nav)
+                          lidar=lidar, slam=slam, nav=args.nav,
+                          map_source=nav_map_source(args, slam, lidar, voxels, log),
+                          goals=goals)
 
     # Who gets the device opened at startup, and who waits for it:
     #

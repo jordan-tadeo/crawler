@@ -54,6 +54,14 @@ MAP_EVERY_S = 1.0
 MAP_STEP = 2
 MAP_VIEW_HALF_M = 20.0
 
+# The navigator's map (nav_map(), only with nav_half_m set, i.e. --nav): the
+# grid's own 5 cm cells, NAV_HALF_M either side of the truck, twice a
+# second. 320 x 320 bytes is 100 KB a message. The /map picture's 10 cm
+# pixels mark a whole pixel solid for one cell in it, which grows every wall
+# by up to a cell and narrows a doorway by two.
+NAV_EVERY_S = 0.5
+NAV_HALF_M = 8.0
+
 # The path: a point every PATH_STEP_M moved, PATH_MAX of them, halved when
 # full so the oldest part of a long drive gets coarser instead of vanishing.
 # A Point3 is three doubles on the wire, and the live view is not compressed:
@@ -148,9 +156,11 @@ def map_view(slam, t, step=MAP_STEP, half_m=MAP_VIEW_HALF_M):
                    y0=float(y0), res=g.res * step, codes=codes)
 
 
-def _work(inbox, outbox, l_max, map_every_s):
+def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
+          nav_every_s=NAV_EVERY_S):
     """The worker, thread or process: scans in, Results and MapViews out.
-    None in the inbox ends it."""
+    None in the inbox ends it. With nav_half_m, a full-resolution MapView
+    for the navigator too, every nav_every_s."""
     from crawler.mapping.clock import SensorClock
     from crawler.mapping.egomap import EgoMap
     from crawler.mapping.imu import ImuTrack
@@ -165,6 +175,7 @@ def _work(inbox, outbox, l_max, map_every_s):
     ego = EgoMap()
     clock = SensorClock()
     next_map = 0.0
+    next_nav = 0.0
     lost_out = 0
     grid_seen = (0, 0)
     while True:
@@ -214,6 +225,14 @@ def _work(inbox, outbox, l_max, map_every_s):
                     outbox.put_nowait(("map", view))
                 except queue.Full:
                     pass
+        if nav_half_m is not None and host_t >= next_nav:
+            next_nav = host_t + nav_every_s
+            view = map_view(slam, t, step=1, half_m=nav_half_m)
+            if view is not None:
+                try:
+                    outbox.put_nowait(("nav", view))
+                except queue.Full:
+                    pass
 
 
 class SlamRunner:
@@ -225,7 +244,7 @@ class SlamRunner:
 
     def __init__(self, mode=MODE_THREAD, tele=None, logger=None, mount=None,
                  l_max=None, inbox=INBOX, map_every_s=MAP_EVERY_S,
-                 clock=time.monotonic):
+                 clock=time.monotonic, nav_half_m=None):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
         if mount is None:
@@ -238,6 +257,9 @@ class SlamRunner:
         self.l_max = l_max
         self.inbox_size = inbox
         self.map_every_s = map_every_s
+        # --nav's full-resolution map, NAV_HALF_M round the truck; None, the
+        # default, never draws it.
+        self.nav_half_m = nav_half_m
         self._clock = clock
 
         self._imu = deque(maxlen=IMU_KEEP)
@@ -258,6 +280,7 @@ class SlamRunner:
         self._latest = None
         self._latest_at = None
         self._map = None
+        self._nav_map = None
         self._crop = None
         self._path = []
         self._path_version = 0
@@ -277,13 +300,15 @@ class SlamRunner:
             ctx = mp.get_context("spawn")
             self._inbox = ctx.Queue(maxsize=self.inbox_size)
             self._outbox = ctx.Queue(maxsize=OUTBOX)
-            args = (self._inbox, self._outbox, self.l_max, self.map_every_s)
+            args = (self._inbox, self._outbox, self.l_max, self.map_every_s,
+                    self.nav_half_m)
             self._worker = ctx.Process(target=_work, args=args, name="slam",
                                        daemon=True)
         else:
             self._inbox = queue.Queue(maxsize=self.inbox_size)
             self._outbox = queue.Queue(maxsize=OUTBOX)
-            args = (self._inbox, self._outbox, self.l_max, self.map_every_s)
+            args = (self._inbox, self._outbox, self.l_max, self.map_every_s,
+                    self.nav_half_m)
             self._worker = threading.Thread(target=_work, args=args,
                                             name="slam", daemon=True)
         self._worker.start()
@@ -395,6 +420,11 @@ class SlamRunner:
         """The newest MapView, at most MAP_EVERY_S old, or None."""
         return self._map
 
+    def nav_map(self) -> Optional[MapView]:
+        """The newest full-resolution MapView round the truck, or None:
+        always None unless built with nav_half_m."""
+        return self._nav_map
+
     def path(self):
         """The (x, y) points driven so far, a copy."""
         return list(self._path)
@@ -450,6 +480,8 @@ class SlamRunner:
             tele = self.tele
             if tele is not None and tele.wants("map", now):
                 tele.offer("map", item[1], now)
+        elif kind == "nav":
+            self._nav_map = item[1]
         elif kind == "grid":
             _, grew, dropped, size = item
             was = self.grid_dropped

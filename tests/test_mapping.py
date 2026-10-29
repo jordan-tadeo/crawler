@@ -507,6 +507,40 @@ def test_the_runner_maps_the_room_on_its_worker(monkeypatch, mode):
     assert not r.stats()["alive"]
 
 
+@pytest.mark.parametrize("nav_half_m", [None, rn.NAV_HALF_M])
+def test_the_navigators_map_is_the_grids_own_cells_and_only_with_nav(
+        monkeypatch, nav_half_m):
+    monkeypatch.setattr(rn, "ranges_of", lambda scan, mount: scan.ranges)
+    r = rn.SlamRunner(mode=rn.MODE_THREAD, map_every_s=0.0,
+                      nav_half_m=nav_half_m)
+    r.start()
+    try:
+        for k in range(10):
+            t = (k + 1) * PERIOD
+            r.on_scan(FakeScan(t, scan_at(t)))
+            end = time.monotonic() + 5.0
+            while r.results + r.dropped < k + 1 and time.monotonic() < end:
+                time.sleep(0.002)
+        end = time.monotonic() + 2.0
+        while (r.map() is None or (nav_half_m and r.nav_map() is None)) \
+                and time.monotonic() < end:
+            time.sleep(0.005)
+        assert r.map() is not None
+        if nav_half_m is None:
+            assert r.nav_map() is None, "no --nav, no nav map drawn"
+            return
+        nav, pic = r.nav_map(), r.map()
+        assert nav.res == pytest.approx(0.05)
+        assert pic.res == pytest.approx(0.05 * rn.MAP_STEP)
+        assert (nav.codes == gr.OCCUPIED).any()
+        # The same lattice as the picture, finer, and it spans no more than
+        # NAV_HALF_M each side.
+        assert ((nav.x0 - pic.x0) / 0.05) == pytest.approx(round((nav.x0 - pic.x0) / 0.05))
+        assert nav.codes.shape[0] * nav.res <= 2 * rn.NAV_HALF_M + 1e-9
+    finally:
+        r.close()
+
+
 def test_pose_at_interpolates_between_scans_and_refuses_outside_them():
     P = rn.PoseStamp
     poses = [P(1.0, 0.0, 0.0, math.radians(179), 0.9, "tracking"),

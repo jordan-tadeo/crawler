@@ -648,6 +648,7 @@ class VoxelMapper:
         self._sent_at = None
         self._imu = deque(maxlen=IMU_KEEP)
         self._said_error = False
+        self._low = None         # the newest LowView, see low()
         # counts since boot
         self.frames = 0          # handed to on_depth
         self.dropped = 0         # replaced in the slot before the worker took them
@@ -852,6 +853,8 @@ class VoxelMapper:
                 except Exception:
                     pass
         elif kind == "pub":
+            if msg[2] is not None:
+                self._low = msg[2]
             tele = self.tele
             if tele is None:
                 return
@@ -862,6 +865,10 @@ class VoxelMapper:
                 tele.offer("voxel_low", msg[2], now)
 
     # ---- the readers ---------------------------------------------------------
+
+    def low(self) -> Optional["LowView"]:
+        """The newest LowView of the low-obstacle layer, or None."""
+        return self._low
 
     def stats(self) -> dict:
         ms = np.array(self.ms) if self.ms else np.zeros(1)
