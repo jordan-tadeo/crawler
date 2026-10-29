@@ -215,6 +215,13 @@ class CameraHub:
         # close() rather than release(): nothing reopens after this.
         self._final = False
 
+        # Called with (monotonic time, sample) for every IMU sample the reader
+        # drains, on the reader thread: a view's one-deep slot would hand the
+        # SLAM heading prior a fifth of them. A listener must return at once
+        # (runner.SlamRunner.on_imu appends to a deque) and may not raise
+        # into this thread.
+        self.imu_listeners = []
+
     # ---- lifecycle -------------------------------------------------------
 
     def start(self) -> bool:
@@ -394,6 +401,13 @@ class CameraHub:
 
                 for view in self._view_list:
                     view._put(stream, packet)
+
+                if stream == "imu":
+                    for listener in self.imu_listeners:
+                        try:
+                            listener(now, packet)
+                        except Exception:
+                            pass
 
                 self._offer(stream, packet, now)
 

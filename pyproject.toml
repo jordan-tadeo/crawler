@@ -57,6 +57,16 @@ dependencies = [
     # binho-host-adapter. Named here because the lidar imports it directly
     # now, and a transitive dependency can leave without asking.
     "pyserial==3.5",
+    # The live lidar map, crawler/mapping/: its scan matcher looks up the
+    # nearest map point for every return through scipy's cKDTree. 1.13.1
+    # because it takes numpy 1.26.4 (it asks for numpy>=1.22.4,<2.3), it is
+    # the version checked on the car (installed from PyPI into a scratch venv
+    # and timed there), and it ships
+    #
+    #   scipy-1.13.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+    #
+    # so nothing compiles on the Pi. Imported only with --slam.
+    "scipy==1.13.1",
 ]
 
 [project.optional-dependencies]

@@ -1698,6 +1698,25 @@ def parse_args(argv=None):
              "port or 'auto' (the default when the flag is bare). Off unless "
              "given",
     )
+    # Off unless named, and mapping only: nothing reads the pose to drive
+    # yet. Builds the room's map from the lidar as the truck goes, on a
+    # worker of its own, and shows it in Foxglove (/map, /slam/path,
+    # /slam/status, map -> base_link on /tf). Needs --lidar. Also starts the
+    # camera without waiting, for the IMU's heading and tilt; with the camera
+    # missing it maps on the lidar alone. See crawler/mapping/.
+    parser.add_argument(
+        "--slam",
+        action="store_true",
+        help="map the room from the lidar as the truck drives (needs "
+             "--lidar); shown in Foxglove on /map. Off unless given",
+    )
+    parser.add_argument(
+        "--slam-worker",
+        choices=("thread", "process"),
+        default="process",
+        help="where the mapper runs: its own process (the default, it cannot "
+             "hold the control loop's GIL) or a thread",
+    )
     return parser.parse_args(argv)
 
 
@@ -1782,10 +1801,24 @@ def main(argv=None):
     # in or not: a missing sensor must never hold up the one boot that has to
     # work. Closed after the ESC is at neutral, with the camera.
     lidar = None
+    slam = None
+    if args.slam and not args.lidar:
+        log.log("warning", "SLAM", "--slam needs --lidar; not mapping")
     if args.lidar:
         from crawler.hardware import lidar as ld
+        if args.slam:
+            # Before the reader, so its first scan has somewhere to go. The
+            # worker comes up on its own; nothing here waits for it.
+            from crawler.mapping import runner as slam_runner
+            slam = slam_runner.SlamRunner(
+                mode=args.slam_worker, logger=log,
+                tele=tele if channels_live else None)
+            slam.start()
+            hub.imu_listeners.append(slam.on_imu)
+            log.log("info", "SLAM", f"Mapping on a {args.slam_worker}")
         lidar = ld.LidarReader(device=args.lidar, logger=log,
-                               tele=tele if channels_live else None)
+                               tele=tele if channels_live else None,
+                               slam=slam)
         lidar.start()
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           lidar=lidar)
@@ -1800,7 +1833,10 @@ def main(argv=None):
     #                        here is safe and it is what the old code did.
     #   --dashboard          same, since the depth panes are its whole job.
     #   otherwise            nothing. The first press of START starts it.
-    if args.telemetry_camera or modes.mode == AUTO or args.dashboard:
+    #   --slam               start it, do not wait: the mapper wants the IMU,
+    #                        and maps on the lidar alone until it is up.
+    if (args.telemetry_camera or modes.mode == AUTO or args.dashboard
+            or slam is not None):
         hub.start()
     if modes.mode == AUTO or args.dashboard:
         if not hub.wait_ready():
@@ -1858,6 +1894,8 @@ def main(argv=None):
             # and the ESC reaching neutral.
             if lidar is not None:
                 lidar.close()
+            if slam is not None:
+                slam.close()
             hub.close()
             tele.stop()
         return 0
@@ -1892,6 +1930,8 @@ def main(argv=None):
         worker.join(timeout=5)
         if lidar is not None:
             lidar.close()
+        if slam is not None:
+            slam.close()
         hub.close()
         tele.stop()
 

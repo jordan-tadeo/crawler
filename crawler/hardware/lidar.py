@@ -250,6 +250,13 @@ class Scan(NamedTuple):
     speed_dps: float             # mean of its packets' speed field
     packets: int
     bins: Optional[np.ndarray] = None   # bin_scan() of it, filled by the reader
+    # The sensor's millisecond stamp (u16, wraps at 30000) of the packet that
+    # closed the revolution, and of every packet with a point in it, in
+    # order. `t` lags the real end by up to one serial read (~52 ms at
+    # READ_CHUNK); these do not. crawler/mapping/clock.py turns them into a
+    # de-jittered host time.
+    stamp_ms: Optional[int] = None
+    stamps_ms: tuple = ()
 
     @property
     def rpm(self) -> float:
@@ -284,6 +291,7 @@ class ScanAssembler:
         self._dist = []
         self._inten = []
         self._speeds = []
+        self._stamps = []
         self._last = None
 
     def add(self, packet, now) -> Optional[Scan]:
@@ -291,7 +299,7 @@ class ScanAssembler:
         angles = packet_angles(packet)
         for a, d, inten in zip(angles, packet.distances_mm, packet.intensities):
             if self._last is not None and a < self._last - 180.0:
-                done = self._finish(now)
+                done = self._finish(now, packet.timestamp_ms)
             self._angles.append(a)
             self._dist.append(d)
             self._inten.append(inten)
@@ -299,12 +307,13 @@ class ScanAssembler:
         # The packet that closes a scan counts towards the next one's speed:
         # most of its points are in that one.
         self._speeds.append(packet.speed_dps)
+        self._stamps.append(packet.timestamp_ms)
         if len(self._angles) > self.MAX_POINTS:
             self._reset()
             self._first = True
         return done
 
-    def _finish(self, now) -> Optional[Scan]:
+    def _finish(self, now, stamp_ms=None) -> Optional[Scan]:
         scan = None
         if not self._first and self._angles:
             speeds = self._speeds or [0]
@@ -313,7 +322,10 @@ class ScanAssembler:
                         distances_mm=np.asarray(self._dist, dtype=np.uint16),
                         intensities=np.asarray(self._inten, dtype=np.uint8),
                         speed_dps=float(sum(speeds)) / len(speeds),
-                        packets=len(self._speeds))
+                        packets=len(self._speeds),
+                        stamp_ms=stamp_ms,
+                        stamps_ms=tuple(self._stamps) + (
+                            () if stamp_ms is None else (stamp_ms,)))
         self._first = False
         self._reset()
         return scan
@@ -535,15 +547,21 @@ class LidarReader:
     3D panel: /lidar/scan, /tf and /lidar/truck (telemetry/lidar_view.py).
     Only the handing over happens here; the messages are built on the
     telemetry thread.
+
+    `slam`, with --slam, is a crawler.mapping.runner.SlamRunner: every scan
+    goes to its on_scan(), which never blocks, and while it is producing
+    poses it sends /tf itself (map -> base_link as well as base_link ->
+    lidar), so this thread leaves /tf to it.
     """
 
     def __init__(self, device="auto", logger=None, tele=None, mount=MOUNT,
                  opener=None, ports=None, clock=time.monotonic,
-                 retry_s=RETRY_S, silent_s=SILENT_S):
+                 retry_s=RETRY_S, silent_s=SILENT_S, slam=None):
         self.device = device or "auto"
         self.logger = logger
         self.tele = tele
         self.mount = mount
+        self.slam = slam
         self._opener = opener or _open_serial
         self._ports = ports or candidate_ports
         self._clock = clock
@@ -722,13 +740,20 @@ class LidarReader:
         scan = scan._replace(bins=bins)
         self._scan = scan
         self.scans += 1
+        slam = self.slam
+        if slam is not None:
+            try:
+                slam.on_scan(scan)
+            except Exception:
+                pass
         tele = self.tele
         if tele is None:
             return
         try:
             if tele.wants("lidar", now):
                 tele.offer("lidar", lidar_sample(scan, self.stats(now)), now)
-            if tele.wants("tf", now):
+            if tele.wants("tf", now) and not (
+                    slam is not None and slam.owns_tf(now)):
                 tele.offer("tf", self.mount, now)
             if tele.wants("lidar_scan", now):
                 tele.offer("lidar_scan", (scan, self.mount), now)
@@ -766,6 +791,8 @@ def lidar_sample(scan, stats) -> dict:
         "crc_errors": int(stats.get("crc_errors", 0)),
         "crc_error_rate": float(stats.get("crc_error_rate", 0.0)),
         "rejected_packets": int(stats.get("rejected_packets", 0)),
+        "stamp_ms": -1 if scan.stamp_ms is None else int(scan.stamp_ms),
+        "stamps_ms": [int(v) for v in scan.stamps_ms],
     }
     for name in SECTORS:
         row[f"nearest_{name}_mm"] = nearest_in_sector(bins, name)

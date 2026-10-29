@@ -127,6 +127,12 @@ INTERVALS = {
     "lidar_scan": 0.0,
     "tf": 0.0,
     "lidar_truck": 1.0,
+    # With --slam. The status and the map -> base_link half of /tf come once
+    # per matched scan; the map picture once a second (the runner only makes
+    # one that often anyway) and the path every two.
+    "slam_status": 0.0,
+    "map": 1.0,
+    "slam_path": 2.0,
 }
 
 # Longest side of an image channel after downscaling, in pixels. The mono
@@ -459,6 +465,29 @@ JSON_SCHEMAS = {
         "nearest_left_mm": _INT,
         "nearest_rear_mm": _INT,
         "nearest_right_mm": _INT,
+        # The sensor's own millisecond clock (wraps at 30000): the packet
+        # that closed the revolution, and every packet in it, in order. The
+        # host time a scan arrives lags its real end by up to a 52 ms serial
+        # read; these do not, so a replay can de-skew against them.
+        "stamp_ms": _INT,
+        "stamps_ms": {"type": "array", "items": _INT},
+    }),
+    # One scan through the mapper, with --slam: crawler.mapping.runner.
+    # status_row(). state is tracking / tilted / rolled / lost / no_points;
+    # written says whether this scan went into the map and why says why not.
+    # inliers, rms_mm, returns and constraint (the smallest eigenvalue of the
+    # fit's translation block, 0 in a corridor or an open field, 0.5 in a
+    # room) are what to trust the pose by. -1 for a number there is none of.
+    "slam_status": _schema("crawler.SlamStatus", {
+        "state": _STR,
+        "x": _NUM, "y": _NUM, "yaw_deg": _NUM,
+        "matched": _BOOL, "written": _BOOL, "why": _STR,
+        "inliers": _NUM, "rms_mm": _NUM, "constraint": _NUM,
+        "returns": _INT, "points": _INT, "ground_dropped": _INT,
+        "tilt_deg": _NUM, "iters": _INT, "ms": _NUM,
+        # The runner's counts since boot: scans offered, dropped because the
+        # mapper was behind, and steps that raised.
+        "scans": _INT, "dropped": _INT, "errors": _INT,
     }),
 }
 
@@ -506,6 +535,7 @@ JSON_TOPICS = {
     "marks": "/marks",
     "footprint": "/footprint",
     "lidar": "/lidar",
+    "slam_status": "/slam/status",
 }
 
 # Raw depth: the uint16 millimetres exactly as the driver scans them, as a
@@ -543,8 +573,18 @@ LIDAR_VIEW_CHANNELS = {
     "lidar_truck": "/lidar/truck",
 }
 
+# The map with --slam, see map_view.py: a foxglove.Grid and a SceneUpdate,
+# both in the "map" frame that the SLAM half of /tf hangs base_link off.
+# Measured through the SDK's MCAP writer on a replayed drive: see
+# tools/slam_bench.py --bandwidth.
+SLAM_CHANNELS = {
+    "map": "/map",
+    "slam_path": "/slam/path",
+}
+
 ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
-            + tuple(RAW_DEPTH_CHANNELS) + tuple(LIDAR_VIEW_CHANNELS))
+            + tuple(RAW_DEPTH_CHANNELS) + tuple(LIDAR_VIEW_CHANNELS)
+            + tuple(SLAM_CHANNELS))
 
 # Everything the camera produces, which is what stops being written while
 # there is no pad: a file of nothing but pictures and IMU has no driving in it
@@ -552,9 +592,10 @@ ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
 # own channels are not in here -- /diagnostics is what says the pad went.
 # /lidar is, for the same reason: it is a sensor with no driving in it, and
 # so is its 3D view, the transform and the outline with it.
-CAMERA_KEYS = frozenset(("imu", "lidar") + tuple(IMAGE_CHANNELS)
+CAMERA_KEYS = frozenset(("imu", "lidar", "slam_status") + tuple(IMAGE_CHANNELS)
                         + tuple(RAW_DEPTH_CHANNELS)
-                        + tuple(LIDAR_VIEW_CHANNELS))
+                        + tuple(LIDAR_VIEW_CHANNELS)
+                        + tuple(SLAM_CHANNELS))
 
 
 class Telemetry:
@@ -658,6 +699,7 @@ class Telemetry:
             from foxglove import Channel, Schema
             from foxglove.channels import (CompressedImageChannel,
                                            FrameTransformsChannel,
+                                           GridChannel,
                                            LaserScanChannel,
                                            SceneUpdateChannel)
 
@@ -692,6 +734,11 @@ class Telemetry:
                            "lidar_truck": SceneUpdateChannel}
             for key, topic in LIDAR_VIEW_CHANNELS.items():
                 self._channels[key] = lidar_kinds[key](topic=topic)
+
+            slam_kinds = {"map": GridChannel,
+                          "slam_path": SceneUpdateChannel}
+            for key, topic in SLAM_CHANNELS.items():
+                self._channels[key] = slam_kinds[key](topic=topic)
 
         except Exception as e:
             self.error = str(e)
@@ -1004,7 +1051,7 @@ class Telemetry:
             channel.log(payload, log_time=log_time)
             return
 
-        if key in LIDAR_VIEW_CHANNELS:
+        if key in LIDAR_VIEW_CHANNELS or key in SLAM_CHANNELS:
             message = self.lidar_view_message(key, payload, log_time)
             if message is not None:
                 channel.log(message, log_time=log_time)
@@ -1041,15 +1088,28 @@ class Telemetry:
         """The SDK message for one of LIDAR_VIEW_CHANNELS, or None.
 
         What lidar.LidarReader offers: "lidar_scan" a (Scan, Mount) pair,
-        "tf" the Mount, "lidar_truck" nothing it needs.
+        "tf" the Mount, "lidar_truck" nothing it needs. With --slam, the
+        mapping runner offers "tf" as (Mount, (x, y, yaw), scan time) and
+        the SLAM_CHANNELS: "map" a runner.MapView, "slam_path" (x, y) points.
         """
         if key == "lidar_scan":
             scan, mount = payload
             return lidar_view.laser_scan(scan, log_time, mount)
         if key == "tf":
+            if isinstance(payload, tuple) and len(payload) == 3:
+                from crawler.telemetry import map_view
+                mount, pose, t = payload
+                return map_view.frame_transforms(log_time, mount, pose,
+                                                 epoch_ns(t))
             return lidar_view.frame_transforms(log_time, payload)
         if key == "lidar_truck":
             return lidar_view.truck_scene(log_time)
+        if key == "map":
+            from crawler.telemetry import map_view
+            return map_view.grid_message(payload, log_time)
+        if key == "slam_path":
+            from crawler.telemetry import map_view
+            return map_view.path_scene(payload, log_time)
         return None
 
     @staticmethod
