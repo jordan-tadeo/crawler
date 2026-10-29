@@ -181,20 +181,39 @@ JPEG_QUALITY = 60
 
 
 # Timestamps. One monotonic source for every channel, so a plot of the
-# throttle and a plot of the IMU line up even if NTP steps the clock mid-run.
+# throttle and a plot of the IMU line up, made into epoch time by adding the
+# offset between time.time() and time.monotonic(). Foxglove wants nanoseconds
+# since the unix epoch or it draws everything in 1970.
 #
-# time.monotonic() has an arbitrary zero, and Foxglove wants nanoseconds since
-# the unix epoch or it will draw everything in 1970. So the offset between the
-# two clocks is captured once, here, at import -- and then never again. Every
-# timestamp this file emits is monotonic plus that one fixed constant, which
-# means the series cannot go backwards and cannot jump, and still lands at
-# roughly the right wall-clock time.
+# That offset used to be taken once, at import, and never again. The Pi has
+# no RTC: the service starts on the clock fake-hwclock saved at the last
+# shutdown, and NTP steps it forward a little later. The 10-29 boot imported
+# before the step and stamped every message for the whole run 90.1 s behind
+# the wall (Goal set at 15:10:26.1 in the journal, /goal/status stamped
+# 15:08:56.0 in the MCAP); an earlier one was 58.5 s. Foxglove's live
+# connection runs its clock off the viewer's wall time, not off these stamps,
+# so every entity, transform and plot was a minute and a half in its past.
+#
+# So the offset is checked on every stamp and taken again when it has moved
+# by more than CLOCK_STEP_S. A step is a step, and the series follows it once;
+# what NTP slews by in between is microseconds and is ignored, so the stamps
+# never wobble with it.
+CLOCK_STEP_S = 1.0
 _EPOCH_OFFSET = time.time() - time.monotonic()
+
+
+def epoch_offset() -> float:
+    """time.time() - time.monotonic(), as of the last wall-clock step."""
+    global _EPOCH_OFFSET
+    now = time.time() - time.monotonic()
+    if abs(now - _EPOCH_OFFSET) > CLOCK_STEP_S:
+        _EPOCH_OFFSET = now
+    return _EPOCH_OFFSET
 
 
 def epoch_ns(mono: float) -> int:
     """A time.monotonic() reading as nanoseconds since the unix epoch."""
-    return int((mono + _EPOCH_OFFSET) * 1e9)
+    return int((mono + epoch_offset()) * 1e9)
 
 
 def _schema(name: str, properties: dict) -> dict:
