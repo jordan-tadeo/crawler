@@ -441,6 +441,38 @@ answer that minimises its error is the middle. The sidecar says `steer_head`;
 one without it is a regression, and `policy.decode_steer` reads both, on the
 car and in the eval. A different head is a different contract, so a MAJOR.
 
+`--steer-head per_gear` is a regression per gear, `steer_forward` and
+`steer_reverse`, each as wide as the chunk. I swap lock on 95% of my
+reversals, so one steer had to flip sign on exactly the tick the gear did,
+and a tick late it backed out on the forward lock. Each head trains only on
+its own gear's ticks; a stop trains the head of the gear the car moves in
+next within `--stop-gear-s` (2 s), else the one before, else forward
+(`policy_train.steer_gears`). The car steers with the head of the gear it
+commands, read after the refractory and the rear mask have had their say, so
+a reverse the rear stop turns forward steers on the forward head, and a stop
+on the head of the better of forward and reverse. The steering I put on
+standing still stays a label with its own value: that is where the lock for
+the next gear goes on.
+
+`--mirror both` puts every batch in as it is and mirrored, side by side (the
+frame, the IMU's lateral signs, the scan's bins, the crop's columns, the
+goal's bearing, every steer label's sign), instead of `coin`, one or the
+other a batch.
+
+`--map-act leaky --optimizer adamw` is the map branch that works. With ReLUs
+and Adam's L2 decay the branch died in every map model up to goal2: its
+gradient starts about the size of the decay, the units go dead in a few
+hundred steps, and the decay walks the weights to zero, so the map changed
+nothing (blanking the crop moves goal2's steer by exactly 0). Either fix on
+its own still died on a seed in three; both together lived on all three.
+
+`tools/scorecard.txt` names drives no model trains on (`--train-on-scorecard`
+to override), and `tools/policy_scorecard.py DATA.npz --map CROPS M.onnx ...`
+grades models side by side on them: gear, stop and reverse, steer side, the
+lock across my reversals, the mirror test, hindsight goals including ones
+behind, the first ticks of each takeover, and `map_use`, how far the steer
+moves with the crop blanked. Add drives to the list, never take one off.
+
 The trainer prints the model against always-forward, the hand-written rule
 and the median throttle, which is the number that says whether it learned
 anything, and the mode head against always-stay: its recall on the ticks

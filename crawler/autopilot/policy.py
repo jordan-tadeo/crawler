@@ -299,12 +299,27 @@ STEER_SCALE = 0.7
 # far (`steer_mag`, a sigmoid, the fraction of full lock), and the steer is
 # the class's side times the magnitude, 0 for straight. decode_steer() is
 # the one place either is read, on the car and in the eval.
+#
+# PER_GEAR is a regression per gear: `steer_forward` and `steer_reverse`, each
+# a tanh as wide as the chunk, each trained only on ticks whose gear is its
+# own (a stop on the gear that comes next, policy_train.steer_gears). I swap
+# lock on 95% of my reversals, so the one regression had to flip its sign on
+# exactly the tick the gear flipped, and when it was a tick late the car
+# backed out on the forward lock and rocked. Here the head the car steers
+# with is the one of the gear it commands (gear_steer()), worked out after
+# every rule that changes the gear: a stop steers with the head of the
+# better of forward and reverse (moving_action), and a reverse the rear stop
+# turns into a forward steers with the forward head.
 STEER_REGRESSION = "regression"
 STEER_DIRECTION = "direction"
-STEER_HEADS = (STEER_REGRESSION, STEER_DIRECTION)
+STEER_PER_GEAR = "per_gear"
+STEER_HEADS = (STEER_REGRESSION, STEER_DIRECTION, STEER_PER_GEAR)
 STEER_OUTPUT = "steer"
 STEER_DIR_OUTPUT = "steer_dir"
 STEER_MAG_OUTPUT = "steer_mag"
+STEER_FORWARD_OUTPUT = "steer_forward"
+STEER_REVERSE_OUTPUT = "steer_reverse"
+GEAR_STEER_OUTPUTS = (STEER_FORWARD_OUTPUT, STEER_REVERSE_OUTPUT)
 # Negative steering is left, as driver.turn_sweep_clears(scan, -1) is.
 LEFT = "left"
 STRAIGHT = "straight"
@@ -957,6 +972,9 @@ def check_steer_head(meta, outputs, where="sidecar"):
     if steer_head_of({name: None for name in outputs}) != head:
         raise ValueError(f"{where}: steer_head {head!r} but the graph's outputs are "
                          f"{sorted(outputs)}")
+    if head == STEER_PER_GEAR and not all(n in outputs for n in GEAR_STEER_OUTPUTS):
+        raise ValueError(f"{where}: steer_head {head!r} needs both of "
+                         f"{list(GEAR_STEER_OUTPUTS)}, the graph's outputs are {sorted(outputs)}")
     if head == STEER_DIRECTION and tuple(meta.get("steer_dirs", ())) != STEER_DIRS:
         raise ValueError(f"{where}: steer_dirs {meta.get('steer_dirs')} != {list(STEER_DIRS)}")
     return head
@@ -985,8 +1003,10 @@ def check_chunk(meta, output_shapes, steer_head=STEER_REGRESSION, where="sidecar
     widths = {"logits": len(ACTIONS) * k}
     if steer_head == STEER_REGRESSION:
         widths[STEER_OUTPUT] = k
+    elif steer_head == STEER_PER_GEAR:
+        widths.update({name: k for name in GEAR_STEER_OUTPUTS})
     elif k > 1:
-        raise ValueError(f"{where}: chunk {k} needs the regression steer head, not {steer_head!r}")
+        raise ValueError(f"{where}: chunk {k} needs a regression steer head, not {steer_head!r}")
     for name, want in widths.items():
         got = _last_dim(output_shapes.get(name))
         if got is not None and got != want:
@@ -1004,7 +1024,8 @@ def check_chunk(meta, output_shapes, steer_head=STEER_REGRESSION, where="sidecar
 
 def first_of_chunk(outputs):
     """A chunk model's raw outputs -> the same with only offset 0: logits
-    (3,) and steer (1,), the answer for this decision alone. Anything else
+    (3,) and steer (1,) (each gear's, for a per-gear head), the answer for
+    this decision alone. Anything else
     comes back as it is, for read_output to check."""
     logits = np.asarray(outputs["logits"]).ravel()
     k = logits.size // len(ACTIONS)
@@ -1012,17 +1033,23 @@ def first_of_chunk(outputs):
         return outputs
     out = dict(outputs)
     out["logits"] = logits[:len(ACTIONS)]
-    if STEER_OUTPUT in outputs:
-        steer = np.asarray(outputs[STEER_OUTPUT]).ravel()
+    for name in _steer_names(outputs):
+        steer = np.asarray(outputs[name]).ravel()
         if steer.size == k:
-            out[STEER_OUTPUT] = steer[:1]
+            out[name] = steer[:1]
     return out
+
+
+def _steer_names(outputs):
+    """The steer outputs a chunk is as wide as: `steer`, or the two gears'."""
+    return [n for n in (STEER_OUTPUT, *GEAR_STEER_OUTPUTS) if n in outputs]
 
 
 class ChunkEnsembler:
     """ACT's temporal ensemble over a chunk model's last K answers.
 
-    Each answer is kept as (t, K x 3 gear probabilities, K steers). apply()
+    Each answer is kept as (t, K x 3 gear probabilities, K steers per steer
+    output: one, or a per-gear head's two, each blended alike). apply()
     turns this decision's raw outputs into one-step ones: logits the log of
     the weighted mean probability (so argmax, moving_action and the
     confidence scale read them as before) and steer the weighted mean, the
@@ -1056,13 +1083,15 @@ class ChunkEnsembler:
         if self.k == 1:
             return outputs
         k = self.k
+        names = _steer_names(outputs)
         try:
             logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
-            steer = np.asarray(outputs[STEER_OUTPUT], dtype=np.float64).ravel()
+            steer = np.stack([np.asarray(outputs[n], dtype=np.float64).ravel()
+                              for n in names]) if names else None
         except (KeyError, TypeError, ValueError):
             self.reset()
             return outputs
-        if (logits.shape != (len(ACTIONS) * k,) or steer.shape != (k,)
+        if (steer is None or logits.shape != (len(ACTIONS) * k,) or steer.shape[1:] != (k,)
                 or not np.isfinite(logits).all() or not np.isfinite(steer).all()):
             self.reset()
             return outputs
@@ -1073,11 +1102,11 @@ class ChunkEnsembler:
         z = logits.reshape(k, len(ACTIONS))
         e = np.exp(z - z.max(axis=1, keepdims=True))
         self._buf = [(now, e / e.sum(axis=1, keepdims=True), steer)] + self._buf[:k - 1]
-        p, s, den = np.zeros(len(ACTIONS)), 0.0, 0.0
+        p, s, den = np.zeros(len(ACTIONS)), np.zeros(len(names)), 0.0
         for age, (_, probs, steers) in enumerate(self._buf):
             w = math.exp(self.m * age)
             p += w * probs[age]
-            s += w * steers[age]
+            s += w * steers[:, age]
             den += w
         # Stop is the newest answer's own: my stops between gears are about
         # 2 ticks, and averaged over the chunk one needs three answers to win,
@@ -1090,7 +1119,8 @@ class ChunkEnsembler:
         go[stop] = p_stop
         out = dict(outputs)
         out["logits"] = np.log(go + 1e-9)
-        out[STEER_OUTPUT] = np.array([s / den])
+        for n, v in zip(names, s):
+            out[n] = np.array([v / den])
         return out
 
 
@@ -1122,35 +1152,76 @@ def _in(value, low, high):
 
 def steer_head_of(outputs):
     """Which steering head these outputs come from, by their names. None
-    when it is neither or both: a graph that answers both ways is not one
-    anything here knows how to read."""
+    when it is none of them or more than one: a graph that answers two ways
+    is not one anything here knows how to read."""
     has_dir = STEER_DIR_OUTPUT in outputs or STEER_MAG_OUTPUT in outputs
     has_reg = STEER_OUTPUT in outputs
-    if has_dir == has_reg:
+    has_gear = any(name in outputs for name in GEAR_STEER_OUTPUTS)
+    if has_dir + has_reg + has_gear != 1:
         return None
-    return STEER_DIRECTION if has_dir else STEER_REGRESSION
+    return (STEER_DIRECTION if has_dir else STEER_REGRESSION if has_reg
+            else STEER_PER_GEAR)
 
 
-def decode_steer(outputs):
-    """Either steering head -> (steer, p_dir, ""), or (None, None, why).
+def steer_gear(outputs, action):
+    """The gear whose steering head an action steers with: its own for
+    forward and reverse, and for a stop the better of the two by the
+    logits (moving_action), the gear the stop is between."""
+    return action if action in (FORWARD, REVERSE) else moving_action(outputs)
+
+
+def gear_steer_output(gear):
+    return STEER_FORWARD_OUTPUT if gear == FORWARD else STEER_REVERSE_OUTPUT
+
+
+def gear_steer(outputs, action):
+    """A per-gear model's steer for the action the car commands, a fraction
+    of full lock; None for any other head, whose one steer stands. Only on
+    outputs read_output() has passed, so it is finite and in range."""
+    if steer_head_of(outputs) != STEER_PER_GEAR:
+        return None
+    s = np.asarray(outputs[gear_steer_output(steer_gear(outputs, action))],
+                   dtype=np.float64).ravel()
+    return float(np.clip(s[0], -1.0, 1.0))
+
+
+def decode_steer(outputs, action=None):
+    """Any steering head -> (steer, p_dir, ""), or (None, None, why).
 
     steer is a fraction of full lock in [-1, 1]. p_dir is the direction
     head's softmax over STEER_DIRS, None for a regression head. The one
-    decode for both: the car's read_output and the eval go through here.
-    Checked as read_output checks the rest, finite and in range first, and
-    never clamped into range.
+    decode for every head: the car's read_output and the eval go through
+    here. Checked as read_output checks the rest, finite and in range first,
+    and never clamped into range. A per-gear head is both of its steers
+    checked and the one of `action`'s gear (steer_gear) returned; with no
+    action, the argmax of the logits.
     """
     head = steer_head_of(outputs)
     if head is None:
         return None, None, "missing"
     try:
-        if head == STEER_REGRESSION:
+        if head == STEER_PER_GEAR:
+            gears = [np.asarray(outputs[n], dtype=np.float64).ravel()
+                     for n in GEAR_STEER_OUTPUTS]
+            if action is None:
+                logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
+                action = ACTIONS[int(np.argmax(logits[:len(ACTIONS)]))]
+        elif head == STEER_REGRESSION:
             steer = np.asarray(outputs[STEER_OUTPUT], dtype=np.float64).ravel()
         else:
             dir_logits = np.asarray(outputs[STEER_DIR_OUTPUT], dtype=np.float64).ravel()
             mag = np.asarray(outputs[STEER_MAG_OUTPUT], dtype=np.float64).ravel()
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, IndexError):
         return None, None, "missing"
+    if head == STEER_PER_GEAR:
+        if any(g.shape != (1,) for g in gears):
+            return None, None, "shape"
+        if not all(math.isfinite(g[0]) for g in gears):
+            return None, None, "not finite"
+        if not all(_in(g[0], -1.0, 1.0) for g in gears):
+            return None, None, "steer out of range"
+        g = gears[GEAR_STEER_OUTPUTS.index(gear_steer_output(steer_gear(outputs, action)))]
+        return float(np.clip(g[0], -1.0, 1.0)), None, ""
     if head == STEER_REGRESSION:
         if steer.shape != (1,):
             return None, None, "shape"
@@ -1191,8 +1262,9 @@ def read_output(outputs):
         # though a nan on any offset is a broken model all the same.
         first = first_of_chunk(outputs)
         whole = ([] if first is outputs else
-                 [np.asarray(outputs["logits"], dtype=np.float64).ravel(),
-                  np.asarray(outputs[STEER_OUTPUT], dtype=np.float64).ravel()])
+                 [np.asarray(outputs["logits"], dtype=np.float64).ravel()]
+                 + [np.asarray(outputs[n], dtype=np.float64).ravel()
+                    for n in _steer_names(outputs)])
         outputs = first
         logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
         mag = np.asarray(outputs["throttle"], dtype=np.float64).ravel()
@@ -1985,6 +2057,9 @@ class PolicyDriver(dv.Driver):
             # Not arrived, so not a stop. Only the direction changes; the
             # floor below still holds a forward, as it holds any other.
             action = moving_action(outputs)
+        # A per-gear model's steer is already its head for this gear
+        # (read_output decodes a stop on moving_action's); it is read again
+        # below once the refractory and the rear mask have had their say.
 
         # The reverse commit. One running past REVERSE_COMMIT_S ends, and the
         # model's answer this tick stands. One still running holds reverse,
@@ -2022,7 +2097,8 @@ class PolicyDriver(dv.Driver):
         # to 800 mm, until I took over. So reverse is taken off the table and
         # the better of the other two by its own logits drives, forward
         # through the floor like any forward; a stop is the rear stop below,
-        # as before. Its magnitude and steering stand.
+        # as before. Its magnitude and steering stand, except that a per-gear
+        # model's steering is then its forward head's, the gear it goes in.
         rear_masked = False
         if (not self.hand_rules and action == REVERSE and not self.human_throttle
                 and dv.rear_blocked(self.rear_clearance)
@@ -2033,6 +2109,9 @@ class PolicyDriver(dv.Driver):
                 print(f"Rear stop - {self.rear_clearance:.0f} mm behind me, "
                       "going forward instead.")
             self._rear_said = True
+        geared = None if self.reverse_commit else gear_steer(outputs, action)
+        if geared is not None:
+            steer = geared
 
         # Every neutral has returned by here, so this is a committed model
         # action. The floor's hold below is a 0 no scale touches, so the

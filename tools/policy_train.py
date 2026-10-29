@@ -187,8 +187,98 @@ def flip_steer_labels(steer, steer_dir):
 def output_names(steer_head=pl.STEER_REGRESSION):
     """The graph's outputs, in order, for a steering head."""
     steer = ([pl.STEER_OUTPUT] if steer_head == pl.STEER_REGRESSION
+             else list(pl.GEAR_STEER_OUTPUTS) if steer_head == pl.STEER_PER_GEAR
              else [pl.STEER_DIR_OUTPUT, pl.STEER_MAG_OUTPUT])
     return ["logits", "throttle", *steer, pl.MODE_OUTPUT]
+
+
+# The per-gear head (policy.STEER_PER_GEAR): which gear's steer a tick's
+# steering label trains. A forward or a reverse is its own. A stop is the
+# gear the car moves in next, if it moves within STOP_GEAR_S, else the one it
+# last moved in within STOP_GEAR_S, else forward: the lock I put on standing
+# still between gears is for the gear that comes next, and the car steers a
+# model stop with the head of the better of forward and reverse
+# (policy.steer_gear), the gear its logits say comes next.
+STOP_GEAR_S = 2.0
+GEAR_FORWARD, GEAR_REVERSE = 0, 1
+
+
+def steer_gears(data, stop_gear_s=STOP_GEAR_S):
+    """(N,) per tick GEAR_FORWARD or GEAR_REVERSE: the head its steering
+    label trains (see STOP_GEAR_S). Off every tick's action, labelled or
+    not: what the car did next is what came next, whoever drove it."""
+    action = np.asarray(data["action"], dtype=np.int64)
+    t = np.asarray(data["t_ns"], dtype=np.int64)
+    sess = np.asarray(data["session"], dtype=np.int64)
+    fwd, rev = pl.ACTIONS.index(pl.FORWARD), pl.ACTIONS.index(pl.REVERSE)
+    out = np.where(action == rev, GEAR_REVERSE, GEAR_FORWARD).astype(np.int64)
+    order = np.lexsort((t, sess))
+    a, ts, ss = action[order], t[order], sess[order]
+    moving = a != pl.ACTIONS.index(pl.STOP)
+    n = len(order)
+    nxt = np.full(n, -1, np.int64)
+    last = -1
+    for j in range(n - 1, -1, -1):
+        if j + 1 < n and ss[j + 1] != ss[j]:
+            last = -1
+        if moving[j]:
+            last = j
+        nxt[j] = last
+    prv = np.full(n, -1, np.int64)
+    last = -1
+    for j in range(n):
+        if j and ss[j - 1] != ss[j]:
+            last = -1
+        if moving[j]:
+            last = j
+        prv[j] = last
+    for j in np.flatnonzero(~moving):
+        pick = -1
+        if nxt[j] >= 0 and (ts[nxt[j]] - ts[j]) / 1e9 <= stop_gear_s:
+            pick = nxt[j]
+        elif prv[j] >= 0 and (ts[j] - ts[prv[j]]) / 1e9 <= stop_gear_s:
+            pick = prv[j]
+        out[order[j]] = GEAR_REVERSE if pick >= 0 and a[pick] == rev else GEAR_FORWARD
+    return out
+
+
+# The scorecard: drives no model is trained on, so every model can be graded
+# on the same ticks it has never seen (tools/policy_scorecard.py). Names only,
+# one a line, # for a comment; the recordings themselves never come here.
+SCORECARD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scorecard.txt")
+
+
+def scorecard_sessions(path=SCORECARD_FILE):
+    """The scorecard's session names, [] with no file."""
+    if not path or not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [line.split("#", 1)[0].strip() for line in f
+                if line.split("#", 1)[0].strip()]
+
+
+def scorecard_mask(data, names):
+    """Per tick, whether its session is one of `names` (the scorecard's)."""
+    sessions = list(data["meta"]["sessions"])
+    ids = [sessions.index(n) for n in names if n in sessions]
+    return np.isin(np.asarray(data["session"]), ids)
+
+
+# The mirror augmentation (--mirror). coin: each batch goes in as it is or
+# mirrored, a coin toss a batch, which is every model up to goal2. both: each
+# batch goes in as it is and mirrored, side by side, so every tick is seen
+# both ways every epoch and no batch leans to one side. none: never.
+MIRROR_MODES = ("coin", "both", "none")
+
+# The map branch's activation (--map-act): relu is every map model up to
+# goal2, whose map branch trained to all zeros (MapBranch); leaky keeps
+# MAP_LEAK of the gradient through a unit that is off.
+MAP_ACTS = ("relu", "leaky")
+MAP_LEAK = 0.05
+
+# The optimizer (--optimizer): adam, the weight decay folded into the
+# gradient, is every model up to goal2; adamw decays the weights apart.
+OPTIMIZERS = ("adam", "adamw")
 
 
 # The lidar branch's output width, before the present flag joins it.
@@ -210,17 +300,20 @@ GOAL_FEATURES = 16
 
 
 def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION,
-                uses_lidar=False, uses_map=False, chunk=1, uses_goal=False):
+                uses_lidar=False, uses_map=False, chunk=1, uses_goal=False, map_act="relu"):
     import torch
     from torch import nn
 
+    if map_act not in MAP_ACTS:
+        raise ValueError(f"map activation {map_act!r}: one of {MAP_ACTS}")
     if steer_head not in pl.STEER_HEADS:
         raise ValueError(f"steer head {steer_head!r}: one of {pl.STEER_HEADS}")
     if not 1 <= int(chunk) <= pl.CHUNK_MAX:
         raise ValueError(f"chunk {chunk}: 1..{pl.CHUNK_MAX}")
-    if chunk > 1 and steer_head != pl.STEER_REGRESSION:
-        raise ValueError(f"chunk {chunk} needs the regression steer head")
+    if chunk > 1 and steer_head == pl.STEER_DIRECTION:
+        raise ValueError(f"chunk {chunk} needs a regression steer head")
     direction = steer_head == pl.STEER_DIRECTION
+    per_gear = steer_head == pl.STEER_PER_GEAR
     imu_width = pimu.size(imu_yaw) if uses_imu else 0
     lidar_width = LIDAR_FEATURES + 1 if uses_lidar else 0
     map_width = MAP_FEATURES + 1 if uses_map else 0
@@ -248,18 +341,25 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
         convs down to 4 x 4, a small linear layer, multiplied by present
         (the last plane) as the lidar branch is, and present on to the
         trunk: no map is exactly no map features.
+
+        With plain ReLUs this branch died in every map model up to goal2:
+        its gradient starts near the size of the weight decay, the units go
+        dead within a few hundred steps, and Adam then walks the weights to
+        zero, so the map changed nothing. map_act="leaky" (MAP_ACTS) keeps
+        a gradient through every unit.
         """
 
         def __init__(self):
             super().__init__()
+            act = (lambda: nn.LeakyReLU(MAP_LEAK)) if map_act == "leaky" else nn.ReLU
             self.conv = nn.Sequential(
-                nn.Conv2d(em.CHANNELS - 1, 8, 5, stride=2, padding=2), nn.ReLU(),
-                nn.Conv2d(8, 16, 3, stride=2, padding=1), nn.ReLU(),
-                nn.Conv2d(16, 16, 3, stride=2, padding=1), nn.ReLU(),
-                nn.Conv2d(16, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(em.CHANNELS - 1, 8, 5, stride=2, padding=2), act(),
+                nn.Conv2d(8, 16, 3, stride=2, padding=1), act(),
+                nn.Conv2d(16, 16, 3, stride=2, padding=1), act(),
+                nn.Conv2d(16, 16, 3, stride=2, padding=1), act(),
                 nn.Flatten())
             self.fc = nn.Sequential(
-                nn.Linear(16 * (em.SIZE // 16) ** 2, MAP_FEATURES), nn.ReLU())
+                nn.Linear(16 * (em.SIZE // 16) ** 2, MAP_FEATURES), act())
 
         def forward(self, m):
             present = m[:, em.PRESENT, 0, 0:1]
@@ -311,6 +411,10 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             if direction:
                 self.steer_dir = nn.Linear(64, len(pl.STEER_DIRS))
                 self.steer_mag = nn.Linear(64, 1)
+            elif per_gear:
+                # policy.GEAR_STEER_OUTPUTS: forward's steer, then reverse's.
+                self.steer_forward = nn.Linear(64, chunk)
+                self.steer_reverse = nn.Linear(64, chunk)
             else:
                 self.steer = nn.Linear(64, chunk)
             self.mode = nn.Linear(64, pl.MODE_SIZE)
@@ -335,7 +439,8 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
                 parts.append(self.goal(goal))
             h = self.trunk(torch.cat(parts, dim=1))
             steer = ((self.steer_dir(h), torch.sigmoid(self.steer_mag(h))) if direction
-                     else (torch.tanh(self.steer(h)),))
+                     else (torch.tanh(self.steer_forward(h)), torch.tanh(self.steer_reverse(h)))
+                     if per_gear else (torch.tanh(self.steer(h)),))
             return (self.logits(h), torch.sigmoid(self.throttle(h)), *steer,
                     self.mode(h) + self.mode_skip(mode))
 
@@ -406,6 +511,24 @@ def flip(x, prev, imu=None, imu_yaw=True, lidar=None):
     if lidar is not None:
         return torch.flip(x, dims=[-1]), prev, imu, pli.mirror(lidar)
     return torch.flip(x, dims=[-1]), prev, imu
+
+
+def mirror_inputs(x, prev, imu, lidar, ego, goal, imu_yaw=True):
+    """Every input of a batch, mirrored left to right, any of them None: the
+    frame and prev (flip), the IMU's lateral signs, the scan's bins, the
+    crop's columns (egomap.mirror) and the goal's bearing (policy_goal.MIRROR).
+    The mode has no side. Labels are the caller's: every steer changes sign."""
+    import torch
+
+    if lidar is not None:
+        x, prev, imu, lidar = flip(x, prev, imu, imu_yaw, lidar)
+    else:
+        x, prev, imu = flip(x, prev, imu, imu_yaw)
+    if ego is not None:
+        ego = torch.flip(ego, dims=[-1])   # egomap.mirror
+    if goal is not None:
+        goal = goal * torch.from_numpy(pg.MIRROR)   # policy_goal.mirror
+    return x, prev, imu, lidar, ego, goal
 
 
 def map_inputs(data, rows):
@@ -663,19 +786,25 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           imu_yaw=True, imu_tilt=False, steer_head=pl.STEER_REGRESSION,
           straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT,
           uses_lidar=False, lidar_dropout=LIDAR_DROPOUT, uses_map=False,
-          map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE):
+          map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE,
+          mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam"):
     import torch
     from torch import nn
 
+    if optimizer not in OPTIMIZERS:
+        raise ValueError(f"optimizer {optimizer!r}: one of {OPTIMIZERS}")
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
     model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar, uses_map,
-                        chunk, uses_goal)
+                        chunk, uses_goal, map_act)
     # The goals' draws on a generator of their own, so a model without the
     # goal is trained on exactly the draws it always was.
     goal_rng = np.random.default_rng([seed, 1])
     direction = steer_head == pl.STEER_DIRECTION
+    per_gear = steer_head == pl.STEER_PER_GEAR
+    if mirror not in MIRROR_MODES:
+        raise ValueError(f"mirror {mirror!r}: one of {MIRROR_MODES}")
 
     idx = np.flatnonzero(train_mask)
     x_all = torch.from_numpy(data["x"])
@@ -697,6 +826,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     steer = torch.from_numpy(data["steer"][idx])
     steer_dir = torch.from_numpy(steer_classes(data["steer"][idx], straight_band))
     straight = pl.STEER_DIRS.index(pl.STRAIGHT)
+    gears_all = steer_gears(data, stop_gear_s) if per_gear else None
+    gear_of = torch.from_numpy(gears_all[idx]) if per_gear else None
     w_all = torch.from_numpy(tick_weights(data, idx, good_weight, takeover_weight))
     w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
     steer_all, throttle_all = pe.label_masks(data, label_mode)
@@ -724,6 +855,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
         bad = pe.bad_marked(data)
         c_action = torch.from_numpy(data["action"][fut0].astype(np.int64))
         c_steer = torch.from_numpy(data["steer"][fut0].astype(np.float32))
+        c_gear = torch.from_numpy(gears_all[fut0]) if per_gear else None
         c_tok = torch.from_numpy((fut >= 0) & throttle_all[fut0] & ~bad[fut0])
         c_sok = torch.from_numpy((fut >= 0) & steer_all[fut0] & ~bad[fut0])
         c_w = torch.from_numpy(tick_weights(data, fut0.ravel(), good_weight, takeover_weight)
@@ -732,7 +864,11 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
         # exactly the one-step labels.
         assert bool((c_tok[:, 0] == throttle_ok).all() and (c_sok[:, 0] == steer_ok).all())
 
-    opt = torch.optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-4)
+    # OPTIMIZERS: "adam" folds the weight decay into the gradient, which on
+    # a branch with a small gradient (the map's) is most of what it gets;
+    # "adamw" decays the weights apart from it.
+    opt = (torch.optim.AdamW if optimizer == "adamw" else torch.optim.Adam)(
+        model.parameters(), lr=3e-3, weight_decay=1e-4)
     batch = 64
     for epoch in range(epochs):
         model.train()
@@ -757,52 +893,64 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                     gb = torch.from_numpy(goal_inputs(data, idx[b.numpy()], shown, goal_rng,
                                                       no_goal_share))
                 mb = torch.from_numpy(mb)
-            sb, db = steer[b], steer_dir[b]
-            mirrored = torch.rand(1).item() < 0.5
-            if mirrored:
-                if lb is not None:
-                    xb, pb, ib, lb = flip(xb, pb, ib, imu_yaw, lb)
-                else:
-                    xb, pb, ib = flip(xb, pb, ib, imu_yaw)
-                if mb is not None:
-                    mb = torch.flip(mb, dims=[-1])   # egomap.mirror
-                if gb is not None:
-                    gb = gb * torch.from_numpy(pg.MIRROR)   # policy_goal.mirror
-                sb, db = flip_steer_labels(sb, db)
+            # The mirror (MIRROR_MODES). Every input of a mirrored row is the
+            # same moment seen in a mirror, and its steering labels change
+            # sign; bb is which training tick each row of the batch is, and
+            # sign is +1 as it is, -1 mirrored.
+            if mirror == "both":
+                mx, mp, mi, ml, mm, mg = mirror_inputs(xb, pb, ib, lb, mb, gb, imu_yaw)
+                cat = lambda a, c: None if a is None else torch.cat([a, c])  # noqa: E731
+                xb, pb, ib, lb, mb, gb = (cat(xb, mx), cat(pb, mp), cat(ib, mi),
+                                          cat(lb, ml), cat(mb, mm), cat(gb, mg))
+                bb = torch.cat([b, b])
+                sign = torch.cat([torch.ones(len(b)), -torch.ones(len(b))])
+            else:
+                bb = b
+                flipped = mirror == "coin" and torch.rand(1).item() < 0.5
+                if flipped:
+                    xb, pb, ib, lb, mb, gb = mirror_inputs(xb, pb, ib, lb, mb, gb, imu_yaw)
+                sign = torch.full((len(b),), -1.0 if flipped else 1.0)
+            sb = steer[bb] * sign
+            db = torch.where(sign < 0, (len(pl.STEER_DIRS) - 1) - steer_dir[bb], steer_dir[bb])
             extra = [v for v in (ib, lb, mb, gb) if v is not None]
-            out = model(xb, pb, mode_in[b], *extra)
+            out = model(xb, pb, mode_in[bb], *extra)
             logits, t_out, m_out = out[0], out[1], out[-1]
-            tok, sok = throttle_ok[b], steer_ok[b]
-            wb = w_all[b]
-            moving = tok & (action[b] != pl.ACTIONS.index(pl.STOP))
+            tok, sok = throttle_ok[bb], steer_ok[bb]
+            wb = w_all[bb]
+            moving = tok & (action[bb] != pl.ACTIONS.index(pl.STOP))
             loss = torch.zeros(())
             if chunk > 1:
                 # The gear and steer losses averaged over the offsets, as ACT
-                # averages its L1; throttle and mode stay one step.
-                lc = logits.reshape(len(b), chunk, len(pl.ACTIONS))
-                sc = -c_steer[b] if mirrored else c_steer[b]
-                ta, sa, wc, ac = c_tok[b], c_sok[b], c_w[b], c_action[b]
+                # averages its L1; throttle and mode stay one step. A per-gear
+                # head's offset i is trained on the head of that offset's
+                # own gear (steer_gears), the other head left alone.
+                n = len(bb)
+                lc = logits.reshape(n, chunk, len(pl.ACTIONS))
+                sc = c_steer[bb] * sign[:, None]
+                ta, sa, wc, ac = c_tok[bb], c_sok[bb], c_w[bb], c_action[bb]
+                so = (torch.where(c_gear[bb] == GEAR_REVERSE, out[3], out[2]) if per_gear
+                      else out[2])
                 gear, turn = torch.zeros(()), torch.zeros(())
                 for i in range(chunk):
                     if ta[:, i].any():
                         gear = gear + _weighted(ce(lc[ta[:, i], i], ac[ta[:, i], i]),
                                                 wc[ta[:, i], i])
                     if sa[:, i].any():
-                        turn = turn + _weighted((out[2][sa[:, i], i] - sc[sa[:, i], i]).abs(),
+                        turn = turn + _weighted((so[sa[:, i], i] - sc[sa[:, i], i]).abs(),
                                                 wc[sa[:, i], i])
                 loss = loss + gear / chunk + turn / chunk
                 if moving.any():
-                    loss = loss + _weighted((t_out[moving, 0] - mag[b][moving]).abs(), wb[moving])
+                    loss = loss + _weighted((t_out[moving, 0] - mag[bb][moving]).abs(), wb[moving])
                 if sok.any():
-                    loss = loss + _weighted(ce_mode(m_out[sok], mode[b][sok]), w_mode[b][sok])
+                    loss = loss + _weighted(ce_mode(m_out[sok], mode[bb][sok]), w_mode[bb][sok])
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
                 continue
             if tok.any():
-                loss = loss + _weighted(ce(logits[tok], action[b][tok]), wb[tok])
+                loss = loss + _weighted(ce(logits[tok], action[bb][tok]), wb[tok])
             if moving.any():
-                loss = loss + _weighted((t_out[moving, 0] - mag[b][moving]).abs(), wb[moving])
+                loss = loss + _weighted((t_out[moving, 0] - mag[bb][moving]).abs(), wb[moving])
             if sok.any() and direction:
                 # Which way, on every steering label; how far, only where it
                 # is a turn: a straight label says nothing about how hard.
@@ -811,10 +959,13 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 turn = sok & (db != straight)
                 if turn.any():
                     loss = loss + _weighted((g_out[turn, 0] - sb[turn].abs()).abs(), wb[turn])
+            elif sok.any() and per_gear:
+                so = torch.where(gear_of[bb] == GEAR_REVERSE, out[3][:, 0], out[2][:, 0])
+                loss = loss + _weighted((so[sok] - sb[sok]).abs(), wb[sok])
             elif sok.any():
                 loss = loss + _weighted((out[2][sok, 0] - sb[sok]).abs(), wb[sok])
             if sok.any():
-                loss = loss + _weighted(ce_mode(m_out[sok], mode[b][sok]), w_mode[b][sok])
+                loss = loss + _weighted(ce_mode(m_out[sok], mode[bb][sok]), w_mode[bb][sok])
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -864,14 +1015,14 @@ def imu_meta(uses_imu, tilt, yaw=True):
                            "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.GAP_S}}
 
 
-def map_meta(uses_map, dropout=MAP_DROPOUT):
+def map_meta(uses_map, dropout=MAP_DROPOUT, act="relu"):
     """The map half of the sidecar: what policy.check_map reads. A uses_map
     model drives with the hand-written driving rules off (policy.py,
     PolicyDriver) and is refused on a car not running --slam."""
     if not uses_map:
         return {}
     return {"uses_map": True, **em.meta(), "map_dropout": float(dropout),
-            "map_features": MAP_FEATURES}
+            "map_features": MAP_FEATURES, "map_act": act}
 
 
 def goal_meta(uses_goal, no_goal_share=pg.NO_GOAL_SHARE):
@@ -959,10 +1110,13 @@ def mode_meta(switch_weight=MODE_SWITCH_WEIGHT):
     }
 
 
-def steer_meta(steer_head=pl.STEER_REGRESSION, band=STRAIGHT_BAND):
+def steer_meta(steer_head=pl.STEER_REGRESSION, band=STRAIGHT_BAND, stop_gear_s=STOP_GEAR_S):
     """The steering head's half of the sidecar: what policy.check_steer_head
     reads, and the outputs the graph has."""
     out = {"steer_head": steer_head, "outputs": output_names(steer_head)}
+    if steer_head == pl.STEER_PER_GEAR:
+        out["steer_gears"] = [pl.FORWARD, pl.REVERSE]
+        out["steer_stop_gear_s"] = float(stop_gear_s)
     if steer_head == pl.STEER_DIRECTION:
         out["steer_dirs"] = list(pl.STEER_DIRS)
         out["steer_straight_band"] = float(band)
@@ -1042,6 +1196,22 @@ def main(argv=None):
     ap.add_argument("--straight-band", type=float, default=STRAIGHT_BAND,
                     help="with --steer-head direction: |steer| under this is the "
                          f"straight class (default {STRAIGHT_BAND} of full lock)")
+    ap.add_argument("--mirror", choices=MIRROR_MODES, default="coin",
+                    help="the left-right mirror augmentation: coin, each batch as it is or "
+                         "mirrored; both, every batch both ways side by side; none")
+    ap.add_argument("--map-act", choices=MAP_ACTS, default="relu",
+                    help="with --map: the map branch's activation; relu trained to a dead "
+                         "branch in every map model up to goal2, leaky does not")
+    ap.add_argument("--optimizer", choices=OPTIMIZERS, default="adam",
+                    help="adam folds the weight decay into the gradient (every model up to "
+                         "goal2); adamw decays the weights apart from it")
+    ap.add_argument("--stop-gear-s", type=float, default=STOP_GEAR_S,
+                    help="with --steer-head per_gear: a stop's steering trains the head of "
+                         "the gear the car moves in next within this many seconds, else the "
+                         f"last one (default {STOP_GEAR_S})")
+    ap.add_argument("--train-on-scorecard", action="store_true",
+                    help="train on the scorecard's sessions too (tools/scorecard.txt), "
+                         "which every model is otherwise kept off so they stay a fair test")
     ap.add_argument("--chunk", type=int, default=1, metavar="K",
                     help="action chunks: the gear and steer heads answer for this decision "
                          "and the next K-1, which the car blends (policy.ChunkEnsembler). "
@@ -1083,8 +1253,8 @@ def main(argv=None):
     if not 1 <= args.chunk <= pl.CHUNK_MAX:
         print(f"--chunk is 1..{pl.CHUNK_MAX}, not {args.chunk}")
         return 2
-    if args.chunk > 1 and args.steer_head != pl.STEER_REGRESSION:
-        print("--chunk needs the regression steer head")
+    if args.chunk > 1 and args.steer_head == pl.STEER_DIRECTION:
+        print("--chunk needs a regression steer head (regression or per_gear)")
         return 2
     if args.chunk > 1 and not -10.0 <= args.ensemble_m <= 10.0:
         print(f"--ensemble-m is -10..10, not {args.ensemble_m}")
@@ -1147,6 +1317,15 @@ def main(argv=None):
 
     steer_ok, throttle_ok = pe.label_masks(data, args.labels)
     labelled = steer_ok | throttle_ok
+    # The scorecard's sessions are never trained on (unless asked): every
+    # mask below is off `labelled`, so this one line keeps them out of the
+    # folds, the final model and --val alike.
+    held_card = [] if args.train_on_scorecard else [n for n in scorecard_sessions()
+                                                     if n in sessions]
+    if held_card:
+        labelled = labelled & ~scorecard_mask(data, held_card)
+        print(f"scorecard: {len(held_card)} sessions kept out of training "
+              f"({SCORECARD_FILE})")
     data["x"] = encode_frames(data["frames"], args.representation)
     fit = dict(representation=args.representation, label_mode=args.labels,
                uses_prev=args.prev, epochs=args.epochs, seed=args.seed,
@@ -1156,7 +1335,9 @@ def main(argv=None):
                straight_band=args.straight_band, takeover_weight=args.takeover_weight,
                uses_lidar=args.lidar, lidar_dropout=args.lidar_dropout,
                uses_map=bool(args.map), map_dropout=args.map_dropout, chunk=args.chunk,
-               uses_goal=args.goal, no_goal_share=args.no_goal_share)
+               uses_goal=args.goal, no_goal_share=args.no_goal_share,
+               mirror=args.mirror, stop_gear_s=args.stop_gear_s,
+               map_act=args.map_act, optimizer=args.optimizer)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1297,20 +1478,28 @@ def _base_meta(meta_in, args, val_ids, val_names):
         **lidar_meta(getattr(args, "lidar", False),
                      getattr(args, "lidar_dropout", LIDAR_DROPOUT)),
         **map_meta(bool(getattr(args, "map", None)),
-                   getattr(args, "map_dropout", MAP_DROPOUT)),
+                   getattr(args, "map_dropout", MAP_DROPOUT),
+                   getattr(args, "map_act", "relu")),
         **goal_meta(bool(getattr(args, "goal", False)),
                     getattr(args, "no_goal_share", pg.NO_GOAL_SHARE)),
         **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
-                     getattr(args, "straight_band", STRAIGHT_BAND)),
+                     getattr(args, "straight_band", STRAIGHT_BAND),
+                     getattr(args, "stop_gear_s", STOP_GEAR_S)),
         **chunk_meta(getattr(args, "chunk", 1), getattr(args, "ensemble_m", 0.0)),
         "steer_scale": pl.STEER_SCALE,
         "labels": args.labels,
-        "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids],
+        "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids
+                           and (getattr(args, "train_on_scorecard", False)
+                                or s not in scorecard_sessions())],
         "val_sessions": val_names,
         "good_weight": args.good_weight,
         "takeover_weight": getattr(args, "takeover_weight", TAKEOVER_WEIGHT),
         "epochs": args.epochs,
         "seed": args.seed,
+        "mirror": getattr(args, "mirror", "coin"),
+        "optimizer": getattr(args, "optimizer", "adam"),
+        "scorecard_sessions": ([] if getattr(args, "train_on_scorecard", False)
+                               else [n for n in scorecard_sessions() if n in sessions]),
     }
 
 
