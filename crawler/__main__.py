@@ -1678,6 +1678,22 @@ def parse_args(argv=None):
         help="drive auto with a learned policy (a .onnx with its .json "
              "beside it) instead of the hand-written autopilot",
     )
+    # Off unless named, so the unit does not change until the roof lidar is
+    # plugged in. Bare --lidar finds the USB-UART board on its own; a path
+    # (/dev/ttyUSB0, /dev/serial0) names the port. Nothing drives on it yet:
+    # it is read, binned in the car's frame and recorded on /lidar. A sensor
+    # that is missing or goes away costs one line in the journal and nothing
+    # else -- see crawler/hardware/lidar.py.
+    parser.add_argument(
+        "--lidar",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="DEVICE",
+        help="read the 2D lidar and record it on /lidar; DEVICE is a serial "
+             "port or 'auto' (the default when the flag is bare). Off unless "
+             "given",
+    )
     return parser.parse_args(argv)
 
 
@@ -1757,6 +1773,16 @@ def main(argv=None):
     # always run.
     hub = camera.CameraHub(logger=log, tele=tele if channels_live else None,
                            rectified=channels_live)
+
+    # The lidar is a thread of its own and start() returns at once, plugged
+    # in or not: a missing sensor must never hold up the one boot that has to
+    # work. Closed after the ESC is at neutral, with the camera.
+    lidar = None
+    if args.lidar:
+        from crawler.hardware import lidar as ld
+        lidar = ld.LidarReader(device=args.lidar, logger=log,
+                               tele=tele if channels_live else None)
+        lidar.start()
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy)
 
     # Who gets the device opened at startup, and who waits for it:
@@ -1825,6 +1851,8 @@ def main(argv=None):
             # two things in this process that do not matter -- and because a
             # USB device that refuses to close must not get between SIGTERM
             # and the ESC reaching neutral.
+            if lidar is not None:
+                lidar.close()
             hub.close()
             tele.stop()
         return 0
@@ -1857,6 +1885,8 @@ def main(argv=None):
     finally:
         stop_event.set()
         worker.join(timeout=5)
+        if lidar is not None:
+            lidar.close()
         hub.close()
         tele.stop()
 

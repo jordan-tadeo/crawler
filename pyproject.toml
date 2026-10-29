@@ -51,6 +51,12 @@ dependencies = [
     # and it imports and runs against numpy 1.26.4. Its own dependencies are
     # flatbuffers, packaging and protobuf.
     "onnxruntime==1.31.1",
+    # The roof lidar's UART, crawler/hardware/lidar.py. Pure Python, one
+    # py2.py3-none-any wheel, and already in the lock and on the car before
+    # this line: Adafruit-Blinka pulls it in through pyftdi and
+    # binho-host-adapter. Named here because the lidar imports it directly
+    # now, and a transitive dependency can leave without asking.
+    "pyserial==3.5",
 ]
 
 [project.optional-dependencies]

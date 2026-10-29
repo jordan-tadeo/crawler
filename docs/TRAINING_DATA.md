@@ -49,8 +49,8 @@ Bluetooth link times out at 5 s on every connection
 (`deploy/install-pad-lst.sh`; the default is 20 s), and the loop sees the
 device go within about 0.8 s. Either way the session's last `/diagnostics` row says
 `controller_connected: false`. With no pad connected the camera channels
-(`/camera/*`, `/imu`, `/policy/depth_small`) are not written at all, in any
-file, until it is back.
+(`/camera/*`, `/imu`, `/policy/depth_small`) and `/lidar` are not written at
+all, in any file, until it is back.
 
 ## The tick and how to pair things
 
@@ -66,6 +66,21 @@ of these carry the **same `log_time`** (ns since the epoch):
 
 Pair by `log_time`, or by `seq` against the `frame_id` suffix; both always
 agree. `seq` counts from 1 per process, so a gap in it is a dropped row.
+
+`/lidar` (only with `--lidar`) is not on the tick: it is one row per
+revolution of the roof lidar, about 10 Hz on the sensor's own clock. Pair it
+with a tick by nearest `log_time`, and treat a row more than 0.3 s older than
+the tick as no scan (`lidar.STALE_S`).
+
+## `/lidar` (JSON, schema `crawler.Lidar`)
+
+`bins` is 72 nearest ranges in mm, from the middle of the car, one per 5
+degrees: bin `i` is centred on bearing `i * 5` counter-clockwise from straight
+ahead, so 0 ahead, 18 left, 36 behind, 54 right. 0 is no return in that bin.
+`nearest_front_mm` / `_left_` / `_rear_` / `_right_` are the nearest bin in each
+quarter (the 45 degree bins count in both neighbours). `rpm`, `packets_per_s`
+(417 expected), `crc_error_rate` and `crc_errors` are the sensor's health.
+`crawler/hardware/lidar.py` has the mount, the frame and why 5 degrees.
 
 ## `/policy/depth_small`
 

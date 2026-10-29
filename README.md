@@ -13,6 +13,8 @@ drive can be read back afterwards instead of remembered.
 - Quicrun 880 ESC on GPIO 18 through pigpio. Neutral is 1575 us.
 - Front and rear steering servos on a PCA9685 over I2C.
 - OAK-D: stereo depth and the IMU, computed on the camera.
+- LDRobot STL-19P 2D lidar (the D500 kit) on the roof, arrow to the truck's
+  right. Read and recorded with `--lidar`; nothing drives on it yet.
 - An Xbox pad over Bluetooth, driven by xpadneo.
 
 ## Layout
@@ -98,6 +100,36 @@ journalctl -u 'crawler-pad-lst@*'               # one line per connection
 
 The OAK-D's udev rule is already on the car and the installer does not touch
 it. The comment at the top of `deploy/install-service.sh` says what it is.
+
+## The roof lidar
+
+The STL-19P only transmits: 230400 8N1, no commands, streaming as soon as its
+motor is up to speed. Its 4-pin lead goes to the kit's USB-UART board, and
+the board to a USB port on the Pi. The board is a CP2102: it shows up as
+`/dev/ttyUSB0` with a `/dev/serial/by-id/*CP2102*` link, and bare `--lidar`
+finds it by that name. On the Pi's header pins instead it is sensor 1 Tx to GPIO 15
+(RXD), 3 GND to a ground, 4 5V to a 5V pin, 2 PWM to ground, with the serial
+console off and the UART on in `raspi-config`, and then
+`--lidar /dev/serial0`. The Tx line is 3.3 V, so either way is safe for the
+Pi. The service user needs group `dialout` for the tty.
+
+Bring-up, with the service left as it is (it does not read the lidar):
+
+```sh
+./.venv/bin/python tools/lidar_check.py --list         # the ports auto tries
+./.venv/bin/python tools/lidar_check.py --seconds 20   # then hold a hand at the front, then the right
+```
+
+Expect about 600 rpm, 417 packets/s, 0% CRC errors and about 480 points a
+scan. The mount has been checked once already with a box off the front
+bumper: it showed up at raw sensor angle 270, which `MOUNT` puts straight
+ahead. The near number has to land under `front`, then `right`. If it lands a
+quarter turn off, `--yaw` tries another mount yaw, and `MOUNT` in
+`crawler/hardware/lidar.py` is where it goes once it is right. The sensor
+sits at the middle of the car, which is the frame's origin, so its offset is
+0, 0. Then add `--lidar` to the
+service's ExecStart with `sudo systemctl edit crawler`, and `/lidar` is in
+every recording.
 
 ## Modes and controls
 

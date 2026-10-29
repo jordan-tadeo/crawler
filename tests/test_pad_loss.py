@@ -67,8 +67,8 @@ def test_the_camera_stops_being_written_while_there_is_no_pad(monkeypatch):
     tele = out["tele"]
     mutes = [e for e in tele.events if e[0] in ("mute", "unmute")]
     assert mutes == [("mute", tm.CAMERA_KEYS), ("unmute",)]
-    assert {"imu", "depth", "disparity", "rectified_left", "depth_raw",
-            "depth_small"} == set(tm.CAMERA_KEYS)
+    assert {"imu", "lidar", "depth", "disparity", "rectified_left",
+            "depth_raw", "depth_small"} == set(tm.CAMERA_KEYS)
     assert not {"controller", "vehicle", "diagnostics", "marks",
                 "footprint"} & set(tm.CAMERA_KEYS)
 

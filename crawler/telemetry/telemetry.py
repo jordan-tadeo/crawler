@@ -116,6 +116,10 @@ INTERVALS = {
     "footprint": 0.0,
     "depth_raw": 0.0,
     "depth_small": 0.0,
+    # Offered once per revolution by lidar.LidarReader, so the sensor sets
+    # the rate: 10 Hz, 13 at the most it can be driven to. One row is about
+    # 600 bytes of JSON.
+    "lidar": 0.0,
 }
 
 # Longest side of an image channel after downscaling, in pixels. The mono
@@ -404,6 +408,28 @@ JSON_SCHEMAS = {
         # its last answer; all -1 for a regression head, 0 when no policy drives.
         "policy_steer_dir_p": {"type": "array", "items": _NUM, "minItems": 3, "maxItems": 3},
     }),
+    # One revolution of the roof lidar, see crawler/hardware/lidar.py. bins
+    # is lidar.BINS nearest ranges in mm from the middle of the car, bin i
+    # centred on bearing i * bin_deg counter-clockwise from straight ahead
+    # (0 ahead, 18 left, 36 behind, 54 right), 0 where nothing came back.
+    "lidar": _schema("crawler.Lidar", {
+        "bins": {"type": "array", "items": _INT},
+        "bin_deg": _NUM,
+        "points": _INT,
+        "valid_points": _INT,
+        "rpm": _NUM,
+        # Over the last second. 5000 points a second is 417 packets.
+        "packets_per_s": _NUM,
+        "crc_error_rate": _NUM,
+        # Since the reader started.
+        "crc_errors": _INT,
+        "rejected_packets": _INT,
+        # lidar.nearest_in_sector() of bins, so a plot panel can watch them.
+        "nearest_front_mm": _INT,
+        "nearest_left_mm": _INT,
+        "nearest_rear_mm": _INT,
+        "nearest_right_mm": _INT,
+    }),
 }
 
 # The image channels, which do get a well-known schema: foxglove.CompressedImage,
@@ -449,6 +475,7 @@ JSON_TOPICS = {
     "imu": "/imu",
     "marks": "/marks",
     "footprint": "/footprint",
+    "lidar": "/lidar",
 }
 
 # Raw depth: the uint16 millimetres exactly as the driver scans them, as a
@@ -480,7 +507,8 @@ ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS) + tuple(RAW_DEPTH_CHANNELS
 # there is no pad: a file of nothing but pictures and IMU has no driving in it
 # to pair them with, and one afternoon of those was 77 MB. The control loop's
 # own channels are not in here -- /diagnostics is what says the pad went.
-CAMERA_KEYS = frozenset(("imu",) + tuple(IMAGE_CHANNELS)
+# /lidar is, for the same reason: it is a sensor with no driving in it.
+CAMERA_KEYS = frozenset(("imu", "lidar") + tuple(IMAGE_CHANNELS)
                         + tuple(RAW_DEPTH_CHANNELS))
 
 

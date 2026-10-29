@@ -176,6 +176,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pigpio" },
     { name = "pygame" },
+    { name = "pyserial" },
 ]
 
 [package.dev-dependencies]
@@ -195,6 +196,7 @@ requires-dist = [
     { name = "opencv-python", specifier = "==4.11.0.86" },
     { name = "pigpio", specifier = "==1.78" },
     { name = "pygame", specifier = "==2.6.1" },
+    { name = "pyserial", specifier = "==3.5" },
 ]
 provides-extras = ["dashboard"]
 
