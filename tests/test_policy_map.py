@@ -609,3 +609,182 @@ def test_a_floor_blip_is_quiet_and_a_floor_hold_is_logged(capsys):
         t += 0.1
     lines = _neutral_lines(capsys.readouterr().out)
     assert len(lines) == 1 and lines[0].startswith("Auto neutral - model floor"), lines
+
+
+# --- a lost map hands the wheels to the map-free fallback, not to neutral ----------
+
+class FallbackStub(OldStub):
+    label = "the fallback"
+    chunk = 1
+
+
+def fallback_driver(primary=None, fallback=None, slam=None, depth=None):
+    primary = primary or MapStub(FORWARD, steer=0.25)
+    fallback = fallback or FallbackStub(FORWARD, steer=-0.3)
+    slam = slam or FakeSlam()
+    d = pl.PolicyDriver(FakeController(), FakeCamera(depth=clear() if depth is None else depth),
+                        primary, lidar=reader(), slam=slam, fallback=fallback)
+    return d, primary, fallback, slam
+
+
+def _drive(d, slam, t, seconds, present):
+    """Tick every 0.1 s for `seconds`, the crop present or not."""
+    for _ in range(int(round(seconds / 0.1))):
+        t = round(t + 0.1, 6)
+        slam.at(t, present=present)
+        d.tick(t)
+    return t
+
+
+def test_a_lost_map_drives_on_the_fallback_and_comes_back_after_a_healthy_second():
+    d, primary, fallback, slam = fallback_driver()
+    t = _drive(d, slam, T0, 0.5, True)
+    assert len(primary.fed) == 5 and not fallback.fed
+    assert not d.policy_fields()["policy_fallback"]
+    # Under MAP_LOST_S the map model rides the gap on its no-map input.
+    t = _drive(d, slam, t, pl.MAP_LOST_S - 0.1, False)
+    assert not fallback.fed, "inside the window it is still the map model"
+    # Past it: the fallback, never neutral.
+    t = _drive(d, slam, t, 0.5, False)
+    assert fallback.fed and d.policy_fields()["policy_fallback"]
+    assert d.controller.throttles[-1] > 0
+    assert d.controller.steerings[-1][0] == pytest.approx(-0.3 * pl.STEER_SCALE)
+    assert d.last_decision.reason != "map lost"
+    # The map back, but not yet for a second: still the fallback.
+    n = len(primary.fed)
+    t = _drive(d, slam, t, pl.MAP_BACK_S - 0.2, True)
+    assert len(primary.fed) == n, "hysteresis: a healthy map has to stay healthy first"
+    # A blink restarts the second.
+    t = _drive(d, slam, t, 0.1, False)
+    t = _drive(d, slam, t, pl.MAP_BACK_S - 0.2, True)
+    assert len(primary.fed) == n
+    t = _drive(d, slam, t, 0.4, True)
+    assert len(primary.fed) > n and not d.policy_fields()["policy_fallback"]
+    assert d.controller.steerings[-1][0] == pytest.approx(0.25 * pl.STEER_SCALE)
+    # One model a tick, never both.
+    ticks = round((t - T0) / 0.1)
+    assert len(primary.fed) + len(fallback.fed) == ticks
+
+
+def test_the_fallback_is_never_fed_a_map_and_the_map_model_rides_short_gaps():
+    d, primary, fallback, slam = fallback_driver()
+    t = _drive(d, slam, T0, 0.3, True)
+    t = _drive(d, slam, t, pl.MAP_LOST_S + 0.5, False)
+    assert fallback.fed and all(m is None for m in fallback.fed)
+
+
+def test_every_switch_resets_the_chunk_blend():
+    d, primary, fallback, slam = fallback_driver()
+    resets = {"map": 0, "fallback": 0}
+    for name, slot in d._slots.items():
+        real = slot["ensembler"].reset
+
+        def counted(real=real, name=name):
+            resets[name] += 1
+            real()
+        slot["ensembler"].reset = counted
+    t = _drive(d, slam, T0, 0.3, True)
+    before = dict(resets)
+    t = _drive(d, slam, t, pl.MAP_LOST_S + 0.3, False)
+    assert resets["fallback"] > before["fallback"], "switching to the fallback"
+    before = dict(resets)
+    t = _drive(d, slam, t, pl.MAP_BACK_S + 0.3, True)
+    assert resets["map"] > before["map"], "switching back to the map model"
+
+
+def test_the_mapper_down_goes_to_the_fallback_at_once():
+    d, primary, fallback, slam = fallback_driver()
+    t = _drive(d, slam, T0, 0.3, True)
+    slam.alive = False
+    t = _drive(d, slam, t, 0.1, True)
+    assert fallback.fed and d.controller.throttles[-1] > 0
+
+
+def test_bad_sensor_input_is_still_neutral_on_the_fallback():
+    d, primary, fallback, slam = fallback_driver()
+    t = _drive(d, slam, T0, 0.3, True)
+    t = _drive(d, slam, t, pl.MAP_LOST_S + 0.3, False)
+    assert d.policy_fields()["policy_fallback"]
+    d.camera.depth = None
+    t = round(t + 0.1, 6)
+    d.tick(t)
+    assert d.controller.throttles[-1] == 0 and d.last_decision.reason == "no frame"
+
+
+def test_no_fallback_loaded_is_still_neutral_on_a_lost_map():
+    model, slam = MapStub(FORWARD), FakeSlam()
+    d = driver(model, slam)
+    t = _drive(d, slam, T0, pl.MAP_LOST_S + 0.5, False)
+    assert d.controller.throttles[-1] == 0 and d.last_decision.reason == "map lost"
+
+
+def test_a_fallback_that_needs_the_map_is_refused():
+    with pytest.raises(ValueError):
+        fallback_driver(fallback=MapStub())
+
+
+def test_each_switch_is_logged_with_its_reason(capsys):
+    d, primary, fallback, slam = fallback_driver()
+    t = _drive(d, slam, T0, 0.3, True)
+    capsys.readouterr()
+    t = _drive(d, slam, t, pl.MAP_LOST_S + 0.5, False)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("Auto ")]
+    assert len(lines) == 1 and lines[0].startswith("Auto fallback - map lost"), lines
+    assert "the fallback" in lines[0]
+    t = _drive(d, slam, t, pl.MAP_BACK_S + 0.5, True)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("Auto ")]
+    assert len(lines) == 1 and lines[0].startswith("Auto map back"), lines
+    # A second round inside the rate limit says nothing; the next line
+    # after it counts what went unsaid.
+    t = _drive(d, slam, t, pl.MAP_LOST_S + 0.5, False)
+    t = _drive(d, slam, t, pl.MAP_BACK_S + 0.5, True)
+    assert not [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("Auto ")]
+    t = _drive(d, slam, t, pl.STOP_LOG_EVERY_S, True)
+    t = _drive(d, slam, t, pl.MAP_LOST_S + 0.5, False)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("Auto ")]
+    assert len(lines) == 1 and "1 more like it" in lines[0], lines
+
+
+def test_the_idle_model_s_imu_window_keeps_up():
+    d, primary, fallback, slam = fallback_driver()
+    pushes = {"map": 0, "fallback": 0}
+    for name, slot in d._slots.items():
+        real = slot["imu_features"].push
+
+        def counted(row, now, real=real, name=name):
+            pushes[name] += 1
+            return real(row, now)
+        slot["imu_features"].push = counted
+    _drive(d, slam, T0, 0.5, True)
+    assert pushes == {"map": 5, "fallback": 5}
+
+
+# --- crawler/__main__.py: --fallback-policy ------------------------------------------
+
+def _pilot(**kw):
+    from crawler import __main__ as mn
+    from test_policy import Log, ReadyHub
+    log = Log()
+    return mn, log, mn.AutoPilot(FakeController(), log, hub=ReadyHub(), slam=FakeSlam(),
+                                 policy_path=str(MAP_MODEL), **kw)
+
+
+def test_the_fallback_flag_loads_the_fallback_beside_the_map_model():
+    smoke = FIXTURES / "policy-smoke.onnx"
+    mn, log, pilot = _pilot(fallback_path=str(smoke))
+    assert mn.parse_args(["--fallback-policy", str(smoke)]).fallback_policy == str(smoke)
+    assert mn.parse_args([]).fallback_policy is None
+    assert pilot.resume() is True
+    assert pilot.driver.fallback is not None and pilot.driver.uses_map
+    assert any("falls back to" in line[2] for line in log.lines)
+
+
+def test_no_fallback_flag_is_the_map_model_alone():
+    mn, log, pilot = _pilot()
+    assert pilot.resume() is True
+    assert pilot.driver.fallback is None
+
+
+def test_a_fallback_that_will_not_load_is_auto_unavailable(tmp_path):
+    mn, log, pilot = _pilot(fallback_path=str(tmp_path / "missing.onnx"))
+    assert pilot.resume() is False and pilot.unavailable is True

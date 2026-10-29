@@ -9,6 +9,7 @@
         --notes "held the line through the turn"
     python3 tools/models.py deploy 1.3              # put kblock 1.3 on the car
     python3 tools/models.py rollback                # back to what drove before
+    python3 tools/models.py deploy candidate-sweep2-1029 --fallback   # the map model's fallback
     python3 tools/models.py status                  # what the car points at
     python3 tools/models.py approve 1.2 --notes ".."  # record that a release drove well
     python3 tools/models.py note 1.2 "loops on a 3-point turn"   # a dated drive note
@@ -88,6 +89,12 @@ on 8765, is still at neutral, and has written no Traceback since the restart.
 through exactly the same steps. Once the links point at it, the registry's
 "deployed" says which model that was and when.
 
+--fallback (deploy, rollback) does the same to the second slot,
+models/fallback.onnx and fallback.json with models/.fallback-previous: the
+map-free model a map --policy drives on while its map is lost, started with
+--fallback-policy models/fallback.onnx. A map model is refused there, and the
+registry's "deployed_fallback" says which model it was.
+
 The car is CRAWLER_HOST, else jt@jtpi.local, the same as pull_mcaps.py: by name,
 because the DHCP lease moves (tests/test_car_address.py).
 """
@@ -130,6 +137,13 @@ CAR_MODELS = CAR_REPO + "/models"
 LINK_ONNX = "policy.onnx"
 LINK_JSON = "policy.json"
 PREVIOUS = ".policy-previous"
+# The second slot: the map-free model a map model hands the wheels to while
+# the map is lost (--fallback-policy models/fallback.onnx). Same links, same
+# swap, same rollback, its own names; deploy/rollback --fallback.
+SLOTS = {
+    "policy": ("policy.onnx", "policy.json", ".policy-previous", "deployed"),
+    "fallback": ("fallback.onnx", "fallback.json", ".fallback-previous", "deployed_fallback"),
+}
 SERVICE = pm.SERVICE
 PORT = 8765
 # The ESC's GPIO and its neutral pulse, read with pigs and never written here.
@@ -927,18 +941,19 @@ def is_parked(reading):
     return str(reading).strip() == str(PARKED_US)
 
 
-def probe_command():
-    """Read-only: the throttle pulse, the symlinks and what they point at,
-    and the service's restart count."""
+def probe_command(slot="policy"):
+    """Read-only: the throttle pulse, the slot's symlinks and what they point
+    at, and the service's restart count."""
     m = shlex.quote(CAR_MODELS)
+    link_onnx, link_json, previous, _ = SLOTS[slot]
     return (f"cd {m} && echo pulse=$(pigs gpw {THROTTLE_GPIO} 2>&1); "
-            f"echo onnx=$(readlink {LINK_ONNX}); echo json=$(readlink {LINK_JSON}); "
-            f"echo previous=$(cat {PREVIOUS} 2>/dev/null); "
+            f"echo onnx=$(readlink {link_onnx}); echo json=$(readlink {link_json}); "
+            f"echo previous=$(cat {previous} 2>/dev/null); "
             f"echo nrestarts=$(systemctl show {SERVICE} -p NRestarts --value); "
             f"echo active=$(systemctl is-active {SERVICE}); "
             f"echo since=$(systemctl show {SERVICE} -p ActiveEnterTimestamp "
             f"--timestamp=unix --value | tr -d @); "
-            f"echo linked=$(stat -c %Y {LINK_ONNX} 2>/dev/null)")
+            f"echo linked=$(stat -c %Y {link_onnx} 2>/dev/null)")
 
 
 def parse_kv(text):
@@ -957,16 +972,17 @@ def sync_command(paths):
     return "sync -- " + " ".join(shlex.quote(p) for p in [*paths, CAR_MODELS])
 
 
-def swap_command(entry, previous_target):
+def swap_command(entry, previous_target, slot="policy"):
     """One shell: parked check, both symlinks re-pointed atomically, the old
     target remembered, all of it flushed to the card, the service restarted.
     Prints the car's clock just before the restart as restart_at=<unix s>."""
     m = shlex.quote(CAR_MODELS)
+    link_onnx, link_json, previous, _ = SLOTS[slot]
     steps = [f"cd {m}", "{ " + parked_check_shell() + "; }"]
     if previous_target:
-        steps.append(f"printf '%s\\n' {shlex.quote(previous_target)} > {PREVIOUS}.tmp"
-                     f" && mv -T {PREVIOUS}.tmp {PREVIOUS}")
-    for target, link in ((entry["onnx"], LINK_ONNX), (entry["json"], LINK_JSON)):
+        steps.append(f"printf '%s\\n' {shlex.quote(previous_target)} > {previous}.tmp"
+                     f" && mv -T {previous}.tmp {previous}")
+    for target, link in ((entry["onnx"], link_onnx), (entry["json"], link_json)):
         steps.append(f"ln -sfn {shlex.quote(target)} .{link}.tmp && "
                      f"mv -T .{link}.tmp {link}")
     # A symlink cannot be fsynced through its own path, so the whole card.
@@ -1048,8 +1064,8 @@ class Car:
                  f"test ! -e {shlex.quote(part)}")
 
 
-def survey(car):
-    _, out = car.run(probe_command())
+def survey(car, slot="policy"):
+    _, out = car.run(probe_command(slot))
     return parse_kv(out)
 
 
@@ -1066,17 +1082,27 @@ def active_entry(registry, car, state=None):
 
 
 def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
-           out=print, wait_s=30.0, sleep=time.sleep, clock=time.monotonic):
-    """Put `entry`, a release or a candidate, on the car and restart the
-    service under it. -> exit code."""
+           out=print, wait_s=30.0, sleep=time.sleep, clock=time.monotonic,
+           slot="policy"):
+    """Put `entry`, a release or a candidate, on the car in `slot` (SLOTS:
+    the policy, or the map model's fallback) and restart the service under
+    it. -> exit code."""
+    link_onnx = SLOTS[slot][0]
     say = (lambda s: out(f"[dry-run] {s}")) if dry_run else out
     local = {n: os.path.join(models_dir, entry[n]) for n in ("onnx", "json")}
     for kind, path in local.items():
         if not os.path.isfile(path) or pm.sha256_local(path) != entry[f"{kind}_sha256"]:
             raise SystemExit(f"{path} is missing or not what the registry recorded")
+    if slot == "fallback":
+        # The car refuses a map fallback at engage (auto unavailable), so
+        # it is refused here before anything moves.
+        with open(local["json"]) as f:
+            if json.load(f).get("uses_map", False):
+                raise SystemExit(f"{entry['label']} drives off the map: a fallback "
+                                 "is the model for when there is none")
 
-    state = survey(car)
-    say(f"car: policy.onnx -> {state.get('onnx') or '(none)'}, throttle pulse "
+    state = survey(car, slot)
+    say(f"car: {link_onnx} -> {state.get('onnx') or '(none)'}, throttle pulse "
         f"{state.get('pulse')}, service {state.get('active')}, NRestarts "
         f"{state.get('nrestarts')}")
     if not is_parked(state.get("pulse", "")):
@@ -1105,7 +1131,7 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
 
     previous = state.get("onnx", "")
     command = swap_command(entry, previous if previous != entry["onnx"] else
-                           state.get("previous", ""))
+                           state.get("previous", ""), slot)
     say(f"ssh {car.host} '{command}'")
     if dry_run:
         say(f"then health: {health_command(0).replace('@0', '@<restart_at>')}")
@@ -1121,8 +1147,8 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
         return 1
     kv = parse_kv(text)
     restart_at = int(kv.get("restart_at", "0") or 0)
-    out(f"policy.onnx -> {entry['onnx']}; restarted {SERVICE}")
-    mark_deployed(registry, entry, models_dir)
+    out(f"{link_onnx} -> {entry['onnx']}; restarted {SERVICE}")
+    mark_deployed(registry, entry, models_dir, slot=slot)
 
     deadline = clock() + wait_s
     while True:
@@ -1146,20 +1172,21 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
     return 0
 
 
-def mark_deployed(registry, entry, models_dir=MODELS_DIR, now=None):
+def mark_deployed(registry, entry, models_dir=MODELS_DIR, now=None, slot="policy"):
     """Write down which model the car was last pointed at, so the registry
     can say without an ssh (tools/retrain.py grades against it)."""
-    registry["deployed"] = {"label": entry["label"], "onnx": entry["onnx"],
+    registry[SLOTS[slot][3]] = {"label": entry["label"], "onnx": entry["onnx"],
                             "onnx_sha256": entry["onnx_sha256"], "date": stamp(now)}
     save_registry(registry, models_dir)
 
 
-def rollback_entry(registry, car):
-    """The registered model models/.policy-previous names, by its hash."""
-    state = survey(car)
+def rollback_entry(registry, car, slot="policy"):
+    """The registered model models/.policy-previous (or the slot's) names,
+    by its hash."""
+    state = survey(car, slot)
     target = state.get("previous", "")
     if not target:
-        raise SystemExit("the car has no models/.policy-previous: deploy a model by name")
+        raise SystemExit(f"the car has no models/{SLOTS[slot][2]}: deploy a model by name")
     path = f"{CAR_MODELS}/{target}"
     sha = car.sha256([path]).get(path)
     entry = find_by_sha(registry, sha, os.path.basename(target)) if sha else None
@@ -1354,18 +1381,22 @@ def _entry_for(registry, args):
     return entry
 
 
+def _slot(args):
+    return "fallback" if getattr(args, "fallback", False) else "policy"
+
+
 def cmd_deploy(args, car_factory=Car):
     registry = load_registry(args.models_dir)
     return deploy(registry, _entry_for(registry, args), car_factory(),
-                  args.models_dir, args.dry_run)
+                  args.models_dir, args.dry_run, slot=_slot(args))
 
 
 def cmd_rollback(args, car_factory=Car):
     registry = load_registry(args.models_dir)
     car = car_factory()
-    entry = rollback_entry(registry, car)
+    entry = rollback_entry(registry, car, _slot(args))
     print(f"rolling back to {entry['label']}")
-    return deploy(registry, entry, car, args.models_dir, args.dry_run)
+    return deploy(registry, entry, car, args.models_dir, args.dry_run, slot=_slot(args))
 
 
 def cmd_status(args, car_factory=Car):
@@ -1464,6 +1495,9 @@ def parse_args(argv):
             s.add_argument("--candidate", default=None, metavar="TAG")
         s.add_argument("--name", default=None)
         s.add_argument("--dry-run", action="store_true")
+        s.add_argument("--fallback", action="store_true",
+                       help="the map model's fallback slot (models/fallback.onnx), "
+                            "not the policy")
 
     sub.add_parser("status", help="what the car's symlink points at, by sha256")
     args = p.parse_args(argv)

@@ -389,6 +389,36 @@ def test_a_car_that_moves_before_the_swap_is_left_alone(registered):
     assert rc == 3 and any("stopped being parked" in line for line in lines)
 
 
+def test_the_fallback_slot_has_its_own_links_previous_and_mark(registered):
+    _, entry, folder = registered
+    car = FakeCar()
+    rc, lines = deploy(registered, car, slot="fallback")
+    assert rc == 0, lines
+    probe = [c for c in car.commands if c.startswith(f"cd {md.CAR_MODELS} && echo pulse=")]
+    assert probe and "readlink fallback.onnx" in probe[0]
+    (swap,) = swaps(car)
+    assert "mv -T .fallback.onnx.tmp fallback.onnx" in swap
+    assert "mv -T .fallback.json.tmp fallback.json" in swap
+    assert "> .fallback-previous.tmp" in swap
+    assert "policy.onnx" not in swap.replace("policy-old.onnx", "")
+    reg = md.load_registry(folder)
+    assert "deployed" not in reg
+    assert reg["deployed_fallback"]["onnx"] == entry["onnx"]
+    assert md.parse_args(["deploy", "candidate-sweep2-1029", "--fallback"]).fallback is True
+
+
+def test_a_map_model_is_refused_as_the_fallback(tmp_path):
+    src = write_model(tmp_path, "policy-20261029-100000Z", b"a map model",
+                      sidecar(uses_map=True, uses_lidar=True))
+    md.register(str(src), str(tmp_path), str(tmp_path), tag="map")
+    reg = md.load_registry(str(tmp_path))
+    car = FakeCar()
+    with pytest.raises(SystemExit, match="drives off the map"):
+        md.deploy(reg, reg["candidates"][0], car, str(tmp_path), out=lambda s: None,
+                  sleep=lambda s: None, slot="fallback")
+    assert car.commands == []
+
+
 @pytest.mark.parametrize("bad", [{"tracebacks": "2"}, {"nrestarts": "1"},
                                  {"pulse": "1600"}, {"active": "failed"},
                                  {"listening": "0"}])

@@ -103,6 +103,10 @@ AUTOPILOT_FIELDS = {
     "policy_steer_dir_p": [0.0, 0.0, 0.0],
     # A lidar model was fed a real roof lidar scan this decision (policy_lidar).
     "policy_lidar_present": False,
+    # A map model was fed a trusted, fresh egomap crop this decision.
+    "policy_map_present": False,
+    # A map model had handed the wheels to its map-free fallback (the map lost).
+    "policy_fallback": False,
     # The back-out (driver.Driver.begin_recover), for either autopilot.
     "backout_phase": "",         # reverse / settle / handback, "" with none
     "backout_reason": "",        # stuck / standoff / obstacle: what started it

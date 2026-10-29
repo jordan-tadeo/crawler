@@ -415,8 +415,17 @@ REVERSE_STEER = 0.7      # the commit's front servo command, my median reversing
 REVERSE_REFRACTORY_S = 1.5
 # A map model goes neutral ("map lost") after this long with no trusted crop
 # (egomap.trusted: matched, tracking or tilted) fresher than egomap.STALE_S,
-# and stays there until one comes back.
+# and stays there until one comes back (or drives on its FALLBACK).
 MAP_LOST_S = 1.0
+# FALLBACK. With a map-free model loaded beside a map model
+# (--fallback-policy), the map lost past MAP_LOST_S, or the mapper down,
+# hands the wheels to it instead of neutral, and they come back once the map
+# has been present for MAP_BACK_S without a break: a map that blinks back for
+# a scan is not a map to drive on yet. Only the active model runs a tick.
+# With no fallback loaded a lost map is neutral, as it always was.
+MAP_BACK_S = 1.0
+MAP_SLOT = "map"
+FALLBACK_SLOT = "fallback"
 # The journal line for a stop (StopLog). A safety neutral in auto says why
 # when it starts, again every STOP_LOG_EVERY_S while it lasts, and how long
 # it lasted when the car moves again. A floor hold is the one safety zero that
@@ -1263,7 +1272,7 @@ class PolicyDriver(dv.Driver):
     """
 
     def __init__(self, controller, oakd, model, downsample=None, goal=None,
-                 lidar=None, slam=None):
+                 lidar=None, slam=None, fallback=None):
         super().__init__(controller, oakd, lidar=lidar)
         self.model = model
         # Whether the car has arrived: the only thing that lets a model stop
@@ -1361,20 +1370,96 @@ class PolicyDriver(dv.Driver):
         self._rear_said = False
         # Why the car is stopped, in the journal (StopLog).
         self.stop_log = StopLog()
+        # The fallback (FALLBACK, by MAP_BACK_S): a map-free model a map model hands
+        # the wheels to while the map is lost, instead of neutral. Each model
+        # is a slot of its own inputs and its own chunk blend; only the active
+        # one runs. uses_map, the map watch and the safety layer stay the map
+        # model's, so the rules are off on the fallback too.
+        self._slots = {MAP_SLOT: self._slot_of_self()}
+        self.fallback = None
+        self.on_fallback = False
+        self._map_ok_since = None
+        self._switch_said_at = {}
+        self._switch_quiet = {}
+        if fallback is not None:
+            if getattr(fallback, "uses_map", False):
+                raise ValueError(f"{getattr(fallback, 'label', 'the fallback')} drives off "
+                                 "the map: a fallback is the model for when there is none")
+            if not self.uses_map:
+                print(f"{getattr(fallback, 'label', 'the fallback')}: a fallback is only "
+                      "for a map model; not loaded")
+            else:
+                self.fallback = fallback
+                self._slots[FALLBACK_SLOT] = {
+                    "model": fallback,
+                    "downsample": downsample_for(fallback.contract),
+                    "has_mode": bool(getattr(fallback, "has_mode", False)),
+                    "uses_imu": bool(getattr(fallback, "uses_imu", False)),
+                    "imu_features": pimu.ImuFeatures(
+                        tilt=bool(getattr(fallback, "imu_tilt", False)),
+                        yaw=bool(getattr(fallback, "imu_yaw", True))),
+                    "uses_lidar": bool(getattr(fallback, "uses_lidar", False)),
+                    "ensembler": ChunkEnsembler(getattr(fallback, "chunk", 1),
+                                                getattr(fallback, "ensemble_m", 0.0),
+                                                getattr(fallback, "ensemble_link_s",
+                                                        CHUNK_LINK_S)),
+                }
+
+    def _slot_of_self(self):
+        return {"model": self.model, "downsample": self.downsample,
+                "has_mode": self.has_mode, "uses_imu": self.uses_imu,
+                "imu_features": self.imu_features, "uses_lidar": self.uses_lidar,
+                "ensembler": self.ensembler}
+
+    def _use(self, name):
+        """Make slot `name` the one that runs, both chunk blends started over:
+        what one model said is no prediction of what the other will."""
+        for key, value in self._slots[name].items():
+            setattr(self, key, value)
+        for slot in self._slots.values():
+            slot["ensembler"].reset()
+        self.on_fallback = name == FALLBACK_SLOT
+        self._prev = (STOP, 0.0, 0.0)
+
+    def _switch(self, name, now, why):
+        """To the fallback or back, said in the journal (rate-limited)."""
+        self._use(name)
+        label = getattr(self.model, "label", "") or name
+        if name == FALLBACK_SLOT:
+            text = f"Auto fallback - {why}: driving on {label} until the map is back"
+        else:
+            text = f"Auto map back for {MAP_BACK_S:.1f} s - driving on {label} again"
+        # Rate-limited each way on its own, so a flicker is at most two lines
+        # every STOP_LOG_EVERY_S and the way back is never the one hidden.
+        try:
+            said = self._switch_said_at.get(name)
+            if said is not None and now - said < STOP_LOG_EVERY_S - 1e-6:
+                self._switch_quiet[name] = self._switch_quiet.get(name, 0) + 1
+                return
+            quiet = self._switch_quiet.pop(name, 0)
+            if quiet:
+                text += f" ({quiet} more like it since the last line)"
+            print(text)
+            self._switch_said_at[name] = now
+        except Exception:
+            pass
 
     def abort(self):
         """Driver's abort, and the mode latch forgets the pad: the next tick
-        is an engage, and starts at whatever SteerMode is then."""
+        is an engage, and starts at whatever SteerMode is then, on the map
+        model."""
         super().abort()
         self._pad_seen = None
-        self.imu_features.reset()
         self.confidence.reset()
         self._end_commit()
         self._reset_standoff()
         self._turn_front = self._turn_at = None
         self._last_reverse_at = None
         self._map_good_at = None
-        self.ensembler.reset()
+        self._map_ok_since = None
+        self._use(MAP_SLOT)
+        for slot in self._slots.values():
+            slot["imu_features"].reset()
         self.stop_log.reset()
 
     def _stop_detail(self):
@@ -1579,6 +1664,8 @@ class PolicyDriver(dv.Driver):
             # map model).
             "policy_map_present": bool(self.uses_map and self.last_map_present),
             "policy_hand_rules": bool(self.hand_rules),
+            # Whether the map-free fallback drove this tick (the map lost).
+            "policy_fallback": bool(self.on_fallback),
         }
 
     def _recover(self, now, reason):
@@ -1663,8 +1750,13 @@ class PolicyDriver(dv.Driver):
             self._imu_sample, self._imu_at = imu, now
         # Every tick with a frame pushes, blind and stuck ones too, so the
         # window is the last half second of the car and not of the model.
-        imu_x = self.imu_features.push(
-            pimu.row_fields(self._imu_sample, self._imu_at, now), now)
+        # The idle model's window keeps up too, so a switch hands it the
+        # last half second of the car and not a cold start.
+        imu_row = pimu.row_fields(self._imu_sample, self._imu_at, now)
+        imu_out = {}
+        for slot in self._slots.values():
+            feats = slot["imu_features"]
+            imu_out[id(feats)] = feats.push(dict(imu_row), now)
         scan = self.scan_footprint(depth)
         # Every scan, blind ones too: a blind scan is exactly the one the
         # latch is for. The cap is read each tick, as the throttle is.
@@ -1701,6 +1793,40 @@ class PolicyDriver(dv.Driver):
             self._neutral("rear bumper")
             return
 
+        ego = None
+        if self.uses_map:
+            alive = self._slam_alive()
+            present = False
+            lost = None
+            if not alive:
+                lost = "mapper down"
+            else:
+                crop = self.slam.crop()
+                ego = em.encode(crop, now)
+                present = bool(ego[0, em.PRESENT, 0, 0] > 0)
+                if self._map_lost(crop.t if present else None, now):
+                    lost = "map lost"
+            self.last_map_present = present
+            if self.fallback is None:
+                if lost is not None:
+                    self.ensembler.reset()
+                    self._neutral(lost)
+                    return
+            else:
+                # Back on the map only after MAP_BACK_S of it unbroken, so a
+                # map flickering at the edge of tilted is one switch, not ten.
+                if present and lost is None:
+                    if self._map_ok_since is None:
+                        self._map_ok_since = now
+                else:
+                    self._map_ok_since = None
+                if lost is not None and not self.on_fallback:
+                    self._switch(FALLBACK_SLOT, now, lost)
+                elif (self.on_fallback and self._map_ok_since is not None
+                        and now - self._map_ok_since >= MAP_BACK_S - 1e-3):
+                    self._switch(MAP_SLOT, now, "")
+        imu_x = imu_out[id(self.imu_features)]
+
         x = encode_input(self.model.representation, self.downsample(depth))
         prev = (encode_prev(*self._prev) if self.model.uses_prev
                 else np.zeros((1, PREV_SIZE), dtype=np.float32))
@@ -1715,17 +1841,7 @@ class PolicyDriver(dv.Driver):
             bins = pli.live_bins(self.lidar)
             self.last_lidar_present = bins is not None
             extra["lidar"] = pli.encode(bins)
-        if self.uses_map:
-            if not self._slam_alive():
-                self._neutral("mapper down")
-                return
-            crop = self.slam.crop()
-            ego = em.encode(crop, now)
-            self.last_map_present = bool(ego[0, em.PRESENT, 0, 0] > 0)
-            if self._map_lost(crop.t if self.last_map_present else None, now):
-                self.ensembler.reset()
-                self._neutral("map lost")
-                return
+        if self.uses_map and not self.on_fallback:
             extra["map"] = ego
         started = time.perf_counter()
         if extra:

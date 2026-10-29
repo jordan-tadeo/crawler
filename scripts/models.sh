@@ -15,6 +15,7 @@
 #   ./scripts/models.sh deploy 1.3 --dry-run       # what it would do, touching nothing
 #   ./scripts/models.sh deploy 1.3                 # copy, verify, re-point, restart, check
 #   ./scripts/models.sh rollback                   # back to what drove before
+#   ./scripts/models.sh deploy candidate-sweep2-1029 --fallback   # the map model's fallback slot
 #   ./scripts/models.sh status                     # the car's symlink, by sha256
 #   ./scripts/models.sh approve 1.2 --notes "..."  # it drove well on the car
 #   ./scripts/models.sh note 1.2 "..." [--kind general]   # a dated drive note

@@ -795,7 +795,8 @@ class AutoPilot:
     """
 
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
-                 slam=None, nav=False, map_source=None, goals=None):
+                 slam=None, nav=False, map_source=None, goals=None,
+                 fallback_path=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -809,6 +810,9 @@ class AutoPilot:
         # --policy: a learned model's .onnx. None is the hand-written
         # autopilot, which is the default and stays the default.
         self.policy_path = policy_path
+        # --fallback-policy: a map-free model a map model drives on while the
+        # map is lost, instead of neutral (policy.PolicyDriver, "fallback").
+        self.fallback_path = fallback_path
         # Whether the car has arrived, for a learned driver's stop (goal.py).
         # Never set yet; a person follower sets it on this object.
         self.goal = goal.Goal()
@@ -917,8 +921,19 @@ class AutoPilot:
                         f"({model.representation}, {model.contract}, "
                         f"sha256 {model.sha256[:12]})")
         print(f"[auto] policy {model.label} sha256 {model.sha256}", file=sys.stderr)
+        fallback = None
+        if self.fallback_path is not None:
+            # Same rule as the policy: one named that will not load is auto
+            # unavailable, never a car that parks on a lost map unannounced.
+            fallback = policy.PolicyModel(self.fallback_path)
+            self.logger.log("info", "Mode",
+                            f"Auto falls back to {fallback.label}, the policy in "
+                            f"{self.fallback_path}, while the map is lost "
+                            f"(sha256 {fallback.sha256[:12]})")
+            print(f"[auto] fallback {fallback.label} sha256 {fallback.sha256}",
+                  file=sys.stderr)
         return policy.PolicyDriver(self.command, view, model, goal=self.goal,
-                                   lidar=self.lidar, slam=self.slam)
+                                   lidar=self.lidar, slam=self.slam, fallback=fallback)
 
     def step(self, now, takeover=None, split=False):
         """One pass of auto mode. False means hand the wheels back to manual.
@@ -1699,6 +1714,15 @@ def parse_args(argv=None):
         help="drive auto with a learned policy (a .onnx with its .json "
              "beside it) instead of the hand-written autopilot",
     )
+    # Off unless named. A map --policy drives on this one while its map is
+    # lost (a tilted chassis, the mapper down) instead of parking the car.
+    parser.add_argument(
+        "--fallback-policy",
+        default=None,
+        metavar="MODEL.onnx",
+        help="with a map --policy, the map-free policy (a .onnx with its .json "
+             "beside it) to drive on while the map is lost, instead of neutral",
+    )
     # Off unless named, so the unit does not change until the roof lidar is
     # plugged in. Bare --lidar finds the USB-UART board on its own; a path
     # (/dev/ttyUSB0, /dev/serial0) names the port. Nothing drives on it yet:
@@ -1924,6 +1948,7 @@ def main(argv=None):
         hub.imu_listeners.append(voxels.on_imu)
         log.log("info", "Voxel", "Mapping the OAK-D's depth")
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
+                          fallback_path=args.fallback_policy,
                           lidar=lidar, slam=slam, nav=args.nav,
                           map_source=nav_map_source(args, slam, lidar, voxels, log),
                           goals=goals)

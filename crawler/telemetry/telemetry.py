@@ -429,6 +429,10 @@ JSON_SCHEMAS = {
         # Whether a lidar model was fed a real roof lidar scan this
         # decision (policy_lidar); false for every other model and tick.
         "policy_lidar_present": _BOOL,
+        # Whether a map model was fed a trusted, fresh egomap crop, and
+        # whether it had handed the wheels to its map-free fallback.
+        "policy_map_present": _BOOL,
+        "policy_fallback": _BOOL,
         # The back-out, either autopilot (driver.Driver.backout_fields): its
         # phase (reverse / settle / handback, "" with none), what started it,
         # why its reverse ended, time since it began, how long the reverse
