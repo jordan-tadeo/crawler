@@ -102,10 +102,13 @@ def test_a_model_stop_short_of_the_goal_drives_the_better_of_forward_and_reverse
     d = policy_driver(StubModel(logits, throttle=0.5, steer=-0.25), clear())
     d.tick(T0)
     # At the model's magnitude, slowed by its confidence no further than the
-    # moving floor for that direction.
+    # moving floor for that direction; a reverse then goes out at
+    # ESCAPE_SPEED, as every autonomous reverse does.
     floor = pl.MOVING_FLOOR_REVERSE if want == pl.REVERSE else pl.MOVING_FLOOR_FORWARD
-    assert d.controller.throttles[-1] == pytest.approx(
-        pl.slowed_throttle(0.5 * getattr(d, speed), d.confidence.scale, floor))
+    expect = pl.slowed_throttle(0.5 * getattr(d, speed), d.confidence.scale, floor)
+    if want == pl.REVERSE:
+        expect = dv.auto_reverse_throttle(expect)
+    assert d.controller.throttles[-1] == pytest.approx(expect)
     # A reverse out of a stop is a fresh one, so the commit steers it: to the
     # model's own side, at REVERSE_STEER.
     front = -pl.REVERSE_STEER if want == pl.REVERSE else -0.25 * pl.STEER_SCALE
@@ -293,16 +296,20 @@ def test_a_model_floor_lets_go_on_open_floor_and_on_backing_off():
     assert d.last_decision.reason == "model"
 
     # Latched again, then the model backs up -- at ESCAPE_SPEED, every
-    # autonomous reverse is -- while the probe stays blind: 200 mm at the
-    # ESTIMATED 74 mm/s is about 2.7 s of it, and forward is the model's again.
+    # autonomous reverse is -- while the probe stays blind: FLOOR_RELEASE_
+    # REVERSE_MM at ESCAPE_SPEED's ESTIMATED credit (about 2 s of it at -0.6),
+    # and forward is the model's again.
+    need = dv.FLOOR_RELEASE_REVERSE_MM / (dv.REVERSE_CREDIT_MM_S * -dv.ESCAPE_SPEED)
+    short = int(round(need * 10)) - 2      # ticks: a little under the release
     d = policy_driver(StubModel(REVERSE), centre_band(190))
     drive_through(d, [centre_band(190), centre_band(0)])
-    drive_through(d, [centre_band(0) for _ in range(24)], start=T0 + 0.2)
-    assert d.floor_veto.vetoes()  # 2.5 s of reverse: 177 mm, not yet
-    drive_through(d, [centre_band(0) for _ in range(4)], start=T0 + 2.6)
-    assert not d.floor_veto.vetoes()  # 2.9 s: 207 mm
+    drive_through(d, [centre_band(0) for _ in range(short)], start=T0 + 0.2)
+    assert d.floor_veto.vetoes()  # not yet
+    after = T0 + 0.2 + short * 0.1
+    drive_through(d, [centre_band(0) for _ in range(5)], start=after)
+    assert not d.floor_veto.vetoes()  # past the release
     d.model.out["logits"] = np.array([FORWARD], dtype=np.float32)
-    drive_through(d, [centre_band(0)], start=T0 + 3.0)
+    drive_through(d, [centre_band(0)], start=after + 0.5)
     assert d.last_decision.reason == "model"
     assert d.controller.throttles[-1] == pytest.approx(d.forward_speed)
 

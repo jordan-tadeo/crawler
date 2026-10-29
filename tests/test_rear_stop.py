@@ -112,10 +112,12 @@ def neutral(d):
 def test_an_autonomous_reverse_is_capped_at_the_escape_speed_and_still_moves():
     f = dv.auto_reverse_throttle
     assert f(-1.0) == dv.ESCAPE_SPEED
-    assert f(-0.6) == dv.ESCAPE_SPEED
-    # Between the moving floor and the cap it is left alone...
-    assert f(-0.42) == pytest.approx(-0.42)
-    # ...and under the floor it is raised to the cap, so it moves.
+    assert f(dv.ESCAPE_SPEED - 0.05) == dv.ESCAPE_SPEED
+    # Under the cap it is raised to it: between the moving floor and the cap,
+    # so it is never slower than the cap...
+    assert f(-0.42) == dv.ESCAPE_SPEED
+    assert f(dv.ESCAPE_SPEED + 0.05) == dv.ESCAPE_SPEED
+    # ...and under the floor, so it moves.
     assert f(-0.2) == dv.ESCAPE_SPEED
     assert f(-1e-6) == dv.ESCAPE_SPEED
     assert f(0.0) == 0.0 and f(0.4) == 0.4
@@ -248,6 +250,15 @@ def test_the_rear_clearance_is_from_the_bumper_and_drops_the_car_itself():
     assert not dv.rear_blocked(None)
     assert dv.rear_blocked(dv.REAR_STOP_CLEAR_MM - 1)
     assert not dv.rear_blocked(dv.REAR_STOP_CLEAR_MM)
+
+
+def test_the_rear_stop_covers_the_margin_and_the_travel_at_the_escape_speed():
+    """REAR_STOP_CLEAR_MM is the margin plus how far ESCAPE_SPEED carries the
+    car in REAR_STOP_LAG_S, ESTIMATED off REVERSE_CREDIT_MM_S -- and rounded
+    up by less than 10 mm, so it follows ESCAPE_SPEED both ways."""
+    travel = dv.REAR_STOP_LAG_S * dv.REVERSE_CREDIT_MM_S * -dv.ESCAPE_SPEED
+    need = dv.REAR_STOP_MARGIN_MM + travel
+    assert need <= dv.REAR_STOP_CLEAR_MM < need + 10.0
 
 
 # --- the rear stop on the policy's reverses -----------------------------------

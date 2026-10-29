@@ -349,8 +349,12 @@ CONF_EMA_DECISIONS = 5   # EMA length in decisions; 5 at 10 Hz is about 0.5 s
 # Forward 0.2 is the start threshold the first record session found (driver.py,
 # above FORWARD_SPEED), and my drives since agree with it. Reverse was 0.6, the
 # old REVERSE_SPEED, borrowed; my drives bracket the real one at about 0.40
-# (driver.REVERSE_MOVING_FLOOR, ESTIMATED), so this is the back-out's own
-# escape magnitude, a little over it.
+# (driver.REVERSE_MOVING_FLOOR, ESTIMATED). This one follows the back-out's
+# escape magnitude (0.6) rather than sitting at that 0.40: every reverse
+# then goes through driver.auto_reverse_throttle, which sends it out at
+# exactly ESCAPE_SPEED whatever it was, so a lower floor would change
+# nothing on the wheels and only make the scaled throttle read as something
+# the car never did.
 MOVING_FLOOR_FORWARD = 0.2
 MOVING_FLOOR_REVERSE = -dv.ESCAPE_SPEED
 

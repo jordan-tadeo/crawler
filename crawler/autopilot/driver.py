@@ -238,7 +238,7 @@ REVERSE_STALL_SAMPLES = 4
 # So at a slow reverse the forward threshold would read a stalled car as
 # moving and the bumper would never fire. 0.1 sits between the buzz and real
 # reversing. ESTIMATED: real reversing was measured at full reverse, and a
-# reverse at ESCAPE_SPEED -0.45 shakes less; if it reads under 0.1 the bumper
+# reverse at ESCAPE_SPEED -0.6 shakes less; if it reads under 0.1 the bumper
 # cuts every back-out at 0.8 s, which the journal line will show.
 REVERSE_GYRO_STILL_MAX = 0.1  # rad/s
 
@@ -1143,17 +1143,20 @@ REVERSE_SPEED = -1.0
 # that, the conservative end. Not measured at full lock on its own.
 REVERSE_MOVING_FLOOR = 0.40
 
-# How fast it reverses: just past REVERSE_MOVING_FLOOR, so it is slow but
+# How fast it reverses: clear of REVERSE_MOVING_FLOOR, so it is slow but
 # still moves the car with the wheels at lock, where the back-out always is.
-# Was -1.0 (REVERSE_SPEED, full reverse). This is the one line to change.
-ESCAPE_SPEED = -0.45
+# Was -1.0 (REVERSE_SPEED, full reverse), then -0.45, which I drove and found
+# a bit too slow. -0.6 is what the model's reverse commits ran at before
+# this cap (median |throttle| 0.60 over 812 commits), and those were fine.
+# This is the one line to change; REAR_STOP_CLEAR_MM follows it.
+ESCAPE_SPEED = -0.60
 
 # The ease-in, counted in decisions (10 Hz, AUTO_TICK_INTERVAL), not loop
 # ticks: half, then all of ESCAPE_SPEED. The first step is under the moving
 # floor and does not move the car; that is the cost of not stepping the ESC
 # straight to the escape pulse, and it is 0.1 s. There is no ease-off at the
-# other end: ESCAPE_SPEED already sits just over the floor, so slowing for
-# the exit would be stopping, and the exit is a stop anyway.
+# other end: ESCAPE_SPEED is already slow, so slowing for the exit would be
+# next to stopping, and the exit is a stop anyway.
 ESCAPE_RAMP_DECISIONS = 2
 
 
@@ -1162,13 +1165,14 @@ def auto_reverse_throttle(throttle) -> float:
 
     Every reverse auto commands on its own goes through here -- the policy's
     tick-by-tick reverses and its reverse commit; the back-out is already at
-    ESCAPE_SPEED -- so "auto reverses slowly" is one line. ESCAPE_SPEED is
-    the cap: the model's reverses used to go out at up to reverse_speed,
-    -1.0, median |throttle| 0.60 over 812 commits. And it never goes out
-    under REVERSE_MOVING_FLOOR: one that would (the model asked for a little)
-    is raised to ESCAPE_SPEED, not to the floor, because 0.40 is the top of a
-    bracket and was never seen to move the car at lock, where a commit is.
-    So in practice every autonomous reverse is ESCAPE_SPEED.
+    ESCAPE_SPEED -- so "auto reverses slowly" is one line. Every autonomous
+    reverse goes out at exactly ESCAPE_SPEED, whatever the model asked for.
+    A faster one is capped: the model's reverses used to go out at up to
+    reverse_speed, -1.0, median |throttle| 0.60 over 812 commits. A slower
+    one is raised to it, not to REVERSE_MOVING_FLOOR, because 0.40 is the top
+    of a bracket and was never seen to move the car at lock, where a commit
+    is -- and because with the cap at 0.6 a reverse left at its own 0.4-0.6
+    would be slower than the 0.45 I already found too slow.
 
     My trigger under takeover never comes through here: AutoPilot writes it
     over the driver's throttle (main.AutoPilot._pad_throttle), scaled by
@@ -1183,9 +1187,7 @@ def auto_reverse_throttle(throttle) -> float:
         return 0.0
     if t >= 0.0:
         return t
-    if -t < REVERSE_MOVING_FLOOR:
-        return float(ESCAPE_SPEED)
-    return max(t, float(ESCAPE_SPEED))
+    return float(ESCAPE_SPEED)
 
 
 # ---------------------------------------------------------------------------
@@ -1224,13 +1226,18 @@ REAR_STOP_SECTOR = (180.0, 20.0)
 REAR_SELF_MM = abs(_lidar.REAR_BUMPER_X_MM)
 
 # How near the bumper is too near: the 120 mm of margin I asked for, plus how
-# far the car goes before the stop takes, ESTIMATED. At ESCAPE_SPEED -0.45
-# the ground speed is ESTIMATED 74 mm/s (REVERSE_CREDIT_MM_S x 0.45, never
-# measured). The return can be a revolution old (0.1 s at 10 Hz) and the
-# decision a tick late (0.1 s) before the neutral goes out, the revolution
-# itself takes 0.1 s, and the car coasts a little after: call it 0.5 s,
-# 37 mm, rounded up to 40. It is the one number, mine to judge on the floor.
-REAR_STOP_CLEAR_MM = 160.0
+# far the car goes before the stop takes, ESTIMATED. At ESCAPE_SPEED the
+# ground speed is ESTIMATED REVERSE_CREDIT_MM_S x |ESCAPE_SPEED| (98 mm/s at
+# -0.6, never measured). The return can be a revolution old (0.1 s at 10 Hz)
+# and the decision a tick late (0.1 s) before the neutral goes out, the
+# revolution itself takes 0.1 s, and the car coasts a little after: call it
+# REAR_STOP_LAG_S 0.5 s, 49 mm at -0.6, rounded up to the next 10 mm: 170.
+# The margin is the one number, mine to judge on the floor. A literal, because
+# REVERSE_CREDIT_MM_S is defined further down; tests/test_rear_stop.py holds
+# it to the sum, so a faster ESCAPE_SPEED cannot leave it short.
+REAR_STOP_MARGIN_MM = 120.0
+REAR_STOP_LAG_S = 0.5
+REAR_STOP_CLEAR_MM = 170.0
 
 
 def rear_clearance_mm(bins):
@@ -1283,8 +1290,8 @@ BACKOUT_STUCK_MIN_S = 1.0
 # Off my 29 recorded recovers (all of them standoffs): at full reverse the
 # forward floor let go after median 0.49 s, p90 0.77 s, and every probe
 # cleared after median 0.72 s, p90 1.09 s -- about 120 mm median and 190 mm
-# p90 of travel, ESTIMATED. Reverse ground speed at -0.45 is not measured; if
-# it is half of full reverse's, 2.0 s covers the p90 with a little room. 21 of
+# p90 of travel, ESTIMATED. Reverse ground speed at ESCAPE_SPEED -0.6 is not
+# measured; if it is half of full reverse's, 2.0 s covers the p90 with room. 21 of
 # the 29 ran the old timer to the end, so the cap is the exception now, not
 # the rule, and escalation has the long one.
 
@@ -1456,11 +1463,11 @@ FLOOR_RELEASE_REVERSE_MM = REVERSE_FLOOR_MM
 # bracketed off my drives at about 0.40), and then at REVERSE_CREDIT_MM_S
 # times its magnitude: 164 mm/s at -1.0, the slowest clean ground speed this
 # car has been measured at in either direction, and proportionally less below
-# it. At the -1.0 cap that is ESTIMATED 1.22 s of backing up. At the
-# back-out's ESCAPE_SPEED -0.45 it is 74 mm/s and 2.7 s, longer than one
-# back-out's cap, so a probe that stays blind lets go over two of them; the
-# usual release is the probe reading a distance again, which needs no
-# estimate. This used to be a flat 164 mm/s from -0.5, which gave a slow
+# it. At the -1.0 cap that is ESTIMATED 1.22 s of backing up. At
+# ESCAPE_SPEED -0.6, which every autonomous reverse is, it is 98 mm/s and
+# 2.0 s, about one back-out's cap, so a probe that stays blind lets go at the
+# end of one or over two; the usual release is the probe reading a distance
+# again, which needs no estimate. This used to be a flat 164 mm/s from -0.5, which gave a slow
 # reverse no credit at all and a -0.5 one full-speed credit. Both numbers
 # still err toward holding the latch longer.
 REVERSE_CREDIT_MIN = -REVERSE_MOVING_FLOOR
