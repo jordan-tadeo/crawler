@@ -38,7 +38,10 @@ failure commands neutral. In the order they are checked:
   probe gone blind on the way in    throttle 0, the model's steering still
                                     goes out (driver.ForwardFloorVeto;
                                     my trigger under takeover is never
-                                    held by it, as in manual). A
+                                    held by it, as in manual). A map
+                                    model's forward clear of the floor
+                                    at CREEP_THROTTLE goes at no more
+                                    than that, reason "model creep". A
                                     model reverse is never vetoed: the
                                     camera cannot see behind, so the floor
                                     has nothing to say about it
@@ -386,6 +389,27 @@ CONF_EMA_DECISIONS = 5   # EMA length in decisions; 5 at 10 Hz is about 0.5 s
 # the car never did.
 MOVING_FLOOR_FORWARD = 0.2
 MOVING_FLOOR_REVERSE = -dv.ESCAPE_SPEED
+
+# ---- the creep: a map model's forward the floor holds at the cap ------------
+#
+# The floor's distance is REVERSE_FLOOR_MM plus how far the car can overrun
+# while the picture ages, and that overrun is worked out at the cap
+# (forward_speed, 0.4: 363 mm). A forward at CREEP_THROTTLE overruns less --
+# driver.forward_floor_mm(0.2) is 282 mm -- so when the cap's floor holds a
+# map model's forward and the creep's does not, the forward goes out at no
+# more than CREEP_THROTTLE instead of 0, on the model's own steering. The
+# line it stops at, REVERSE_FLOOR_MM, is the same; only the overrun follows
+# the speed. A probe latched blind holds the creep as it holds the cap.
+#
+# Why: 191314Z held a map model's forward for 9.9 s and 10.3 s (19:17:47,
+# 19:18:18) with the nearest thing in front at 291-348 mm on every tick and
+# the rear 71-160 mm off the bumper, until I took over and drove forward at
+# full lock on the steering it was asking for. Every one of those ticks
+# clears the creep's floor. The hand rules keep their standoff back-out.
+# CREEP_THROTTLE is the least that moves the car, so a creep is as slow as a
+# forward goes; raise it and the creep's floor moves out with it.
+CREEP_THROTTLE = MOVING_FLOOR_FORWARD
+CREEP_REASON = "model creep"
 
 # ---- the standoff: the model pushing forward into the floor ----------------
 #
@@ -1952,7 +1976,15 @@ class PolicyDriver(dv.Driver):
             scale = 1.0
         reason = ("model commit" if self.reverse_commit
                   else "model rear masked" if rear_masked else "model")
-        if action == FORWARD and self.floor_veto.vetoes():
+        held = action == FORWARD and self.floor_veto.vetoes()
+        if (held and not self.hand_rules
+                and not self.floor_veto.vetoes(CREEP_THROTTLE)):
+            # Held at the cap, clear at the creep: the creep (see
+            # CREEP_THROTTLE), never faster than the model asked.
+            throttle = min(slowed_throttle(self.forward_speed * magnitude, scale,
+                                           MOVING_FLOOR_FORWARD), CREEP_THROTTLE)
+            reason = CREEP_REASON
+        elif held:
             # Blocks the forward, not the decision: the steering still goes
             # out, and next tick the model can choose to reverse.
             throttle, reason = 0.0, "model floor"

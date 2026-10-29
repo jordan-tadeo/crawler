@@ -1694,8 +1694,12 @@ class ForwardFloorVeto:
         self._throttle = t if math.isfinite(t) else 0.0
         self._throttle_at = now
 
-    def vetoes(self) -> bool:
-        return forward_floor_vetoes(self.latch, self.scan, self.forward_speed)
+    def vetoes(self, forward_speed=None) -> bool:
+        """Hold a forward at the cap, or at `forward_speed` if one is given:
+        a slower forward overruns less, so its floor is nearer. The latch is
+        the same either way."""
+        speed = self.forward_speed if forward_speed is None else forward_speed
+        return forward_floor_vetoes(self.latch, self.scan, speed)
 
 
 class Driver:
