@@ -795,7 +795,7 @@ class AutoPilot:
     """
 
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
-                 slam=None):
+                 slam=None, nav=False, map_source=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -818,6 +818,10 @@ class AutoPilot:
         # The SLAM runner with --slam, else None: a map model's input. A map
         # model without it is auto unavailable (policy.PolicyDriver refuses).
         self.slam = slam
+        # --nav: the map navigator drives (crawler/nav/driver.py), off the
+        # map in map_source. False, the default, never imports crawler.nav.
+        self.nav = bool(nav)
+        self.map_source = map_source
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -894,6 +898,12 @@ class AutoPilot:
         for the model, and a car that drives on something else without saying
         so is a test I cannot read.
         """
+        if self.nav:
+            # Raises with no map source, which resume() logs as auto
+            # unavailable: --nav never falls back to the rules quietly.
+            from crawler.nav.driver import NavDriver
+            return NavDriver(self.command, view, self.map_source,
+                             lidar=self.lidar)
         if self.policy_path is None:
             from crawler.autopilot.driver import Driver
             return Driver(self.command, view, lidar=self.lidar)
@@ -1732,6 +1742,17 @@ def parse_args(argv=None):
              "lidar (needs --slam); shown in Foxglove on /voxel/points and "
              "/voxel/low. Off unless given",
     )
+    # Off unless named. With it, START hands the wheels to the navigator
+    # (crawler/nav/): a clicked goal, or rove. It needs the live lidar map,
+    # and nothing in this process builds one yet, so for now --nav is auto
+    # unavailable with that said in the journal -- never a truck driving on
+    # no map. Every safety layer is under it either way (nav/driver.py).
+    parser.add_argument(
+        "--nav",
+        action="store_true",
+        help="drive auto with the map navigator instead of the hand-written "
+             "autopilot (needs the live lidar map; off unless given)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1849,7 +1870,7 @@ def main(argv=None):
         hub.imu_listeners.append(voxels.on_imu)
         log.log("info", "Voxel", "Mapping the OAK-D's depth")
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
-                          lidar=lidar, slam=slam)
+                          lidar=lidar, slam=slam, nav=args.nav)
 
     # Who gets the device opened at startup, and who waits for it:
     #

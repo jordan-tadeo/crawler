@@ -632,10 +632,14 @@ class Telemetry:
     """
 
     def __init__(self, logger=None, host=DEFAULT_HOST, port=DEFAULT_PORT,
-                 recorder=None):
+                 recorder=None, server_options=None):
         self.logger = logger
         self.host = host
         self.port = port
+        # More start_server() arguments, or None for the server as it always
+        # was. nav/click.py's ClickGoals.server_options() goes here to let
+        # Foxglove publish a clicked goal; nothing passes it yet.
+        self.server_options = dict(server_options or {})
 
         self.running = False
         self.serving = False
@@ -778,6 +782,7 @@ class Telemetry:
                     name="crawler",
                     host=self.host,
                     port=self.port,
+                    **self.server_options,
                 )
                 self.serving = True
             except Exception as e:
