@@ -1,0 +1,38 @@
+{
+  "input_contract": "depth_small",
+  "representation": "profile",
+  "actions": [
+    "forward",
+    "reverse",
+    "stop"
+  ],
+  "uses_prev_action": false,
+  "steer_head": "regression",
+  "outputs": [
+    "logits",
+    "throttle",
+    "steer",
+    "mode_logits"
+  ],
+  "steer_scale": 0.7,
+  "labels": "pad",
+  "note": "untrained weights, seed 0: a test fixture for action chunks (chunk 5), not a driver",
+  "steer_modes": [
+    "unified",
+    "split"
+  ],
+  "mode_switch": {
+    "threshold": 0.7,
+    "dwell_s": 0.5,
+    "min_interval_s": 2.0
+  },
+  "mode_rear": {
+    "unified": "steering_pair(front)",
+    "split": 0.0
+  },
+  "mode_not_modelled": "split with the right stick on the rear (|rear| > split_rear_rest); the dataset drops those rows",
+  "mode_switch_weight": 10.0,
+  "chunk": 5,
+  "ensemble_m": -0.5,
+  "ensemble_link_s": 0.25
+}

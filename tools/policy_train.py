@@ -103,6 +103,17 @@ every batch, so that "a scan is there" cannot become a tell for which
 session this is, and the model learns to drive with the lidar gone. Only in
 training: the car never blanks a scan it has. The flip mirrors the scan
 (policy_lidar.MIRROR). The sidecar says uses_lidar and lidar_layout.
+
+--chunk K widens the gear head to 3K logits and the steer head to K: the
+answer for this decision and the next K-1 (ACT's action chunks). Offset i's
+label is the i-th next decision tick of the same session, every step of the
+chain under policy.CHUNK_LINK_S (chunk_index), with that tick's own masks and
+weight, and the gear and steer losses are averaged over the offsets. Throttle
+and mode stay one step. The car blends the last K answers
+(policy.ChunkEnsembler) with the weight --ensemble-m sets, so the sidecar says
+chunk, ensemble_m and ensemble_link_s. --chunk 1 is the one-step model, the
+same training step for step and a sidecar with none of the three. The eval
+here grades offset 0 alone.
 """
 
 import argparse
@@ -194,12 +205,16 @@ MAP_DROPOUT = 0.3
 
 
 def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION,
-                uses_lidar=False, uses_map=False):
+                uses_lidar=False, uses_map=False, chunk=1):
     import torch
     from torch import nn
 
     if steer_head not in pl.STEER_HEADS:
         raise ValueError(f"steer head {steer_head!r}: one of {pl.STEER_HEADS}")
+    if not 1 <= int(chunk) <= pl.CHUNK_MAX:
+        raise ValueError(f"chunk {chunk}: 1..{pl.CHUNK_MAX}")
+    if chunk > 1 and steer_head != pl.STEER_REGRESSION:
+        raise ValueError(f"chunk {chunk} needs the regression steer head")
     direction = steer_head == pl.STEER_DIRECTION
     imu_width = pimu.size(imu_yaw) if uses_imu else 0
     lidar_width = LIDAR_FEATURES + 1 if uses_lidar else 0
@@ -266,13 +281,15 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
                 nn.ReLU())
             self.lidar = LidarBranch() if lidar_width else None
             self.map = MapBranch() if map_width else None
-            self.logits = nn.Linear(64, len(pl.ACTIONS))
+            # A chunk model answers for this decision and the next chunk - 1:
+            # offset i's gear logits at [3i, 3i + 3), its steer at i.
+            self.logits = nn.Linear(64, len(pl.ACTIONS) * chunk)
             self.throttle = nn.Linear(64, 1)
             if direction:
                 self.steer_dir = nn.Linear(64, len(pl.STEER_DIRS))
                 self.steer_mag = nn.Linear(64, 1)
             else:
-                self.steer = nn.Linear(64, 1)
+                self.steer = nn.Linear(64, chunk)
             self.mode = nn.Linear(64, pl.MODE_SIZE)
             # The mode going in, straight to the mode logits: "stay" is one
             # weight, and the trunk only has to learn when not to.
@@ -332,6 +349,7 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     model.uses_map = bool(uses_map)
     model.imu_yaw = bool(imu_yaw)
     model.steer_head = steer_head
+    model.chunk = int(chunk)
     return model
 
 
@@ -518,6 +536,26 @@ def _weighted(values, w):
     return (values * w).sum() / w.sum()
 
 
+def chunk_index(data, k, link_s=pl.CHUNK_LINK_S):
+    """(N, k) dataset rows: column i is tick j's i-th next decision tick in
+    the same session, every step of the chain under link_s, the gap the car's
+    ChunkEnsembler starts over at; -1 past a gap or the session's end.
+    Column 0 is the tick itself, on decision ticks; -1 on the rest."""
+    n = len(data["t_ns"])
+    fut = np.full((n, k), -1, np.int64)
+    t = np.asarray(data["t_ns"]) / 1e9
+    o = np.lexsort((t, data["session"]))
+    o = o[np.asarray(data["decision"], dtype=bool)[o]]
+    ok = (np.diff(data["session"][o]) == 0) & (np.diff(t[o]) <= link_s)   # link j -> j + 1
+    fut[o, 0] = o
+    for i in range(1, k):
+        good = np.ones(max(len(o) - i, 0), dtype=bool)
+        for s in range(i):
+            good &= ok[s:len(ok) - i + 1 + s]
+        fut[o[:len(o) - i][good], i] = o[i:][good]
+    return fut
+
+
 def training_mask(data, in_val, labelled):
     """Decision ticks outside val, labelled, and not inside a BAD mark."""
     return ~in_val & data["decision"] & labelled & ~pe.bad_marked(data)
@@ -557,14 +595,15 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           imu_yaw=True, imu_tilt=False, steer_head=pl.STEER_REGRESSION,
           straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT,
           uses_lidar=False, lidar_dropout=LIDAR_DROPOUT, uses_map=False,
-          map_dropout=MAP_DROPOUT):
+          map_dropout=MAP_DROPOUT, chunk=1):
     import torch
     from torch import nn
 
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
-    model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar, uses_map)
+    model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar, uses_map,
+                        chunk)
     direction = steer_head == pl.STEER_DIRECTION
 
     idx = np.flatnonzero(train_mask)
@@ -606,6 +645,21 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                              reduction="none")
     ce_mode = nn.CrossEntropyLoss(reduction="none")
     ce_steer = nn.CrossEntropyLoss(reduction="none")
+    if chunk > 1:
+        # Offset i's labels: the i-th next decision tick's gear and steer,
+        # with that tick's own masks and weight. Offset 0 is the stock loss.
+        fut = chunk_index(data, chunk)[idx]
+        fut0 = np.where(fut >= 0, fut, 0)
+        bad = pe.bad_marked(data)
+        c_action = torch.from_numpy(data["action"][fut0].astype(np.int64))
+        c_steer = torch.from_numpy(data["steer"][fut0].astype(np.float32))
+        c_tok = torch.from_numpy((fut >= 0) & throttle_all[fut0] & ~bad[fut0])
+        c_sok = torch.from_numpy((fut >= 0) & steer_all[fut0] & ~bad[fut0])
+        c_w = torch.from_numpy(tick_weights(data, fut0.ravel(), good_weight, takeover_weight)
+                               .reshape(fut0.shape))
+        # Training ticks are decision ticks outside BAD marks, so offset 0 is
+        # exactly the one-step labels.
+        assert bool((c_tok[:, 0] == throttle_ok).all() and (c_sok[:, 0] == steer_ok).all())
 
     opt = torch.optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-4)
     batch = 64
@@ -628,7 +682,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 mb[blank] = 0.0
                 mb = torch.from_numpy(mb)
             sb, db = steer[b], steer_dir[b]
-            if torch.rand(1).item() < 0.5:
+            mirrored = torch.rand(1).item() < 0.5
+            if mirrored:
                 if lb is not None:
                     xb, pb, ib, lb = flip(xb, pb, ib, imu_yaw, lb)
                 else:
@@ -643,6 +698,29 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
             wb = w_all[b]
             moving = tok & (action[b] != pl.ACTIONS.index(pl.STOP))
             loss = torch.zeros(())
+            if chunk > 1:
+                # The gear and steer losses averaged over the offsets, as ACT
+                # averages its L1; throttle and mode stay one step.
+                lc = logits.reshape(len(b), chunk, len(pl.ACTIONS))
+                sc = -c_steer[b] if mirrored else c_steer[b]
+                ta, sa, wc, ac = c_tok[b], c_sok[b], c_w[b], c_action[b]
+                gear, turn = torch.zeros(()), torch.zeros(())
+                for i in range(chunk):
+                    if ta[:, i].any():
+                        gear = gear + _weighted(ce(lc[ta[:, i], i], ac[ta[:, i], i]),
+                                                wc[ta[:, i], i])
+                    if sa[:, i].any():
+                        turn = turn + _weighted((out[2][sa[:, i], i] - sc[sa[:, i], i]).abs(),
+                                                wc[sa[:, i], i])
+                loss = loss + gear / chunk + turn / chunk
+                if moving.any():
+                    loss = loss + _weighted((t_out[moving, 0] - mag[b][moving]).abs(), wb[moving])
+                if sok.any():
+                    loss = loss + _weighted(ce_mode(m_out[sok], mode[b][sok]), w_mode[b][sok])
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                continue
             if tok.any():
                 loss = loss + _weighted(ce(logits[tok], action[b][tok]), wb[tok])
             if moving.any():
@@ -770,6 +848,15 @@ def write_sidecar(out_path, meta):
         json.dump(meta, f, indent=2)
 
 
+def chunk_meta(chunk=1, ensemble_m=0.0):
+    """The chunk half of the sidecar: what policy.check_chunk reads. Nothing
+    for a one-step model, as before the chunk heads."""
+    if chunk <= 1:
+        return {}
+    return {"chunk": int(chunk), "ensemble_m": float(ensemble_m),
+            "ensemble_link_s": pl.CHUNK_LINK_S}
+
+
 def mode_meta(switch_weight=MODE_SWITCH_WEIGHT):
     """The mode head's half of the sidecar: what policy.check_sidecar reads."""
     return {
@@ -858,6 +945,13 @@ def main(argv=None):
     ap.add_argument("--straight-band", type=float, default=STRAIGHT_BAND,
                     help="with --steer-head direction: |steer| under this is the "
                          f"straight class (default {STRAIGHT_BAND} of full lock)")
+    ap.add_argument("--chunk", type=int, default=1, metavar="K",
+                    help="action chunks: the gear and steer heads answer for this decision "
+                         "and the next K-1, which the car blends (policy.ChunkEnsembler). "
+                         "1 is the one-step model")
+    ap.add_argument("--ensemble-m", type=float, default=0.0, metavar="M",
+                    help="with --chunk: the car's blend weight exp(M * age), age 0 the "
+                         "newest answer; under 0 trusts the newest more, 0 a plain mean")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--good-weight", type=float, default=GOOD_WEIGHT,
@@ -888,6 +982,15 @@ def main(argv=None):
     if args.model_version is not None:
         print("--model-version is gone: a model gets a number only from "
               "tools/models.py promote, once it beats the latest release")
+        return 2
+    if not 1 <= args.chunk <= pl.CHUNK_MAX:
+        print(f"--chunk is 1..{pl.CHUNK_MAX}, not {args.chunk}")
+        return 2
+    if args.chunk > 1 and args.steer_head != pl.STEER_REGRESSION:
+        print("--chunk needs the regression steer head")
+        return 2
+    if args.chunk > 1 and not -10.0 <= args.ensemble_m <= 10.0:
+        print(f"--ensemble-m is -10..10, not {args.ensemble_m}")
         return 2
     if args.fold is not None and not (
             args.blocks and (args.fold == "final"
@@ -948,7 +1051,7 @@ def main(argv=None):
                imu_tilt=args.imu_tilt, steer_head=args.steer_head,
                straight_band=args.straight_band, takeover_weight=args.takeover_weight,
                uses_lidar=args.lidar, lidar_dropout=args.lidar_dropout,
-               uses_map=bool(args.map), map_dropout=args.map_dropout)
+               uses_map=bool(args.map), map_dropout=args.map_dropout, chunk=args.chunk)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1084,6 +1187,7 @@ def _base_meta(meta_in, args, val_ids, val_names):
                    getattr(args, "map_dropout", MAP_DROPOUT)),
         **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
                      getattr(args, "straight_band", STRAIGHT_BAND)),
+        **chunk_meta(getattr(args, "chunk", 1), getattr(args, "ensemble_m", 0.0)),
         "steer_scale": pl.STEER_SCALE,
         "labels": args.labels,
         "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids],

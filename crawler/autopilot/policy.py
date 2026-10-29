@@ -418,6 +418,18 @@ REVERSE_REFRACTORY_S = 1.5
 # one comes back. Lost does not recover once the truck has moved off, so in
 # practice that is a park.
 MAP_LOST_S = 1.0
+# ---- action chunks ----------------------------------------------------------
+#
+# A chunk model (sidecar "chunk": K > 1) answers for this decision and the
+# next K-1 at once: logits (1, 3K), offset i at [3i, 3i + 3), and steer
+# (1, K). ChunkEnsembler blends them as ACT does (Zhao et al. 2023, sec 3.3):
+# this decision's gear and steer are the weighted mean of offset `age` of each
+# of the last K answers, weight exp(m * age), age 0 the answer made now, so
+# m < 0 trusts the newest more and m = 0 is a plain mean. m is the sidecar's
+# ensemble_m. Two decisions are one chain only when they are under
+# CHUNK_LINK_S apart, the gap the trainer chains labels across.
+CHUNK_LINK_S = 0.25
+CHUNK_MAX = 50
 # The side rule is the back-out's too, so it lives in driver.py, with these
 # three: a front past REVERSE_TURN_MIN is a turn (servo units), a turning
 # forward inside REVERSE_TURN_WINDOW_S sets the side, and with none it is
@@ -638,7 +650,7 @@ def committed_confidence(outputs, action):
     Only called on outputs read_output() has already checked, so the logits
     are three finite numbers.
     """
-    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
+    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()[:len(ACTIONS)]
     e = np.exp(logits - logits.max())
     return float(e[ACTIONS.index(action)] / e.sum())
 
@@ -809,6 +821,128 @@ def check_steer_head(meta, outputs, where="sidecar"):
     return head
 
 
+def _last_dim(shape):
+    """An ONNX output's last dimension, None when it is not a number."""
+    try:
+        d = list(shape)[-1]
+    except (TypeError, IndexError):
+        return None
+    return d if isinstance(d, int) and not isinstance(d, bool) else None
+
+
+def check_chunk(meta, output_shapes, steer_head=STEER_REGRESSION, where="sidecar"):
+    """The chunk half of the contract -> (K, ensemble_m, ensemble_link_s).
+
+    A sidecar with no "chunk" is every model from before the chunk heads, K
+    = 1. output_shapes maps output names to the graph's shapes. ValueError
+    when the sidecar's K and the graph's widths disagree, logits not 3K or
+    steer not K wide, or when a chunk model has no usable ensemble_m.
+    """
+    k = meta.get("chunk", 1)
+    if isinstance(k, bool) or not isinstance(k, int) or not 1 <= k <= CHUNK_MAX:
+        raise ValueError(f"{where}: chunk {k!r} is not a whole number 1..{CHUNK_MAX}")
+    widths = {"logits": len(ACTIONS) * k}
+    if steer_head == STEER_REGRESSION:
+        widths[STEER_OUTPUT] = k
+    elif k > 1:
+        raise ValueError(f"{where}: chunk {k} needs the regression steer head, not {steer_head!r}")
+    for name, want in widths.items():
+        got = _last_dim(output_shapes.get(name))
+        if got is not None and got != want:
+            raise ValueError(f"{where}: chunk {k} needs {name} {want} wide, the graph's is {got}")
+    if k == 1:
+        return 1, 0.0, CHUNK_LINK_S
+    m, link = meta.get("ensemble_m"), meta.get("ensemble_link_s", CHUNK_LINK_S)
+    for name, v, lo, hi in (("ensemble_m", m, -10.0, 10.0),
+                            ("ensemble_link_s", link, 1e-3, 5.0)):
+        if (isinstance(v, bool) or not isinstance(v, (int, float))
+                or not math.isfinite(v) or not lo <= v <= hi):
+            raise ValueError(f"{where}: chunk {k} needs {name} a number in [{lo}, {hi}], not {v!r}")
+    return k, float(m), float(link)
+
+
+def first_of_chunk(outputs):
+    """A chunk model's raw outputs -> the same with only offset 0: logits
+    (3,) and steer (1,), the answer for this decision alone. Anything else
+    comes back as it is, for read_output to check."""
+    logits = np.asarray(outputs["logits"]).ravel()
+    k = logits.size // len(ACTIONS)
+    if k <= 1 or logits.size != len(ACTIONS) * k:
+        return outputs
+    out = dict(outputs)
+    out["logits"] = logits[:len(ACTIONS)]
+    if STEER_OUTPUT in outputs:
+        steer = np.asarray(outputs[STEER_OUTPUT]).ravel()
+        if steer.size == k:
+            out[STEER_OUTPUT] = steer[:1]
+    return out
+
+
+class ChunkEnsembler:
+    """ACT's temporal ensemble over a chunk model's last K answers.
+
+    Each answer is kept as (t, K x 3 gear probabilities, K steers). apply()
+    turns this decision's raw outputs into one-step ones: logits the log of
+    the weighted mean probability (so argmax, moving_action and the
+    confidence scale read them as before) and steer the weighted mean, the
+    weights exp(m * age). Throttle, the mode head and anything else pass
+    through. K = 1 is a pass-through, the very same dict.
+
+    The chain starts over on a gap over link_s, a different mode going in,
+    and reset() (an abort, my hand on the pad, map lost). An answer that is
+    not finite, or not K wide, is never kept: the chain starts over and the
+    raw outputs go on, for read_output to refuse.
+    """
+
+    def __init__(self, k=1, m=0.0, link_s=CHUNK_LINK_S):
+        self.k, self.m, self.link_s = int(k), float(m), float(link_s)
+        self._buf = []          # newest first, at most k
+        self._last_t = None
+        self._mode = None
+
+    def reset(self):
+        self._buf = []
+        self._last_t = None
+        self._mode = None
+
+    @property
+    def depth(self):
+        """How many answers this decision's blend is over."""
+        return len(self._buf)
+
+    def apply(self, outputs, now, mode=None):
+        if self.k == 1:
+            return outputs
+        k = self.k
+        try:
+            logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
+            steer = np.asarray(outputs[STEER_OUTPUT], dtype=np.float64).ravel()
+        except (KeyError, TypeError, ValueError):
+            self.reset()
+            return outputs
+        if (logits.shape != (len(ACTIONS) * k,) or steer.shape != (k,)
+                or not np.isfinite(logits).all() or not np.isfinite(steer).all()):
+            self.reset()
+            return outputs
+        if (self._last_t is None or not 0.0 <= now - self._last_t <= self.link_s
+                or mode != self._mode):
+            self._buf = []
+        self._last_t, self._mode = now, mode
+        z = logits.reshape(k, len(ACTIONS))
+        e = np.exp(z - z.max(axis=1, keepdims=True))
+        self._buf = [(now, e / e.sum(axis=1, keepdims=True), steer)] + self._buf[:k - 1]
+        p, s, den = np.zeros(len(ACTIONS)), 0.0, 0.0
+        for age, (_, probs, steers) in enumerate(self._buf):
+            w = math.exp(self.m * age)
+            p += w * probs[age]
+            s += w * steers[age]
+            den += w
+        out = dict(outputs)
+        out["logits"] = np.log(p / den + 1e-9)
+        out[STEER_OUTPUT] = np.array([s / den])
+        return out
+
+
 class Decision(NamedTuple):
     """What the policy decided on one tick, and why. Read-only bookkeeping.
 
@@ -902,6 +1036,13 @@ def read_output(outputs):
     tanh head is a broken model, and the answer to a broken model is neutral.
     """
     try:
+        # A chunk model's raw (3K,) and (K,): this decision's offset alone,
+        # though a nan on any offset is a broken model all the same.
+        first = first_of_chunk(outputs)
+        whole = ([] if first is outputs else
+                 [np.asarray(outputs["logits"], dtype=np.float64).ravel(),
+                  np.asarray(outputs[STEER_OUTPUT], dtype=np.float64).ravel()])
+        outputs = first
         logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
         mag = np.asarray(outputs["throttle"], dtype=np.float64).ravel()
         rear = outputs.get("rear")
@@ -912,7 +1053,8 @@ def read_output(outputs):
             or (rear is not None and rear.shape != (1,))):
         return None, "shape"
     values = [*logits, mag[0]] + ([] if rear is None else [rear[0]])
-    if not all(math.isfinite(v) for v in values):
+    if (not all(math.isfinite(v) for v in values)
+            or not all(np.isfinite(w).all() for w in whole)):
         return None, "not finite"
     steer, _, why = decode_steer(outputs)
     if steer is None:
@@ -932,7 +1074,7 @@ def moving_action(outputs):
     Only called on outputs read_output() has already checked, so the logits
     are three finite numbers. A tie is forward, as argmax over all three is.
     """
-    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()
+    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()[:len(ACTIONS)]
     f, r = logits[ACTIONS.index(FORWARD)], logits[ACTIONS.index(REVERSE)]
     return FORWARD if f >= r else REVERSE
 
@@ -1001,6 +1143,10 @@ class PolicyModel:
             self.meta, input_names, self.output_names, meta_path)
         self.has_mode = self.mode_switch is not None
         self.steer_head = check_steer_head(self.meta, self.output_names, meta_path)
+        # (1, 0.0, CHUNK_LINK_S) for every model before the chunk heads.
+        self.chunk, self.ensemble_m, self.ensemble_link_s = check_chunk(
+            self.meta, {o.name: o.shape for o in self.session.get_outputs()},
+            self.steer_head, meta_path)
         # (False, False, False) for every model before the IMU input: it is
         # never fed one, and runs exactly as it did.
         self.uses_imu, self.imu_tilt, self.imu_yaw = check_imu(
@@ -1108,6 +1254,12 @@ class PolicyDriver(dv.Driver):
         # and neutral on no frame, a blind scan, a bad output or the mapper
         # down. Every model before the map input keeps every rule.
         self.hand_rules = not self.uses_map
+        # A chunk model's answers, blended (ChunkEnsembler); K = 1, every
+        # model before the chunk heads, passes straight through.
+        self.ensembler = ChunkEnsembler(getattr(model, "chunk", 1),
+                                        getattr(model, "ensemble_m", 0.0),
+                                        getattr(model, "ensemble_link_s", CHUNK_LINK_S))
+        self._hand_last = False
         if not self.hand_rules:
             # The head's own answer every tick: over half, that mode.
             self.mode = ModeLatch(0.5, 0.0, 0.0)
@@ -1146,6 +1298,7 @@ class PolicyDriver(dv.Driver):
         self._turn_front = self._turn_at = None
         self._last_reverse_at = None
         self._map_good_at = None
+        self.ensembler.reset()
 
     def _map_lost(self, good_t, now):
         """A map model whose newest trusted crop (good_t, the time it was
@@ -1369,6 +1522,12 @@ class PolicyDriver(dv.Driver):
         # standoff, for the reason it disarms STUCK below.
         if self.human_throttle or self.human_steering:
             self._end_commit()
+        # And the chunk, under my hand and on the tick I let go: what the
+        # model said before or under it is not what it says once I let go.
+        hand = bool(self.human_throttle or self.human_steering)
+        if hand or self._hand_last:
+            self.ensembler.reset()
+        self._hand_last = hand
         if self.human_throttle:
             self._reset_standoff()
 
@@ -1442,6 +1601,7 @@ class PolicyDriver(dv.Driver):
             ego = em.encode(crop, now)
             self.last_map_present = bool(ego[0, em.PRESENT, 0, 0] > 0)
             if self._map_lost(crop.t if self.last_map_present else None, now):
+                self.ensembler.reset()
                 self._neutral("map lost")
                 return
             extra["map"] = ego
@@ -1453,6 +1613,8 @@ class PolicyDriver(dv.Driver):
         else:
             outputs = self.model.run(x, prev)
         self.last_infer_ms = (time.perf_counter() - started) * 1000.0
+        # Before anything reads the answer: a chunk model's last K, blended.
+        outputs = self.ensembler.apply(outputs, now, self.mode.split if self.has_mode else None)
 
         decided, why = read_output(outputs)
         self.last_steer_dir_p = steer_dir_p(outputs)

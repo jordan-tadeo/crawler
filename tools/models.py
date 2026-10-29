@@ -160,6 +160,9 @@ CONTRACT_KEYS = {
     # trained on. Before the key, no lidar.
     "uses_lidar": False,
     "lidar_layout": None,
+    # Action chunks (policy.ChunkEnsembler): how many decisions the gear and
+    # steer heads answer for. Before the key, one.
+    "chunk": 1,
 }
 
 # The scores list shows, off the CV mean or the held-out sessions.
