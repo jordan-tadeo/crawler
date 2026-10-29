@@ -36,9 +36,9 @@ failure commands neutral. In the order they are checked:
   a forward with anything measured
   inside FORWARD_FLOOR_MM, or a
   probe gone blind on the way in    throttle 0, the model's steering still
-                                    goes out (driver.ForwardFloorVeto, the
-                                    same veto the takeover holds my
-                                    trigger with, its own instance). A
+                                    goes out (driver.ForwardFloorVeto;
+                                    my trigger under takeover is never
+                                    held by it, as in manual). A
                                     model reverse is never vetoed: the
                                     camera cannot see behind, so the floor
                                     has nothing to say about it
@@ -1266,8 +1266,9 @@ class PolicyDriver(dv.Driver):
             # Blocks the forward, not the decision: the steering still goes
             # out, and next tick the model can choose to reverse.
             throttle, reason = 0.0, "model floor"
-            # Under my trigger the floor is holding me, not the model, so
-            # it is no standoff (the count was reset above).
+            # Under my trigger the model's held forward never reaches the
+            # wheels -- mine does, unheld -- so it is no standoff (the count
+            # was reset above).
             if not self.human_throttle:
                 if self._standoff_since is None:
                     self._standoff_since = now

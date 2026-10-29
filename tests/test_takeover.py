@@ -12,7 +12,8 @@ fake pad, and hold:
   a manoeuvre under a taken-over group: my hand keeps it, the driver keeps
   the rest;
   at most one set_steering and one set_throttle reach the hardware a pass;
-  the 200 mm floor holds my forward throttle at 0 and never my reverse;
+  no floor holds my trigger either way, as none does in manual, and my
+  hand wins both groups on its first pass through any manoeuvre;
   a lost pad, a pad fault or a nan ends at neutral;
   every /footprint row says whose each group was, next to the command that
   actually went out.
@@ -217,13 +218,12 @@ def test_the_caps_are_read_off_the_live_driver_not_copied():
     pilot.driver = dv.Driver(pilot.command, Camera(far_frame()))
     pilot.driver.forward_speed = 0.13
     pilot.driver.reverse_speed = -0.31
-    pilot._scan, pilot._scan_at = dv.free_by_column(far_frame()), 0.0
     takeover = mn.Takeover()
     pad = FakePad()
     for pull, want in ((1.0, 0.13), (-1.0, -0.31), (0.5, 0.065)):
         pad.throttle = pull
         assert takeover.poll(pad, 0.0)
-        assert pilot._pad_throttle(0.0, takeover) == pytest.approx(want)
+        assert pilot._pad_throttle(takeover) == pytest.approx(want)
 
 
 # --- taking and giving back -------------------------------------------------
@@ -429,61 +429,6 @@ def test_without_my_hand_auto_writes_what_the_driver_asks(monkeypatch):
     assert got == ctl.calls
 
 
-def test_the_floor_holds_my_forward_and_never_my_reverse(monkeypatch):
-    """Something at 190 mm, inside the 200 mm floor: full RT is held at 0
-    from the very first scan. Full LT is auto's reverse speed regardless."""
-    def forward(n, pad, cam):
-        pad.throttle = 1.0
-
-    out = run_auto(monkeypatch, 60, Camera(wall_frame(190)), plan=forward)
-    assert out["snaps"][1]["throttle_by"] == mn.PAD
-    assert out["vecon"].throttles
-    assert all(t <= 0.0 for t in out["vecon"].throttles)
-
-    def back(n, pad, cam):
-        pad.throttle = -1.0
-
-    out = run_auto(monkeypatch, 60, Camera(wall_frame(190)), plan=back)
-    assert all(snap["throttle"] == pytest.approx(dv.REVERSE_SPEED)
-               for snap in out["snaps"][1:])
-
-    # And the floor is the only thing holding it: open floor, full RT.
-    out = run_auto(monkeypatch, 30, Camera(far_frame()), plan=forward)
-    assert out["snaps"][-1]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
-
-
-def test_a_scan_too_old_to_say_holds_my_forward(monkeypatch):
-    """A recover makes no scans. Once the last one is older than
-    FLOOR_SCAN_MAX_AGE my forward trigger is held at 0."""
-    def plan(n, pad, cam):
-        pad.throttle = 1.0
-
-    # A wall the rules reverse from ("spans") that is still outside the
-    # forward floor, so only the age of the scan can hold the trigger.
-    mm = 380
-    assert dv.FORWARD_FLOOR_MM < mm < dv.CLEARANCE_MM
-    out = run_auto(monkeypatch, 100, Camera(wall_frame(mm)), plan=plan)
-    stale = [snap for snap in out["snaps"]
-             if snap["phase"] is not None
-             and snap["now"] > mn.FLOOR_SCAN_MAX_AGE + mn.AUTO_TICK_INTERVAL]
-    assert stale
-    assert all(snap["throttle"] == 0.0 for snap in stale)
-    # Before it went stale, the same scene let the trigger through.
-    assert out["snaps"][1]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
-
-
-def test_the_forward_floor_covers_the_rules_floor_and_more():
-    """Wherever the rules reverse on R2 my forward is held, and it is held
-    further out too: everything under FORWARD_FLOOR_MM."""
-    for mm in (150, 190, 199, 200, 230, 300, 360, 370, 380):
-        scan = dv.free_by_column(wall_frame(mm))
-        held = dv.forward_floor_vetoes(dv.EMPTY_FLOOR_LATCH, scan)
-        if dv.read_the_gradient(scan).reason.startswith("floor"):
-            assert held, mm
-        assert held == (mm < dv.FORWARD_FLOOR_MM), mm
-    assert dv.forward_floor_vetoes(dv.EMPTY_FLOOR_LATCH, None)
-
-
 def centre_frame(mm):
     """Probes 3-5 at `mm` (0 is blind), the rest open floor."""
     frame = far_frame()
@@ -494,18 +439,57 @@ def centre_frame(mm):
 
 def standing_policy(command, cam):
     """A policy that only ever says stop: it scans every tick and never
-    starts a recover, so the takeover's veto sees every scan of an approach
-    the rules would have backed away from half way in."""
+    starts a recover, so all that is left holding my trigger is whatever
+    holds it in takeover itself."""
     from test_policy import STOP, StubModel
     from crawler.autopilot import policy as pl
     # Short of the goal its stop is driven on, at the magnitude it gave: 0.
     return pl.PolicyDriver(command, cam, StubModel(STOP, throttle=0.0))
 
 
-def test_my_forward_stays_held_when_the_probe_goes_blind_on_the_way_in(monkeypatch):
-    """390, 300, 190, then the centre reads nothing because it is too close.
-    The old veto only counted NEAR probes, so on the blind scans it let full
-    RT through -- exactly when the car was closest."""
+def full_rt(n, pad, cam):
+    pad.throttle = 1.0
+
+
+# --- my forward is manual's forward -----------------------------------------
+#
+# Taken over, the trigger is mine the way it is in manual: no floor, no scan
+# it has to wait for. Manual has never held a forward of mine, and the floor
+# that used to sit on my trigger here is what kept me from driving out of a
+# spot until I had backed up first. The autopilot's own forwards keep their
+# floor (driver.ForwardFloorVeto, policy "model floor"); mine do not.
+
+
+@pytest.mark.parametrize("mm", [340, 174])
+def test_my_forward_goes_through_a_probe_under_the_floor(monkeypatch, mm):
+    """The drive that showed it: the centre probes at 340 and 174, under the
+    363 mm floor, full RT, and 0 on the wheels until I backed up."""
+    assert mm < dv.FORWARD_FLOOR_MM
+    out = run_auto(monkeypatch, 60, Camera(centre_frame(mm)), plan=full_rt,
+                   make_driver=standing_policy)
+    assert all(snap["throttle_by"] == mn.PAD for snap in out["snaps"])
+    assert all(snap["throttle"] == pytest.approx(dv.FORWARD_SPEED)
+               for snap in out["snaps"])
+
+
+def test_my_forward_and_my_reverse_go_through_a_wall_at_the_bumper(monkeypatch):
+    """Everything at 190 mm, which the rules reverse from: my trigger is
+    still mine both ways, from the first pass."""
+    out = run_auto(monkeypatch, 60, Camera(wall_frame(190)), plan=full_rt)
+    assert all(snap["throttle"] == pytest.approx(dv.FORWARD_SPEED)
+               for snap in out["snaps"])
+
+    def back(n, pad, cam):
+        pad.throttle = -1.0
+
+    out = run_auto(monkeypatch, 60, Camera(wall_frame(190)), plan=back)
+    assert all(snap["throttle"] == pytest.approx(dv.REVERSE_SPEED)
+               for snap in out["snaps"])
+
+
+def test_my_forward_goes_through_a_probe_gone_blind_on_the_way_in(monkeypatch):
+    """390, 300, 190, then nothing because it is too close. The autopilot's
+    floor latches on that; my trigger does not."""
     approach = [390, 300, 190, 0]
     tick = int(round(mn.AUTO_TICK_INTERVAL / STEP)) + 1
 
@@ -515,29 +499,154 @@ def test_my_forward_stays_held_when_the_probe_goes_blind_on_the_way_in(monkeypat
 
     out = run_auto(monkeypatch, 6 * tick, Camera(centre_frame(390)),
                    plan=plan, make_driver=standing_policy)
-    floor = out["pilot"]._floor
-    assert floor.scan.reason[4] == dv.NO_RETURN
-    assert floor.latch.latched[4]
-    # Every pass from the 300 mm scan on, the blind ones included.
-    held = out["snaps"][tick + 2:]
-    assert held and all(snap["throttle"] == 0.0 for snap in held)
-    # 390 is outside the floor, so the trigger went through there.
-    assert out["snaps"][2]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
+    assert out["driver"].last_scan.reason[4] == dv.NO_RETURN
+    assert all(snap["throttle"] == pytest.approx(dv.FORWARD_SPEED)
+               for snap in out["snaps"])
 
 
-def test_a_blind_probe_out_of_open_floor_does_not_hold_my_forward(monkeypatch):
-    """A dark patch is not a wall: nothing near before it, nothing held."""
-    tick = int(round(mn.AUTO_TICK_INTERVAL / STEP)) + 1
+def test_the_forward_floor_covers_the_rules_floor_and_more():
+    """The autopilot's own floor, which my trigger no longer sits under:
+    wherever the rules reverse on R2 a forward the rules did not choose is
+    held, and it is held further out too, everything under FORWARD_FLOOR_MM."""
+    for mm in (150, 190, 199, 200, 230, 300, 360, 370, 380):
+        scan = dv.free_by_column(wall_frame(mm))
+        held = dv.forward_floor_vetoes(dv.EMPTY_FLOOR_LATCH, scan)
+        if dv.read_the_gradient(scan).reason.startswith("floor"):
+            assert held, mm
+        assert held == (mm < dv.FORWARD_FLOOR_MM), mm
+    assert dv.forward_floor_vetoes(dv.EMPTY_FLOOR_LATCH, None)
+
+
+# --- my hand outranks every manoeuvre, from its first pass -------------------
+
+
+def _rules_wall(command, cam):
+    return dv.Driver(command, cam)
+
+
+def _policy(logits):
+    def make(command, cam):
+        from test_policy import StubModel
+        from crawler.autopilot import policy as pl
+        return pl.PolicyDriver(command, cam, StubModel(logits, throttle=1.0))
+    return make
+
+
+def _chair_leg():
+    from test_policy import chair_leg
+    return chair_leg()
+
+
+# (make_driver, the scene, the IMU from pass n, is it running?) for each of
+# the manoeuvres that drive the car on their own: the rules' recover off a
+# wall, the policy's standoff with its floor, its STUCK, and its reverse
+# commit. Each is caught some way in -- past FLOOR_SCAN_MAX_AGE, where a
+# recover has made no scan for a while -- and that is when I take both groups.
+def _manoeuvres():
+    from test_policy import FORWARD, REVERSE
+
+    def recovering(d):
+        return d._phase == dv._PHASE_REVERSE
+
+    return {
+        "rules recover": (_rules_wall, lambda: wall_frame(200),
+                          lambda n: MOVING, recovering),
+        "policy standoff": (_policy(FORWARD), _chair_leg,
+                            lambda n: MOVING, recovering),
+        # STUCK waits out the recover cooldown from t=0, then the car stops.
+        "policy stuck": (_policy(FORWARD), lambda: far_frame(),
+                         lambda n: MOVING if n < 360 else STILL, recovering),
+        "policy reverse commit": (_policy(REVERSE), lambda: far_frame(),
+                                  lambda n: MOVING,
+                                  lambda d: d.reverse_commit),
+    }
+
+
+def run_caught(monkeypatch, name, hold, passes=None, into=None):
+    """Drive into the manoeuvre, take both groups `into` passes after it
+    started (full RT, the stick at 0.5), hold them `hold` passes, let go.
+    Returns the run and the pass I took them on."""
+    make, scene, imu, running = _manoeuvres()[name]
+    if into is None:
+        # A commit is 0.7 s; catch it before it ends. A recover's reverse is
+        # 2 s; catch it once its last scan is past FLOOR_SCAN_MAX_AGE.
+        into = 8 if name.endswith("commit") else 32
+    box = {}
+
+    def make_driver(command, cam):
+        box["d"] = make(command, cam)
+        return box["d"]
 
     def plan(n, pad, cam):
-        pad.throttle = 1.0
-        cam.frame = far_frame() if n < 2 * tick else centre_frame(0)
+        d = box["d"]
+        cam.imu = imu(n) if "began" not in box else MOVING
+        if "began" not in box and running(d):
+            box["began"] = n
+        began = box.get("began")
+        if began is not None and n == began + into:
+            box["took"] = n
+            pad.throttle = 1.0
+            pad.axes["LEFT_X"] = 0.5
+        if "took" in box and n == box["took"] + hold:
+            pad.throttle = 0.0
+            pad.axes["LEFT_X"] = 0.0
 
-    out = run_auto(monkeypatch, 2 * tick + 4, Camera(far_frame()), plan=plan)
-    assert out["pilot"]._floor.scan.reason[4] == dv.NO_RETURN
-    assert not any(out["pilot"]._floor.latch.latched)
-    assert out["snaps"][-1]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
+    out = run_auto(monkeypatch, passes or 700, Camera(scene()), plan=plan,
+                   make_driver=make_driver)
+    assert "took" in box, f"{name} never started"
+    return out, box["took"]
 
+
+@pytest.mark.parametrize("name", list(_manoeuvres()))
+def test_my_hand_wins_both_groups_on_its_first_pass(monkeypatch, name):
+    out, took = run_caught(monkeypatch, name, hold=20)
+    s = out["snaps"]
+    mine = dv.steering_pair(limited(0.5))
+    for i in range(took, took + 20):
+        assert (s[i]["steer_by"], s[i]["throttle_by"]) == (mn.PAD, mn.PAD), i
+        assert s[i]["throttle"] == pytest.approx(dv.FORWARD_SPEED), i
+        assert s[i]["steering"] == pytest.approx(mine), i
+    # The pass before was still the manoeuvre's: a reverse, not mine.
+    assert s[took - 1]["throttle"] < 0.0
+
+
+@pytest.mark.parametrize("name", ["rules recover", "policy standoff",
+                                  "policy stuck"])
+def test_letting_go_mid_recover_hands_back_the_recovers_own_command(
+        monkeypatch, name):
+    """As before the fix: my hand off the triggers and stick for half a
+    second puts the recover's standing reverse and turn back on, not a stop."""
+    hold = 10
+    out, took = run_caught(monkeypatch, name, hold=hold)
+    s = out["snaps"]
+    back = took + hold + HALF
+    for i in range(took + hold, back):
+        assert (s[i]["steer_by"], s[i]["throttle_by"]) == (mn.PAD, mn.PAD), i
+        assert s[i]["throttle"] == 0.0, i
+    handback = s[back]
+    assert (handback["steer_by"], handback["throttle_by"]) == (mn.DRIVER,
+                                                               mn.DRIVER)
+    assert handback["phase"] == dv._PHASE_REVERSE
+    assert handback["throttle"] == pytest.approx(dv.REVERSE_SPEED)
+    # The recover's turn, as it stood on the pass before I took it.
+    assert handback["steering"] == pytest.approx(s[took - 1]["steering"])
+    assert handback["steering"] != pytest.approx((0.0, 0.0))
+
+
+def test_a_lost_pad_under_the_floor_still_parks_at_neutral(monkeypatch):
+    """My forward going through under the floor changes nothing about losing
+    the pad: both groups back, auto parked, neutral last."""
+    class Dropping(FakePad):
+        def is_connected(self):
+            return self.frames < 30
+
+    out = run_auto(monkeypatch, 40, Camera(centre_frame(300)), plan=full_rt,
+                   pad=Dropping(), make_driver=standing_policy)
+    assert out["snaps"][20]["throttle"] == pytest.approx(dv.FORWARD_SPEED)
+    assert out["modes"].mode == mn.MANUAL
+    assert not out["takeover"].steering and not out["takeover"].throttle
+    assert out["vecon"].writes[-1][1] == "neutral"
+    assert out["vecon"].last_throttle == 0.0
 
 # --- the safe paths ---------------------------------------------------------
 
@@ -592,8 +701,7 @@ def test_a_nan_trigger_never_reaches_the_esc_as_a_limit():
         throttle = True
         intent = (float("nan"), 0.0, 0.0)
 
-    pilot._scan, pilot._scan_at = dv.free_by_column(far_frame()), 0.0
-    assert pilot._pad_throttle(0.0, Held()) == 0.0
+    assert pilot._pad_throttle(Held()) == 0.0
 
 
 def test_a_pad_read_that_raises_parks_auto_at_neutral(monkeypatch):

@@ -665,15 +665,15 @@ def free_by_column(depth, threshold_mm=CLEARANCE_MM) -> FootprintScan:
 # edge -- is 35 mm, which was about 1.7 ticks of travel at 0.2 and is about
 # one tick (33-42 mm) at 0.4, so a forward decision on one tick can carry an
 # obstacle straight past it. A picture is 88 ms old when it is decided on, and
-# takeover's forward trigger accepts one up to FLOOR_SCAN_MAX_AGE 0.3 s old:
+# the forward floor allows for one up to FLOOR_SCAN_MAX_AGE 0.3 s old:
 # 0.19-0.39 s between the picture and the next chance to stop, 60-80 mm at the
 # common end and 130-165 mm at the worst, so something read at 201 mm can be
 # inside 165 before anything looks again. The rules autopilot is still safe
 # there because R1 reverses on any NO_RETURN, and too close reads NO_RETURN.
-# Takeover's forward trigger and the policy runtime used to ask this floor
-# about NEAR probes only, so inside 165 mm they stopped vetoing. They ask
-# ForwardFloorVeto now, which holds them further out (FORWARD_FLOOR_MM) and
-# keeps holding when a probe goes blind on the way in. This number is still
+# The policy runtime used to ask this floor about NEAR probes only, so inside
+# 165 mm it stopped vetoing. It asks ForwardFloorVeto now, which holds it
+# further out (FORWARD_FLOOR_MM) and keeps holding when a probe goes blind on
+# the way in. My trigger under takeover asks nothing: it is mine, as in manual. This number is still
 # the rules autopilot's R2, and the base the forward floor is built on.
 REVERSE_FLOOR_MM = 200.0
 
@@ -1089,7 +1089,10 @@ REVERSE_SPEED = -1.0
 #
 # Two things drive this car forward in auto without going through
 # read_the_gradient(): my trigger under takeover (main.AutoPilot) and the
-# policy runtime (policy.PolicyDriver). Both used to ask one scan whether a
+# policy runtime (policy.PolicyDriver). Only the policy is held by this. My
+# trigger used to be too, and that floor is what kept me from driving out of
+# a spot until I had backed up, so a taken-over trigger is manual's trigger
+# now and nothing here asks about it. Both used to ask one scan whether a
 # NEAR probe was under REVERSE_FLOOR_MM, and at forward 0.4 that had two holes.
 # Inside about 165 mm the stereo pair measures nothing, so a probe read
 # NO_RETURN and the veto let go exactly when the car was closest. And the
@@ -1113,16 +1116,15 @@ MM_S_PER_THROTTLE = 210.0 / 0.2
 
 # How old a picture is when the next chance to stop comes round, at worst.
 # The frame behind a decision is 88 ms old (measured, see EVADE_SECONDS), and
-# takeover lets my trigger through on a scan up to FLOOR_SCAN_MAX_AGE old.
-# The policy decides on a fresh frame every tick and so sees at most 0.19 s
-# of this; one number covers both callers, and it is the takeover's.
+# FLOOR_SCAN_MAX_AGE is the margin on top. The policy decides on a fresh frame
+# every tick and so sees at most 0.19 s of this; the 0.3 s is what takeover
+# used to accept when the floor held my trigger, and it stays, because the
+# forward floor's distance is built on it.
 FRAME_AGE_S = 0.088
 
-# How old the last scan may be and still clear my forward throttle past the
-# floor veto. Three decision ticks. A recover makes no scans, so for most of
-# one my forward trigger is held at 0 -- the camera has not been asked, and
-# no picture is not a clear picture. Reverse is never held. (crawler/__main__.py reads it
-# from here: the floor is built on it.)
+# Three decision ticks of picture age the forward floor allows for. Takeover
+# used to hold my forward trigger at 0 on a scan older than this, which a
+# recover (it makes no scans) always was; it holds nothing of mine now.
 FLOOR_SCAN_MAX_AGE = 0.3
 WORST_PICTURE_AGE_S = FRAME_AGE_S + FLOOR_SCAN_MAX_AGE
 
