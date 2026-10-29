@@ -70,6 +70,7 @@ import threading
 import time
 
 from crawler.autopilot import policy_imu
+from crawler.telemetry import lidar_view
 
 # The Foxglove default, which is what Studio offers in the connection dialog,
 # so there is nothing to type but the host.
@@ -120,6 +121,12 @@ INTERVALS = {
     # the rate: 10 Hz, 13 at the most it can be driven to. One row is about
     # 600 bytes of JSON.
     "lidar": 0.0,
+    # The same revolution for the 3D panel, see lidar_view.py, and the
+    # transform it is drawn through, once per scan each. The truck outline
+    # never changes, so once a second: enough for a client that joins late.
+    "lidar_scan": 0.0,
+    "tf": 0.0,
+    "lidar_truck": 1.0,
 }
 
 # Longest side of an image channel after downscaling, in pixels. The mono
@@ -501,15 +508,30 @@ RAW_DEPTH_CHANNELS = {
 # is 123 KB in 36 ms. The 8% is not worth half again the encode.
 DEPTH_PNG_LEVEL = 1
 
-ALL_KEYS = tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS) + tuple(RAW_DEPTH_CHANNELS)
+# The roof lidar for the 3D panel, in Foxglove's own schemas: a LaserScan of
+# every revolution, the base_link -> lidar transform it is drawn through, and
+# a truck outline to see it against. lidar_view.py builds all three, on the
+# publisher thread. One scan is 720 doubles, 5.8 KB before zstd, and the three
+# together came to 10.3 KiB/s (36 MiB an hour) through the SDK's own MCAP
+# writer at 10 scans a second of a synthetic room. Not yet measured on the car.
+LIDAR_VIEW_CHANNELS = {
+    "tf": "/tf",
+    "lidar_scan": "/lidar/scan",
+    "lidar_truck": "/lidar/truck",
+}
+
+ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
+            + tuple(RAW_DEPTH_CHANNELS) + tuple(LIDAR_VIEW_CHANNELS))
 
 # Everything the camera produces, which is what stops being written while
 # there is no pad: a file of nothing but pictures and IMU has no driving in it
 # to pair them with, and one afternoon of those was 77 MB. The control loop's
 # own channels are not in here -- /diagnostics is what says the pad went.
-# /lidar is, for the same reason: it is a sensor with no driving in it.
+# /lidar is, for the same reason: it is a sensor with no driving in it, and
+# so is its 3D view, the transform and the outline with it.
 CAMERA_KEYS = frozenset(("imu", "lidar") + tuple(IMAGE_CHANNELS)
-                        + tuple(RAW_DEPTH_CHANNELS))
+                        + tuple(RAW_DEPTH_CHANNELS)
+                        + tuple(LIDAR_VIEW_CHANNELS))
 
 
 class Telemetry:
@@ -611,7 +633,10 @@ class Telemetry:
         try:
             import foxglove
             from foxglove import Channel, Schema
-            from foxglove.channels import CompressedImageChannel
+            from foxglove.channels import (CompressedImageChannel,
+                                           FrameTransformsChannel,
+                                           LaserScanChannel,
+                                           SceneUpdateChannel)
 
             # Quiet by default. The SDK logs every client connect and
             # disconnect at info, and this process shares a journal with the
@@ -638,6 +663,12 @@ class Telemetry:
 
             for key, topic in RAW_DEPTH_CHANNELS.items():
                 self._channels[key] = CompressedImageChannel(topic=topic)
+
+            lidar_kinds = {"tf": FrameTransformsChannel,
+                           "lidar_scan": LaserScanChannel,
+                           "lidar_truck": SceneUpdateChannel}
+            for key, topic in LIDAR_VIEW_CHANNELS.items():
+                self._channels[key] = lidar_kinds[key](topic=topic)
 
         except Exception as e:
             self.error = str(e)
@@ -950,6 +981,12 @@ class Telemetry:
             channel.log(payload, log_time=log_time)
             return
 
+        if key in LIDAR_VIEW_CHANNELS:
+            message = self.lidar_view_message(key, payload, log_time)
+            if message is not None:
+                channel.log(message, log_time=log_time)
+            return
+
         if key in RAW_DEPTH_CHANNELS:
             frame_id = "oakd"
             if isinstance(payload, tuple):
@@ -975,6 +1012,22 @@ class Telemetry:
             ),
             log_time=log_time,
         )
+
+    @staticmethod
+    def lidar_view_message(key, payload, log_time):
+        """The SDK message for one of LIDAR_VIEW_CHANNELS, or None.
+
+        What lidar.LidarReader offers: "lidar_scan" a (Scan, Mount) pair,
+        "tf" the Mount, "lidar_truck" nothing it needs.
+        """
+        if key == "lidar_scan":
+            scan, mount = payload
+            return lidar_view.laser_scan(scan, log_time, mount)
+        if key == "tf":
+            return lidar_view.frame_transforms(log_time, payload)
+        if key == "lidar_truck":
+            return lidar_view.truck_scene(log_time)
+        return None
 
     @staticmethod
     def depth_png(frame, log_time, frame_id="oakd"):

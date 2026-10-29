@@ -527,7 +527,10 @@ class LidarReader:
     runs. Nothing here ever blocks a caller: latest() is one attribute read.
 
     Telemetry, if given one, gets a /lidar row per scan from this thread,
-    gated by wants() like the camera's channels.
+    gated by wants() like the camera's channels, and the same scan for the
+    3D panel: /lidar/scan, /tf and /lidar/truck (telemetry/lidar_view.py).
+    Only the handing over happens here; the messages are built on the
+    telemetry thread.
     """
 
     def __init__(self, device="auto", logger=None, tele=None, mount=MOUNT,
@@ -721,6 +724,12 @@ class LidarReader:
         try:
             if tele.wants("lidar", now):
                 tele.offer("lidar", lidar_sample(scan, self.stats(now)), now)
+            if tele.wants("tf", now):
+                tele.offer("tf", self.mount, now)
+            if tele.wants("lidar_scan", now):
+                tele.offer("lidar_scan", (scan, self.mount), now)
+            if tele.wants("lidar_truck", now):
+                tele.offer("lidar_truck", None, now)
         except Exception:
             pass
 

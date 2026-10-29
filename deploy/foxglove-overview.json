@@ -372,11 +372,84 @@
       "showLegend": true,
       "foxglovePanelTitle": "Health (/diagnostics)"
     },
-    "RawMessages!vehicle": {
-      "expansion": "all",
-      "topicPath": "/vehicle",
-      "fontSize": 11,
-      "foxglovePanelTitle": "/vehicle raw"
+    "3D!lidar": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 4,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "base_link",
+      "scene": {
+        "transforms": {
+          "showLabel": false,
+          "axisSize": 0.15
+        }
+      },
+      "transforms": {
+        "frame:lidar": {
+          "visible": false
+        }
+      },
+      "topics": {
+        "/lidar/scan": {
+          "visible": true,
+          "pointShape": "circle",
+          "pointSize": 3,
+          "decayTime": 0,
+          "colorMode": "colormap",
+          "colorField": "range",
+          "colorMap": "turbo",
+          "minValue": 0.2,
+          "maxValue": 4
+        },
+        "/lidar/truck": {
+          "visible": true
+        }
+      },
+      "layers": {
+        "grid": {
+          "visible": true,
+          "layerId": "foxglove.Grid",
+          "frameId": "base_link",
+          "size": 10,
+          "divisions": 20,
+          "lineWidth": 1,
+          "color": "#248eff",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      },
+      "foxglovePanelTitle": "Lidar from above, front is up (/lidar/scan, 0.5 m grid)"
     }
   },
   "layout": {
@@ -414,8 +487,8 @@
           "second": {
             "direction": "column",
             "first": "StateTransitions!diagnostics",
-            "second": "RawMessages!vehicle",
-            "splitPercentage": 58
+            "second": "3D!lidar",
+            "splitPercentage": 30
           },
           "splitPercentage": 50
         },
