@@ -52,7 +52,9 @@ failure commands neutral. In the order they are checked:
   commit) with a fresh lidar scan
   showing something inside
   driver.REAR_STOP_CLEAR_MM of the
-  rear bumper                       neutral, reason "rear stop"; never
+  rear bumper                       throttle 0, reason "rear stop", the
+                                    wheels left where the model put
+                                    them (only the throttle is cut); never
                                     under my trigger, and with no fresh
                                     scan it is the gyro's rear bumper only.
                                     A map model's reverse is instead the
@@ -541,8 +543,10 @@ class StopLog:
 # (1, K). ChunkEnsembler blends them as ACT does (Zhao et al. 2023, sec 3.3):
 # this decision's gear and steer are the weighted mean of offset `age` of each
 # of the last K answers, weight exp(m * age), age 0 the answer made now, so
-# m < 0 trusts the newest more and m = 0 is a plain mean. m is the sidecar's
-# ensemble_m. Two decisions are one chain only when they are under
+# m < 0 trusts the newest more and m = 0 is a plain mean -- except stop's
+# probability, which is the newest answer's alone (forward and reverse split
+# the rest as the blend does), so a 2-tick stop between gears still stops.
+# m is the sidecar's ensemble_m. Two decisions are one chain only when they are under
 # CHUNK_LINK_S apart, the gap the trainer chains labels across.
 CHUNK_LINK_S = 0.25
 CHUNK_MAX = 50
@@ -1022,7 +1026,8 @@ class ChunkEnsembler:
     turns this decision's raw outputs into one-step ones: logits the log of
     the weighted mean probability (so argmax, moving_action and the
     confidence scale read them as before) and steer the weighted mean, the
-    weights exp(m * age). Throttle, the mode head and anything else pass
+    weights exp(m * age). Stop's probability is the newest answer's own,
+    forward and reverse sharing the rest as their weighted means split it. Throttle, the mode head and anything else pass
     through. K = 1 is a pass-through, the very same dict.
 
     The chain starts over on a gap over link_s, a different mode going in,
@@ -1074,8 +1079,17 @@ class ChunkEnsembler:
             p += w * probs[age]
             s += w * steers[age]
             den += w
+        # Stop is the newest answer's own: my stops between gears are about
+        # 2 ticks, and averaged over the chunk one needs three answers to win,
+        # so the blend never stopped. Forward against reverse is the blend.
+        stop = ACTIONS.index(STOP)
+        p_stop = float(self._buf[0][1][0][stop])
+        go = p / den
+        go[stop] = 0.0
+        go *= (1.0 - p_stop) / max(go.sum(), 1e-12)
+        go[stop] = p_stop
         out = dict(outputs)
-        out["logits"] = np.log(p / den + 1e-9)
+        out["logits"] = np.log(go + 1e-9)
         out[STEER_OUTPUT] = np.array([s / den])
         return out
 
@@ -1646,27 +1660,29 @@ class PolicyDriver(dv.Driver):
             self._neutral("exception")
             raise
 
-    def _neutral(self, reason):
+    def _neutral(self, reason, pair=(0, 0), steer=0.0):
         """Throttle to zero, steering to centre, evidence forgotten.
 
         Each write on its own try, throttle first: a steering servo that
         raises must not stop the throttle reaching zero, and this is called
         from the exception path, where raising again would lose the original.
+        `pair` and `steer` are only ever not centre for the rear stop, which
+        cuts the throttle and leaves the wheels where this tick put them.
         """
         try:
             self.controller.set_throttle(0)
         except Exception:
             pass
         try:
-            self.controller.set_steering(0, 0)
+            self.controller.set_steering(*pair)
         except Exception:
             pass
         self._commanded(0.0, self._now)
         self._clear_motion_evidence()
         self._end_commit()
         self._reset_standoff()
-        self._prev = (STOP, 0.0, 0.0)
-        self._note(Decision(STOP, 0.0, 0.0, None, reason))
+        self._prev = (STOP, 0.0, steer)
+        self._note(Decision(STOP, 0.0, steer, None, reason, 0.0, pair[0]))
         self._say_stop(reason)
 
     def _note(self, decision):
@@ -2064,25 +2080,6 @@ class PolicyDriver(dv.Driver):
         if reason != "model floor":
             self._reset_standoff()
 
-        # The rear stop. A reverse with something too near behind it on a
-        # fresh lidar scan is neutral, never just not commanded: pigpio would
-        # hold the last reverse. Not under my trigger, which is mine, and
-        # with no fresh scan this is never true and the gyro bumper is it.
-        if (action == REVERSE and not self.human_throttle
-                and dv.rear_blocked(self.rear_clearance)):
-            self._last_reverse_at = now
-            if not self._rear_said:
-                print(f"Rear stop - {self.rear_clearance:.0f} mm behind me, "
-                      "cutting the reverse.")
-            self._rear_said = True
-            self._neutral("rear stop")
-            self.rear_stop = True
-            return
-        if not rear_masked:
-            self._rear_said = False
-        if action == REVERSE and not self.human_throttle:
-            self._last_reverse_at = now
-
         # magnitude, steer and rear are already known finite and in range,
         # so none of these can exceed a cap or STEER_SCALE.
         front = steer * STEER_SCALE
@@ -2103,6 +2100,28 @@ class PolicyDriver(dv.Driver):
             pair = (front, 0.0)
         else:
             pair = dv.steering_pair(front)
+
+        # The rear stop. A reverse with something too near behind it on a
+        # fresh lidar scan is neutral, never just not commanded: pigpio would
+        # hold the last reverse. Not under my trigger, which is mine, and
+        # with no fresh scan this is never true and the gyro bumper is it.
+        if (action == REVERSE and not self.human_throttle
+                and dv.rear_blocked(self.rear_clearance)):
+            self._last_reverse_at = now
+            if not self._rear_said:
+                print(f"Rear stop - {self.rear_clearance:.0f} mm behind me, "
+                      "cutting the reverse.")
+            self._rear_said = True
+            # The throttle is the safety; the wheels stay where this tick
+            # put them, so a car boxed in can still turn them standing still.
+            self._neutral("rear stop", pair, steer)
+            self.rear_stop = True
+            return
+        if not rear_masked:
+            self._rear_said = False
+        if action == REVERSE and not self.human_throttle:
+            self._last_reverse_at = now
+
         # Steering first, as the autopilot orders them; main.DriverCommand
         # holds both and AutoPilot.step() writes them once.
         self.controller.set_steering(*pair)

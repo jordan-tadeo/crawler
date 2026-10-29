@@ -405,7 +405,7 @@ def test_the_safety_layer_still_cuts_a_map_models_throttle():
     near = int(dv.REAR_SELF_MM + dv.REAR_STOP_CLEAR_MM - 40)
     d = driver(model, FakeSlam(), lidar=reader(near))
     d.tick(T0)
-    assert d.controller.throttles[-1] == 0 and d.controller.steerings[-1] == (0, 0)
+    assert d.controller.throttles[-1] == 0
     assert d.last_decision.reason == "rear stop"
     # The reverse speed cap the rear stop is set for.
     d = driver(MapStub(REVERSE, throttle=1.0), FakeSlam())
@@ -424,6 +424,29 @@ def test_the_safety_layer_still_cuts_a_map_models_throttle():
     assert not d.recovering(T0 + 3.0), "no standoff back-out"
     assert d.controller.steerings[-1][0] == pytest.approx(0.5 * pl.STEER_SCALE), \
         "the model keeps its steering under the hold"
+
+
+def test_a_rear_stop_cuts_the_throttle_and_leaves_the_models_steering():
+    """Boxed in, the model asks a reverse at lock (on the car, -0.65 at up to
+    0.88 for 5.8 s) and the rear stop cuts it. It used to centre the wheels
+    too, so every tick the model's lock was undone and it never got to turn
+    them while stopped, which is how I get out of a tight spot. The throttle
+    is the safety; the wheels are the model's."""
+    model = MapStub((0.0, 5.0, 1.0), throttle=1.0, steer=-0.65)
+    near = int(dv.REAR_SELF_MM + dv.REAR_STOP_CLEAR_MM - 40)
+    d = driver(model, FakeSlam(), lidar=reader(near))
+    for k in range(5):
+        d.tick(T0 + 0.1 * k)
+        assert d.controller.throttles[-1] == 0, k
+        assert d.last_decision.reason == "rear stop"
+        assert d.controller.steerings[-1] == pytest.approx(
+            dv.steering_pair(-0.65 * pl.STEER_SCALE)), k
+    assert d.rear_stop
+    assert all(t >= 0.0 for t in d.controller.throttles)
+    # A neutral that is not the rear stop still centres them: the mapper down.
+    d.slam.alive = False
+    d.tick(T0 + 0.6)
+    assert d.controller.throttles[-1] == 0 and d.controller.steerings[-1] == (0, 0)
 
 
 def test_a_map_models_reverse_into_the_rear_stop_goes_forward_if_it_would():

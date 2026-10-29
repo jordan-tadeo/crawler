@@ -128,6 +128,41 @@ def test_a_step_from_forward_to_reverse_takes_the_ticks_its_weights_say(m, ticks
     assert took == ticks
 
 
+STOP = (0.0, 0.0, 5.0)
+
+
+@pytest.mark.parametrize("m", [0.0, -0.5])
+def test_a_stop_the_newest_answer_says_is_the_blends_stop_at_once(m):
+    """My stops in a multi-point turn are 2 ticks long (median, 856 of them):
+    a stop averaged over five answers at m = 0 needs three answers to win, so
+    the blend all but never stopped (offline, stop recall 12% raw, 1% blended).
+    Stop's share is the newest answer's own; only forward against reverse is
+    smoothed."""
+    e = pl.ChunkEnsembler(5, m)
+    t = T0
+    for _ in range(5):
+        e.apply(same(FWD, 0.0), t)
+        t += 0.1
+    assert blend_of(e.apply(same(STOP, 0.6), t))[0] == pl.STOP
+    assert blend_of(e.apply(same(FWD, 0.0), t + 0.1))[0] == pl.FORWARD, \
+        "and a forward after it goes again on that answer"
+
+
+def test_forward_against_reverse_is_still_the_blend_of_the_chunk():
+    """Under the newest answer's stop share, forward and reverse split as the
+    chunk's weighted mean says: one reverse answer after four forwards does not
+    flip the gear, and the probabilities still sum to one."""
+    e = pl.ChunkEnsembler(5, 0.0)
+    for k in range(4):
+        e.apply(same(FWD, 0.0), T0 + 0.1 * k)
+    out = e.apply(same(REV, 0.0), T0 + 0.4)
+    assert blend_of(out)[0] == pl.FORWARD
+    p = np.exp(np.asarray(out["logits"]).ravel())
+    assert p.sum() == pytest.approx(1.0, abs=1e-6)
+    newest_stop = math.exp(0.0) / (2 * math.exp(0.0) + math.exp(5.0))
+    assert p[pl.ACTIONS.index(pl.STOP)] == pytest.approx(newest_stop, abs=1e-6)
+
+
 def test_the_steer_is_the_weighted_mean_of_each_answers_own_offset():
     """Offset `age` of each answer, not offset 0 of all of them."""
     e = pl.ChunkEnsembler(3, -0.5)

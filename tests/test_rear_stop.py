@@ -107,6 +107,13 @@ def neutral(d):
     return d.controller.throttles[-1] == 0 and d.controller.steerings[-1] == (0, 0)
 
 
+def rear_stopped(d):
+    """The rear stop's neutral: throttle 0, the wheels left where the tick
+    before put them (the rear stop cuts only the throttle)."""
+    return (d.controller.throttles[-1] == 0
+            and d.controller.steerings[-1] == d.controller.steerings[-2])
+
+
 # --- every autonomous reverse is slow -----------------------------------------
 
 def test_an_autonomous_reverse_is_capped_at_the_escape_speed_and_still_moves():
@@ -275,7 +282,7 @@ def test_a_near_return_behind_stops_the_commit_with_neutral():
     assert not d.rear_stop
     reader._scan = reader._scan._replace(bins=near())
     d.tick(T0 + 0.1)
-    assert neutral(d)
+    assert rear_stopped(d)
     assert not d.reverse_commit
     assert d.last_decision.reason == "rear stop"
     row = fp.autopilot_fields(d, T0 + 0.1)
@@ -295,7 +302,7 @@ def test_a_fresh_reverse_into_a_near_return_is_never_commanded():
                       reader=lidar(near()))
     for k in range(10):
         d.tick(T0 + k * 0.1)
-    assert neutral(d) and d.rear_stop
+    assert rear_stopped(d) and d.rear_stop
     assert all(t >= 0.0 for t in d.controller.throttles)
 
 
