@@ -188,13 +188,14 @@ def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
         item = inbox.get()
         if item is None:
             return
-        host_t, stamp_ms, ranges, rows = item
+        host_t, stamp_ms, ranges, rows = item[:4]
+        speed = item[4] if len(item) > 4 else None
         for r in rows:
             up = r[4:7]
             imu.add(r[0], r[1:4], None if math.isnan(up[0]) else up)
         t = clock.fit(host_t, stamp_ms)
         try:
-            res = slam.step(t, ranges)
+            res = slam.step(t, ranges, speed=speed)
         except Exception as e:      # a bad scan costs that scan
             try:
                 outbox.put_nowait(("error", repr(e)))
@@ -250,7 +251,7 @@ class SlamRunner:
 
     def __init__(self, mode=MODE_THREAD, tele=None, logger=None, mount=None,
                  l_max=None, inbox=INBOX, map_every_s=MAP_EVERY_S,
-                 clock=time.monotonic, nav_half_m=None):
+                 clock=time.monotonic, nav_half_m=None, speed=None):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
         if mount is None:
@@ -267,6 +268,11 @@ class SlamRunner:
         # default, never draws it.
         self.nav_half_m = nav_half_m
         self._clock = clock
+        # The commanded ground speed now, m/s, or None: called once a scan on
+        # the lidar's thread and handed to Slam.step, which reckons where the
+        # truck has got to while it is lost with it (slam.py, "How a fresh
+        # map sits on the one before it"). main() asks the throttle.
+        self.speed = speed
 
         self._imu = deque(maxlen=IMU_KEEP)
         self._imu_lock = threading.Lock()
@@ -383,9 +389,16 @@ class SlamRunner:
         with self._imu_lock:
             rows = list(self._imu)
             self._imu.clear()
+        speed = None
+        if self.speed is not None:
+            try:
+                speed = float(self.speed())
+            except Exception:
+                speed = None
         try:
             self._inbox.put_nowait(
-                (float(scan.t), getattr(scan, "stamp_ms", None), ranges, rows))
+                (float(scan.t), getattr(scan, "stamp_ms", None), ranges, rows,
+                 speed))
         except queue.Full:
             self.dropped += 1
             # The samples are not the scan's to lose: they go with the next.

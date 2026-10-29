@@ -852,9 +852,13 @@ class AutoPilot:
 
     def goal_marker(self):
         """/goal/marker's payload: the goal on the map the truck is on now,
-        or nothing, which clears the disc."""
+        or nothing, which clears the disc. A goal carried across a reseed
+        (goal.ClickGoal) says approx_m, how far off it may be, and is drawn
+        as wide as that."""
         st = self.goal.status()
         if st["goal_set"] and st["frame"] == st["frame_now"]:
+            if st.get("approx"):
+                return {"goal": (st["x"], st["y"]), "approx_m": st["approx_m"]}
             return {"goal": (st["x"], st["y"])}
         return {}
 
@@ -2025,10 +2029,17 @@ def main(argv=None):
             # Before the reader, so its first scan has somewhere to go. The
             # worker comes up on its own; nothing here waits for it.
             from crawler.mapping import runner as slam_runner
+            from crawler.nav import truck
+
+            def commanded_speed():
+                # What the throttle last written asks for on flat floor, for
+                # the dead reckoning that carries a goal across a reseed.
+                return truck.ground_speed(vecon.last_throttle or 0.0)
             slam = slam_runner.SlamRunner(
                 mode=args.slam_worker, logger=log,
                 tele=tele if channels_live else None,
-                nav_half_m=slam_runner.NAV_HALF_M if args.nav else None)
+                nav_half_m=slam_runner.NAV_HALF_M if args.nav else None,
+                speed=commanded_speed)
             slam.start()
             hub.imu_listeners.append(slam.on_imu)
             log.log("info", "SLAM", f"Mapping on a {args.slam_worker}")

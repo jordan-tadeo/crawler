@@ -578,11 +578,13 @@ JSON_SCHEMAS = {
     # whether it can be placed off the newest crop; distance_m (-1 with none)
     # and bearing_deg (counter-clockwise, left positive) from the truck;
     # arrived, the safety layer's neutral hold within arrive_m; clicks
-    # taken and refused.
+    # taken and refused. approx: the goal was carried onto this map across
+    # a reseed, and approx_m how far off it may be (0 when exact).
     "goal_status": _schema("crawler.GoalStatus", {
         "goal_set": _BOOL, "x": _NUM, "y": _NUM, "frame": _INT, "frame_now": _INT,
         "on_map": _BOOL, "distance_m": _NUM, "bearing_deg": _NUM, "arrived": _BOOL,
         "arrive_m": _NUM, "clicks": _INT, "refused": _INT,
+        "approx": _BOOL, "approx_m": _NUM,
     }),
 }
 

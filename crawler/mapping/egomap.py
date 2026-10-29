@@ -30,6 +30,11 @@ to the downsample.
           "young"), so a point on the old map means nothing on it; "merged"
           puts the old map back. 0 at boot, a new number every fresh map,
           the old one again on a merge (EgoMap.after_step).
+  links   how those maps sit on each other (Link, off slam.Result.link):
+          one for every reseed and merge so far, oldest first, the newest
+          LINKS_KEPT. On every crop, so a reader that skips crops (the
+          control loop takes the newest) still sees every one. What a goal
+          clicked on one map rides onto the next (autopilot/goal.py).
 
 The input
 ---------
@@ -57,6 +62,28 @@ STALE_S = 0.3
 CHANNELS = 5
 LAYOUT = f"ego{SIZE}_{int(round(RES * 100))}cm_trail{int(TRAIL_S)}"
 PRESENT = 4
+# Links a crop carries: far more reseeds than a drive has between two reads
+# of the newest crop.
+LINKS_KEPT = 32
+
+
+class Link(NamedTuple):
+    """One reseed or merge: map frame `frm` onto map frame `to`, a point p
+    on frm is T . p on to with T = (x, y, yaw). err_m and err_yaw how far
+    off T's position (metres) and heading (radians) may be, and (px, py)
+    the point on frm the heading's error turns about; all 0 for a merge,
+    which is a fit. seq counts every link, from 1."""
+    seq: int
+    why: str              # slam.Result.reseed: "lost", "young" or "merged"
+    frm: int
+    to: int
+    x: float
+    y: float
+    yaw: float
+    err_m: float
+    err_yaw: float
+    px: float
+    py: float
 
 
 class Crop(NamedTuple):
@@ -68,6 +95,7 @@ class Crop(NamedTuple):
     y: float = 0.0
     yaw: float = 0.0
     frame: int = 0        # which map that pose is on (see the docstring)
+    links: tuple = ()     # Link, oldest first (see the docstring)
 
 
 # The states a matched pose is good in. Tilted is the map's write gate, not
@@ -105,20 +133,33 @@ class EgoMap:
         self.frame = 0
         self._next_frame = 1
         self._shelved = None
+        self.links = ()
+        self._seq = 0
 
-    def _follow_reseed(self, why):
+    def _follow_reseed(self, res):
+        why = getattr(res, "reseed", "")
+        was = self.frame
         if why == "lost":
-            self._shelved = self.frame
+            # The map left goes on the shelf, unless the shelf kept the
+            # bigger one it had (slam._start_over): then that one is still
+            # what a merge brings back.
+            if not getattr(res, "kept_shelf", False):
+                self._shelved = self.frame
             self.frame, self._next_frame = self._next_frame, self._next_frame + 1
         elif why == "young":
             # A young map started again: a new origin, the shelf as it was.
             self.frame, self._next_frame = self._next_frame, self._next_frame + 1
         elif why == "merged" and self._shelved is not None:
             self.frame, self._shelved = self._shelved, None
+        link = getattr(res, "link", ())
+        if self.frame != was and len(link) == 7:
+            self._seq += 1
+            self.links = (self.links + (Link(self._seq, why, was, self.frame,
+                                             *(float(v) for v in link)),))[-LINKS_KEPT:]
 
     def after_step(self, grid, res) -> Crop:
         """The Result the step just made, and the grid it wrote: the crop."""
-        self._follow_reseed(getattr(res, "reseed", ""))
+        self._follow_reseed(res)
         if res.state not in ("rolled", "no_points"):
             self._tx.append(res.x)
             self._ty.append(res.y)
@@ -129,7 +170,8 @@ class EgoMap:
                 del self._tx[:k], self._ty[:k], self._tt[:k]
         codes, trail = self.render(grid, res.x, res.y, res.yaw, res.t)
         return Crop(float(res.t), trusted(res), codes, trail,
-                    float(res.x), float(res.y), float(res.yaw), int(self.frame))
+                    float(res.x), float(res.y), float(res.yaw), int(self.frame),
+                    self.links)
 
     def render(self, grid, x, y, yaw, t):
         S, sub = self.size, self.sub

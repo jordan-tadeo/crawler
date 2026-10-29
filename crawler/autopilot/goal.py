@@ -28,10 +28,26 @@ Arriving is the one rule, by the owner's ruling a safety exception like the
 rear stop: once the truck's map pose is within ARRIVE_M of the goal,
 reached() is True and the driver holds neutral ("goal reached"), and it
 stays True until a new goal is clicked that is more than ARRIVE_M from it.
-It never steers. A goal on a map frame the truck is not on now (a reseed
-since) is kept, never placed, and never arrives; the model drives without
-it until the map it is on comes back (a merge), as it does with the map
-lost.
+It never steers.
+
+Across a reseed. A fresh map (slam.py, "lost" or "young") has an origin of
+its own, so the goal is carried onto it: every crop carries the links
+between the map frames so far (egomap.Link), each saying how one map sits
+on the next and how far off that may be, and the goal rides each one. A
+"lost" link is dead reckoning, the gyro's heading and the commanded speed
+over the time nothing fitted, so the goal on the fresh map is approximate:
+/goal/status says approx, and approx_m how far off it may be (the link's
+own error, and its heading's swung over the distance from the truck,
+added up link by link), and the disc is drawn as wide as that. It is fed
+to the model and drawn all the same, and an approximate goal still arrives
+and holds: ARRIVE_M of where the goal is believed to be. The goal keeps
+its place on every map it has been carried to. When a merge brings an old
+map back, the place it already has there wins if it is the surer one, so
+a goal clicked on the old map snaps back to exactly where it was clicked;
+how far the carried one had drifted from it is said, and kept in
+transfer_errors. A goal clicked on a fresh map moves onto the old one by
+the merge's fit, and stays exact. A goal on a map frame no link reaches is
+kept, never placed, and never arrives, as it does with the map lost.
 """
 
 import math
@@ -75,6 +91,13 @@ class ClickGoal(Goal):
         self.last = None            # (distance m, bearing rad) off the newest crop
         self.on_map = False         # the newest crop is present and on the goal's frame
         self.frame_now = None
+        # The goal on every map frame it has been carried to: frame ->
+        # (x, y, how far off it may be in metres, 0 where it was clicked).
+        self.places = {}
+        self._seq = 0               # the newest egomap.Link taken
+        # How far a carried goal was from its exact place when a merge put
+        # it back, metres, newest last: the carry's measured error.
+        self.transfer_errors = []
 
     def _log(self, level, text):
         print(text)
@@ -99,6 +122,7 @@ class ClickGoal(Goal):
                 and math.hypot(x - self.goal[0], y - self.goal[1]) <= self.arrive_m):
             return False
         self.goal = (x, y, int(frame))
+        self.places = {int(frame): (x, y, 0.0)}
         self.yaw = yaw
         self.last = None
         if self._reached:
@@ -112,6 +136,10 @@ class ClickGoal(Goal):
         it on the map off this crop's pose, then observe(crop)."""
         click = clicks.take() if clicks is not None else None
         if click is not None:
+            # Links up to this crop are from before the click: they are not
+            # the new goal's to ride.
+            if crop is not None:
+                self.follow(getattr(crop, "links", ()))
             self.take_click(click, crop)
         self.observe(crop)
 
@@ -132,9 +160,47 @@ class ClickGoal(Goal):
 
     # ---- each tick -------------------------------------------------------------
 
+    def follow(self, links):
+        """Carry the goal along the links it has not taken yet."""
+        for L in links:
+            if L.seq <= self._seq:
+                continue
+            self._seq = L.seq
+            self._carry(L)
+
+    def _carry(self, L):
+        here = self.places.get(L.frm)
+        if here is None:
+            return
+        x, y, e = here
+        c, s = math.cos(L.yaw), math.sin(L.yaw)
+        nx, ny = c * x - s * y + L.x, s * x + c * y + L.y
+        ne = e + L.err_m + math.hypot(x - L.px, y - L.py) * L.err_yaw
+        have = self.places.get(L.to)
+        if have is not None and have[2] <= ne:
+            if have[2] == 0.0 and ne > 0.0:
+                off = math.hypot(nx - have[0], ny - have[1])
+                self.transfer_errors = (self.transfer_errors + [off])[-50:]
+                self._log("info", f"Back on map {L.to}: the goal is exactly where it "
+                          f"was clicked again; the carried one was {off:.2f} m off")
+            return
+        self.places[L.to] = (nx, ny, ne)
+        if L.why == "lost":
+            self._log("info", f"Lost the map the goal was on; carried it onto map "
+                      f"{L.to} at ({nx:.2f}, {ny:.2f}) m, about {ne:.2f} m off")
+        elif L.why == "merged":
+            self._log("info", f"Map {L.frm} merged into map {L.to}; the goal moved "
+                      f"with it to ({nx:.2f}, {ny:.2f}) m"
+                      + (f", about {ne:.2f} m off" if ne > 0.0 else ""))
+
     def observe(self, crop):
         """Where the goal is from this crop's pose, and the arrival latch."""
         self.frame_now = None if crop is None else int(getattr(crop, "frame", 0))
+        if crop is not None:
+            self.follow(getattr(crop, "links", ()))
+            place = self.places.get(self.frame_now)
+            if self.goal is not None and place is not None:
+                self.goal = (place[0], place[1], self.frame_now)
         if self.goal is None or crop is None or not getattr(crop, "present", False):
             self.on_map = False
             return
@@ -153,10 +219,19 @@ class ClickGoal(Goal):
         """The model's goal input this decision (policy_goal.encode)."""
         return pg.encode(crop, self.goal)
 
+    def approx_m(self):
+        """How far off the goal may be on the map it is on: 0 where it was
+        clicked (or moved by a merge's fit), more once carried."""
+        if self.goal is None:
+            return 0.0
+        place = self.places.get(self.goal[2])
+        return float(place[2]) if place is not None else 0.0
+
     def status(self):
         """/goal/status."""
         d, b = self.last if self.last is not None else (-1.0, 0.0)
         x, y, frame = self.goal if self.goal is not None else (0.0, 0.0, -1)
+        e = self.approx_m()
         return {"goal_set": self.goal is not None, "x": float(x), "y": float(y),
                 "frame": int(frame),
                 "frame_now": -1 if self.frame_now is None else int(self.frame_now),
@@ -164,4 +239,5 @@ class ClickGoal(Goal):
                 "distance_m": float(d) if self.goal is not None else -1.0,
                 "bearing_deg": float(math.degrees(b)) if self.goal is not None else 0.0,
                 "arrived": bool(self._reached), "arrive_m": self.arrive_m,
-                "clicks": int(self.clicks), "refused": int(self.refused)}
+                "clicks": int(self.clicks), "refused": int(self.refused),
+                "approx": e > 0.0, "approx_m": e}

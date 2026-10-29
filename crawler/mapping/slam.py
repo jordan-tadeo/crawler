@@ -64,6 +64,18 @@ again (Result.reseed "merged"). That search is done a piece at a time,
 SHELF_SHARE_S of it a scan (Slam._shelf_slice), never whole in one step:
 the fresh map is the one being driven on meanwhile.
 
+How a fresh map sits on the one before it. A fresh map goes on from the
+pose the truck was last believed at, which after a loss is where it froze,
+not where it is, so a point on the old map is not the same point on the new
+one. Every reseed says how far off (Result.link): the old map's frame onto
+the new one, from where the truck is reckoned to have got since its last
+good fit. The heading off the gyro (bias taken off, projected on up, so a
+rollover too); the position off the commanded speed step() is handed (the
+throttle through nav/truck.ground_speed) along that heading; and an error
+estimate for both, LINK_ERR_* below. A merge's link is the fit that merged
+(old = T . fresh) with no error. A goal clicked on the map rides these
+(autopilot/goal.py ClickGoal); nothing in here uses them.
+
 A map is young until it has had SEED_WRITES writes. A young map that a scan
 does not fit is started again from that scan (Result.reseed "young"), and
 nothing is shelved: one or two scans are no map to hold the truck to. On
@@ -183,6 +195,20 @@ SHELF_MOVE_M = 1.0
 # starts it again instead of failing.
 SEED_WRITES = 5
 
+# How sure a link (Result.link) is. The dead reckoning's position is off by
+# LINK_ERR_FRAC of the distance it counted (wheels spin on rock, and the
+# speed curve is flat floor), plus LINK_ERR_M; with no speed handed in it
+# cannot count any, and it owns up to LINK_UNKNOWN_M_S of movement it did
+# not see. The gyro's heading drifts LINK_ERR_DEG_S a second on top of
+# LINK_ERR_DEG. Rolled over or picked up, the truck may be anywhere near:
+# LINK_ROLLED_M once for each time.
+LINK_ERR_FRAC = 0.3
+LINK_ERR_M = 0.1
+LINK_UNKNOWN_M_S = 0.3
+LINK_ERR_DEG = 1.0
+LINK_ERR_DEG_S = 0.1
+LINK_ROLLED_M = 1.0
+
 # The revolution period when there is nothing better to go on: 0.1009 s
 # measured over the four drives.
 PERIOD_S = 0.101
@@ -219,6 +245,16 @@ class Result(NamedTuple):
     held: int = 0             # directions the fit kept at the prediction
     banded: bool = False      # the fit landed outside the band and was refused
     reseed: str = ""          # "young" / "lost": this scan started a fresh map
+    #                           "merged": the old one is the map again
+    # With a reseed: how the map before this scan sits on the one after it,
+    # new = T . old, as (x, y, yaw, err_m, err_yaw, px, py): the transform,
+    # how far off its position may be (metres) and its heading (radians),
+    # and where on the old map the truck was reckoned to be (the heading's
+    # error swings a point round there). () without one.
+    link: tuple = ()
+    # A "lost" reseed that left the shelf as it was: what it had there was
+    # the bigger map, and the one this scan left is gone.
+    kept_shelf: bool = False
 
 
 class Shelf:
@@ -293,10 +329,24 @@ class Slam:
         self.retries = 0
         self.recoveries = 0
         self.last_points = None
+        # Dead reckoning since the last good fit, on the current map: the
+        # pose it was at, moved on by the gyro and the commanded speed while
+        # nothing fits (see "How a fresh map sits"). And what it has counted
+        # since: metres, seconds, metres it could not count, rollovers.
+        self._dr = np.zeros(3)
+        self._dr_m = 0.0
+        self._dr_s = 0.0
+        self._dr_unknown_m = 0.0
+        self._dr_rolled = 0
+        self._link = ()
+        self._shelved = False
 
     # ---- the step -------------------------------------------------------
 
-    def step(self, t, ranges, period=None) -> Result:
+    def step(self, t, ranges, period=None, speed=None) -> Result:
+        """One revolution. `speed`, the commanded ground speed (m/s, signed)
+        as of this scan, or None: only ever used to reckon where the truck
+        has got to while nothing fits, for Result.link."""
         t0 = self._clock()
         self.scans += 1
         self.last_points = None
@@ -311,6 +361,8 @@ class Slam:
         self._att = imu.pitch_roll(t)
         self._banded = False
         self._reseed = ""
+        self._link = ()
+        self._shelved = False
 
         if tilt > ROLL_DEG:
             # Frozen. Whatever the scan sees now is the floor, the ceiling or
@@ -319,9 +371,12 @@ class Slam:
             # truck has turned about the vertical while it is over.
             if not self.lost:
                 self._lost_yaw = float(self.pose[2])
-            self._carry_yaw(imu.rate_between(last_t, t, self.bias)
-                            if last_t is not None else None,
+            rolled_rate = (imu.rate_between(last_t, t, self.bias)
+                           if last_t is not None else None)
+            self._carry_yaw(rolled_rate,
                             t - last_t if last_t is not None else 0.0)
+            if last_t is not None:
+                self._reckon(rolled_rate, None, t - last_t, rolled=True)
             self.lost = True
             self._lost_since = t
             self._search = None
@@ -398,12 +453,15 @@ class Slam:
             if not good and self._map_writes < SEED_WRITES:
                 self._reseed = "young"
 
+        if last_t is not None and not (good and not self._reseed):
+            self._reckon(imu_rate, speed, dt)
         if self._reseed:
             # A fresh map from this scan, at the pose the truck is believed
             # to be at, heading off the IMU: written below as the first scan
             # of a map is. A lost one's old map is shelved, never dropped.
-            self._start_over(keep=self._reseed == "lost")
+            self._shelved = self._start_over(keep=self._reseed == "lost")
             newpose, good, fit = pred.copy(), True, None
+            self._link = self._link_from_reckoning(newpose)
         if self._tree is not None and not good and not self.lost:
             self.fails += 1
             self.vel *= 0.5
@@ -433,6 +491,8 @@ class Slam:
                 # fits: an EMA slow enough that one bad fit is noise.
                 self.bias += 0.002 * (imu_rate - v_new[2])
         self.pose = newpose
+        if good:
+            self._dr_reset(newpose)
 
         pitch, roll = self._att
         state = LOST if self.lost else (
@@ -452,6 +512,7 @@ class Slam:
                 and state in (TRACKING, TILTED)
                 and self._shelf_slice(p, nrm, t0)):
             self._reseed = "merged"
+            self._dr_reset(self.pose)
         self._refresh_target()
         self.last_t = t
         return self._result(t, state, good, written, why, fit, returns,
@@ -492,10 +553,13 @@ class Slam:
         """A fresh map, from nothing: no tree, nothing lost or failing. With
         `keep` the old one goes on the shelf (the bigger of it and whatever
         is there already), else it is cleared in place. The pose is kept, so
-        the map frame goes on where it was."""
+        the map frame goes on where it was. True if the map it left went on
+        the shelf."""
+        shelved = False
         if keep:
             if self._shelf is None or self._map_writes > self._shelf.writes:
                 self._shelf = Shelf(self.grid, self._map_writes)
+                shelved = True
             g = self.grid
             self.grid = gr.Grid(size=g.size, res=g.res, l_max=g.l_max,
                                 x0=float(self.pose[0]), y0=float(self.pose[1]),
@@ -513,6 +577,46 @@ class Slam:
         self.vel[:] = 0.0
         self._map_writes = 0
         self.reseeds += 1
+        return shelved
+
+    # ---- dead reckoning, for Result.link ---------------------------------
+
+    def _dr_reset(self, pose):
+        self._dr = np.array(pose, float)
+        self._dr_m = self._dr_s = self._dr_unknown_m = 0.0
+        self._dr_rolled = 0
+
+    def _reckon(self, rate, speed, dt, rolled=False):
+        """Move the dead-reckoned pose on over dt: the heading by the gyro's
+        rate (kept with none), the position by `speed` along it. Rolled, it
+        is not driving; it may be being carried (LINK_ROLLED_M)."""
+        if not dt > 0.0:
+            return
+        if rate is not None and math.isfinite(rate):
+            self._dr[2] = _wrap(self._dr[2] + rate * dt)
+        self._dr_s += dt
+        if rolled:
+            self._dr_rolled = 1
+            return
+        if speed is None or not math.isfinite(speed) or dt > 1.0:
+            # A second's gap is not one speed held across it.
+            self._dr_unknown_m += LINK_UNKNOWN_M_S * dt
+            return
+        step = float(speed) * dt
+        self._dr[0] += step * math.cos(self._dr[2])
+        self._dr[1] += step * math.sin(self._dr[2])
+        self._dr_m += abs(step)
+
+    def _link_from_reckoning(self, new_pose):
+        """Result.link for a reseed: the old map onto the new one, off where
+        the truck is reckoned to be on the old map and where the new one
+        puts it (new_pose = T . reckoned)."""
+        T = _between(new_pose, self._dr)
+        err_m = (LINK_ERR_M + LINK_ERR_FRAC * self._dr_m + self._dr_unknown_m
+                 + LINK_ROLLED_M * self._dr_rolled)
+        err_yaw = math.radians(LINK_ERR_DEG + LINK_ERR_DEG_S * self._dr_s)
+        return (T[0], T[1], T[2], float(err_m), float(err_yaw),
+                float(self._dr[0]), float(self._dr[1]))
 
     def _carry_yaw(self, rate, dt):
         """Turn the lost heading on by the gyro's rate over dt; a scan with
@@ -673,6 +777,8 @@ class Slam:
         self._tree_at = None
         self.vel[:] = 0.0
         self.merges += 1
+        self._link = (float(T[0]), float(T[1]), float(T[2]), 0.0, 0.0,
+                      float(self.pose[0]), float(self.pose[1]))
         return True
 
     def _why_not(self, fit, good, state):
@@ -751,7 +857,9 @@ class Slam:
             ms=(self._clock() - t0) * 1000.0,
             pitch_deg=float(self._att[0]), roll_deg=float(self._att[1]),
             held=int(getattr(fit, "held", 0)) if fit is not None else 0,
-            banded=bool(self._banded), reseed=self._reseed)
+            banded=bool(self._banded), reseed=self._reseed,
+            link=self._link if self._reseed else (),
+            kept_shelf=self._reseed == "lost" and not self._shelved)
 
 
 # ---- poses and maps ---------------------------------------------------------
