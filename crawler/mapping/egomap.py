@@ -19,14 +19,15 @@ to the downsample.
   codes   uint8 (SIZE, SIZE): grid.UNKNOWN / FREE / OCCUPIED
   trail   uint8 (SIZE, SIZE): where the truck has been in the last TRAIL_S,
           255 now fading to 1 at TRAIL_S, 0 never (or longer ago)
-  present whether the pose this crop is drawn at is one to trust: tracking
-          and matched. A crop that is not present goes in as no map.
+  present whether the pose this crop is drawn at is one to trust: matched,
+          tracking or tilted (see trusted). A crop that is not present goes
+          in as no map.
 
 The input
 ---------
 (1, CHANNELS, SIZE, SIZE) float32: occupied, free, unknown, trail / 255,
 and a plane of present. No map -- no --slam, a crop older than STALE_S, a
-pose that is not tracking -- is every value 0, present included.
+pose that is not trusted -- is every value 0, present included.
 
 Mirroring: column c and column SIZE - 1 - c swap; the trainer's flip
 augmentation flips the last axis, and nothing else moves.
@@ -57,9 +58,20 @@ class Crop(NamedTuple):
     trail: np.ndarray     # uint8 (SIZE, SIZE)
 
 
+# The states a matched pose is good in. Tilted is the map's write gate, not
+# the pose's: the scan still matched, only it is not written, so the crop is
+# the map as last written at a pose that keeps updating. Leaving tilted out
+# parked the car on "map lost" whenever the chassis sat rolled past the
+# 5.5 degree gate after a knock: 9 of the 11 stops on 2026-10-29 17:46Z,
+# rolled 6 to 8 degrees, with 659 of 668 tilted scans matched (median
+# inliers 0.89).
+TRUSTED_STATES = ("tracking", "tilted")
+
+
 def trusted(res) -> bool:
-    """A Result whose pose a crop may be drawn at."""
-    return res is not None and res.state == "tracking" and bool(res.matched)
+    """A Result whose pose a crop may be drawn at: matched, and tracking or
+    tilted. Lost, rolled and no_points never are."""
+    return res is not None and res.state in TRUSTED_STATES and bool(res.matched)
 
 
 class EgoMap:

@@ -32,6 +32,9 @@ lidar.LidarReader), and every call returns at once:
                     `constraint` (a corridor, an open space) is not, and the
                     fallback is the lidar's own car-frame scan
                     (LidarReader.latest().bins) and following a person.
+                    The policy's map input also drives on tilted and
+                    matched: the map as last written, at a pose still
+                    tracked (egomap.trusted).
   runner.pose()     (x, y, yaw) of that, or None
   runner.map()      a MapView, at most a second old: uint8 codes per 10 cm
                     pixel, grid.UNKNOWN / FREE / OCCUPIED, and where pixel

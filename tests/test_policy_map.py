@@ -418,3 +418,194 @@ def test_the_safety_layer_still_cuts_a_map_models_throttle():
     assert not d.recovering(T0 + 3.0), "no standoff back-out"
     assert d.controller.steerings[-1][0] == pytest.approx(0.5 * pl.STEER_SCALE), \
         "the model keeps its steering under the hold"
+
+
+# --- a chassis left sitting tilted is not a lost map ----------------------------------
+
+def _result(**kw):
+    from crawler.mapping.slam import Result
+    base = Result(t=0.0, x=0.0, y=0.0, yaw=0.0, state="tracking", matched=True,
+                  written=True, why="", inliers=1.0, rms_m=0.0, constraint=0.4,
+                  returns=700, points=600, ground_dropped=0, tilt_deg=0.0, iters=3, ms=1.0)
+    return base._replace(**kw)
+
+
+def test_a_crop_at_a_tilted_but_matched_pose_is_present():
+    """Tilted is the write gate, not the pose: the scan still matched, so the
+    crop drawn at it is one to drive on, off the map as it was last written.
+    A tilted scan that did not match, lost and rolled are still no map."""
+    g = wall_grid(1.0)
+    ego = em.EgoMap()
+    tilted = _result(t=1.0, state="tilted", written=False, why="tilted",
+                     tilt_deg=7.5, roll_deg=7.5)
+    crop = ego.after_step(g, tilted)
+    assert crop.present
+    assert em.encode(crop, 1.05)[0, em.PRESENT].all()
+    assert not ego.after_step(g, tilted._replace(t=1.1, matched=False)).present
+    assert not ego.after_step(g, tilted._replace(t=1.2, state="lost")).present
+    assert not ego.after_step(g, tilted._replace(t=1.3, state="rolled", matched=False)).present
+
+
+class LiveSlam:
+    """The runner's face over a real Slam and EgoMap, stepped by the test."""
+
+    def __init__(self):
+        from crawler.mapping import slam as sl
+        from crawler.mapping.imu import ImuTrack
+        self.imu = ImuTrack()
+        self.slam = sl.Slam(imu=self.imu)
+        self.ego = em.EgoMap()
+        self.c = None
+        self.res = None
+
+    def step(self, t, up):
+        from test_mapping import drive
+        self.res = drive(self.slam, 1, t0=t - PERIOD, imu=self.imu, up=up)[-1]
+        self.c = self.ego.after_step(self.slam.grid, self.res)
+        return self.res
+
+    def crop(self):
+        return self.c
+
+    def latest(self):
+        return self.res
+
+    def stats(self):
+        return {"alive": True}
+
+
+def test_a_map_model_drives_on_through_a_chassis_left_tilted():
+    """The drive of 2026-10-29 17:46Z: after a knock the truck sat rolled 6 to
+    8 degrees, past the 5.5 degree roll gate, so every scan came back tilted
+    (matched, not written), no crop was present, and a second later the car
+    was parked on "map lost" until I took over. Measured there, 659 of 668
+    tilted scans matched, median inliers 0.89. Here: a real Slam, level for
+    2 s, then rolled 7.5 degrees and held there for 4 s. The pose keeps
+    tracking, the model is fed the map every tick, and the car never stops."""
+    from test_mapping import LEVEL, err_vs_truth, rolled_up
+    live = LiveSlam()
+    model = MapStub(FORWARD, steer=0.2)
+    d = driver(model, live)
+    t = 0.0
+    for _ in range(20):
+        t = round(t + PERIOD, 6)
+        live.step(t, LEVEL)
+        d.tick(t + 0.01)
+    up = rolled_up(7.5)
+    for _ in range(40):
+        t = round(t + PERIOD, 6)
+        res = live.step(t, up)
+        assert res.state == "tilted" and res.matched and not res.written, \
+            "the premise: past the roll gate, matched, not written"
+        d.tick(t + 0.01)
+        assert d.last_decision.reason == "model", f"{t:.1f} s: {d.last_decision.reason}"
+        assert d.controller.throttles[-1] > 0
+        assert model.fed[-1][0, em.PRESENT].all()
+    pos_err, _ = err_vs_truth(res)
+    assert pos_err < 0.05, "the pose kept tracking under the tilt"
+
+
+def test_a_really_lost_map_still_parks_the_car():
+    """The safety neutral stays for a SLAM that is genuinely lost."""
+    from test_mapping import LEVEL
+    live = LiveSlam()
+    d = driver(MapStub(FORWARD), live)
+    t = 0.0
+    for _ in range(20):
+        t = round(t + PERIOD, 6)
+        live.step(t, LEVEL)
+        d.tick(t + 0.01)
+    assert d.controller.throttles[-1] > 0
+    for _ in range(int(pl.MAP_LOST_S / PERIOD) + 3):
+        t = round(t + PERIOD, 6)
+        live.step(t, LEVEL)
+        live.c = live.c._replace(present=False)   # what a lost Result draws
+        d.tick(t + 0.01)
+    assert d.controller.throttles[-1] == 0 and d.last_decision.reason == "map lost"
+
+
+# --- every safety neutral in auto says why, once ------------------------------------
+
+def _neutral_lines(out):
+    return [ln for ln in out.splitlines() if ln.startswith("Auto ")]
+
+
+def test_a_safety_neutral_in_auto_is_logged_with_its_reason_and_rate_limited(capsys):
+    """A stop says why when it starts, again only every STOP_LOG_EVERY_S while
+    it lasts, and how long it lasted when the car moves again: the journal
+    of 10-29 had 15 takeovers and not one word on why the car had stopped."""
+    model, slam = MapStub(FORWARD), FakeSlam()
+    d = driver(model, slam)
+    slam.at(T0)
+    d.tick(T0)
+    capsys.readouterr()
+    t = T0
+    n = int((pl.MAP_LOST_S + pl.STOP_LOG_EVERY_S + 0.5) / 0.1)
+    for _ in range(n):
+        t += 0.1
+        slam.at(t, present=False)
+        d.tick(t)
+    lines = _neutral_lines(capsys.readouterr().out)
+    assert len(lines) == 2, lines
+    assert lines[0].startswith("Auto neutral - map lost")
+    assert lines[1].startswith("Auto still neutral - map lost")
+    t += 0.1
+    slam.at(t)
+    d.tick(t)
+    lines = _neutral_lines(capsys.readouterr().out)
+    assert len(lines) == 1 and lines[0].startswith("Auto driving again"), lines
+    assert "map lost" in lines[0]
+
+
+def test_a_flickering_stop_is_one_line_and_a_takeover_says_what_it_ended():
+    said = []
+    log = pl.StopLog(say=said.append)
+    t = 0.0
+    for _ in range(10):                      # stop, move, stop, move: 2 s
+        log.stopped("map lost", t)
+        log.moving(t + 0.1)
+        t += 0.2
+    assert said[0] == "Auto neutral - map lost"
+    assert [s for s in said if s.startswith("Auto neutral")] == said[:1], said
+    t = pl.STOP_LOG_EVERY_S + 1.0
+    log.stopped("map lost", t, "slam tilted, pitch 0.2 roll 7.9")
+    assert said[-1] == ("Auto neutral - map lost (slam tilted, pitch 0.2 roll 7.9), "
+                        "9 more since the last line")
+    log.taken(t + 2.5)
+    assert said[-1] == "Auto takeover after 2.5 s of map lost"
+    n = len(said)
+    log.moving(t + 3.0)
+    assert len(said) == n, "the takeover already ended it"
+
+
+def test_a_stop_under_my_trigger_is_not_logged(capsys):
+    model, slam = MapStub(FORWARD), FakeSlam()
+    d = driver(model, slam)
+    d.human_throttle = True
+    t = T0
+    for _ in range(int(pl.MAP_LOST_S / 0.1) + 5):
+        t += 0.1
+        slam.at(t, present=False)
+        d.tick(t)
+    assert d.last_decision.reason == "map lost"
+    assert not _neutral_lines(capsys.readouterr().out)
+
+
+def test_a_floor_blip_is_quiet_and_a_floor_hold_is_logged(capsys):
+    wall = clear()
+    wall[150:350, 220:420] = 300
+    model, slam = MapStub(FORWARD), FakeSlam()
+    d = driver(model, slam, depth=wall)
+    t = T0
+    for _ in range(3):
+        slam.at(t)
+        d.tick(t)
+        t += 0.1
+    assert d.last_decision.reason == "model floor"
+    assert not _neutral_lines(capsys.readouterr().out), "a short hold says nothing"
+    for _ in range(int(pl.FLOOR_LOG_AFTER_S / 0.1) + 2):
+        slam.at(t)
+        d.tick(t)
+        t += 0.1
+    lines = _neutral_lines(capsys.readouterr().out)
+    assert len(lines) == 1 and lines[0].startswith("Auto neutral - model floor"), lines

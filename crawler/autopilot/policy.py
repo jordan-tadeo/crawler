@@ -414,10 +414,84 @@ REVERSE_STEER = 0.7      # the commit's front servo command, my median reversing
 # floor.
 REVERSE_REFRACTORY_S = 1.5
 # A map model goes neutral ("map lost") after this long with no trusted crop
-# (tracking and matched) fresher than egomap.STALE_S, and stays there until
-# one comes back. Lost does not recover once the truck has moved off, so in
-# practice that is a park.
+# (egomap.trusted: matched, tracking or tilted) fresher than egomap.STALE_S,
+# and stays there until one comes back.
 MAP_LOST_S = 1.0
+# The journal line for a stop (StopLog). A safety neutral in auto says why
+# when it starts, again every STOP_LOG_EVERY_S while it lasts, and how long
+# it lasted when the car moves again. A floor hold is the one safety zero that
+# comes in single-tick blips (18 of them in four minutes on 10-29, the longest
+# 0.3 s), so it is only said once it has held FLOOR_LOG_AFTER_S. The same
+# reason starting again inside STOP_LOG_EVERY_S of its last line is counted
+# and said with the next one, so a stop that flickers is one line, not ten.
+STOP_LOG_EVERY_S = 5.0
+FLOOR_LOG_AFTER_S = 1.0
+FLOOR_REASON = "model floor"
+# Not a safety stop: the model's own stop answer, committed (only a map
+# model's ever is). Said like a floor hold, once it has held a second, so a
+# car the model parks says that in the journal too.
+MODEL_STOP_REASON = "model stop"
+
+
+class StopLog:
+    """The journal's side of every auto stop, rate-limited.
+
+    stopped(reason, now, detail) on every tick the driver put the throttle at
+    0 for safety, moving(now) on every tick it did not. Nothing for a tick
+    under my trigger: the car is mine then, whatever the driver says.
+    """
+
+    def __init__(self, say=print, every_s=STOP_LOG_EVERY_S,
+                 floor_after_s=FLOOR_LOG_AFTER_S):
+        self.say = say
+        self.every_s = float(every_s)
+        self.floor_after_s = float(floor_after_s)
+        self.reset()
+
+    def reset(self):
+        self.reason = None      # the stop in progress, None while moving
+        self.since = None
+        self.said_at = None     # when this stop was last said, None if not yet
+        self._last_start = {}   # reason -> when a line last started a stop of it
+        self._quiet = {}        # reason -> stops of it started and not said
+
+    def _delay(self, reason):
+        return self.floor_after_s if reason in (FLOOR_REASON, MODEL_STOP_REASON) else 0.0
+
+    def taken(self, now):
+        """My hand took the throttle: a stop it ends is said, as a takeover."""
+        if self.reason is not None and self.said_at not in (None, -math.inf):
+            self.say(f"Auto takeover after {now - self.since:.1f} s of {self.reason}")
+        self.reason = self.since = self.said_at = None
+
+    def stopped(self, reason, now, detail=""):
+        if reason != self.reason:
+            self.moving(now)
+            self.reason, self.since, self.said_at = reason, now, None
+        held = now - self.since
+        tail = f" ({detail})" if detail else ""
+        if self.said_at is None:
+            if held < self._delay(reason) - 1e-6:
+                return
+            last = self._last_start.get(reason)
+            if last is not None and now - last < self.every_s - 1e-6:
+                # Said a moment ago: counted, not said again.
+                self._quiet[reason] = self._quiet.get(reason, 0) + 1
+                self.said_at = -math.inf    # this stop is accounted for
+                return
+            more = self._quiet.pop(reason, 0)
+            again = f", {more} more since the last line" if more else ""
+            self.say(f"Auto neutral - {reason}{tail}{again}")
+            self._last_start[reason] = now
+            self.said_at = now
+        elif self.said_at != -math.inf and now - self.said_at >= self.every_s - 1e-6:
+            self.say(f"Auto still neutral - {reason}, {held:.1f} s{tail}")
+            self.said_at = now
+
+    def moving(self, now):
+        if self.reason is not None and self.said_at not in (None, -math.inf):
+            self.say(f"Auto driving again after {now - self.since:.1f} s of {self.reason}")
+        self.reason = self.since = self.said_at = None
 # ---- action chunks ----------------------------------------------------------
 #
 # A chunk model (sidecar "chunk": K > 1) answers for this decision and the
@@ -1285,6 +1359,8 @@ class PolicyDriver(dv.Driver):
         self._last_reverse_at = None
         self.reverse_refractory = False
         self._rear_said = False
+        # Why the car is stopped, in the journal (StopLog).
+        self.stop_log = StopLog()
 
     def abort(self):
         """Driver's abort, and the mode latch forgets the pad: the next tick
@@ -1299,6 +1375,50 @@ class PolicyDriver(dv.Driver):
         self._last_reverse_at = None
         self._map_good_at = None
         self.ensembler.reset()
+        self.stop_log.reset()
+
+    def _stop_detail(self):
+        """What the journal line for a stop carries besides its reason: the
+        SLAM state and the tilt it read, else the camera IMU's tilt. Never
+        raises; "" when there is nothing to say."""
+        try:
+            res = self.slam.latest() if self.slam is not None else None
+            if res is not None:
+                return (f"slam {res.state}, pitch {float(res.pitch_deg):.1f} "
+                        f"roll {float(res.roll_deg):.1f}")
+            up = (self._imu_sample or {}).get("up")
+            if up is not None and len(up) == 3:
+                _, uy, uz = (float(v) for v in up)
+                pitch = abs(math.degrees(math.asin(max(-1.0, min(1.0, uz)))))
+                roll = abs(math.degrees(math.asin(max(-1.0, min(1.0, uy)))))
+                return f"pitch {pitch:.1f} roll {roll:.1f}"
+        except Exception:
+            pass
+        return ""
+
+    def _say_stop(self, reason):
+        """The stop log for a tick the driver put the throttle at 0. Never
+        raises: it runs on the neutral path too."""
+        try:
+            if self._now is None:
+                return
+            if self.human_throttle:
+                self.stop_log.taken(self._now)
+            else:
+                self.stop_log.stopped(reason, self._now, self._stop_detail())
+        except Exception:
+            pass
+
+    def _say_moving(self):
+        try:
+            if self._now is None:
+                return
+            if self.human_throttle:
+                self.stop_log.taken(self._now)
+            else:
+                self.stop_log.moving(self._now)
+        except Exception:
+            pass
 
     def _map_lost(self, good_t, now):
         """A map model whose newest trusted crop (good_t, the time it was
@@ -1390,6 +1510,7 @@ class PolicyDriver(dv.Driver):
         self._reset_standoff()
         self._prev = (STOP, 0.0, 0.0)
         self._note(Decision(STOP, 0.0, 0.0, None, reason))
+        self._say_stop(reason)
 
     def _note(self, decision):
         """Leave the decision behind for telemetry, as the autopilot does.
@@ -1512,6 +1633,7 @@ class PolicyDriver(dv.Driver):
             self.floor_veto.observe(self.last_scan, now)
             self._commanded(self._backout_throttle, now)
             self._reset_standoff()
+            self._say_moving()
             if self._backout_throttle < 0.0 or self.rear_stop:
                 self._last_reverse_at = now
             return
@@ -1754,6 +1876,12 @@ class PolicyDriver(dv.Driver):
         self.controller.set_steering(*pair)
         self.controller.set_throttle(throttle)
         self._commanded(throttle, now)
+        if reason == "model floor":
+            self._say_stop(FLOOR_REASON)
+        elif throttle == 0.0 and action == STOP:
+            self._say_stop(MODEL_STOP_REASON)
+        else:
+            self._say_moving()
         if throttle > 0.0:
             if self._throttle_since is None:
                 self._throttle_since = now
