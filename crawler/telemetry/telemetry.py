@@ -414,6 +414,18 @@ JSON_SCHEMAS = {
         # A direction-head model's [left, straight, right] probabilities on
         # its last answer; all -1 for a regression head, 0 when no policy drives.
         "policy_steer_dir_p": {"type": "array", "items": _NUM, "minItems": 3, "maxItems": 3},
+        # The back-out, either autopilot (driver.Driver.backout_fields): its
+        # phase (reverse / settle / handback, "" with none), what started it,
+        # why its reverse ended, time since it began, how long the reverse
+        # lasted, its side, this decision's throttle and its escalation level.
+        "backout_phase": _STR,
+        "backout_reason": _STR,
+        "backout_exit": _STR,
+        "backout_elapsed_s": _NUM,
+        "backout_reverse_s": _NUM,
+        "backout_side": _NUM,
+        "backout_speed": _NUM,
+        "backout_level": _INT,
     }),
     # One revolution of the roof lidar, see crawler/hardware/lidar.py. bins
     # is lidar.BINS nearest ranges in mm from the middle of the car, bin i

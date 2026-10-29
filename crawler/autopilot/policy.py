@@ -112,7 +112,8 @@ gets neutral, not that.
 A reverse is the model's, tick by tick: reverse_speed times its magnitude,
 on its steering, decided again at the next 10 Hz tick like every other
 answer -- except the first REVERSE_COMMIT_S of a fresh one (below). The
-canned 2 s recover is kept for STUCK and for a standoff with the floor.
+driver's back-out (driver.Driver.begin_recover) runs for STUCK and for a
+standoff with the floor.
 
 Steering is in manual's units, a fraction of STEER_SCALE (main's
 STEERING_LIMIT_PERC, 70%), not of the autopilot's max_turn 0.6: the labels
@@ -331,11 +332,12 @@ CONF_EMA_DECISIONS = 5   # EMA length in decisions; 5 at 10 Hz is about 0.5 s
 # under them is left where it was. Not calibrated: deploy/speed_cal.py
 # measures the real ones at full lock and has never been run into this file.
 # Forward 0.2 is the start threshold the first record session found (driver.py,
-# above FORWARD_SPEED). Reverse 0.6 is the old REVERSE_SPEED, which drove
-# every backup-and-turn recover with the wheels turned; -0.2957 barely moved
-# straight and did not move at lock.
+# above FORWARD_SPEED), and my drives since agree with it. Reverse was 0.6, the
+# old REVERSE_SPEED, borrowed; my drives bracket the real one at about 0.40
+# (driver.REVERSE_MOVING_FLOOR, ESTIMATED), so this is the back-out's own
+# escape magnitude, a little over it.
 MOVING_FLOOR_FORWARD = 0.2
-MOVING_FLOOR_REVERSE = 0.6
+MOVING_FLOOR_REVERSE = -dv.ESCAPE_SPEED
 
 # ---- the standoff: the model pushing forward into the floor ----------------
 #
@@ -354,9 +356,13 @@ STANDOFF_S = 1.0         # a floor hold this long runs the STUCK recover
 # again. Every stop still ends it at once. I tune these by feel.
 REVERSE_COMMIT_S = 0.7   # how long a fresh reverse is held; 7 ticks, my median run
 REVERSE_STEER = 0.7      # the commit's front servo command, my median reversing; full lock
-REVERSE_TURN_MIN = 0.15  # a front past this is a turn, not straight (servo units)
-REVERSE_TURN_WINDOW_S = 1.5  # a turning forward this recent sets the commit's side
-REVERSE_DEFAULT_SIDE = -1.0  # with no turn to go on: left, as I did 15 of 19 times
+# The side rule is the back-out's too, so it lives in driver.py, with these
+# three: a front past REVERSE_TURN_MIN is a turn (servo units), a turning
+# forward inside REVERSE_TURN_WINDOW_S sets the side, and with none it is
+# REVERSE_DEFAULT_SIDE, left, as I did 15 of 19 times.
+REVERSE_TURN_MIN = dv.REVERSE_TURN_MIN
+REVERSE_TURN_WINDOW_S = dv.REVERSE_TURN_WINDOW_S
+REVERSE_DEFAULT_SIDE = dv.REVERSE_DEFAULT_SIDE
 
 
 def legacy_levels_to_mm(levels):
@@ -551,15 +557,10 @@ def reverse_commit_front(turn_front, turn_age_s, model_front):
       else               REVERSE_DEFAULT_SIDE
 
     turn_front is None when there has been no turn; turn_age_s is how long
-    ago it was. Positive is right, as everywhere.
+    ago it was. Positive is right, as everywhere. The side is
+    driver.reverse_side(), the rule the back-out reverses on too.
     """
-    if (turn_front is not None and turn_age_s <= REVERSE_TURN_WINDOW_S
-            and abs(turn_front) > REVERSE_TURN_MIN):
-        side = -math.copysign(1.0, turn_front)
-    elif abs(model_front) > REVERSE_TURN_MIN:
-        side = math.copysign(1.0, model_front)
-    else:
-        side = REVERSE_DEFAULT_SIDE
+    side = dv.reverse_side(turn_front, turn_age_s, model_front)
     return side * min(REVERSE_STEER, STEER_SCALE)
 
 
@@ -963,10 +964,8 @@ class PolicyDriver(dv.Driver):
         self._commit_since = None
         self._commit_magnitude = 0.0
         self._commit_front = 0.0
-        # The last forward this driver drove with a turn in it, and when: the
-        # commit's side comes off it.
-        self._turn_front = None
-        self._turn_at = None
+        # The last forward with a turn in it (Driver._turn_front / _turn_at)
+        # is Driver's: the commit's side and the back-out's both come off it.
         # What the IMU said this tick, for the commit's rear bumper.
         self._evidence = dv.UNKNOWN
 
@@ -1108,14 +1107,23 @@ class PolicyDriver(dv.Driver):
         }
 
     def _recover(self, now, reason):
-        """The canned backup-and-turn, for STUCK and for a standoff with the
-        floor. Every other reverse is the model's own."""
+        """The back-out (driver.Driver.begin_recover), for STUCK and for a
+        standoff with the floor. Every other reverse is the model's own.
+
+        The model is not asked whether to stop backing out. The camera is:
+        the back-out ends when the scan says the way forward is open with
+        margin. A standoff is the model insisting on a forward the floor will
+        not allow, so "the model would go forward" is what it was already
+        saying and is no evidence the way is open; and a model that wants to
+        reverse again once it has the car back can, through its own commit.
+        """
         self._end_commit()
         self._standoff_since = None   # standoff_ticks stays on this row
-        self._note(Decision(REVERSE, 1.0, 0.0, None, reason, self.reverse_speed, 0.0))
+        self.begin_recover(now, reason)
+        self._note(Decision(REVERSE, 1.0, 0.0, None, reason,
+                            self._backout_throttle, self._turn_dir))
         self._prev = (REVERSE, 1.0, 0.0)
-        self.begin_recover(now)
-        self._commanded(self.reverse_speed, now)
+        self._commanded(self._backout_throttle, now)
 
     def _commanded(self, throttle, now):
         """Tell the floor veto what this driver just put on the throttle.
@@ -1138,10 +1146,12 @@ class PolicyDriver(dv.Driver):
             print("Goal reached - stopping." if self.goal_reached
                   else "Goal no longer reached - driving on.")
         if self.recovering(now):
-            # The recover's reverse, then its settle at 0, as the veto's
-            # record of what the wheels were told.
-            self._commanded(self.reverse_speed
-                            if self._phase == dv._PHASE_REVERSE else 0.0, now)
+            # The back-out's reverse, then its settle at 0, as the veto's
+            # record of what the wheels were told, and the scan it made, so
+            # the latch sees the car back away.
+            self.floor_veto.forward_speed = self.forward_speed
+            self.floor_veto.observe(self.last_scan, now)
+            self._commanded(self._backout_throttle, now)
             self._reset_standoff()
             return
         # My hand on either group ends a commit: the pad wins, and when I let
@@ -1294,6 +1304,15 @@ class PolicyDriver(dv.Driver):
         # magnitude, steer and rear are already known finite and in range,
         # so none of these can exceed a cap or STEER_SCALE.
         front = steer * STEER_SCALE
+        if (action == FORWARD and rear is None
+                and not (self.human_throttle or self.human_steering)):
+            # Just handed back by a back-out: lean toward the side that
+            # opened, on top of the model's steer, for HANDBACK_S. The bias
+            # is the driver's own finite number, and the sum is held to the
+            # servo range the model's steer is.
+            lean = self.handback_bias(now) * self.max_turn
+            if lean:
+                front = float(np.clip(front + lean, -STEER_SCALE, STEER_SCALE))
         if rear is not None:
             pair = (front, rear * STEER_SCALE)
         elif self.mode.split:

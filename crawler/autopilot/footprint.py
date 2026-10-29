@@ -100,20 +100,42 @@ AUTOPILOT_FIELDS = {
     "standoff_ticks": 0,         # decisions in a row the floor held a model forward
     # The direction head's [left, straight, right]; all -1 for a regression head.
     "policy_steer_dir_p": [0.0, 0.0, 0.0],
+    # The back-out (driver.Driver.begin_recover), for either autopilot.
+    "backout_phase": "",         # reverse / settle / handback, "" with none
+    "backout_reason": "",        # stuck / standoff / obstacle: what started it
+    "backout_exit": "",          # opened / bumper / cap / no frame / abort
+    "backout_elapsed_s": 0.0,    # since the current one began, 0 with none
+    "backout_reverse_s": 0.0,    # how long its reverse lasted, once it ended
+    "backout_side": 0.0,         # the side it reversed on, -1 left, +1 right
+    "backout_speed": 0.0,        # what it put on the throttle this decision
+    "backout_level": 0,          # escalation: 0, then 1, 2... at the same spot
 }
 
 
-def autopilot_fields(driver):
+def _driver_fields(driver, now):
+    """The driver's own fields for the row: the back-out's, then the
+    policy's when it is one. Each read off a method the driver has, never
+    a call that could command anything."""
+    out = {}
+    backout = getattr(driver, "backout_fields", None)
+    if backout is not None:
+        out.update(backout(now))
+    policy = getattr(driver, "policy_fields", None)
+    if policy is not None:
+        out.update(policy())
+    return out
+
+
+def autopilot_fields(driver, now=None):
     """AUTOPILOT_FIELDS for a row, off the auto driver (None in record)."""
     out = dict(AUTOPILOT_FIELDS)
     if driver is None:
         return out
     out["autopilot"] = "rules"
-    fields = getattr(driver, "policy_fields", None)
-    if fields is None:
-        return out
     try:
-        for key, value in fields().items():
+        if getattr(driver, "policy_fields", None) is not None:
+            out["autopilot"] = "policy"
+        for key, value in _driver_fields(driver, now).items():
             if key in out:
                 if isinstance(out[key], bool):
                     out[key] = bool(value)
@@ -132,7 +154,8 @@ def autopilot_fields(driver):
                 else:
                     out[key] = _num(value, 0.0)
     except Exception:
-        out["autopilot"] = "policy"
+        out["autopilot"] = ("policy" if getattr(driver, "policy_fields", None)
+                            is not None else "rules")
     return out
 
 
@@ -290,12 +313,13 @@ class FootprintTap:
               throttle_by, takeover, pad_throttle, limits):
         """A row on every pass where the driver made a new scan.
 
-        The driver's tick is already gated at 10 Hz, so this is too. A recover
-        makes no scan and so makes no row of the driver's: those 2.5 seconds
-        are a fixed manoeuvre, not a decision. Unless my hand has a group --
-        then what it does during the manoeuvre is a correction, which is the
-        most useful label there is, so the row comes off our own view at the
-        decision rate, exactly as in record, marked source "tap".
+        The driver's tick is already gated at 10 Hz, so this is too. A back-out
+        scans every decision too (that is how it knows the way opened), so its
+        rows are the driver's, with the backout_* fields set. A pass in a
+        recover with no new scan of the driver's and my hand on a group still
+        makes a row: what my hand does there is a correction, the most useful
+        label there is, so the row comes off our own view at the decision rate,
+        exactly as in record, marked source "tap".
         """
         if driver is None or self.tele is None:
             return None
@@ -321,7 +345,7 @@ class FootprintTap:
             committed=getattr(driver, "last_verdict", None),
             steering_mode=steering_mode, steer_by=steer_by,
             throttle_by=throttle_by, pad_throttle=pad_throttle,
-            limits=limits, autopilot=autopilot_fields(driver))
+            limits=limits, autopilot=autopilot_fields(driver, now))
         return self._offer(row, now, depth)
 
     # ---- record: our own scan, my hands' command -------------------------
@@ -358,7 +382,7 @@ class FootprintTap:
                           scan_ms, pad_throttle=pad_throttle, limits=limits,
                           steering_mode=steering_mode, steer_by=steer_by,
                           throttle_by=throttle_by,
-                          autopilot=autopilot_fields(driver))
+                          autopilot=autopilot_fields(driver, now))
         if mode != RECORD:
             return self._offer(row, now, depth)
 

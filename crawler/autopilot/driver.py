@@ -30,11 +30,16 @@ halfway through a reverse.
 The reverse phase reads the IMU as it goes. Nothing on this car points
 backwards, so backing up is blind -- but the gyro is a contact sensor: a car
 commanded in reverse that has stopped shaking has hit something, and the
-reverse can end there instead of pushing for the rest of its two seconds.
+reverse can end there instead of pushing on.
+
+And it reads the camera. The recover is a back-out now (the block below
+REVERSE_SPEED): slow, on the side my own reversing picks, ended when the way
+forward has opened rather than after a fixed two seconds, and handed back
+leaning toward the side that opened. A back-out soon after the last one is
+the same spot, and it escalates instead of repeating.
 """
 
 import math
-import random
 import time
 from typing import NamedTuple
 
@@ -44,8 +49,11 @@ import numpy as np
 _PHASE_REVERSE = "reverse"
 _PHASE_SETTLE = "settle"
 
-# How long each phase holds. These two came out of the original recover()'s
-# asyncio.sleep() calls, so it is the same feel, just not blocking.
+# How long each phase may hold. These two came out of the original
+# recover()'s asyncio.sleep() calls. SETTLE_SECONDS is still exactly that.
+# REVERSE_SECONDS is not a duration any more, it is the cap: the reverse ends
+# when the way forward opens (see "The back-out", below REVERSE_SPEED), and
+# two seconds is only how long it is allowed to go on looking.
 REVERSE_SECONDS = 2.0
 SETTLE_SECONDS = 0.5
 
@@ -213,6 +221,17 @@ STUCK_ARM_SECONDS = 1.0
 # is: the loop does not always make its rate, and a count can only ever take
 # longer in real time, never fire early.
 REVERSE_STALL_SAMPLES = 4
+
+# What "not shaking" means to the rear bumper, which is not what it means to
+# the forward detector. Off my drives: a car held at -0.3, which does not move
+# it, reads over GYRO_MOVING_MIN 0.010 on 61% of samples (the ESC buzzing the
+# chassis), against 0.002 parked and at least 0.33 when it really reverses.
+# So at a slow reverse the forward threshold would read a stalled car as
+# moving and the bumper would never fire. 0.1 sits between the buzz and real
+# reversing. ESTIMATED: real reversing was measured at full reverse, and a
+# reverse at ESCAPE_SPEED -0.45 shakes less; if it reads under 0.1 the bumper
+# cuts every back-out at 0.8 s, which the journal line will show.
+REVERSE_GYRO_STILL_MAX = 0.1  # rad/s
 
 
 # ---------------------------------------------------------------------------
@@ -1084,6 +1103,178 @@ REVERSE_SPEED = -1.0
 
 
 # ---------------------------------------------------------------------------
+# The back-out: how every recover reverses
+# ---------------------------------------------------------------------------
+#
+# The recover used to be two seconds at REVERSE_SPEED, full reverse, on a
+# random one of four steering angles, cut short only by the gyro. It did not
+# look at anything, so it went on backing up long after the way forward had
+# opened, and it backed up the same way into the same corner as often as not.
+# The camera points forward and it is still live while the car reverses, so
+# the back-out watches the thing it is backing away from and stops when the
+# way past it is open.
+#
+#   slow        ESCAPE_SPEED, eased in over ESCAPE_RAMP_DECISIONS, never -1.0
+#   steered     on the side my own reversing picks (reverse_side), not a coin
+#   watched     ends when backout_opened() says the way forward is clear for
+#               BACKOUT_OPEN_DECISIONS decisions in a row, after BACKOUT_MIN_S;
+#               the rear bumper still cuts it, and REVERSE_SECONDS caps it
+#   handed back the wheels come back leaning toward the side that opened,
+#               HANDBACK_STEER of max_turn, gone over HANDBACK_S
+#   escalated   another back-out within ESCALATE_WINDOW_S of the last one is
+#               the same spot: it reverses longer, and from the second repeat
+#               on it alternates sides, which is a three-point turn
+#
+# Every number in this block is a feel number and mine to judge on the floor.
+
+# The least reverse throttle that moves the car, as a magnitude. ESTIMATED,
+# bracketed off my recorded drives (decoded depth at each held reverse):
+# -0.24 to -0.30 left the depth unchanged on 9 of 10 holds, -0.41 to -0.49
+# moved it 6 of 6. So the floor is somewhere in 0.30-0.41; 0.40 is the top of
+# that, the conservative end. Not measured at full lock on its own.
+REVERSE_MOVING_FLOOR = 0.40
+
+# How fast it reverses: just past REVERSE_MOVING_FLOOR, so it is slow but
+# still moves the car with the wheels at lock, where the back-out always is.
+# Was -1.0 (REVERSE_SPEED, full reverse). This is the one line to change.
+ESCAPE_SPEED = -0.45
+
+# The ease-in, counted in decisions (10 Hz, AUTO_TICK_INTERVAL), not loop
+# ticks: half, then all of ESCAPE_SPEED. The first step is under the moving
+# floor and does not move the car; that is the cost of not stepping the ESC
+# straight to the escape pulse, and it is 0.1 s. There is no ease-off at the
+# other end: ESCAPE_SPEED already sits just over the floor, so slowing for
+# the exit would be stopping, and the exit is a stop anyway.
+ESCAPE_RAMP_DECISIONS = 2
+
+# How open "open" is. The rules reverse on anything inside CLEARANCE_MM and
+# the policy's floor holds at FORWARD_FLOOR_MM, so a back-out that ended the
+# moment the fan cleared 400 mm would hand back a car one tick from reversing
+# again. 600 is 200 mm past the budget: about half a second of driving at the
+# ESTIMATED 420 mm/s of forward 0.4 before anything trips, and still well
+# inside the 899 mm an open probe reads off the floor, so open floor passes.
+BACKOUT_OPEN_MM = 600.0
+
+# Open for this many decisions in a row before the reverse ends: one frame
+# of a doorway is not a doorway. 0.3 s.
+BACKOUT_OPEN_DECISIONS = 3
+
+# The shortest reverse, so a fan that reads open on the first frame does not
+# make the car twitch backwards and straight back in. STUCK gets longer: a
+# stick is something the camera did not see (a rock under the chassis, a
+# wheel on a lip), so an open fan says nothing about whether the car is free,
+# and only distance does.
+BACKOUT_MIN_S = 0.5
+BACKOUT_STUCK_MIN_S = 1.0
+
+# The cap, REVERSE_SECONDS 2.0 at the top of this file, read as distance.
+# Off my 29 recorded recovers (all of them standoffs): at full reverse the
+# forward floor let go after median 0.49 s, p90 0.77 s, and every probe
+# cleared after median 0.72 s, p90 1.09 s -- about 120 mm median and 190 mm
+# p90 of travel, ESTIMATED. Reverse ground speed at -0.45 is not measured; if
+# it is half of full reverse's, 2.0 s covers the p90 with a little room. 21 of
+# the 29 ran the old timer to the end, so the cap is the exception now, not
+# the rule, and escalation has the long one.
+
+# Escalation. A back-out that starts within ESCALATE_WINDOW_S of the end of
+# the last one is taken to be the same spot -- there is no odometry, so time
+# is the proxy -- and the level goes up by one; otherwise it is 0. From level
+# 1 the reverse is held at least ESCALATED_MIN_S and capped at
+# ESCALATED_REVERSE_SECONDS; from level 2 each one takes the other side from
+# the one before.
+ESCALATE_WINDOW_S = 5.0
+ESCALATED_MIN_S = 1.0
+ESCALATED_REVERSE_SECONDS = 3.0
+
+# The hand-back: a fraction of max_turn toward the side that opened, decaying
+# to nothing over HANDBACK_S, added to whatever the driver steers. 0.5 is
+# 0.3 servo at the start, past REVERSE_TURN_MIN, so the next reverse (if there
+# is one) reads it as the forward turn it was and keeps turning the same way.
+HANDBACK_STEER = 0.5
+HANDBACK_S = 1.0
+
+# Which way to reverse, off my own record data (policy.reverse_commit_front
+# has the numbers): opposite the last forward turn, 83 of 85 times when I had
+# turned within REVERSE_TURN_WINDOW_S; the clearer side was a coin. Servo
+# units, both of them: the policy's front is a fraction of 0.7 and the
+# autopilot's of max_turn, and both are servo commands by the time they are
+# remembered.
+REVERSE_TURN_MIN = 0.15      # a front past this is a turn, not straight
+REVERSE_TURN_WINDOW_S = 1.5  # a turning forward this recent sets the side
+REVERSE_DEFAULT_SIDE = -1.0  # with no turn to go on: left, as I did 15 of 19 times
+
+# Why a back-out's reverse ended.
+EXIT_OPENED = "opened"
+EXIT_BUMPER = "bumper"
+EXIT_CAP = "cap"
+EXIT_NO_FRAME = "no frame"
+EXIT_ABORT = "abort"
+
+# What started one.
+BACKOUT_STUCK = "stuck"
+BACKOUT_STANDOFF = "standoff"
+BACKOUT_OBSTACLE = "obstacle"
+
+# The phase after the settle, for telemetry only: recover no longer owns the
+# wheels, but the hand-back bias is still on them.
+HANDBACK = "handback"
+
+
+def reverse_side(turn_front, turn_age_s, fallback_front=0.0) -> float:
+    """Which side to reverse on, -1.0 left or +1.0 right. Pure.
+
+      a forward turn (|front| > REVERSE_TURN_MIN) inside REVERSE_TURN_WINDOW_S
+                         the other side, so the car keeps yawing one way
+      else fallback_front, if it is past REVERSE_TURN_MIN
+                         its side (the policy passes the model's own steer)
+      else               REVERSE_DEFAULT_SIDE
+
+    turn_front is None when there has been no turn. A non-finite anything is
+    treated as no evidence, so a nan can never pick a side.
+    """
+    try:
+        tf = None if turn_front is None else float(turn_front)
+        age = float(turn_age_s)
+        fb = float(fallback_front)
+    except (TypeError, ValueError):
+        return REVERSE_DEFAULT_SIDE
+    if (tf is not None and math.isfinite(tf) and age <= REVERSE_TURN_WINDOW_S
+            and abs(tf) > REVERSE_TURN_MIN):
+        return -math.copysign(1.0, tf)
+    if math.isfinite(fb) and abs(fb) > REVERSE_TURN_MIN:
+        return math.copysign(1.0, fb)
+    return REVERSE_DEFAULT_SIDE
+
+
+def backout_opened(scan, side) -> str:
+    """Is the way forward open enough to stop reversing? Pure.
+
+    "" when it is not, otherwise how: "straight", or "left" / "right" for the
+    side the car is about to lean toward (`side`, -1 or +1). Nothing new
+    decides it; it is the rules' own answers asked with more room:
+
+      read_the_gradient() would drive forward -- nothing inside CLEARANCE_MM,
+      nothing unmeasurable anywhere in the fan;
+
+      and then either every probe is past BACKOUT_OPEN_MM (straight), or the
+      probes from the centre out to the `side` edge are, and turn_sweep_clears()
+      says a full-lock turn that way can begin. That one is the corner case:
+      the near side may still be close, but the car is about to turn away
+      from it.
+    """
+    if read_the_gradient(scan).action != ACT_FORWARD:
+        return ""
+    distance = np.asarray(scan.distance_mm, dtype=float)
+    if not np.all(distance >= BACKOUT_OPEN_MM):
+        half = PROBE_COLUMNS // 2
+        lean = distance[half:] if side > 0 else distance[:half + 1]
+        if side and np.all(lean >= BACKOUT_OPEN_MM) and turn_sweep_clears(scan, side):
+            return "right" if side > 0 else "left"
+        return ""
+    return "straight"
+
+
+# ---------------------------------------------------------------------------
 # The forward floor: the veto on a forward the rules autopilot did not choose
 # ---------------------------------------------------------------------------
 #
@@ -1148,12 +1339,18 @@ FLOOR_RELEASE_REVERSE_MM = REVERSE_FLOOR_MM
 # at -0.296 (170 us) reverse barely moved, and with the wheels turned not at
 # all, so this ESC's reverse starts much later than its forward and no
 # forward fit says anything about it. So a reverse counts only at or past
-# REVERSE_CREDIT_MIN, -0.5 (287 us, 1.7 times the pulse that barely moved),
-# and then only at REVERSE_CREDIT_MM_S, 164 mm/s, the slowest clean ground
-# speed this car has been measured at in either direction. At the -1.0 cap
-# that is ESTIMATED 1.22 s of backing up, about twelve ticks -- inside the
-# recover's own reverse. Both numbers err toward holding the latch longer.
-REVERSE_CREDIT_MIN = -0.5
+# REVERSE_CREDIT_MIN, the reverse moving floor (REVERSE_MOVING_FLOOR,
+# bracketed off my drives at about 0.40), and then at REVERSE_CREDIT_MM_S
+# times its magnitude: 164 mm/s at -1.0, the slowest clean ground speed this
+# car has been measured at in either direction, and proportionally less below
+# it. At the -1.0 cap that is ESTIMATED 1.22 s of backing up. At the
+# back-out's ESCAPE_SPEED -0.45 it is 74 mm/s and 2.7 s, longer than one
+# back-out's cap, so a probe that stays blind lets go over two of them; the
+# usual release is the probe reading a distance again, which needs no
+# estimate. This used to be a flat 164 mm/s from -0.5, which gave a slow
+# reverse no credit at all and a -0.5 one full-speed credit. Both numbers
+# still err toward holding the latch longer.
+REVERSE_CREDIT_MIN = -REVERSE_MOVING_FLOOR
 REVERSE_CREDIT_MM_S = 164.0
 
 
@@ -1298,9 +1495,9 @@ def floor_latch_moved(latch, travelled_mm) -> FloorLatch:
 def floor_travel_mm(throttle, seconds) -> float:
     """ESTIMATED travel at `throttle` for `seconds`, as the latch counts it.
 
-    Backwards at REVERSE_CREDIT_MM_S, and only at or past REVERSE_CREDIT_MIN;
-    forwards on the fast fit. Both choices keep a latch on longer, never
-    shorter.
+    Backwards at REVERSE_CREDIT_MM_S times the throttle's magnitude, and only
+    at or past REVERSE_CREDIT_MIN; forwards on the fast fit. Both choices
+    keep a latch on longer, never shorter.
     """
     if seconds <= 0.0:
         return 0.0
@@ -1309,7 +1506,7 @@ def floor_travel_mm(throttle, seconds) -> float:
     except Exception:
         return 0.0
     if math.isfinite(t) and t <= REVERSE_CREDIT_MIN:
-        return -REVERSE_CREDIT_MM_S * seconds
+        return -REVERSE_CREDIT_MM_S * min(1.0, -t) * seconds
     return ground_speed_mm_s(t) * seconds
 
 
@@ -1439,6 +1636,33 @@ class Driver:
         self._phase = None
         self._phase_until = 0.0
         self._turn_dir = 0.0
+
+        # The back-out (see the block above reverse_side). What started it,
+        # when, which side it reverses on, its escalation level, how many
+        # decisions it has commanded and how many of them in a row saw the
+        # way forward open. _backout_throttle is what it put on the throttle
+        # this decision, 0 in the settle; the policy shows it to its floor
+        # veto.
+        self._backout_reason = ""
+        self._backout_since = 0.0
+        self._backout_side = 0.0
+        self._backout_level = 0
+        self._backout_min_s = BACKOUT_MIN_S
+        self._backout_decisions = 0
+        self._backout_open = 0
+        self._backout_throttle = 0.0
+        self._backout_exit = ""
+        self._backout_reverse_s = 0.0
+        # When the last back-out handed the wheels back, for escalation.
+        self._backout_ended = None
+        # The hand-back lean: side (+-1) and when it started, None when off.
+        self._handback_side = 0.0
+        self._handback_since = None
+        # The last forward with a turn in it, servo units, and when: the
+        # back-out's side comes off it (reverse_side). The policy writes these
+        # too, off its own forwards.
+        self._turn_front = None
+        self._turn_at = None
 
         # The last footprint scan, and what it cost. Read-only bookkeeping for
         # whoever is publishing telemetry -- set as a side effect of the check
@@ -1664,39 +1888,81 @@ class Driver:
         """
         return bool(self.scan_footprint(depth_frame, threshold_mm).blocked.any())
 
-    def begin_recover(self, now):
-        """Start a backup-and-turn. Commands the first phase and returns."""
-        print("[Driver] reversing and turning")
+    def begin_recover(self, now, reason=BACKOUT_STUCK):
+        """Start a back-out. Commands its first decision and returns.
 
-        # Pick a random direction, and a random amount of it. The old version
-        # chose between max_turn/4 and max_turn -- two magnitudes, both
-        # positive -- so the car always pivoted the same way and a corner that
-        # beat it beat it forever. Both signs now.
-        self._turn_dir = random.choice([
-            -self.max_turn,
-            -self.max_turn / 4,
-            self.max_turn / 4,
-            self.max_turn,
-        ])
+        `reason` is what started it, for the journal and /footprint:
+        BACKOUT_STUCK, BACKOUT_STANDOFF or BACKOUT_OBSTACLE. A stick is the
+        one the camera cannot explain, so it gets the longer minimum.
+
+        The side is my own rule, reverse_side(), off the last forward turn --
+        no coin. A repeat inside ESCALATE_WINDOW_S of the last back-out is the
+        same spot: longer from level 1, the other side from level 2.
+        """
+        if (self._backout_ended is not None
+                and 0.0 <= now - self._backout_ended <= ESCALATE_WINDOW_S):
+            level = self._backout_level + 1
+        else:
+            level = 0
+        age = (now - self._turn_at) if self._turn_at is not None else math.inf
+        side = reverse_side(self._turn_front, age)
+        if level >= 2 and self._backout_side:
+            side = -self._backout_side
+        stuck = reason == BACKOUT_STUCK
+        min_s = BACKOUT_STUCK_MIN_S if stuck else BACKOUT_MIN_S
+        cap = REVERSE_SECONDS
+        if level >= 1:
+            min_s = max(min_s, ESCALATED_MIN_S)
+            cap = ESCALATED_REVERSE_SECONDS
+
+        self._backout_reason = str(reason)
+        self._backout_since = now
+        self._backout_side = side
+        self._backout_level = level
+        self._backout_min_s = min_s
+        self._backout_decisions = 0
+        self._backout_open = 0
+        self._backout_exit = ""
+        self._backout_reverse_s = 0.0
+        self._handback_side = 0.0
+        self._handback_since = None
+
+        print(f"[Driver] backing out ({reason}), "
+              f"{'right' if side > 0 else 'left'}, level {level}")
+
+        # At the bench lock, counter-phase, on the chosen side. Always lock:
+        # what the old random.choice could also pick was a quarter of it,
+        # which at a slow speed is a car that does not turn.
+        self._turn_dir = side * self.max_turn
         self.controller.set_steering(*steering_pair(self._turn_dir))
-        self.controller.set_throttle(self.reverse_speed)
+        self._backout_drive()
 
         self._phase = _PHASE_REVERSE
-        self._phase_until = now + REVERSE_SECONDS
+        self._phase_until = now + cap
         self._clear_motion_evidence()
         # Whatever the car was steering around, it is behind the decision now.
         self._clear_evade()
+
+    def _backout_drive(self):
+        """One decision's reverse throttle, on the ease-in. Never non-finite:
+        both factors are constants and a count."""
+        self._backout_decisions += 1
+        ramp = min(1.0, self._backout_decisions / float(ESCAPE_RAMP_DECISIONS))
+        throttle = float(ESCAPE_SPEED) * ramp
+        if not math.isfinite(throttle):
+            throttle = 0.0
+        self._backout_throttle = throttle
+        self.controller.set_throttle(throttle)
 
     def _rear_bumper_hit(self) -> bool:
         """Has the car reversed into something?
 
         There is no camera pointed backwards, so a reverse is blind -- but
         there is a contact sensor bolted to the car already and it is the
-        gyro. The car has been commanded in reverse at reverse_speed and the
-        chassis is
-        not shaking, so either the wheels are against something or it is up on
-        a ledge. Either way the reverse has stopped being useful and the two
-        remaining seconds of it are two seconds of pushing.
+        gyro. The car has been commanded in reverse and the chassis is not
+        shaking, so either the wheels are against something or it is up on
+        a ledge. Either way the reverse has stopped being useful and the rest
+        of it is pushing.
 
         Its own counter, never the forward detector's. Same sensor, same
         notion of motion -- I do not want two definitions of "is it moving" --
@@ -1724,6 +1990,15 @@ class Driver:
         if len(self.gyro_history) < self.imu_window_size:
             return False
 
+        # The same windows, judged against the reverse's own gyro line
+        # (REVERSE_GYRO_STILL_MAX): a reading is a reading, so UNKNOWN stays
+        # UNKNOWN, but what the forward detector calls moving can be an ESC
+        # buzzing a car that is not going anywhere.
+        if evidence != UNKNOWN:
+            shaking = (np.mean(self.gyro_history) > REVERSE_GYRO_STILL_MAX
+                       or np.mean(self.imu_history) > self.stuck_threshold)
+            evidence = MOVING if shaking else STILL
+
         if evidence == MOVING:
             self._reverse_still_samples = 0
             return False
@@ -1733,58 +2008,184 @@ class Driver:
 
         return self._reverse_still_samples >= REVERSE_STALL_SAMPLES
 
-    def recovering(self, now):
-        """Advance the recover phases. True while recover owns the wheels.
+    def _backout_scan(self):
+        """This decision's scan during a back-out, or None with no usable
+        frame. The same scan_footprint() the forward decision uses, so
+        telemetry and the policy's floor veto see it too."""
+        depth = self.camera.get_depth_frame()
+        if depth is None or getattr(depth, "ndim", 0) != 2:
+            return None
+        scan = self.scan_footprint(depth)
+        self.last_verdict = SteerVerdict(
+            ACT_REVERSE, self._backout_side, f"backout {self._backout_reason}")
+        return scan
 
-        This reads the IMU during the reverse phase, which it did not use to.
-        tick() returns the moment this says True, so for the whole 2.5 seconds
-        of REVERSE plus SETTLE nothing in this file looked at depth OR at
-        motion -- and reverse is the one direction with nothing pointed down
-        it. The reverse phase is where the only sensor that can see behind the
-        car is worth reading.
+    def recovering(self, now):
+        """Advance the back-out. True while it owns the wheels.
+
+        Reverse: every decision reads the IMU (the rear bumper) and the depth
+        frame (is the way forward open yet), in that order, and then either
+        keeps reversing or ends. What ends it, first match wins:
+
+          no usable depth frame     EXIT_NO_FRAME: stop, a car that cannot
+                                    see is not a car that decides
+          the rear bumper           EXIT_BUMPER
+          past the cap              EXIT_CAP (REVERSE_SECONDS, or
+                                    ESCALATED_REVERSE_SECONDS)
+          open BACKOUT_OPEN_DECISIONS
+          in a row, past the min    EXIT_OPENED
+
+        Every one of those commands throttle 0 on the decision it fires, then
+        the settle holds 0 for SETTLE_SECONDS with the steering already
+        leaning toward the side that opened, and the wheels come back.
         """
         if self._phase is None:
             return False
 
         if self._phase == _PHASE_REVERSE:
-            # Asked every tick, and before the deadline, because it is
-            # accumulating evidence rather than answering a question. Short
-            # circuiting it on the last tick of a reverse would be harmless;
-            # skipping it on any other tick would not be.
+            # The bumper is asked every decision, before anything can end the
+            # reverse, because it is accumulating evidence.
             hit = self._rear_bumper_hit()
-            if not hit and now < self._phase_until:
+            scan = self._backout_scan()
+            elapsed = now - self._backout_since
+            if scan is not None and backout_opened(scan, -self._backout_side):
+                self._backout_open += 1
+            else:
+                self._backout_open = 0
+
+            if scan is None:
+                exit_reason = EXIT_NO_FRAME
+            elif hit:
+                exit_reason = EXIT_BUMPER
+            elif now >= self._phase_until:
+                exit_reason = EXIT_CAP
+            elif (self._backout_open >= BACKOUT_OPEN_DECISIONS
+                    and elapsed >= self._backout_min_s - 1e-3):
+                exit_reason = EXIT_OPENED
+            else:
+                self._backout_drive()
                 return True
-            if hit:
-                print("Rear bumper - something behind me, cutting the reverse.")
-            self.controller.set_throttle(0)
-            self._phase = _PHASE_SETTLE
-            self._phase_until = now + SETTLE_SECONDS
+
+            self._end_reverse(now, exit_reason)
             return True
 
-        if now < self._phase_until:
-            return True
+        if self._phase == _PHASE_SETTLE:
+            # Scanned for telemetry and the policy's floor veto; nothing in
+            # the settle decides on it, and a missing frame changes nothing,
+            # because the throttle is already 0.
+            self._backout_scan()
+            self._backout_throttle = 0.0
+            if now < self._phase_until:
+                return True
 
-        # Settle is up: centre the steering and hand the wheels back.
-        #
-        # This used to command set_steering(-self._turn_dir, 0), which is the
-        # opposite front lock and a centred rear -- not centre, and not the
-        # counter-phase pair begin_recover() set either. Nothing is moving by
-        # here (the throttle went to zero a settle ago) so there was nothing
-        # to counter-steer, and it held a servo at full lock against nothing
-        # for up to a tick. Centre is what "unwind the steering" meant.
-        self.controller.set_steering(0, 0)
+        # Settle is up: hand the wheels back, leaning toward the side that
+        # opened, which is the other side from the one the car reversed on.
+        # The rest of the lean is the driver's (handback_bias), on top of
+        # whatever it decides next.
         self._phase = None
         self._phase_until = 0.0
+        self._backout_throttle = 0.0
+        self._backout_ended = now
+        self._handback_side = -self._backout_side
+        self._handback_since = now
+        self.controller.set_steering(*steering_pair(
+            self._handback_side * HANDBACK_STEER * self.max_turn))
         # The bumper has been sampling the IMU for the length of the reverse,
-        # so unlike before there is real evidence in the windows now, and all
-        # of it was taken going the other way.
+        # and all of it was taken going the other way.
         self._clear_motion_evidence()
         return False
 
+    def _end_reverse(self, now, exit_reason):
+        """Stop reversing: throttle 0 now, then the settle.
+
+        The steering goes first and the throttle last, the order every tick
+        in this file asks them in and the order AutoPilot writes them: both
+        reach the hardware on this same pass.
+        """
+        # Point the wheels where the hand-back will steer while the car is
+        # stopping, so the first forward is already leaning the right way.
+        self.controller.set_steering(*steering_pair(
+            -self._backout_side * HANDBACK_STEER * self.max_turn))
+        self.controller.set_throttle(0)
+        self._backout_throttle = 0.0
+        self._backout_exit = exit_reason
+        self._backout_reverse_s = max(0.0, now - self._backout_since)
+        if exit_reason == EXIT_BUMPER:
+            print("Rear bumper - something behind me, cutting the reverse.")
+        print(f"[Driver] back-out {exit_reason} after "
+              f"{self._backout_reverse_s:.1f} s ({self._backout_reason}, "
+              f"level {self._backout_level})")
+        self._phase = _PHASE_SETTLE
+        self._phase_until = now + SETTLE_SECONDS
+
+    def handback_bias(self, now) -> float:
+        """The hand-back lean this decision, as a fraction of max_turn: the
+        full HANDBACK_STEER toward the side that opened at the hand-back,
+        straight down to 0 at HANDBACK_S. 0 when there is none."""
+        if self._handback_since is None:
+            return 0.0
+        age = now - self._handback_since
+        if not (0.0 <= age < HANDBACK_S):
+            self._handback_side = 0.0
+            self._handback_since = None
+            return 0.0
+        return self._handback_side * HANDBACK_STEER * (1.0 - age / HANDBACK_S)
+
+    def _note_turn(self, front, now):
+        """Remember a forward that turned, for the next back-out's side."""
+        try:
+            f = float(front)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(f) and abs(f) > REVERSE_TURN_MIN:
+            self._turn_front, self._turn_at = f, now
+
+    def backout_fields(self, now=None):
+        """What /footprint records about the back-out on this decision.
+
+        backout_phase is "reverse", "settle", HANDBACK while the lean is still
+        on the wheels, or "". reason, exit, side, level and reverse_s describe
+        the current back-out, or the last one once it is over; elapsed_s is
+        since the current one began, 0 with none; speed is what it put on the
+        throttle this decision.
+        """
+        if self._phase is not None:
+            phase = str(self._phase)
+        elif self._handback_since is not None:
+            phase = HANDBACK
+        else:
+            phase = ""
+        elapsed = 0.0
+        if phase and now is not None:
+            elapsed = max(0.0, now - self._backout_since)
+        return {
+            "backout_phase": phase,
+            "backout_reason": self._backout_reason,
+            "backout_exit": self._backout_exit,
+            "backout_elapsed_s": float(elapsed),
+            "backout_reverse_s": float(self._backout_reverse_s),
+            "backout_side": float(self._backout_side),
+            "backout_speed": float(self._backout_throttle),
+            "backout_level": int(self._backout_level),
+        }
+
     def abort(self):
-        """Give up on a recover in progress and stop. Safe to call twice."""
+        """Give up on a back-out in progress and stop. Safe to call twice.
+
+        Within the tick it is called on: throttle 0 here, and nothing is left
+        that could command another reverse. The escalation forgets the spot,
+        because the next engage is a fresh start.
+        """
+        if self._phase == _PHASE_REVERSE:
+            self._backout_exit = EXIT_ABORT
         self._phase = None
         self._phase_until = 0.0
+        self._backout_throttle = 0.0
+        self._backout_ended = None
+        self._backout_level = 0
+        self._handback_side = 0.0
+        self._handback_since = None
+        self._turn_front = self._turn_at = None
         self.controller.set_throttle(0)
         self._clear_motion_evidence()
         self._clear_evade()
@@ -1920,7 +2321,7 @@ class Driver:
         self._announce(verdict, scan)
 
         if verdict.action == ACT_REVERSE:
-            self.begin_recover(now)
+            self.begin_recover(now, BACKOUT_OBSTACLE)
             return
 
         if self.human_throttle:
@@ -1929,7 +2330,7 @@ class Driver:
         elif self.stuck(imu, now):
             self.last_recovery_time = now
             print("STUCK - backing up to recover.")
-            self.begin_recover(now)
+            self.begin_recover(now, BACKOUT_STUCK)
             return
 
         # max_turn, applied where it was always meant to be. Its comment says
@@ -1949,8 +2350,15 @@ class Driver:
         # commanded hard turn -- and a nan is meant to reach set_steering()
         # and be rejected into neutral on both channels there. np.clip
         # propagates it.
-        front = float(np.clip(verdict.steer, -1.0, 1.0) * self.max_turn)
+        #
+        # A cruise straight after a back-out leans toward the side that
+        # opened (handback_bias). An evade keeps its own full-lock answer.
+        steer = verdict.steer
+        if verdict.action == ACT_FORWARD:
+            steer = steer + self.handback_bias(now)
+        front = float(np.clip(steer, -1.0, 1.0) * self.max_turn)
         self.controller.set_steering(*steering_pair(front))
         self.controller.set_throttle(self.forward_speed)
+        self._note_turn(front, now)
         if self._throttle_since is None:
             self._throttle_since = now

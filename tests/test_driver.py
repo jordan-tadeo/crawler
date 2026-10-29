@@ -264,7 +264,7 @@ def test_a_genuinely_stuck_car_does_stamp_it_and_recovers(d):
         now += 0.1
 
     assert d.last_recovery_time > 0.0
-    assert any(t == d.reverse_speed for t in d.controller.throttles)
+    assert any(t < 0 for t in d.controller.throttles)
 
 
 # --- throttle bookkeeping ---------------------------------------------------
@@ -336,7 +336,7 @@ def test_obstacle_detection_decides_before_it_commands(d):
     d.tick(100.0)
 
     assert d.forward_speed not in d.controller.throttles
-    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.controller.throttles[-1] < 0
 
 
 # --- the recover phase machine ---------------------------------------------
@@ -344,22 +344,59 @@ def test_obstacle_detection_decides_before_it_commands(d):
 def test_a_recover_never_blocks_and_gives_the_wheels_back(d):
     """The old recover() awaited 2.5 seconds with the throttle pinned in
     reverse, and for those 2.5 seconds nothing polled the stop signal."""
+    d.camera.depth = blocked_depth()
     d.begin_recover(100.0)
     assert d.recovering(100.0) is True
     assert d.recovering(100.0 + dv.REVERSE_SECONDS) is True          # into settle
+    assert d._backout_exit == dv.EXIT_CAP
     assert d.recovering(100.0 + dv.REVERSE_SECONDS + dv.SETTLE_SECONDS) is False
     assert d._phase is None
 
 
-def test_a_recover_can_turn_either_way(d):
-    """It used to choose between max_turn/4 and max_turn, both positive, so
-    the car always pivoted the same way and a corner that beat it beat it
-    forever."""
-    seen = set()
-    for _ in range(200):
+def test_the_back_out_side_is_my_rule_not_a_coin(d):
+    """It used to be random.choice of four angles. Now it is the side I
+    reverse on myself: opposite the last forward turn, left with none, and
+    the same answer every time it is asked the same question."""
+    sides = set()
+    for _ in range(50):
+        d.abort()
         d.begin_recover(100.0)
-        seen.add(d._turn_dir > 0)
-    assert seen == {True, False}
+        sides.add(d._turn_dir)
+    assert sides == {dv.REVERSE_DEFAULT_SIDE * d.max_turn}
+
+    d.abort()
+    d._note_turn(0.6, 99.5)                 # turned right half a second ago
+    d.begin_recover(100.0)
+    assert d._turn_dir == pytest.approx(-d.max_turn)
+
+    d.abort()
+    d._note_turn(-0.6, 99.5)                # turned left
+    d.begin_recover(100.0)
+    assert d._turn_dir == pytest.approx(d.max_turn)
+
+    d.abort()
+    d._note_turn(-0.6, 100.0 - dv.REVERSE_TURN_WINDOW_S - 0.1)   # too long ago
+    d.begin_recover(100.0)
+    assert d._turn_dir == pytest.approx(dv.REVERSE_DEFAULT_SIDE * d.max_turn)
+
+
+def test_the_back_out_side_comes_off_the_rules_own_last_turn(d):
+    """Through tick(): an evade to the right, then a wall, reverses left."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = probe_scene(EVADE_LEFT)
+    d.tick(100.0)
+    assert d._evade_dir == 1.0
+    d.camera.depth = blocked_depth()
+    d.tick(100.1)
+    assert d._phase == dv._PHASE_REVERSE
+    assert d._turn_dir == pytest.approx(-d.max_turn)
+    assert d._backout_reason == dv.BACKOUT_OBSTACLE
+
+
+def test_reverse_side_ignores_a_nan(d):
+    assert dv.reverse_side(float("nan"), 0.1) == dv.REVERSE_DEFAULT_SIDE
+    assert dv.reverse_side(None, 0.0, float("nan")) == dv.REVERSE_DEFAULT_SIDE
+    assert dv.reverse_side(0.5, float("nan")) == dv.REVERSE_DEFAULT_SIDE
 
 
 def test_abort_drops_a_recover_mid_reverse_and_stops(d):
@@ -376,15 +413,294 @@ def test_abort_is_safe_to_call_twice(d):
     assert d._phase is None
 
 
-def test_a_recover_hands_back_centred_steering(d):
-    """It used to hand back set_steering(-self._turn_dir, 0), which is the
-    opposite front lock and a centred rear -- not centre, and not the
-    counter-phase pair begin_recover() set. Nothing is moving by then, so
-    there was nothing to counter-steer with it."""
+def test_a_recover_hands_back_leaning_toward_the_side_that_opened(d):
+    """Not hard-centred: the car reversed on one side, so its nose swung to
+    the other, and the wheels come back leaning that way, counter-phase, at
+    HANDBACK_STEER of max_turn -- never the reverse's own lock."""
+    d.camera.depth = blocked_depth()
     d.begin_recover(100.0)
+    side = d._backout_side
     d.recovering(100.0 + dv.REVERSE_SECONDS)
     d.recovering(100.0 + dv.REVERSE_SECONDS + dv.SETTLE_SECONDS)
-    assert d.controller.steerings[-1] == (0, 0)
+    lean = -side * dv.HANDBACK_STEER * d.max_turn
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(lean))
+    assert abs(lean) < d.max_turn
+
+
+def test_the_hand_back_lean_decays_to_nothing(d):
+    """Through tick() on open floor after a back-out: the first forward leans
+    the full HANDBACK_STEER, it shrinks every decision, and HANDBACK_S later
+    the cruise is straight again."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = blocked_depth()
+    d.begin_recover(100.0)
+    d.camera.depth = clear_depth()
+    now = recover_to_handback(d, 100.0, d.tick)
+    fronts = []
+    for _ in range(int(dv.HANDBACK_S * 10) + 3):
+        fronts.append(d.controller.steerings[-1][0])
+        now = round(now + 0.1, 3)
+        d.tick(now)
+    side = -d._backout_side
+    assert fronts[0] == pytest.approx(side * dv.HANDBACK_STEER * d.max_turn)
+    assert all(abs(b) <= abs(a) + 1e-12 for a, b in zip(fronts, fronts[1:]))
+    assert fronts[-1] == 0.0
+
+
+# --- the back-out: slow, watched, escalating ---------------------------------
+
+def test_a_back_out_never_commands_full_reverse(d):
+    """The whole complaint. Every reverse it puts on the wheels is a fraction
+    of ESCAPE_SPEED, which sits well clear of -1.0, and it eases in rather
+    than stepping straight to it."""
+    d.camera.depth = blocked_depth()
+    d.camera.imu = MOVING_IMU
+    d.begin_recover(100.0)
+    for i in range(1, 40):
+        d.recovering(100.0 + i * 0.1)
+    reverses = [t for t in d.controller.throttles if t < 0]
+    assert reverses
+    assert min(reverses) == pytest.approx(dv.ESCAPE_SPEED)
+    assert dv.ESCAPE_SPEED > -0.9
+    assert reverses[0] > dv.ESCAPE_SPEED, "it stepped straight to the escape speed"
+    ramp = reverses[:dv.ESCAPE_RAMP_DECISIONS]
+    assert ramp == sorted(ramp, reverse=True)
+
+
+def test_the_escape_speed_still_moves_the_car(d):
+    """Slow, not stalled: past the reverse floor my drives bracket, and never
+    under the policy's own reverse floor."""
+    from crawler.autopilot import policy as pl
+    assert abs(dv.ESCAPE_SPEED) > dv.REVERSE_MOVING_FLOOR
+    assert abs(dv.ESCAPE_SPEED) >= pl.MOVING_FLOOR_REVERSE
+
+
+def test_an_esc_buzz_is_not_a_reverse_that_is_moving(d):
+    """Held at a reverse too slow to move it, the chassis buzzes over
+    GYRO_MOVING_MIN; the bumper judges against its own line and still fires.
+    Real reversing, well over that line, never does."""
+    buzz = imu(gyro=(0.03, 0.0, 0.0))
+    assert d.motion_evidence(buzz) == dv.MOVING
+    d.camera.depth = blocked_depth()
+    d.begin_recover(100.0)
+    assert reverse_for(d, ticks=30, imu_sample=buzz) is not None
+    assert d._backout_exit == dv.EXIT_BUMPER
+    d.abort()
+    d.begin_recover(200.0)
+    reversing = imu(gyro=(0.33, 0.0, 0.0))
+    assert reverse_for(d, ticks=19, imu_sample=reversing, start=200.0) is None
+
+
+def open_after(d, blocked_ticks, imu_sample=MOVING_IMU, reason=dv.BACKOUT_OBSTACLE):
+    """A back-out that sees a wall for `blocked_ticks` decisions and then
+    open floor. Returns the decision the reverse ended on, or None."""
+    d.camera.imu = imu_sample
+    d.camera.depth = blocked_depth()
+    d.begin_recover(100.0, reason)
+    for i in range(1, 40):
+        if i > blocked_ticks:
+            d.camera.depth = clear_depth()
+        d.recovering(round(100.0 + i * 0.1, 3))
+        if d._phase != dv._PHASE_REVERSE:
+            return i
+    return None
+
+
+def test_a_back_out_ends_when_the_way_forward_opens(d):
+    """Not a timer: open for BACKOUT_OPEN_DECISIONS decisions in a row and it
+    stops, well before the cap, with throttle 0 on that decision."""
+    ended = open_after(d, blocked_ticks=6)
+    assert ended == 6 + dv.BACKOUT_OPEN_DECISIONS
+    assert ended * 0.1 < dv.REVERSE_SECONDS
+    assert d._backout_exit == dv.EXIT_OPENED
+    assert d.controller.throttles[-1] == 0
+    assert d._phase == dv._PHASE_SETTLE
+
+
+def test_one_open_frame_is_not_an_exit(d):
+    """Open, wall, open: the count is consecutive, so a flicker of an opening
+    starts again from nothing."""
+    d.camera.imu = MOVING_IMU
+    d.begin_recover(100.0)
+    frames = [blocked_depth()] * 6 + [clear_depth()] * (dv.BACKOUT_OPEN_DECISIONS - 1) \
+        + [blocked_depth()] + [clear_depth()] * (dv.BACKOUT_OPEN_DECISIONS - 1)
+    for i, frame in enumerate(frames, start=1):
+        d.camera.depth = frame
+        d.recovering(round(100.0 + i * 0.1, 3))
+        assert d._phase == dv._PHASE_REVERSE, i
+
+
+def test_an_open_front_still_reverses_for_the_minimum(d):
+    """Open from the first frame: it still backs out BACKOUT_MIN_S, so it
+    does not twitch back and straight in again."""
+    ended = open_after(d, blocked_ticks=0)
+    assert d._backout_exit == dv.EXIT_OPENED
+    assert ended * 0.1 >= dv.BACKOUT_MIN_S - 1e-9
+    assert ended * 0.1 < dv.BACKOUT_MIN_S + 0.1 + 1e-9
+
+
+def test_a_stick_reverses_longer_on_an_open_front(d):
+    """STUCK is the one the camera did not see, so an open fan says nothing
+    about whether the car is free: it gets BACKOUT_STUCK_MIN_S."""
+    ended = open_after(d, blocked_ticks=0, reason=dv.BACKOUT_STUCK)
+    assert ended * 0.1 >= dv.BACKOUT_STUCK_MIN_S - 1e-9
+    assert dv.BACKOUT_STUCK_MIN_S > dv.BACKOUT_MIN_S
+
+
+def test_a_back_out_that_never_opens_stops_at_the_cap(d):
+    ended = open_after(d, blocked_ticks=100)
+    assert ended == pytest.approx(dv.REVERSE_SECONDS * 10)
+    assert d._backout_exit == dv.EXIT_CAP
+    assert d.controller.throttles[-1] == 0
+
+
+def test_the_rear_bumper_still_cuts_a_back_out(d):
+    ended = open_after(d, blocked_ticks=100, imu_sample=STILL_IMU)
+    assert d._backout_exit == dv.EXIT_BUMPER
+    assert ended == d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 1
+    assert d.controller.throttles[-1] == 0
+
+
+def test_a_lost_frame_mid_back_out_is_neutral(d):
+    """Stale camera is neutral, as everywhere: a car that cannot see does not
+    keep backing up on the strength of the last picture."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = blocked_depth()
+    d.begin_recover(100.0)
+    d.recovering(100.1)
+    d.camera.depth = None
+    d.recovering(100.2)
+    assert d._backout_exit == dv.EXIT_NO_FRAME
+    assert d.controller.throttles[-1] == 0
+    assert d._phase == dv._PHASE_SETTLE
+    d.recovering(100.3)
+    assert d.controller.throttles[-1] == 0
+
+
+def test_abort_drops_a_back_out_inside_one_tick(d):
+    """START, a pad dropout and SIGTERM all land on abort(): one call, throttle
+    0, and the next decision commands no reverse at all."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = blocked_depth()
+    d.begin_recover(100.0)
+    d.recovering(100.1)
+    assert d.controller.throttles[-1] < 0
+    d.abort()
+    assert d.controller.throttles[-1] == 0
+    assert d._phase is None
+    assert d._backout_exit == dv.EXIT_ABORT
+    n = len(d.controller.throttles)
+    assert d.recovering(100.2) is False
+    assert len(d.controller.throttles) == n
+
+
+MAX_BACKOUT_TICKS = round(
+    (dv.ESCALATED_REVERSE_SECONDS + dv.SETTLE_SECONDS) / 0.1) + 5
+
+
+def recover_to_handback(d, now, step=None):
+    """Tick a back-out at 10 Hz until it hands the wheels back. Bounded: the
+    longest one is the escalated cap plus the settle, so a back-out that never
+    ends fails here instead of hanging the suite."""
+    step = step or d.recovering
+    for _ in range(MAX_BACKOUT_TICKS):
+        if d._phase is None:
+            return now
+        now = round(now + 0.1, 3)
+        step(now)
+    raise AssertionError("the back-out never handed the wheels back")
+
+
+def run_back_out(d, start, blocked=True):
+    """One whole back-out from `start` against a wall that never opens, to
+    the hand-back. Returns the time the wheels came back."""
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = blocked_depth() if blocked else clear_depth()
+    d.begin_recover(start)
+    return recover_to_handback(d, start)
+
+
+def test_a_back_out_at_the_same_spot_escalates(d):
+    """Back again soon after the last one: the next reverses longer, and the
+    one after that takes the other side, a three-point turn instead of the
+    same move forever."""
+    back = run_back_out(d, 100.0)
+    first = (d._backout_side, d._backout_reverse_s, d._backout_level)
+    assert first[2] == 0
+
+    back = run_back_out(d, back + 1.0)
+    second = (d._backout_side, d._backout_reverse_s, d._backout_level)
+    assert second[2] == 1
+    assert second[1] > first[1]
+    assert second[1] == pytest.approx(dv.ESCALATED_REVERSE_SECONDS)
+
+    back = run_back_out(d, back + 1.0)
+    third = (d._backout_side, d._backout_reverse_s, d._backout_level)
+    assert third[2] == 2
+    assert third[0] == -second[0]
+
+    run_back_out(d, back + 1.0)
+    assert d._backout_level == 3
+    assert d._backout_side == -third[0]
+
+
+def test_a_back_out_somewhere_else_starts_from_scratch(d):
+    back = run_back_out(d, 100.0)
+    run_back_out(d, back + 1.0)
+    assert d._backout_level == 1
+    back = run_back_out(d, 200.0)
+    assert d._backout_level == 0
+    assert d._backout_reverse_s == pytest.approx(dv.REVERSE_SECONDS)
+
+
+def test_abort_forgets_the_spot(d):
+    back = run_back_out(d, 100.0)
+    d.abort()
+    run_back_out(d, back + 1.0)
+    assert d._backout_level == 0
+
+
+def test_backout_opened_reuses_the_rules_notion_of_clear():
+    """A frame the rules would reverse on is never open; open floor is; and
+    something past the budget but inside BACKOUT_OPEN_MM is not open straight
+    ahead, because that is a car one tick from reversing again."""
+    assert dv.backout_opened(dv.free_by_column(blocked_depth()), 1.0) == ""
+    assert dv.backout_opened(dv.free_by_column(clear_depth()), 1.0) == "straight"
+    middle = clear_depth(int((dv.CLEARANCE_MM + dv.BACKOUT_OPEN_MM) / 2))
+    assert dv.backout_opened(dv.free_by_column(middle), 1.0) == ""
+    blind = np.zeros((400, 640), dtype=np.uint16)
+    assert dv.backout_opened(dv.free_by_column(blind), 1.0) == ""
+
+
+def test_backout_opened_accepts_the_side_it_is_about_to_turn_to():
+    """Near side still inside BACKOUT_OPEN_MM but past the budget, the side
+    the hand-back leans to open: open that way, and only that way."""
+    scan = dv.free_by_column(clear_depth())
+    d_mm = np.full(dv.PROBE_COLUMNS, 899.0)
+    d_mm[:3] = 450.0                       # the left edge, past 400, short of 600
+    scan = scan._replace(distance_mm=d_mm)
+    assert dv.backout_opened(scan, 1.0) == "right"
+    assert dv.backout_opened(scan, -1.0) == ""
+
+
+def test_backout_fields_say_what_the_back_out_is_doing(d):
+    d.camera.imu = MOVING_IMU
+    d.camera.depth = blocked_depth()
+    assert d.backout_fields(100.0)["backout_phase"] == ""
+    d.begin_recover(100.0, dv.BACKOUT_STANDOFF)
+    d.recovering(100.1)
+    f = d.backout_fields(100.1)
+    assert f["backout_phase"] == dv._PHASE_REVERSE
+    assert f["backout_reason"] == dv.BACKOUT_STANDOFF
+    assert f["backout_elapsed_s"] == pytest.approx(0.1)
+    assert f["backout_side"] == dv.REVERSE_DEFAULT_SIDE
+    assert f["backout_speed"] < 0 and f["backout_exit"] == ""
+    now = recover_to_handback(d, 100.1)
+    f = d.backout_fields(now)
+    assert f["backout_phase"] == dv.HANDBACK
+    assert f["backout_exit"] == dv.EXIT_CAP
+    assert f["backout_reverse_s"] == pytest.approx(dv.REVERSE_SECONDS)
+    assert f["backout_speed"] == 0.0
 
 
 # --- the gyro as a rear bumper ---------------------------------------------
@@ -405,6 +721,10 @@ def reverse_for(d, ticks, imu_sample, start=100.0, step=0.1):
     still reversing when the ticks ran out.
     """
     d.camera.imu = imu_sample
+    if d.camera.depth is None:
+        # Something in front that never moves, so only the bumper or the cap
+        # can end the reverse.
+        d.camera.depth = blocked_depth()
     for i in range(1, ticks + 1):
         d.recovering(start + i * step)
         if d._phase != dv._PHASE_REVERSE:
@@ -453,6 +773,7 @@ def test_an_unknown_in_the_middle_of_a_reverse_holds_the_count(d):
     """Held where it is, not added to and not reset -- the forward detector's
     rule exactly. Every tick here stays inside the fixed reverse window, so
     the only thing that could end the phase is the bumper."""
+    d.camera.depth = blocked_depth()
     d.begin_recover(100.0)
     one_short = d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 2
     assert (one_short + 10) * 0.1 < dv.REVERSE_SECONDS, "the window has to fit"
@@ -472,6 +793,7 @@ def test_an_unknown_in_the_middle_of_a_reverse_holds_the_count(d):
 def test_one_moving_reading_resets_the_reverse_count(d):
     """Evidence has to be consecutive, same as the forward detector. A car
     that moves at all has not hit anything."""
+    d.camera.depth = blocked_depth()
     d.begin_recover(100.0)
     for i in range(1, d.imu_window_size + dv.REVERSE_STALL_SAMPLES - 1):
         d.camera.imu = STILL_IMU
@@ -498,7 +820,7 @@ def test_the_bumper_commands_neutral_when_it_fires(d):
     failsafe, so any path that ends the reverse and does not say so is a
     command to keep reversing."""
     d.begin_recover(100.0)
-    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.controller.throttles[-1] < 0
     reverse_for(d, ticks=20, imu_sample=STILL_IMU)
     assert d.controller.throttles[-1] == 0
 
@@ -576,7 +898,7 @@ def test_a_bumped_reverse_does_not_leave_the_car_one_tick_from_stuck(d):
     for _ in range(30):
         d.tick(now)
         now += 0.1
-    assert any(t == d.reverse_speed for t in d.controller.throttles)
+    assert any(t < 0 for t in d.controller.throttles)
     assert d.last_recovery_time == 0.0, "a wall is not a stick"
 
     # Wall gone, car still not moving. A stick is a legitimate verdict from
@@ -1422,7 +1744,7 @@ def test_an_all_zeros_frame_reverses_rather_than_dividing(d):
     d.camera.depth = blind
     d.camera.imu = MOVING_IMU
     d.tick(100.0)
-    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.controller.throttles[-1] < 0
 
 
 @pytest.mark.parametrize("probe", range(dv.PROBE_COLUMNS))
@@ -1873,7 +2195,7 @@ def test_an_evade_that_never_ends_reverses_instead(d):
             f"gave up after {0.1 * k:.1f} s, inside EVADE_LIMIT_SECONDS")
 
     d.tick(100.0 + dv.EVADE_LIMIT_SECONDS)
-    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.controller.throttles[-1] < 0
     assert d._evade_dir == 0.0
 
 
@@ -1890,7 +2212,7 @@ def test_an_evade_asking_for_the_other_side_becomes_a_reverse(d):
 
     d.camera.depth = probe_scene(EVADE_RIGHT)
     d.tick(100.1)
-    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.controller.throttles[-1] < 0
     assert d._evade_dir == 0.0
 
 
@@ -1942,7 +2264,7 @@ def test_a_reverse_beats_the_commitment_every_time(d):
 
     d.camera.depth = probe_scene([390.0] * 9)
     d.tick(100.1)
-    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d.controller.throttles[-1] < 0
     assert d._evade_dir == 0.0
 
 
@@ -1962,7 +2284,11 @@ def test_a_recover_clears_the_latch(d):
     d.camera.depth = ground_depth()
     d.tick(203.0)        # ends the reverse phase
     d.tick(204.0)        # settle is up, wheels come back, decides afresh
-    assert d.controller.steerings[-1] == (0.0, 0.0)
+    # Afresh means the hand-back's lean and nothing of the evade's full lock.
+    assert d._evade_dir == 0.0
+    lean = d._handback_side * dv.HANDBACK_STEER * d.max_turn
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(lean))
+    assert abs(lean) < d.max_turn
 
 
 def test_abort_clears_the_latch(d):
@@ -2205,8 +2531,8 @@ def test_the_latch_lets_go_after_backing_off_and_forgets_the_approach():
     REVERSE_CREDIT_MIN counts for nothing however long it runs."""
     _, veto = replay([centre("N190"), centre("?")])
     assert veto.vetoes()
-    # -0.45: past the -0.296 that barely moved, short of the credit line.
-    veto.note_throttle(-0.45, 1.0)
+    # -0.30: the band that did not move the car, short of the credit line.
+    veto.note_throttle(-0.30, 1.0)
     veto.note_throttle(0.0, 6.0)
     assert veto.vetoes() and veto.latch.reversed_mm == 0.0
     # At the cap, 164 mm/s: 1.22 s is the release.
@@ -2221,6 +2547,24 @@ def test_the_latch_lets_go_after_backing_off_and_forgets_the_approach():
     assert veto.latch == dv.EMPTY_FLOOR_LATCH
     # Still blind where it stopped: a dark surface now, not a near one.
     veto.observe(centre("?"), 11.0)
+    assert not veto.vetoes()
+
+
+def test_a_slow_back_out_earns_credit_in_proportion():
+    """The back-out reverses at ESCAPE_SPEED, past the moving floor: it earns
+    credit, at its magnitude's share of REVERSE_CREDIT_MM_S, never the
+    full-speed rate."""
+    assert dv.ESCAPE_SPEED <= dv.REVERSE_CREDIT_MIN
+    one_s = -dv.floor_travel_mm(dv.ESCAPE_SPEED, 1.0)
+    assert one_s == pytest.approx(dv.REVERSE_CREDIT_MM_S * -dv.ESCAPE_SPEED)
+    assert 0.0 < one_s < -dv.floor_travel_mm(dv.REVERSE_SPEED, 1.0)
+    assert dv.floor_travel_mm(-(dv.REVERSE_MOVING_FLOOR - 0.05), 1.0) == 0.0
+    _, veto = replay([centre("N190"), centre("?")])
+    need = dv.FLOOR_RELEASE_REVERSE_MM / one_s
+    veto.note_throttle(dv.ESCAPE_SPEED, 10.0)
+    veto.note_throttle(dv.ESCAPE_SPEED, 10.0 + need - 0.05)
+    assert veto.vetoes()
+    veto.note_throttle(0.0, 10.0 + need + 0.01)
     assert not veto.vetoes()
 
 

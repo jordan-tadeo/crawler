@@ -20,7 +20,6 @@ fake pad, and hold:
 """
 
 import math
-import random
 
 import numpy as np
 import pytest
@@ -146,7 +145,6 @@ def run_auto(monkeypatch, passes, cam, plan=None, pad=None, tap=None,
     session = mn.RecordSession(tele, None, log)
     modes = mn.ModeSwitch(mn.AUTO, log)
 
-    random.seed(7)  # begin_recover's random turn
     mn.control_loop(pad, vecon, pilot, modes, log, TickLimit(passes), tele,
                     snaps, mn.SteerMode(log), session=session, tap=tap,
                     clock=clock, takeover=takeover)
@@ -326,7 +324,7 @@ def test_a_recover_under_my_steering_keeps_my_steering(monkeypatch):
     for i in range(let_go, let_go + HALF):
         assert s[i]["steer_by"] == mn.PAD, i
         assert s[i]["steering"] == pytest.approx((0.0, 0.0)), i
-    assert any(s[i]["throttle"] == pytest.approx(dv.REVERSE_SPEED) for i in reversing)
+    assert any(s[i]["throttle"] == pytest.approx(dv.ESCAPE_SPEED) for i in reversing)
 
     handback = s[let_go + HALF]
     assert handback["steer_by"] == mn.DRIVER
@@ -349,7 +347,7 @@ def test_stuck_cannot_fire_under_my_throttle(monkeypatch):
         return plan
 
     alone = run_auto(monkeypatch, 450, Camera(far_frame()), plan=scene(False))
-    assert any(t == pytest.approx(dv.REVERSE_SPEED) for t in alone["vecon"].throttles)
+    assert any(t < 0 for t in alone["vecon"].throttles)
 
     mine = run_auto(monkeypatch, 450, Camera(far_frame()), plan=scene(True))
     assert all(snap["phase"] is None for snap in mine["snaps"])
@@ -412,7 +410,6 @@ def test_without_my_hand_auto_writes_what_the_driver_asks(monkeypatch):
     ctl = Stamped()
     cam = Camera(far_frame())
     direct = dv.Driver(ctl, cam)
-    random.seed(7)
     next_tick = 0.0
     for n in range(passes):
         now = n * STEP
@@ -568,9 +565,10 @@ def run_caught(monkeypatch, name, hold, passes=None, into=None):
     Returns the run and the pass I took them on."""
     make, scene, imu, running = _manoeuvres()[name]
     if into is None:
-        # A commit is 0.7 s; catch it before it ends. A recover's reverse is
-        # 2 s; catch it once its last scan is past FLOOR_SCAN_MAX_AGE.
-        into = 8 if name.endswith("commit") else 32
+        # A commit is 0.7 s; catch it before it ends. A back-out's reverse is
+        # 2 s at most, and on open floor a STUCK one ends after
+        # BACKOUT_STUCK_MIN_S, so catch it early enough to let go inside it.
+        into = 8 if name.endswith("commit") else 16
     box = {}
 
     def make_driver(command, cam):
@@ -627,7 +625,7 @@ def test_letting_go_mid_recover_hands_back_the_recovers_own_command(
     assert (handback["steer_by"], handback["throttle_by"]) == (mn.DRIVER,
                                                                mn.DRIVER)
     assert handback["phase"] == dv._PHASE_REVERSE
-    assert handback["throttle"] == pytest.approx(dv.REVERSE_SPEED)
+    assert handback["throttle"] == pytest.approx(dv.ESCAPE_SPEED)
     # The recover's turn, as it stood on the pass before I took it.
     assert handback["steering"] == pytest.approx(s[took - 1]["steering"])
     assert handback["steering"] != pytest.approx((0.0, 0.0))
@@ -774,11 +772,16 @@ def test_every_auto_row_says_whose_each_group_was(monkeypatch):
 
 
 def test_a_correction_during_a_recover_is_still_a_row(monkeypatch):
-    """The driver makes no scans while it reverses, so a row of its own would
-    be missing exactly when my hand is the label. Ours comes off the tap's
-    view instead, at the decision rate."""
+    """A back-out scans every decision, because it watches for the way
+    forward to open, so a correction during one is the driver's own row, at
+    the decision rate, carrying my hand on the group I took."""
+    class AutoView:
+        # The driver's frame, as the hub's auto view keeps it for the tap.
+        last_depth = wall_frame()
+
     tele = SessionTele()
-    tap = fp.FootprintTap(view=FrameView(wall_frame()), tele=tele)
+    tap = fp.FootprintTap(view=FrameView(wall_frame()), tele=tele,
+                          auto_view=AutoView())
     out = run_auto(monkeypatch, 120, Camera(wall_frame()),
                    plan=at(0, LEFT_X=0.5), tele=tele, tap=tap)
     by_time = {snap["now"]: snap for snap in out["snaps"]}
@@ -792,8 +795,9 @@ def test_a_correction_during_a_recover_is_still_a_row(monkeypatch):
     assert times[0] - start >= fp.INTERVAL
     assert all(b - a >= fp.INTERVAL for a, b in zip(times, times[1:]))
     during = [row for row, _ in during]
-    assert all(row["source"] == "tap" and row["mode"] == "auto"
+    assert all(row["source"] == "driver" and row["mode"] == "auto"
                and row["steer_by"] == mn.PAD and not row["depth_raw"]
+               and row["backout_phase"] in (dv._PHASE_REVERSE, dv._PHASE_SETTLE)
                for row in during)
     assert all(row["depth_small"] for row in during)
     assert tele.of("depth_raw") == []

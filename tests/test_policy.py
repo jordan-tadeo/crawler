@@ -101,7 +101,11 @@ def test_a_model_stop_short_of_the_goal_drives_the_better_of_forward_and_reverse
         logits, want, speed):
     d = policy_driver(StubModel(logits, throttle=0.5, steer=-0.25), clear())
     d.tick(T0)
-    assert d.controller.throttles[-1] == pytest.approx(0.5 * getattr(d, speed))
+    # At the model's magnitude, slowed by its confidence no further than the
+    # moving floor for that direction.
+    floor = pl.MOVING_FLOOR_REVERSE if want == pl.REVERSE else pl.MOVING_FLOOR_FORWARD
+    assert d.controller.throttles[-1] == pytest.approx(
+        pl.slowed_throttle(0.5 * getattr(d, speed), d.confidence.scale, floor))
     # A reverse out of a stop is a fresh one, so the commit steers it: to the
     # model's own side, at REVERSE_STEER.
     front = -pl.REVERSE_STEER if want == pl.REVERSE else -0.25 * pl.STEER_SCALE
@@ -1080,13 +1084,18 @@ def test_every_stop_is_immediate_and_unscaled_however_sure_the_model_was():
             assert d.confidence.scale == 1.0, stop
 
 
-def test_a_stuck_recover_backs_out_at_the_full_reverse_cap():
+def test_a_stuck_recover_backs_out_slowly_not_at_the_reverse_cap():
+    """The confidence scale does not touch it and neither does the cap: the
+    back-out eases in toward ESCAPE_SPEED, and never commands -1.0."""
     d, t = slowed_driver()
     d.recovering = lambda now: False
     d.stuck = lambda imu, now: True
     d.tick(t)
-    assert d.controller.throttles[-1] == d.reverse_speed
+    first = dv.ESCAPE_SPEED / dv.ESCAPE_RAMP_DECISIONS
+    assert d.controller.throttles[-1] == pytest.approx(first)
     assert d.last_decision.reason == "stuck"
+    assert d.last_decision.throttle == pytest.approx(first)
+    assert d._backout_reason == dv.BACKOUT_STUCK
 
 
 def test_pausing_auto_starts_the_confidence_over():
@@ -1140,23 +1149,98 @@ def test_the_floor_holding_a_forward_for_standoff_s_runs_the_stuck_recover():
     reasons = floor_held(d, n + 1)
     assert reasons == ["model floor"] * n + ["standoff"]
     assert d._phase == dv._PHASE_REVERSE
-    assert d.controller.throttles[-1] == d.reverse_speed
+    assert d._backout_reason == dv.BACKOUT_STANDOFF
+    assert dv.ESCAPE_SPEED <= d.controller.throttles[-1] < 0
     assert d.last_verdict.reason == "policy standoff"
     assert d.policy_fields()["standoff_ticks"] == n + 1
     assert d.last_recovery_time == pytest.approx(T0 + pl.STANDOFF_S)
     # The recover owns the wheels, then the model has them back.
     calls = len(model.calls)
     now = T0 + pl.STANDOFF_S
-    while len(model.calls) == calls:
+    for _ in range(MAX_BACKOUT_TICKS):
         now += 0.1
         d.tick(now)
-        if len(model.calls) == calls:
-            assert d.policy_fields()["standoff_ticks"] == 0
+        if len(model.calls) > calls:
+            break
+        assert d.policy_fields()["standoff_ticks"] == 0
+    assert len(model.calls) > calls, "the back-out never handed back"
     # The settle ends and the same tick asks the model.
     assert now - (T0 + pl.STANDOFF_S) == pytest.approx(
         dv.REVERSE_SECONDS + dv.SETTLE_SECONDS, abs=0.25)  # a tick each phase
     assert d.last_decision.reason == "model floor"
     assert d.standoff_ticks == 1
+
+
+MOVING_GYRO = {"accel": (0.0, 0.0, 0.0), "gyro": (0.5, 0.0, 0.0)}
+# Bounds every loop that waits for a back-out to hand back: the longest is the
+# escalated cap plus the settle, plus a few ticks of slack.
+MAX_BACKOUT_TICKS = round(
+    (dv.ESCALATED_REVERSE_SECONDS + dv.SETTLE_SECONDS) / 0.1) + 5
+
+
+def standoff_back_out(model):
+    """A policy driver into a standoff with the chair leg, its back-out
+    started. The driver and the time of the standoff."""
+    d = policy_driver(model, chair_leg(), imu=MOVING_GYRO)
+    n = round(pl.STANDOFF_S / 0.1)
+    assert floor_held(d, n + 1)[-1] == "standoff"
+    return d, T0 + n * 0.1
+
+
+def test_a_standoff_back_out_ends_when_the_chair_leg_clears():
+    """Not the old fixed two seconds: the scene opens, three decisions later
+    the reverse stops, and the model has the car back after the settle --
+    leaning toward the side that opened, on top of its own steer."""
+    model = StubModel(FORWARD, throttle=1.0, steer=0.0)
+    d, now = standoff_back_out(model)
+    side = d._backout_side
+    d.camera.depth = clear()
+    calls = len(model.calls)
+    throttles = []
+    for _ in range(MAX_BACKOUT_TICKS):
+        now = round(now + 0.1, 3)
+        d.tick(now)
+        throttles.append(d.controller.throttles[-1])
+        if len(model.calls) > calls:
+            break
+    assert len(model.calls) > calls, "the back-out never handed back"
+    assert d._backout_exit == dv.EXIT_OPENED
+    assert d._backout_reverse_s < dv.REVERSE_SECONDS
+    assert d._backout_reverse_s == pytest.approx(dv.BACKOUT_MIN_S, abs=0.11)
+    assert min(throttles) == pytest.approx(dv.ESCAPE_SPEED)
+    assert all(t >= dv.ESCAPE_SPEED for t in throttles)
+    # Handed back: the model's forward at full, leaning the other way from the
+    # reverse.
+    assert d.last_decision.action == pl.FORWARD
+    assert d.controller.throttles[-1] > 0.0
+    lean = -side * dv.HANDBACK_STEER * d.max_turn
+    assert d.last_decision.front == pytest.approx(lean)
+    assert d.controller.steerings[-1] == pytest.approx(dv.steering_pair(lean))
+
+
+def test_the_floor_veto_watches_the_back_out():
+    """Every back-out scan reaches the policy's floor veto, and every throttle
+    it commands is credited, so a latch can let go during the back-out."""
+    d, now = standoff_back_out(StubModel(FORWARD, throttle=1.0))
+    d.camera.depth = clear()
+    d.tick(round(now + 0.1, 3))
+    assert d.floor_veto.scan is d.last_scan
+    assert d.floor_veto._throttle == pytest.approx(d._backout_throttle)
+    assert d._backout_throttle < 0.0
+
+
+def test_the_back_out_fields_reach_the_footprint_row():
+    d, now = standoff_back_out(StubModel(FORWARD, throttle=1.0))
+    d.tick(round(now + 0.1, 3))
+    row = fp.autopilot_fields(d, round(now + 0.1, 3))
+    assert row["autopilot"] == "policy"
+    assert row["backout_phase"] == dv._PHASE_REVERSE
+    assert row["backout_reason"] == dv.BACKOUT_STANDOFF
+    assert row["backout_speed"] < 0.0
+    assert row["backout_elapsed_s"] == pytest.approx(0.1)
+    assert row["backout_side"] in (-1.0, 1.0)
+    rules = fp.autopilot_fields(dv.Driver(FakeController(), FakeCamera()), 0.0)
+    assert rules["autopilot"] == "rules" and rules["backout_phase"] == ""
 
 
 def test_a_floor_hold_shorter_than_standoff_s_does_not_recover():

@@ -117,7 +117,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 |---|---|---|
 | `seq` | int | per process, from 1 |
 | `mode` | str | `"record"` or `"auto"` |
-| `source` | str | `"tap"` (our own scan: record, or auto during a recover I have a hand in) or `"driver"` (auto: the driver's scan) |
+| `source` | str | `"tap"` (our own scan: record, or auto in a recover pass with no fresh driver scan while I have a hand in) or `"driver"` (auto: the driver's scan, back-outs included) |
 | `frame_width`, `frame_height` | int | depth frame size, 640x400 (0 if unknown) |
 | `throttle` | float | **the label.** Throttle that reached the ESC this tick, -1..1 (record: already scaled) |
 | `steering_front`, `steering_rear` | float | **the label.** Steering sent to each servo, -0.7..0.7 (the pad's LEFT_X past a 0.12 deadzone, rescaled, x 70%; recordings before the deadzone carry the stick's rest drift, up to about 0.07 raw); `rear` = -`front` in unified mode |
@@ -136,12 +136,20 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
 | `policy_throttle` | float | the model's throttle after its floor veto; what it would have driven even while my trigger has the group |
 | `policy_steering_front` | float | the model's front steering, in manual's units (full lock 0.7) |
-| `policy_reason` | string | why it did that: `model`, `model floor` (a forward held by `driver.ForwardFloorVeto`: something under `FORWARD_FLOOR_MM`, or a probe that went blind on the way in), `model commit` (a fresh reverse held by the reverse commit), `standoff` (the floor held a forward for `policy.STANDOFF_S`, so the STUCK recover ran), `rear bumper`, `blind`, `stuck`, ... |
+| `policy_reason` | string | why it did that: `model`, `model floor` (a forward held by `driver.ForwardFloorVeto`: something under `FORWARD_FLOOR_MM`, or a probe that went blind on the way in), `model commit` (a fresh reverse held by the reverse commit), `standoff` (the floor held a forward for `policy.STANDOFF_S`, so the driver backed out), `rear bumper`, `blind`, `stuck`, ... |
 | `policy_infer_ms` | float | the model's inference time that tick |
 | `policy_steer_mode` | string | the steering mode the model drove with, `unified` or `split` (`policy.ModeLatch`); always `unified` for a model with no mode head. Not the row's `steering_mode`, which is the pad's |
 | `policy_steer_mode_p` | float | the mode head's probability of `policy_steer_mode` on its last answer, low while it wants to switch; -1 with no head |
 | `reverse_commit` | bool | a reverse commit held this tick: a fresh model reverse kept for `policy.REVERSE_COMMIT_S` at `policy.REVERSE_STEER`, whatever the model said. `policy_action` is still the model's own pick |
 | `standoff_ticks` | int | decisions in a row the floor has held a model forward; 0 otherwise |
+| `backout_phase` | string | the driver's back-out this tick: `reverse`, `settle`, `handback` (the model or the rules drive again, `driver.HANDBACK_S` of steering lean still on), or `""`. The fields below describe the current back-out, or the last one once it is over. Absent in rows from before the back-out |
+| `backout_reason` | string | why it started: `stuck`, `standoff` or `obstacle`; `""` before the first |
+| `backout_exit` | string | how the last reverse ended: `opened` (the way forward cleared for `driver.BACKOUT_OPEN_DECISIONS` decisions), `bumper`, `cap`, `no frame` or `abort`; `""` while it still reverses |
+| `backout_elapsed_s` | float | seconds since this back-out started; 0 when `backout_phase` is `""` |
+| `backout_reverse_s` | float | how long its reverse ran, once it ended; 0 before |
+| `backout_side` | float | the side it reversed toward, -1 or 1 (front steering sign) |
+| `backout_speed` | float | the throttle it commanded this tick, never further back than `driver.ESCAPE_SPEED`; 0 outside a reverse |
+| `backout_level` | int | 0, or how many back-outs in a row hit the same spot within `driver.ESCALATE_WINDOW_S` |
 | `policy_steer_dir_p` | float[3] | a direction-head model's steering class probabilities on its last answer, `[left, straight, right]`; all -1 for a regression-head model, all 0 when no policy drives. Absent in rows from before the direction head |
 | `depth_small` | bool | a `/policy/depth_small` picture carries this row's log time |
 | `depth_raw` | bool | a `/camera/depth_raw` frame carries this row's log time |
@@ -186,10 +194,12 @@ stick's resting value (near centre, or a throttle of 0); that is a real thing
 my hand did, but it is also where I stopped meaning anything, so it is worth
 trimming.
 
-Rows that do not exist: manual mode, and auto's 2.5 s recover manoeuvre (no
-scan, no decision) -- unless my hand has a group during it. Then the rows come
-at 10 Hz off the car's own view, `source` `"tap"`, `mode` `"auto"`, with a
-`/policy/depth_small` picture and no raw frame.
+Rows that do not exist: manual mode. A back-out scans every decision, so its
+rows are the driver's with the `backout_*` fields set (recordings from before
+it have no rows in the old 2.5 s recover). A recover pass with no fresh driver
+scan while my hand has a group still makes a row: 10 Hz off the car's own view,
+`source` `"tap"`, `mode` `"auto"`, with a `/policy/depth_small` picture and no
+raw frame.
 
 ## Tilt, and what the IMU columns mean
 
