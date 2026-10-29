@@ -244,3 +244,34 @@ def test_policy_train_refuses_a_fold_that_is_not_one(tmp_path, fold, blocks, cap
         argv += ["--blocks", blocks]
     assert pt.main(argv) == 2
     assert "--fold is final or a block" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# The recipe, and the head-to-head with the deployed model.
+# ---------------------------------------------------------------------------
+
+def last_value(flags, name):
+    return [flags[i + 1] for i, f in enumerate(flags) if f == name][-1]
+
+
+def test_the_recipe_is_20_epochs_at_takeover_weight_1_and_a_flag_after_dashes_wins():
+    args, extra = rt.parse_args([])
+    flags = rt.recipe_flags(args, extra)
+    assert last_value(flags, "--epochs") == "20"
+    assert last_value(flags, "--takeover-weight") == "1"
+    args, extra = rt.parse_args(["--", "--takeover-weight", "3", "--lidar"])
+    flags = rt.recipe_flags(args, extra)
+    assert last_value(flags, "--takeover-weight") == "3" and "--lidar" in flags
+
+
+def test_the_head_to_head_holds_out_every_unseen_session_with_graded_ticks():
+    names = ["rec-a", "rec-b", "drive-c", "rec-d"]
+    session = np.array([0, 0, 1, 1, 2, 2, 3, 3])
+    graded = np.array([1, 1, 1, 0, 0, 0, 0, 1], dtype=bool)  # drive-c: never graded
+    assert rt.unseen_sessions(names, session, graded, {"rec-a"}) == ["rec-b", "rec-d"]
+    assert rt.unseen_sessions(names, session, graded, {"rec-a", "rec-b", "rec-d"}) == []
+
+
+def test_trained_on_reads_names_and_dicts():
+    assert rt.trained_on(None) == set()
+    assert rt.trained_on({"train_sessions": ["a", {"name": "b", "sha256": "x"}]}) == {"a", "b"}

@@ -53,8 +53,14 @@ The junk rules. A session trains unless one of these says it is junk:
 The folds are policy_train.py's --blocks N, so the numbers are the ones a plain
 `policy_train.py --blocks 5` prints. The deployed model is graded as it is, a
 file, so on a block it trained on its score is a fit and not a test; the
-"seen" column says how much of each block that is, and the last row is only
-the ticks it never trained on, where both columns are held out.
+"seen" column says how much of each block that is. The last row is the fair
+one: the record sessions it never trained on, against a candidate trained (in
+one more process, beside the folds) on every session but those, as the
+deployed model was. A fold model there would be missing the rest of its
+block too, and lose for that alone.
+
+The recipe: EPOCHS and TAKEOVER_WEIGHT below, each with the runs that chose
+it. Anything after -- goes to policy_train.py after them and wins.
 """
 
 import argparse
@@ -96,7 +102,18 @@ STUB_BYTES = 64 * 1024
 MIN_USABLE = 15
 BLOCKS = 5
 # 20 graded better held out than 60 on the DAgger-3 folds: 0.650 against 0.628.
+# Again on the 33-session set (2026-10-29), five folds, two seeds each, pooled:
+# direction 0.856 against 0.832 at takeover weight 1, 0.847 against 0.815 at 3,
+# and reverse recall 0.611 against 0.544 and 0.581 against 0.498.
 EPOCHS = 20
+# policy_train.py's --takeover-weight, before anything after --, so one given
+# there wins. Same set, 20 epochs, four seeds, pooled over five folds: 1
+# against 3, steering MAE 0.521 against 0.537 (lower on every seed), direction
+# 0.852 against 0.844, reverse precision 0.398 against 0.380, balanced 0.517
+# both. On the one session dagger2-1029 never saw (702 ticks, 53 of them
+# reverse) 3 read better on reverse recall, 0.731 against 0.580, too few
+# reverses to outweigh the folds.
+TAKEOVER_WEIGHT = 1.0
 JOBS = 12
 # Torch threads per training process, the folds and the final model alike.
 # One fold, 5 epochs, a loaded Mac: 1 thread 0.47 s an epoch, 2 1.63, 4 2.41,
@@ -450,6 +467,22 @@ def deployed_entry(registry, stats=()):
     return None, "nothing in the registry says what the car runs"
 
 
+def trained_on(entry):
+    """The session names a registry entry trained on, empty for None."""
+    return {s["name"] if isinstance(s, dict) else s
+            for s in (entry or {}).get("train_sessions") or []}
+
+
+def unseen_sessions(names, session, graded, seen):
+    """The sessions with graded ticks that a model trained on `seen` never
+    saw, in dataset order. The head-to-head holds these out whole: a fold
+    model graded on them would be missing the rest of its block as well,
+    which the deployed model had, and that alone cost it 0.13 of balanced
+    accuracy on dagger2-1029's one such session (0.427 against 0.561)."""
+    with_ticks = set(np.unique(np.asarray(session)[np.asarray(graded, dtype=bool)]).tolist())
+    return [n for i, n in enumerate(names) if i in with_ticks and n not in seen]
+
+
 def pooled(scores):
     """Pool score_ticks results: the confusions summed, the steering MAE
     weighted by its ticks. None when there is nothing."""
@@ -559,6 +592,13 @@ def parse_args(argv):
     if clash:
         ap.error(f"{clash} after --: retrain.py sets those itself (--blocks, --epochs here)")
     return args, extra
+
+
+def recipe_flags(args, extra):
+    """policy_train.py flags every training process gets: the defaults here
+    first, so the same flag after -- comes later and wins."""
+    return ["--epochs", str(args.epochs), "--seed", str(args.seed), "--model-name", md.FAMILY,
+            "--takeover-weight", f"{TAKEOVER_WEIGHT:g}", *extra]
 
 
 def _train_flags(extra):
@@ -677,16 +717,6 @@ def main(argv=None):
           f"{len(data['frames'])} frames")
     clock.lap("dataset")
 
-    base = [data_path]
-    common = ["--blocks", str(args.blocks), "--epochs", str(args.epochs),
-              "--seed", str(args.seed), "--model-name", md.FAMILY, *extra]
-    pieces = [str(k + 1) for k in range(args.blocks)] + ["final"]
-    outs = [os.path.join(run_dir, f"fold-{p}.onnx") for p in pieces[:-1]]
-    outs.append(os.path.join(run_dir, f"policy-{stamp}.onnx"))
-    commands = [[sys.executable, os.path.abspath(__file__), WORKER, x_path, representation,
-                 "--", *base, out, *common, "--fold", p] for p, out in zip(pieces, outs)]
-    logs = [os.path.splitext(o)[0] + ".log" for o in outs]
-
     registry = md.load_registry(args.models_dir)
     if args.baseline:
         dep, how = md.find_entry(registry, args.baseline), "--baseline"
@@ -694,24 +724,43 @@ def main(argv=None):
         # Every decoded file, junk too: a short drive still says what drove.
         dep, how = deployed_entry(registry, [c.stats for c in cands])
     blocks = pt.time_blocks(data, args.blocks)
+    names = data["meta"]["sessions"]
+    dep_seen = trained_on(dep)
+    any_graded = np.any([held for held, _ in blocks], axis=0) & ~pe.bad_marked(data)
+    held_names = unseen_sessions(names, data["session"], any_graded, dep_seen) if dep else []
+
+    base = [data_path]
+    recipe = recipe_flags(args, extra)
+    pieces = [str(k + 1) for k in range(args.blocks)] + ["final"]
+    outs = [os.path.join(run_dir, f"fold-{p}.onnx") for p in pieces[:-1]]
+    outs.append(os.path.join(run_dir, f"policy-{stamp}.onnx"))
+    child = [sys.executable, os.path.abspath(__file__), WORKER, x_path, representation, "--"]
+    commands = [[*child, *base, out, "--blocks", str(args.blocks), *recipe, "--fold", p]
+                for p, out in zip(pieces, outs)]
+    if held_names:
+        # The head-to-head: trained on every session but the ones the deployed
+        # model never saw, as it was, and graded with it on those.
+        pieces.append("vs-deployed")
+        outs.append(os.path.join(run_dir, "vs-deployed.onnx"))
+        commands.append([*child, *base, outs[-1], *recipe,
+                         *[a for n in held_names for a in ("--val", n)]])
+    logs = [os.path.splitext(o)[0] + ".log" for o in outs]
+    final = outs[args.blocks]
     steer_ok, throttle_ok = pe.label_masks(data, labels)
     labelled = steer_ok | throttle_ok
     graded = [held & ~pe.bad_marked(data) for held, _ in blocks]
     medians = [pe.median_training_magnitude(data, pt.training_mask(data, guard, labelled))
                for _, guard in blocks]
-    names = data["meta"]["sessions"]
-    dep_scores, dep_model, dep_seen = [None] * args.blocks, None, set()
+    dep_scores, dep_model = [None] * args.blocks, None
     grade_s = [0.0]
 
     def grade_deployed():
-        nonlocal dep_model, dep_seen
+        nonlocal dep_model
         if dep is None:
             return
         t = time.perf_counter()
         try:
             dep_model = pl.PolicyModel(os.path.join(args.models_dir, dep["onnx"]))
-            dep_seen = {s["name"] if isinstance(s, dict) else s
-                        for s in dep.get("train_sessions") or []}
             for k in range(args.blocks):
                 dep_scores[k] = pe.score_ticks(dep_model, data, np.flatnonzero(graded[k]),
                                                labels, medians[k])
@@ -720,7 +769,9 @@ def main(argv=None):
             dep_model = None
         grade_s[0] = time.perf_counter() - t
 
-    print(f"training {args.blocks} folds and the final model at once, {args.epochs} epochs"
+    print(f"training {args.blocks} folds and the final model"
+          + (" and the head-to-head" if held_names else "")
+          + f" at once, {args.epochs} epochs, takeover weight {TAKEOVER_WEIGHT:g}"
           + (f", {shlex.join(extra)}" if extra else ""))
     codes = run_children(commands, logs, args.jobs, grade_deployed)
     failed = [(p, log) for p, rc, log in zip(pieces, codes, logs) if rc != 0]
@@ -733,32 +784,30 @@ def main(argv=None):
     clock.lap("train")
 
     fold_scores = []
-    for out in outs[:-1]:
+    for out in outs[:args.blocks]:
         with open(os.path.splitext(out)[0] + ".json") as f:
             fold_scores.append(json.load(f)["fold"]["scores"])
     mean = pt._mean_scores(fold_scores)
     sess = np.asarray(data["session"])
+    held_ids = [i for i, n in enumerate(names) if n in held_names]
     unseen_mask = ~np.isin(sess, [i for i, n in enumerate(names) if n in dep_seen])
-    rows, cand_unseen, dep_unseen = [], [], []
+    rows = []
     for k in range(args.blocks):
         ticks = np.flatnonzero(graded[k])
         seen = 1.0 - float(unseen_mask[ticks].mean()) if dep_model and len(ticks) else None
         rows.append((f"block {k + 1}", len(ticks), seen, fold_scores[k], dep_scores[k]))
-        if dep_model is not None:
-            sub = np.flatnonzero(graded[k] & unseen_mask)
-            if len(sub):
-                cand_unseen.append(pe.score_ticks(pl.PolicyModel(outs[k]), data, sub,
-                                                  labels, medians[k]))
-                dep_unseen.append(pe.score_ticks(dep_model, data, sub, labels, medians[k]))
     total = sum(r[1] for r in rows)
     rows.append(("pooled", total, None, pooled(fold_scores), pooled(dep_scores)))
     unseen = None
-    if cand_unseen:
-        unseen = (pooled(cand_unseen), pooled(dep_unseen))
+    if dep_model is not None and held_names:
+        sub = np.flatnonzero(any_graded & np.isin(sess, held_ids))
+        med = pe.median_training_magnitude(
+            data, pt.training_mask(data, np.isin(sess, held_ids), labelled))
+        unseen = (pe.score_ticks(pl.PolicyModel(outs[-1]), data, sub, labels, med),
+                  pe.score_ticks(dep_model, data, sub, labels, med))
         rows.append(("never seen by deployed", unseen[0]["ticks"], 0.0, *unseen))
     clock.lap("grade")
 
-    final = outs[-1]
     with open(os.path.splitext(final)[0] + ".json") as f:
         meta = json.load(f)
     meta["cv"] = {"blocks": args.blocks, "guard_s": pt.BLOCK_GUARD_S, "mean": mean,
@@ -789,7 +838,9 @@ def main(argv=None):
     print(comparison_table(rows, dep_label))
     print("  dir: direction accuracy, bal: balanced over forward/reverse/stop, rev_r/rev_p:"
           " reverse recall/precision, steer: MAE as a fraction of full lock;"
-          " seen: share of the block the deployed model trained on")
+          " seen: share of the block the deployed model trained on"
+          + (f"; never seen: {', '.join(held_names)}, the candidate trained on every"
+             " other session" if unseen else ""))
     if entry:
         print(f"\nregistered {entry['label']} ({entry['onnx']}); not deployed. On the car: "
               f"./scripts/models.sh deploy candidate-{tag}")
