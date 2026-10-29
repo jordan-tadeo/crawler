@@ -161,6 +161,7 @@ def _work(inbox, outbox, l_max, map_every_s):
     clock = SensorClock()
     next_map = 0.0
     lost_out = 0
+    grid_seen = (0, 0)
     while True:
         item = inbox.get()
         if item is None:
@@ -182,6 +183,15 @@ def _work(inbox, outbox, l_max, map_every_s):
             outbox.put_nowait(("r", res, lost_out))
         except queue.Full:
             lost_out += 1
+        g = slam.grid
+        if (g.grew, g.dropped) != grid_seen:
+            grid_seen = (g.grew, g.dropped)
+            # Waits up to a second for room: this happens a handful of
+            # times a drive and a dropped scroll must not go unsaid.
+            try:
+                outbox.put(("grid", g.grew, g.dropped, g.size), timeout=1.0)
+            except queue.Full:
+                pass
         if host_t >= next_map:
             next_map = host_t + map_every_s
             view = map_view(slam, t)
@@ -229,6 +239,8 @@ class SlamRunner:
         self.results = 0
         self.errors = 0
         self.imu_samples = 0
+        self.grid_grew = 0
+        self.grid_dropped = 0
         self._latest = None
         self._latest_at = None
         self._map = None
@@ -381,6 +393,8 @@ class SlamRunner:
         return {"mode": self.mode, "scans": self.scans,
                 "dropped": self.dropped, "results": self.results,
                 "errors": self.errors, "imu_samples": self.imu_samples,
+                "grid_grew": self.grid_grew,
+                "grid_dropped": self.grid_dropped,
                 "alive": bool(w is not None and w.is_alive())}
 
     # ---- the pump --------------------------------------------------------------
@@ -415,6 +429,14 @@ class SlamRunner:
             tele = self.tele
             if tele is not None and tele.wants("map", now):
                 tele.offer("map", item[1], now)
+        elif kind == "grid":
+            _, grew, dropped, size = item
+            was = self.grid_dropped
+            self.grid_grew, self.grid_dropped = grew, dropped
+            self._say("error" if dropped > was else "info",
+                      f"The map is {size * 0.05:.0f} m a side and lost cells "
+                      f"to a scroll ({dropped} so far)" if dropped > was else
+                      f"The map grew to {size * 0.05:.0f} m a side")
         elif kind == "error":
             self.errors += 1
             if not self._said_error and self.logger is not None:
@@ -424,6 +446,14 @@ class SlamRunner:
                                     f"A scan failed to match: {item[1]}")
                 except Exception:
                     pass
+
+    def _say(self, level, message):
+        if self.logger is None:
+            return
+        try:
+            self.logger.log(level, "SLAM", message)
+        except Exception:
+            pass
 
     def _extend_path(self, res):
         if res.state in ("rolled", "no_points"):
@@ -516,6 +546,8 @@ def status_row(res, stats) -> dict:
         "returns": int(res.returns), "points": int(res.points),
         "ground_dropped": int(res.ground_dropped),
         "tilt_deg": num(res.tilt_deg, 2),
+        "pitch_deg": num(res.pitch_deg, 2), "roll_deg": num(res.roll_deg, 2),
+        "held": int(res.held), "banded": bool(res.banded),
         "iters": int(res.iters), "ms": num(res.ms, 2),
         "scans": int(stats.get("scans", 0)),
         "dropped": int(stats.get("dropped", 0)),

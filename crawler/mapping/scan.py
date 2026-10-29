@@ -25,10 +25,24 @@ SLOT_B = np.radians(np.arange(SLOTS) * lv.SCAN_STEP_DEG)
 CAR_B = SLOT_B + np.radians(ld.MOUNT.yaw_deg)
 FRAC_BEFORE_END = (np.arange(SLOTS) * lv.SCAN_STEP_DEG) / 360.0
 
-# Closer than this is the truck's own body and the roll cage; further than
-# this the points are too sparse and noisy to match a line through.
-MIN_R = 0.32
+# The truck's own body, as a box round the lidar in the car frame, metres:
+# the measured half width over the wheels (lidar.HALF_WIDTH_MM, 135.89),
+# the measured rear bumper (-247.65) and the estimated front one (+270),
+# each with BODY_MARGIN_M on it. A return inside it is the truck or
+# something touching it, and is neither matched nor written. A circle of
+# 0.32 m used to stand in for this, and it was blind to anything within
+# 18 cm of the wheels abeam. On 045557, 0.28% of returns fall in the box.
+BODY_MARGIN_M = 0.04
+BODY_FRONT_M = ld.FRONT_BUMPER_X_MM / 1000.0 + BODY_MARGIN_M
+BODY_REAR_M = ld.REAR_BUMPER_X_MM / 1000.0 - BODY_MARGIN_M
+BODY_HALF_W_M = float(ld.HALF_WIDTH_MM or 150.0) / 1000.0 + BODY_MARGIN_M
+# Nearer than this is inside the sensor's own blind spot whatever the box.
+MIN_R = 0.05
+# Further than this the points are too sparse and noisy to match a line
+# through.
 MAX_R = 10.0
+_COS_B = np.cos(CAR_B)
+_SIN_B = np.sin(CAR_B)
 
 # A point gets a normal only if its four angular neighbours are close by and
 # the five lie on a line within about 1.2 cm. Corners, edges and clutter get
@@ -39,14 +53,34 @@ LINE_FIT_M = 0.012
 MIN_POINTS = 40
 
 
+def valid_mask(ranges):
+    """bool (720,): a usable return, in range and outside the body box."""
+    r = np.asarray(ranges, np.float64)
+    with np.errstate(invalid="ignore"):
+        ok = np.isfinite(r) & (r > MIN_R) & (r < MAX_R)
+        x = r * _COS_B
+        y = r * _SIN_B
+        body = ((x > BODY_REAR_M) & (x < BODY_FRONT_M)
+                & (np.abs(y) < BODY_HALF_W_M))
+    return ok & ~body
+
+
+def all_points(ranges):
+    """Every usable return as car-frame points (n, 2) and its slot idx: what
+    is written to the map, line or no line, so legs and clutter are there."""
+    idx = np.nonzero(valid_mask(ranges))[0]
+    r = np.asarray(ranges, np.float64)[idx]
+    return np.stack([r * _COS_B[idx], r * _SIN_B[idx]], 1), idx
+
+
 def scan_points(ranges):
     """720 ranges -> car-frame points (n, 2), unit normals (n, 2), slot idx.
 
-    Only points with a good local line, so every point has a normal.
+    Only points with a good local line, so every point has a normal: what is
+    matched.
     """
     ranges = np.asarray(ranges, np.float64)
-    ok = np.isfinite(ranges) & (ranges > MIN_R) & (ranges < MAX_R)
-    idx = np.nonzero(ok)[0]
+    idx = np.nonzero(valid_mask(ranges))[0]
     r = ranges[idx]
     b = CAR_B[idx]
     p = np.stack([r * np.cos(b), r * np.sin(b)], 1)
@@ -70,8 +104,7 @@ def scan_points(ranges):
 
 def valid_returns(ranges):
     """How many slots hold a usable return at all, before the line test."""
-    r = np.asarray(ranges, np.float64)
-    return int(np.count_nonzero(np.isfinite(r) & (r > MIN_R) & (r < MAX_R)))
+    return int(np.count_nonzero(valid_mask(ranges)))
 
 
 def deskew(p, idx, period, omega, v):

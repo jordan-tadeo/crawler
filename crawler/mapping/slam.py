@@ -14,18 +14,28 @@ the scan it is given. The order on every revolution:
      RESEED_BELOW (70%) inliers is tried again from the last pose at heading
      offsets out to +-35 degrees and from the prediction moved 25 cm each way,
      and the best one kept.
+     A fit whose heading is more than BAND_YAW_DEG off the IMU's, or whose
+     position is more than BAND_M off the prediction, is not believed: the
+     prediction is kept and the scan counts as a failed fit. Along a
+     direction the scene does not pin down (a corridor's length) the fit
+     keeps the prediction too (matcher.remap).
   4. Write, only if all of these hold:
-       the fit is good (WRITE_MIN_INLIERS, WRITE_MAX_RMS_M);
-       the IMU says the truck is near level (WRITE_MAX_TILT_DEG), because a
+       the fit is good (WRITE_MIN_INLIERS, WRITE_MAX_RMS_M) and the scene
+       pins the pose down (WRITE_MIN_CONSTRAINT);
+       the IMU says the truck is near level, pitch under
+       WRITE_MAX_PITCH_DEG and roll under WRITE_MAX_ROLL_DEG, because a
        tilted scan plane sees the floor and the tops of things;
        nothing is lost or rolled over.
-     Points the tilted plane might be putting on the ground are left out of
-     the write even then (scan.ground_mask).
+     Every usable return is written, not only the ones on a line (those are
+     what is matched), so legs and clutter are in the map; only the line
+     points move the hit means the matcher matches against. Points the tilted
+     plane might be putting on the ground are left out even then
+     (scan.ground_mask).
 
 The states (Result.state):
 
   tracking   matched, and written if the gates above allowed
-  tilted     past WRITE_MAX_TILT_DEG: matched, not written
+  tilted     past the pitch or roll gate: matched, not written
   rolled     past ROLL_DEG, upside down or on its side or in a hand: the pose
              is frozen and nothing is matched or written
   lost       MAX_FAILS fits in a row failed, or it just came back from
@@ -79,10 +89,37 @@ RESEED_SHIFT_M = ((0.25, 0.0), (-0.25, 0.0), (0.0, 0.25), (0.0, -0.25))
 # carried the 27 cm.
 RESEED_BELOW = 0.7
 
-# The write gates.
-WRITE_MAX_TILT_DEG = 6.0
+# The write gates. Pitch and roll separately (imu.ImuTrack.pitch_roll):
+# pitch tips the plane into the floor ahead and behind, roll into it to the
+# sides, and the truck sits rolled a few degrees on its springs far more
+# often than it sits pitched.
+WRITE_MAX_PITCH_DEG = 3.0
+WRITE_MAX_ROLL_DEG = 5.5
 WRITE_MIN_INLIERS = 0.6
 WRITE_MAX_RMS_M = 0.02
+# matcher.Fit.constraint below this and the scene does not say where along
+# it the truck is: matched (on the prediction there), not written.
+WRITE_MIN_CONSTRAINT = 0.02
+
+# The band a fit must land in round the prediction to be believed. The
+# heading's against the IMU integral, when there is an IMU; the position's
+# widens with the time since the last scan, at 1 m/s (the truck's top speed
+# indoors is under that).
+BAND_YAW_DEG = 5.0
+BAND_M = 0.3
+BAND_M_PER_S = 1.0
+# The band only holds a fit to a prediction made from a good fit the scan
+# before. After a refused or failed fit, or a gap, the pose it would hold to
+# is the thing in doubt: in 035203 a bad fit across a 1 s gap put the truck
+# 46 cm off, and a band applied after it refused every fit that would have
+# brought it back, until it was lost (610 scans).
+BAND_MAX_GAP_S = 0.25
+
+# The matcher's tree is rebuilt when the truck has moved this far since the
+# last build, or the map has had this many writes: every scan used to be a
+# rebuild.
+TREE_MOVE_M = 0.2
+TREE_WRITES = 5
 
 # Past this the truck is on its side, upside down, or being carried.
 ROLL_DEG = 60.0
@@ -124,18 +161,26 @@ class Result(NamedTuple):
     tilt_deg: float           # NaN with no IMU
     iters: int
     ms: float                 # time step() took
+    pitch_deg: float = float("nan")   # |pitch|, |roll|, NaN with no IMU
+    roll_deg: float = float("nan")
+    held: int = 0             # directions the fit kept at the prediction
+    banded: bool = False      # the fit landed outside the band and was refused
 
 
 class Slam:
     """The map, the pose, and the step that moves them on."""
 
     def __init__(self, imu: Optional[ImuTrack] = None, grid=None,
-                 l_max=gr.L_MAX, write_max_tilt=WRITE_MAX_TILT_DEG,
-                 ground_guard=True, clock=time.perf_counter):
+                 l_max=gr.L_MAX, write_max_pitch=WRITE_MAX_PITCH_DEG,
+                 write_max_roll=WRITE_MAX_ROLL_DEG, ground_guard=True,
+                 band=True, clock=time.perf_counter):
         self.imu = imu if imu is not None else ImuTrack()
         self.grid = grid if grid is not None else gr.Grid(l_max=l_max)
-        self.write_max_tilt = write_max_tilt
+        self.write_max_pitch = write_max_pitch
+        self.write_max_roll = write_max_roll
         self.ground_guard = ground_guard
+        self.band = band
+        self.banded = 0
         self._clock = clock
         self.pose = np.zeros(3)
         self.vel = np.zeros(3)      # map frame dx, dy, dyaw per second
@@ -149,6 +194,10 @@ class Slam:
         self._tgt = None
         self._tree_at = None
         self._tree_version = -1
+        self._tree_writes = 0
+        self._tree_origin = None
+        self._att = (float("nan"), float("nan"))
+        self._banded = False
         self.scans = 0
         self.writes = 0
         self.retries = 0
@@ -169,6 +218,8 @@ class Slam:
         dt = PERIOD_S if last_t is None else t - last_t
         returns = sc.valid_returns(ranges)
         tilt = imu.tilt(t)
+        self._att = imu.pitch_roll(t)
+        self._banded = False
 
         if tilt > ROLL_DEG:
             # Frozen. Whatever the scan sees now is the floor, the ceiling or
@@ -185,6 +236,8 @@ class Slam:
                 self.last_t = t
             return self._result(t, NO_POINTS, False, False, "few points",
                                 None, returns, len(p), 0, tilt, t0)
+        allp, alli = sc.all_points(ranges)
+        on_line = np.isin(alli, idx)
 
         pose = self.pose
         vcar = mt.rot(-pose[2]) @ self.vel[:2]
@@ -195,6 +248,7 @@ class Slam:
             om = self.vel[2]
         p, _ = sc.deskew(p, idx, period, om, vcar)
         nrm, _ = sc.deskew(nrm, idx, period, om, np.zeros(2))
+        allp, _ = sc.deskew(allp, alli, period, om, vcar)
         # The de-skewed car-frame points, for anyone who wants this scan
         # drawn at the fitted pose (the replay's grading does).
         self.last_points = p
@@ -224,6 +278,16 @@ class Slam:
             newpose = np.array(fit.pose)
             if not good and fit.inliers < TRUST_INLIERS:
                 newpose = pred
+            elif (self.band and self.fails == 0 and dt <= BAND_MAX_GAP_S
+                  and self._out_of_band(newpose, pred, dt,
+                                        imu_rate is not None)):
+                # A fit this far from where the truck can have got to is the
+                # scan lining up with the wrong wall: in 035323 at 89 s, the
+                # truck going over, one did. Keep the prediction.
+                good = False
+                newpose = pred
+                self._banded = True
+                self.banded += 1
 
         if self._tree is not None and not good and not self.lost:
             self.fails += 1
@@ -247,17 +311,19 @@ class Slam:
                 self.bias += 0.002 * (imu_rate - v_new[2])
         self.pose = newpose
 
+        pitch, roll = self._att
         state = LOST if self.lost else (
-            TILTED if tilt > self.write_max_tilt else TRACKING)
+            TILTED if (pitch > self.write_max_pitch
+                       or roll > self.write_max_roll) else TRACKING)
         why = self._why_not(fit, good, state)
         dropped = 0
         written = False
         if not why:
-            keep = np.ones(len(p), bool)
+            keep = np.ones(len(allp), bool)
             if self.ground_guard and imu.up is not None:
-                keep = ~sc.ground_mask(p, imu.up)
+                keep = ~sc.ground_mask(allp, imu.up)
                 dropped = int((~keep).sum())
-            self._write(self.pose, p[keep])
+            self._write(self.pose, allp[keep], on_line[keep])
             written = True
         self._refresh_target()
         self.last_t = t
@@ -331,29 +397,49 @@ class Slam:
             return "few inliers"
         if not fit.rms <= WRITE_MAX_RMS_M:
             return "high residual"
+        if fit.constraint < WRITE_MIN_CONSTRAINT:
+            return "degenerate"
         return ""
 
-    def _write(self, pose, points):
-        """The one place a scan enters the map (the loop-closure seam)."""
+    def _out_of_band(self, pose, pred, dt, have_imu):
+        """True if the fit is further from the prediction than the truck can
+        have got: BAND_YAW_DEG off the IMU heading, or BAND_M (plus
+        BAND_M_PER_S a second since the last scan past the first tenth)."""
+        if have_imu:
+            dyaw = (pose[2] - pred[2] + math.pi) % (2 * math.pi) - math.pi
+            if abs(dyaw) > math.radians(BAND_YAW_DEG):
+                return True
+        lim = BAND_M + BAND_M_PER_S * max(dt - PERIOD_S, 0.0)
+        return math.hypot(pose[0] - pred[0], pose[1] - pred[1]) > lim
+
+    def _write(self, pose, points, on_line=None):
+        """The one place a scan enters the map (the loop-closure seam).
+        `on_line` marks the points that move the hit means (grid.integrate)."""
         g = self.grid
         g.scroll_to(pose[0], pose[1])
         wp = points @ mt.rot(pose[2]).T + pose[:2]
-        g.integrate(pose[0], pose[1], wp[:, 0], wp[:, 1])
+        g.integrate(pose[0], pose[1], wp[:, 0], wp[:, 1], mean=on_line)
         self.writes += 1
 
     def _refresh_target(self):
-        """Rebuild the matcher's tree if the map changed or the truck moved
-        a metre from where it was built."""
+        """Rebuild the matcher's tree once the truck has moved TREE_MOVE_M
+        from where it was built or the map has had TREE_WRITES writes since,
+        or the map was moved under it (a grow)."""
         g = self.grid
         x, y = self.pose[0], self.pose[1]
-        if (self._tree_version == g.version and self._tree_at is not None
-                and math.hypot(x - self._tree_at[0], y - self._tree_at[1]) < 1.0):
+        if (self._tree is not None and self._tree_at is not None
+                and self._tree_origin == (g.ox, g.oy)
+                and self.writes - self._tree_writes < TREE_WRITES
+                and math.hypot(x - self._tree_at[0],
+                               y - self._tree_at[1]) < TREE_MOVE_M):
             return
         tgt = g.local_points(x, y, LOCAL_R_M)
         self._tgt = tgt
         self._tree = cKDTree(tgt) if len(tgt) >= 50 else None
         self._tree_at = (x, y)
         self._tree_version = g.version
+        self._tree_writes = self.writes
+        self._tree_origin = (g.ox, g.oy)
 
     def _result(self, t, state, matched, written, why, fit, returns, points,
                 dropped, tilt, t0):
@@ -368,4 +454,7 @@ class Slam:
             returns=int(returns), points=int(points),
             ground_dropped=int(dropped), tilt_deg=float(tilt),
             iters=int(fit.iters) if fit is not None else 0,
-            ms=(self._clock() - t0) * 1000.0)
+            ms=(self._clock() - t0) * 1000.0,
+            pitch_deg=float(self._att[0]), roll_deg=float(self._att[1]),
+            held=int(getattr(fit, "held", 0)) if fit is not None else 0,
+            banded=bool(self._banded))

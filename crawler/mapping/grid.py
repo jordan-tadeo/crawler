@@ -1,14 +1,14 @@
 """The occupancy grid the truck builds as it drives: log-odds, 5 cm cells.
 
-One square of SIZE x SIZE cells, 51.2 m on a side at the default, centred on
-wherever the truck was at boot. It never forgets on a clock: a cell is only
+One square of SIZE x SIZE cells, 102.4 m on a side at the default, centred
+on wherever the truck was at boot. It never forgets on a clock: a cell is only
 ever changed by an observation. A return lands in a cell and makes it more
 occupied; a ray that passes through a cell on its way to a return makes it
 more free. The log-odds are clamped at both ends, so a wall that was looked
 at for ten minutes is no harder to clear than one looked at for ten seconds:
 see L_MAX for the number and why.
 
-Storage, 5 bytes a cell (5.2 MB at 1024 x 1024):
+Storage, 5 bytes a cell (21 MB at 2048 x 2048, 84 MB at MAX_SIZE):
 
   lo     int8, log-odds in steps of LO_STEP (0.05). 0 is unknown.
   fx,fy  uint8, the mean position of the returns that landed in the cell,
@@ -17,17 +17,23 @@ Storage, 5 bytes a cell (5.2 MB at 1024 x 1024):
          3.5 cm off the wall, a hit mean is a few millimetres off it.
   cnt    uint8, how many returns the mean is over, capped at MEAN_CAP so it
          keeps following a wall that settles. 0 means no mean yet.
+         Only returns on a line (scan.scan_points) move the mean; the
+         rest (legs, clutter, edges) make a cell occupied without one, so
+         the planner sees them and the matcher does not match them. Writing
+         every return into the means took the 045557 revisit drift (300 s
+         or more apart) from 1.3 cm to 3.4 cm median.
 
 Coordinates: the map frame is metres, x and y, the truck's pose at boot is
 the origin facing +x. A cell is identified by its world index floor(x / RES);
 the array holds the window of world cells starting at (ox, oy). Integer
 origins, so scrolling never accumulates a rounding error.
 
-Scrolling: when the truck gets within SCROLL_MARGIN_M of an edge the window
-shifts to put it back in the middle, and what falls off the far side is gone.
-That is what lets it drive a trail for kilometres in fixed memory, and the
-cost is that a place left more than about 25 m behind is forgotten. Loop
-closure would want those kept; it is not in this round.
+Growing: when the truck gets within SCROLL_MARGIN_M of an edge the window
+doubles, everything it held kept where it was, until it is MAX_SIZE (205 m
+a side). Nothing observed is ever dropped before that. Only past it does
+the window scroll to put the truck back in the middle, and what falls off
+the far side is gone; Grid.dropped counts those scrolls and the runner logs
+each one as an error, because the map is then losing places.
 
 Pure numpy, no scipy, so nothing here needs anything the car does not have.
 """
@@ -35,7 +41,10 @@ Pure numpy, no scipy, so nothing here needs anything the car does not have.
 import numpy as np
 
 RES = 0.05
-SIZE = 1024
+SIZE = 2048
+# The window grows to this and no further: 84 MB (plus a 17 MB scratch
+# mask), against the 7 GB the car's Pi 4 has free.
+MAX_SIZE = 4096
 
 # Log-odds in int8 steps. 0.85 and -0.4 a return are the prototype's, which
 # was measured on the four drives: a cell needs one return to go from unknown
@@ -60,6 +69,9 @@ L_OCC = 10          # +0.5: above this a cell is a wall to match against
 # long a removed thing lingers is how long until the truck looks through
 # where it was, not the clamp. So 3.5.
 L_MAX = 70          # +3.5
+# The most a return off any line (no hit mean) can take a cell to: one
+# return makes it occupied, and three clear passes clear it.
+OFF_LINE_MAX = L_OCC + L_HIT
 
 # A mean over at most this many returns, then an exponential average with
 # that weight: a wall a few millimetres off its first sighting moves.
@@ -76,11 +88,16 @@ SCROLL_MARGIN_M = 12.0
 
 class Grid:
     """The map. Every method is a few numpy calls; nothing allocates SIZE^2
-    per scan except scroll(), which happens once every ~14 m of travel at
-    most."""
+    per scan except a grow or a scroll, which happen at most a handful of
+    times a drive."""
 
-    def __init__(self, size=SIZE, res=RES, l_max=L_MAX, x0=0.0, y0=0.0):
+    def __init__(self, size=SIZE, res=RES, l_max=L_MAX, x0=0.0, y0=0.0,
+                 max_size=MAX_SIZE):
         self.size = int(size)
+        self.max_size = max(int(max_size), self.size)
+        self.grew = 0
+        # Scrolls that dropped cells: only ever past max_size.
+        self.dropped = 0
         self.res = float(res)
         self.l_max = int(l_max)
         n = self.size
@@ -119,8 +136,9 @@ class Grid:
     # ---- reading -------------------------------------------------------
 
     def occupied(self):
-        """bool (SIZE, SIZE): the cells a matcher or a planner treats as solid."""
-        return (self.lo > L_OCC) & (self.cnt > 0)
+        """bool (SIZE, SIZE): the cells a planner treats as solid. The
+        matcher uses only those of them with a hit mean (local_points)."""
+        return self.lo > L_OCC
 
     def known(self):
         return self.lo != 0
@@ -159,14 +177,43 @@ class Grid:
 
     # ---- writing -------------------------------------------------------
 
-    def scroll_to(self, x, y, margin=SCROLL_MARGIN_M):
-        """Shift the window if (x, y) is within `margin` of its edge. True if
-        it moved."""
+    def _near_edge(self, x, y, margin):
         n = self.size
         ix, iy = self.world_to_cell(x, y)
         m = int(margin / self.res)
-        if m <= ix < n - m and m <= iy < n - m:
+        return not (m <= ix < n - m and m <= iy < n - m), int(ix), int(iy)
+
+    def grow(self):
+        """Double the window about its centre, keeping every cell."""
+        n = self.size
+        n2 = min(2 * n, self.max_size)
+        pad = (n2 - n) // 2
+        for name in ("lo", "fx", "fy", "cnt"):
+            a = getattr(self, name)
+            b = np.zeros((n2, n2), a.dtype)
+            b[pad:pad + n, pad:pad + n] = a
+            setattr(self, name, b)
+        self._mark = np.zeros(n2 * n2, bool)
+        self.size = n2
+        self.ox -= pad
+        self.oy -= pad
+        self.grew += 1
+        self.version += 1
+
+    def scroll_to(self, x, y, margin=SCROLL_MARGIN_M):
+        """Make room round (x, y) if it is within `margin` of the edge: grow
+        while under max_size, and only then shift the window, dropping what
+        falls off (counted in dropped). True if anything changed."""
+        near, ix, iy = self._near_edge(x, y, margin)
+        if not near:
             return False
+        while near and self.size < self.max_size:
+            self.grow()
+            near, ix, iy = self._near_edge(x, y, margin)
+        if not near:
+            return True
+        n = self.size
+        self.dropped += 1
         sx = int(ix) - n // 2
         sy = int(iy) - n // 2
         for name in ("lo", "fx", "fy", "cnt"):
@@ -184,7 +231,7 @@ class Grid:
         self.version += 1
         return True
 
-    def integrate(self, sx, sy, wx, wy):
+    def integrate(self, sx, sy, wx, wy, mean=None):
         """One scan's returns (wx, wy), map metres, seen from (sx, sy).
 
         Each cell is changed at most once a scan: a cell a dozen rays cross
@@ -192,6 +239,10 @@ class Grid:
         never also cleared by a ray that grazes it on the way to the next
         point along the wall. The second is what keeps a wall seen end-on
         from eroding itself.
+
+        `mean`, bool per return, says which returns move the cells' hit
+        means (the line points); None is all of them. Every return makes
+        its cell more occupied either way.
         """
         n, res = self.size, self.res
         wx = np.asarray(wx, np.float64)
@@ -238,13 +289,27 @@ class Grid:
             self.version += 1
             return
         # Returns: one log-odds step per cell, and the hit mean.
-        px = (wx - gx * res)[inside] / res     # 0..1 within the cell
-        py = (wy - gy * res)[inside] / res
-        u, inv, c = np.unique(hi, return_inverse=True, return_counts=True)
-        mx = np.bincount(inv, px) / c
-        my = np.bincount(inv, py) / c
+        sel = inside if mean is None else inside & np.asarray(mean, bool)[keep]
+        hm = (hx * n + hy)[sel]
+        if mean is not None:
+            # Off-line returns push a cell only to OFF_LINE_MAX, and never
+            # pull one down: they put clutter on the map without holding
+            # up a wall cell the rays are clearing.
+            u = np.setdiff1d(np.unique(hi), hm)
+            old = lo[u].astype(np.int16)
+            lo[u] = np.maximum(old, np.minimum(old + L_HIT, OFF_LINE_MAX)
+                               ).astype(np.int8)
+        if not len(hm):
+            self.version += 1
+            return
+        u = np.unique(hm)
         old = lo[u].astype(np.int16)
         lo[u] = np.minimum(old + L_HIT, self.l_max).astype(np.int8)
+        px = (wx - gx * res)[sel] / res     # 0..1 within the cell
+        py = (wy - gy * res)[sel] / res
+        u, inv, c = np.unique(hm, return_inverse=True, return_counts=True)
+        mx = np.bincount(inv, px) / c
+        my = np.bincount(inv, py) / c
         c0 = cnt[u].astype(np.float64)
         nn = np.minimum(c0 + 1, MEAN_CAP)
         fxf = self.fx.reshape(-1)
@@ -277,12 +342,10 @@ class Grid:
         i1 = i0 + -(-(i1 - i0) // step) * step
         j1 = j0 + -(-(j1 - j0) // step) * step
         lo = np.zeros((i1 - i0, j1 - j0), np.int8)
-        cn = np.zeros_like(lo, dtype=np.uint8)
         si = slice(i0, min(i1, self.size))
         sj = slice(j0, min(j1, self.size))
         lo[:si.stop - i0, :sj.stop - j0] = self.lo[si, sj]
-        cn[:si.stop - i0, :sj.stop - j0] = self.cnt[si, sj]
-        occ = (lo > L_OCC) & (cn > 0)
+        occ = lo > L_OCC
         free = lo < 0
         nx, ny = (i1 - i0) // step, (j1 - j0) // step
         occ = occ.reshape(nx, step, ny, step).any((1, 3))

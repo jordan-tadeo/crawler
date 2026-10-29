@@ -159,17 +159,64 @@ def test_a_wall_seen_end_on_is_not_cleared_by_rays_along_it():
 
 
 def test_the_grid_scrolls_and_keeps_what_it_had():
-    g = gr.Grid(size=256)
+    g = gr.Grid(size=256, max_size=256)
     wall_scan(g, 2.0)
     for _ in range(5):
         wall_scan(g, 2.0)
     before = g.occupied().sum()
     # 256 cells of 5 cm is 12.8 m: 6 m out is within a metre of the edge.
     assert g.scroll_to(6.0, 0.0, margin=1.0)
-    assert g.scrolls == 1
+    assert g.scrolls == 1 and g.dropped == 1, "at its cap it can only scroll"
     assert g.occupied().sum() == before
     ix, iy = g.world_to_cell(2.0, 0.0)
     assert g.occupied()[ix, iy]
+
+
+def test_a_return_off_any_line_is_solid_but_not_matched_against():
+    g = gr.Grid(size=256)
+    g.integrate(0.0, 0.0, np.array([2.0, 0.0]), np.array([0.0, 2.0]),
+                mean=np.array([True, False]))
+    on, off = g.world_to_cell(2.0, 0.0), g.world_to_cell(0.0, 2.0)
+    assert g.occupied()[on] and g.occupied()[off], "both are on the map"
+    got = g.local_points(0.0, 0.0, 5.0)
+    assert len(got) == 1 and got[0, 0] == pytest.approx(2.0, abs=0.01), \
+        "only the line point is a target"
+    for _ in range(3):
+        g.integrate(0.0, 0.0, np.array([2.0]), np.array([0.0]))
+    for _ in range(10):
+        g.integrate(0.0, 0.0, np.array([2.0, 0.0]), np.array([0.0, 2.0]),
+                    mean=np.array([False, False]))
+    assert g.lo[off] == gr.OFF_LINE_MAX, "clutter is held only so hard"
+    assert g.lo[on] > gr.OFF_LINE_MAX, "and never pulls a wall down"
+
+
+def test_the_grid_grows_instead_of_dropping_anything():
+    # A long drive out in a straight line, writing a wall beside it every
+    # metre: under the cap, every wall written is still there at the end.
+    g = gr.Grid(size=256, max_size=1024)
+    for k in range(22):
+        x = float(k)
+        g.scroll_to(x, 0.0, margin=2.0)
+        g.integrate(x, 0.0, np.full(11, x), np.linspace(1.0, 1.5, 11))
+    assert g.grew == 2 and g.size == 1024
+    assert g.dropped == 0 and g.scrolls == 0
+    for k in range(22):
+        ix, iy = g.world_to_cell(float(k), 1.25)
+        assert g.occupied()[ix, iy], f"the wall at x={k} m was dropped"
+
+
+def test_the_runner_says_when_the_map_drops_cells():
+    class Log:
+        said = []
+
+        def log(self, level, subject, message):
+            self.said.append((level, message))
+    r = rn.SlamRunner(logger=Log())
+    r._take(("grid", 1, 0, 4096))
+    r._take(("grid", 1, 1, 4096))
+    levels = [lv for lv, _ in Log.said]
+    assert levels == ["info", "error"]
+    assert r.stats()["grid_dropped"] == 1
 
 
 # ---- the clock and the IMU -------------------------------------------------------
@@ -237,6 +284,113 @@ def test_a_tilted_truck_tracks_but_does_not_write():
     assert slam.grid.version == v, "nothing went into the map"
     out = drive(slam, 5, t0=3.0, imu=imu)
     assert out[-1].state == sl.TRACKING and out[-1].written
+
+
+def rolled_up(deg):
+    """The device up vector with the truck rolled `deg` onto its side."""
+    a = math.radians(deg)
+    return (-math.cos(a), math.sin(a), 0.0)
+
+
+def test_pitch_and_roll_are_gated_separately():
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 20, imu=imu)
+    out = drive(slam, 5, t0=2.0, imu=imu, up=rolled_up(5.0))
+    assert out[-1].roll_deg == pytest.approx(5.0, abs=0.01)
+    assert out[-1].state == sl.TRACKING and out[-1].written, \
+        "5 degrees of roll is under the roll gate"
+    out = drive(slam, 5, t0=2.5, imu=imu, up=tilted_up(4.0))
+    assert out[-1].pitch_deg == pytest.approx(4.0, abs=0.01)
+    assert out[-1].state == sl.TILTED and not out[-1].written, \
+        "4 degrees of pitch is over the pitch gate"
+
+
+# Two walls 2 m apart and nothing else in range: where along it the truck
+# is, the scan cannot say.
+CORRIDOR = [((-60.0, -1.0), (60.0, -1.0)), ((-60.0, 1.0), (60.0, 1.0))]
+
+
+def test_a_corridor_holds_the_prediction_along_it_and_is_not_written():
+    def along(t):
+        return np.array([0.3 * t, 0.0, 0.0])
+    slam = sl.Slam(imu=ImuTrack())
+    out = []
+    for k in range(15):
+        t = (k + 1) * PERIOD
+        out.append(slam.step(t, scan_at(t, along, CORRIDOR)))
+    late = out[3:]
+    assert all(r.constraint < sl.WRITE_MIN_CONSTRAINT for r in late)
+    assert all(r.held >= 1 for r in late), "the length is held, not solved"
+    assert all(r.why == "degenerate" and not r.written for r in late)
+    assert all(abs(r.y) < 0.02 and abs(r.yaw) < math.radians(1) for r in late), \
+        "across it, it is still pinned"
+    assert all(abs(r.x) < 0.01 for r in late), \
+        "along it, it stays on the prediction (still: no fit ever moved it)"
+
+
+def test_a_fit_that_jumps_half_a_metre_is_refused():
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 20, imu=imu)
+    p0 = slam.pose.copy()
+    # The scan says the truck is half a metre from where it was a tenth of
+    # a second ago, and it lines up perfectly there: a wrong wall.
+    jumped = path_pose(2.0) + np.array([0.5, 0.0, 0.0])
+    t = 2.1
+    for j in range(10):
+        imu.add(t - PERIOD + (j + 1) * 0.01, (0.0, 0.0, 0.0), LEVEL)
+    res = slam.step(t, scan_at(t, lambda _t: jumped))
+    assert res.banded and not res.matched and not res.written
+    assert math.hypot(res.x - p0[0], res.y - p0[1]) < 0.05, \
+        "it kept the prediction"
+
+
+def test_the_band_on_heading_is_five_degrees_off_the_imu():
+    slam = sl.Slam(imu=ImuTrack())
+    pred = np.array([1.0, 2.0, 0.3])
+    off = pred + np.array([0.0, 0.0, math.radians(6.0)])
+    near = pred + np.array([0.0, 0.0, math.radians(4.0)])
+    assert slam._out_of_band(off, pred, PERIOD, True)
+    assert not slam._out_of_band(near, pred, PERIOD, True)
+    assert not slam._out_of_band(off, pred, PERIOD, False), \
+        "no IMU, no heading to hold it to"
+    assert slam._out_of_band(pred + [0.31, 0.0, 0.0], pred, PERIOD, False)
+    assert not slam._out_of_band(pred + [0.31, 0.0, 0.0], pred, 0.2, False), \
+        "a longer gap since the last scan widens it"
+
+
+def test_every_return_is_written_not_only_the_line_points():
+    post = [((2.0, -1.0), (2.02, -1.0)), ((2.02, -1.0), (2.02, -0.98)),
+            ((2.02, -0.98), (2.0, -0.98)), ((2.0, -0.98), (2.0, -1.0))]
+    segs = ROOM + post
+
+    def here(t):
+        return np.zeros(3)
+    slam = sl.Slam(imu=ImuTrack())
+    for k in range(5):
+        t = (k + 1) * PERIOD
+        slam.step(t, scan_at(t, here, segs))
+    ix, iy = slam.grid.world_to_cell(2.0, -0.99)
+    near = slam.grid.occupied()[ix - 1:ix + 2, iy - 1:iy + 2]
+    assert near.any(), "a 2 cm post has no line through it and is still a thing"
+
+
+def slot_at(car_bearing_deg):
+    d = np.angle(np.exp(1j * (sc.CAR_B - math.radians(car_bearing_deg))))
+    return int(np.argmin(np.abs(d)))
+
+
+def test_the_body_box_drops_the_truck_and_keeps_what_is_beside_it():
+    r = np.full(sc.SLOTS, np.nan)
+    left, ahead = slot_at(90.0), slot_at(0.0)
+    r[left], r[ahead] = 0.20, 0.25
+    m = sc.valid_mask(r)
+    assert m[left], "20 cm abeam is outside the 18 cm half width"
+    assert not m[ahead], "25 cm ahead is the front bumper"
+    r[left], r[ahead] = 0.15, 0.35
+    m = sc.valid_mask(r)
+    assert not m[left] and m[ahead]
 
 
 def test_a_rollover_freezes_the_pose_and_recovers_after():

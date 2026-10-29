@@ -32,6 +32,17 @@ WIDE_M, MID_M, TIGHT_M = 0.4, 0.2, 0.1
 # Fewer matched points than this and the fit is not a fit.
 MIN_MATCHES = 30
 
+# Degeneracy (Zhang, Kaess and Singh, "On degeneracy of optimization-based
+# state estimation problems", ICRA 2016). Each Gauss-Newton step is solved,
+# then kept only along the eigen-directions of the weight-normalised 3x3
+# Hessian whose eigenvalue is at least DEGEN_EIG; along the others the step
+# is dropped, so the pose stays where the prediction put it instead of
+# sliding wherever noise pushes it. The translation eigenvalues are on the
+# same 0..0.5 scale as Fit.constraint: a long featureless corridor is ~0 along
+# its length, a room 0.1-0.5. The heading's is metres squared (the mean
+# lever arm squared) and is never near this.
+DEGEN_EIG = 0.02
+
 
 class Fit(NamedTuple):
     pose: tuple            # (x, y, yaw) map frame
@@ -41,6 +52,7 @@ class Fit(NamedTuple):
     converged: bool
     matches: int           # pairs in the last iteration
     constraint: float      # smallest translation eigenvalue, 0..0.5
+    held: int = 0          # directions held at the prediction, last step
 
 
 FAILED = None
@@ -61,6 +73,7 @@ def icp(src, nrm, tree, tgt, pose0, yaw_prior=None, sigma_yaw=None, iters=20):
     sched = [WIDE_M] * 3 + [MID_M] * 4 + [TIGHT_M] * max(iters - 7, 0)
     it = 0
     k = KERNEL_M
+    held = 0
     for it, md in enumerate(sched):
         R = rot(th)
         q = src @ R.T + (x, y)
@@ -89,6 +102,7 @@ def icp(src, nrm, tree, tgt, pose0, yaw_prior=None, sigma_yaw=None, iters=20):
             dx = -np.linalg.solve(H + 1e-9 * np.eye(3), g)
         except np.linalg.LinAlgError:
             return Fit((x, y, th), 0.0, np.inf, it, False, int(m.sum()), 0.0)
+        dx, held = remap(H / max(float(w.sum()), 1e-9), dx)
         x += dx[0]
         y += dx[1]
         th += dx[2]
@@ -104,7 +118,20 @@ def icp(src, nrm, tree, tgt, pose0, yaw_prior=None, sigma_yaw=None, iters=20):
     nw = nrm[m] @ R.T
     e = ((q[m] - tgt[j[m]]) * nw).sum(1)
     return Fit((x, y, th), float(m.mean()), float(np.sqrt(np.mean(e ** 2))),
-               it + 1, True, n, constraint(nw, e))
+               it + 1, True, n, constraint(nw, e), held)
+
+
+def remap(Hn, dx, thresh=DEGEN_EIG):
+    """dx with its components along Hn's weak eigen-directions removed, and
+    how many there were. Hn is symmetric, so its eigenvectors are
+    orthonormal and the projection is the solution remapping of Zhang et
+    al. for a single step."""
+    lam, V = np.linalg.eigh(Hn)
+    weak = lam < thresh
+    if not weak.any():
+        return dx, 0
+    good = V[:, ~weak]
+    return good @ (good.T @ dx), int(weak.sum())
 
 
 def constraint(normals, errors=None):

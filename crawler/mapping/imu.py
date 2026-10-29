@@ -131,6 +131,18 @@ class ImuTrack:
             return None
         return d / (t1 - t0) - bias
 
+    def pitch_roll(self, now=None, max_age=1.0):
+        """(|pitch|, |roll|) degrees from the newest up vector, NaN if none.
+
+        In the device axes +z is forward and +y left (scan.plane_drop reads
+        them the same way), so pitch is asin(up_z) and roll asin(up_y).
+        Absolute values, because the signs are only weakly supported."""
+        if self.up is None or (now is not None and now - self.up_t > max_age):
+            return float("nan"), float("nan")
+        _, uy, uz = self.up
+        return (abs(math.degrees(math.asin(max(-1.0, min(1.0, uz))))),
+                abs(math.degrees(math.asin(max(-1.0, min(1.0, uy))))))
+
     def tilt(self, now=None, max_age=1.0):
         """Degrees off level from the newest up vector, NaN if none (or none
         within max_age of `now`)."""

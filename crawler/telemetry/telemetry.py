@@ -484,7 +484,13 @@ JSON_SCHEMAS = {
         "matched": _BOOL, "written": _BOOL, "why": _STR,
         "inliers": _NUM, "rms_mm": _NUM, "constraint": _NUM,
         "returns": _INT, "points": _INT, "ground_dropped": _INT,
-        "tilt_deg": _NUM, "iters": _INT, "ms": _NUM,
+        "tilt_deg": _NUM,
+        # |pitch| and |roll| off level, the two write gates; held is how
+        # many directions the fit kept at the prediction because the scene
+        # did not pin them, banded that the fit was refused for landing too
+        # far from the prediction.
+        "pitch_deg": _NUM, "roll_deg": _NUM, "held": _INT, "banded": _BOOL,
+        "iters": _INT, "ms": _NUM,
         # The runner's counts since boot: scans offered, dropped because the
         # mapper was behind, and steps that raised.
         "scans": _INT, "dropped": _INT, "errors": _INT,

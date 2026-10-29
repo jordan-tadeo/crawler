@@ -412,8 +412,12 @@ def main(argv=None):
                     help="occupied log-odds clamp, in log-odds (default grid.L_MAX)")
     ap.add_argument("--no-imu", action="store_true")
     ap.add_argument("--no-ground-guard", action="store_true")
-    ap.add_argument("--tilt", type=float, default=None,
-                    help="write gate, degrees (default slam.WRITE_MAX_TILT_DEG)")
+    ap.add_argument("--pitch", type=float, default=None,
+                    help="pitch write gate, degrees (default slam.WRITE_MAX_PITCH_DEG)")
+    ap.add_argument("--roll", type=float, default=None,
+                    help="roll write gate, degrees (default slam.WRITE_MAX_ROLL_DEG)")
+    ap.add_argument("--no-band", action="store_true",
+                    help="believe every fit, however far from the prediction")
     ap.add_argument("--raw-time", action="store_true",
                     help="use the host log time as the scan time")
     ap.add_argument("--export", action="store_true",
@@ -424,8 +428,12 @@ def main(argv=None):
     kw = {}
     if a.clamp is not None:
         kw["l_max"] = int(round(a.clamp / gr.LO_STEP))
-    if a.tilt is not None:
-        kw["write_max_tilt"] = a.tilt
+    if a.pitch is not None:
+        kw["write_max_pitch"] = a.pitch
+    if a.roll is not None:
+        kw["write_max_roll"] = a.roll
+    if a.no_band:
+        kw["band"] = False
     if a.no_ground_guard:
         kw["ground_guard"] = False
     for path in a.inputs:
@@ -440,15 +448,18 @@ def main(argv=None):
         m = grade(d, out, pts)
         m.update(run=name, time_source=how, wall_s=round(wall, 1),
                  grid_MB=slam.grid.nbytes() / 1e6, retries=slam.retries,
-                 recoveries=slam.recoveries, scrolls=slam.grid.scrolls)
+                 recoveries=slam.recoveries, scrolls=slam.grid.scrolls,
+                 grew=slam.grid.grew, dropped_scrolls=slam.grid.dropped,
+                 banded=slam.banded)
         with open(os.path.join(a.out, name + ".json"), "w") as f:
             json.dump(m, f, indent=1)
         with open(os.path.join(a.out, name + ".csv"), "w") as f:
-            f.write("t,x,y,yaw,state,written,inliers,rms_m,constraint,tilt_deg\n")
+            f.write("t,x,y,yaw,state,written,inliers,rms_m,constraint,tilt_deg,pitch_deg,roll_deg,held,banded,why\n")
             for r in out:
                 f.write(f"{r.t:.4f},{r.x:.4f},{r.y:.4f},{r.yaw:.5f},{r.state},"
                         f"{int(r.written)},{r.inliers:.3f},{r.rms_m:.4f},"
-                        f"{r.constraint:.3f},{r.tilt_deg:.2f}\n")
+                        f"{r.constraint:.3f},{r.tilt_deg:.2f},{r.pitch_deg:.2f},"
+                        f"{r.roll_deg:.2f},{r.held},{int(r.banded)},{r.why}\n")
         write_png(os.path.join(a.out, name + ".png"), map_picture(slam.grid, out))
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                           for k, v in m.items() if k != "revisits"}), flush=True)

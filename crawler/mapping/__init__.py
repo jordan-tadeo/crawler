@@ -10,8 +10,8 @@ The parts
   imu.py      the OAK-D IMU as heading rate about gravity, and tilt
   clock.py    when a revolution really ended, from the sensor's own stamps
   matcher.py  point-to-line ICP, and how well the fit pins the pose down
-  grid.py     the map: int8 log-odds, 5 cm cells, a 51 m window that
-              scrolls with the truck
+  grid.py     the map: int8 log-odds, 5 cm cells, a 102 m window that
+              grows to 205 m and only then scrolls
   slam.py     Slam.step(), one scan: predict, de-skew, match, gate, write
   runner.py   SlamRunner: Slam on a worker beside the control loop, and
               the Foxglove messages (telemetry/map_view.py draws them)
@@ -54,5 +54,6 @@ kept small. Slam._write(pose, points) is the one place a scan enters the
 map, which is where a pose graph would log scans to re-render from.
 No relocalisation: a truck carried somewhere else while lost recovers its
 heading only, near the pose it froze at.
-The map forgets what is more than about 25 m behind (the window scrolls).
+The map keeps everything inside 205 m a side; past that it scrolls and
+forgets, and says so in the log as an error.
 """
