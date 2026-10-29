@@ -947,10 +947,17 @@ def parse_kv(text):
     return out
 
 
+def sync_command(paths):
+    """Flush the copied files and the models directory to the card. ext4
+    holds new data in the page cache for seconds, and a sha256 then reads the
+    cache: a power cut after it passed has left both files all zeros."""
+    return "sync -- " + " ".join(shlex.quote(p) for p in [*paths, CAR_MODELS])
+
+
 def swap_command(entry, previous_target):
     """One shell: parked check, both symlinks re-pointed atomically, the old
-    target remembered, the service restarted. Prints the car's clock just
-    before the restart as restart_at=<unix s>."""
+    target remembered, all of it flushed to the card, the service restarted.
+    Prints the car's clock just before the restart as restart_at=<unix s>."""
     m = shlex.quote(CAR_MODELS)
     steps = [f"cd {m}", "{ " + parked_check_shell() + "; }"]
     if previous_target:
@@ -959,6 +966,8 @@ def swap_command(entry, previous_target):
     for target, link in ((entry["onnx"], LINK_ONNX), (entry["json"], LINK_JSON)):
         steps.append(f"ln -sfn {shlex.quote(target)} .{link}.tmp && "
                      f"mv -T .{link}.tmp {link}")
+    # A symlink cannot be fsynced through its own path, so the whole card.
+    steps.append("sync")
     steps.append("echo restart_at=$(date +%s)")
     steps.append(f"sudo -n systemctl restart {SERVICE}")
     return " && ".join(steps)
@@ -1081,6 +1090,11 @@ def deploy(registry, entry, car, models_dir=MODELS_DIR, dry_run=False,
             car.put(local[kind], remote[kind])
     if not missing:
         say(f"{entry['onnx']} and {entry['json']} already on the car, sha256 match")
+    if missing:
+        command = sync_command([remote["onnx"], remote["json"]])
+        say(f"ssh {car.host} '{command}'")
+        if not dry_run:
+            car.run(command)
     if not dry_run and missing:
         if copy_plan(entry, car.sha256(list(remote.values()))):
             raise SystemExit("copied files are not on the car after the copy")

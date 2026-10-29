@@ -270,9 +270,11 @@ class FakeCar:
         return 0, ""
 
     def sha256(self, paths):
+        self.commands.append("#sha256 " + " ".join(paths))
         return {p: self.files[p] for p in paths if p in self.files}
 
     def put(self, local, remote):
+        self.commands.append(f"#put {remote}")
         self.puts.append((local, remote))
         self.files[remote] = md.pm.sha256_local(local)
 
@@ -320,10 +322,29 @@ def test_deploy_copies_verifies_repoints_and_restarts(registered):
     assert "ln -sfn kblock-1.0.json .policy.json.tmp && mv -T .policy.json.tmp policy.json" in swap
     assert "policy-old.onnx > .policy-previous.tmp" in swap
     assert swap.endswith("sudo -n systemctl restart crawler")
+    # The links are on the card before the restart, so a power cut after it
+    # cannot leave policy.onnx pointing at nothing.
+    assert swap.index("mv -T .policy.json.tmp policy.json") < swap.index(" && sync && ") \
+        < swap.index("systemctl restart")
     assert any("--since @1234" in c for c in car.commands)
     # Nothing here ever writes a pulse.
     assert not any("pigs s " in c or "pigs servo" in c or "pigs w " in c
                    for c in car.commands)
+
+
+def test_deploy_flushes_the_copies_to_the_card_before_it_checks_them(registered):
+    # The page cache answers a sha256 with the right bytes while the card
+    # still has zeros; only a hash after the sync says the copy survives.
+    car = FakeCar()
+    rc, lines = deploy(registered, car)
+    assert rc == 0, lines
+    c = car.commands
+    onnx, json_ = (f"{md.CAR_MODELS}/kblock-1.0.{x}" for x in ("onnx", "json"))
+    (sync,) = [i for i, cmd in enumerate(c) if cmd.startswith("sync -- ")]
+    assert c[sync] == f"sync -- {onnx} {json_} {md.CAR_MODELS}"
+    assert sync > max(c.index(f"#put {onnx}"), c.index(f"#put {json_}"))
+    verify = [i for i, cmd in enumerate(c) if cmd.startswith("#sha256 ")][-1]
+    assert sync < verify < c.index(swaps(car)[0])
 
 
 def test_deploy_skips_the_copy_of_files_already_there(registered):
