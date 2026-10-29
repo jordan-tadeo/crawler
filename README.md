@@ -167,6 +167,22 @@ The car serves Foxglove on port 8765. In Foxglove: Open connection, Foxglove
 WebSocket, `ws://jtpi.local:8765`. Use the name, not an address: the DHCP lease
 moves. If mDNS fails, `ssh jt@jtpi.local 'hostname -I'` gives the address.
 
+There are two layouts in `deploy/`. In Foxglove: Layouts, Import from file,
+once each, then switch between them from the Layouts menu.
+
+- `foxglove-drive.json`: the three cameras down the left, the SLAM map in the
+  middle and the live lidar on the right. The map panel's display frame is
+  `map`, so the map holds still and the truck outline moves across it on the
+  SLAM pose (`map -> base_link` on `/tf`), with the scan drawn on the walls.
+  `/voxel/points` and `/voxel/low` are in its topic list, off until ticked.
+  Its publish tool is set to a 2D pose on `/move_base_simple/goal`, which is
+  where `--nav` takes goals from. The lidar panel follows the truck, front up.
+- `foxglove-telemetry.json`: commands, ESC, pad axes, IMU, loop health, SLAM
+  fit and cost, the mode and SLAM state strips, and `/footprint` and
+  `/diagnostics` raw.
+
+Pictures, lidar and the map only come while a pad is connected.
+
 Every run is written to `log/mcap/` from service start, in 128 MiB segments,
 with the oldest deleted past 8 GiB and recording stopped under 4 GiB free.
 Record sessions get their own `crawler-record-*.mcap` files and are never

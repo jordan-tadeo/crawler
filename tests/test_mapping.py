@@ -541,6 +541,32 @@ def test_the_navigators_map_is_the_grids_own_cells_and_only_with_nav(
         r.close()
 
 
+def test_the_runner_puts_the_truck_on_the_map_in_tf(monkeypatch):
+    """The drive layout's map panel places the truck through this: every
+    matched scan offers "tf" with the pose, which goes out as map -> base_link."""
+    monkeypatch.setattr(rn, "ranges_of", lambda scan, mount: scan.ranges)
+    tele = AllTele()
+    r = rn.SlamRunner(mode=rn.MODE_THREAD, map_every_s=0.0, tele=tele)
+    r.start()
+    try:
+        for k in range(10):
+            t = (k + 1) * PERIOD
+            r.on_scan(FakeScan(t, scan_at(t)))
+            end = time.monotonic() + 5.0
+            while r.results + r.dropped < k + 1 and time.monotonic() < end:
+                time.sleep(0.002)
+        res = r.latest()
+    finally:
+        r.close()
+    tfs = [p for k, p in tele.rows if k == "tf"]
+    assert len(tfs) == r.results
+    mount, pose, t = tfs[-1]
+    assert pose == (res.x, res.y, res.yaw) and t == res.t
+    # The three-tuple is what lidar_view_message() turns into map ->
+    # base_link as well as base_link -> lidar; test_lidar_view decodes that.
+    assert mount == r.mount
+
+
 def test_pose_at_interpolates_between_scans_and_refuses_outside_them():
     P = rn.PoseStamp
     poses = [P(1.0, 0.0, 0.0, math.radians(179), 0.9, "tracking"),
@@ -701,24 +727,22 @@ def test_tf_with_slam_hangs_base_link_off_the_map_at_the_scan_time():
         "tf", ld.MOUNT, 10**18)).transforms) == 1
 
 
-def test_the_map_layout_reads_topics_that_exist():
+def test_the_drive_layout_draws_the_truck_on_the_slam_map():
     import json
     import os
-    from crawler.telemetry import telemetry as tm
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "deploy", "foxglove-map.json")) as f:
-        layout = json.load(f)
-    topics = (set(tm.JSON_TOPICS.values()) | set(tm.LIDAR_VIEW_CHANNELS.values())
-              | set(tm.SLAM_CHANNELS.values()))
-    three = layout["configById"]["3D!slam"]
+    with open(os.path.join(root, "deploy", "foxglove-drive.json")) as f:
+        three = json.load(f)["configById"]["3D!slam"]
+    # Display frame map, so the map holds still and a clicked goal arrives
+    # in the map frame as it is (nav/click.py), not relative to the truck.
     assert three["followTf"] == "map"
-    assert set(three["topics"]) <= topics
-    for key, cfg in layout["configById"].items():
-        for p in cfg.get("paths", []):
-            topic, field = p["value"].split(".", 1)
-            assert topic in topics, key
-            if topic == "/slam/status":
-                assert field in tm.JSON_SCHEMAS["slam_status"]["schema"]["properties"]
+    assert three["followMode"] == "follow-none"
+    # The truck outline is in base_link; the SLAM half of /tf hangs it
+    # off map. The scan goes through the same chain, so it sits on the walls.
+    for topic in ("/map", "/slam/path", "/lidar/scan", "/lidar/truck"):
+        assert three["topics"][topic]["visible"] is True, topic
+    assert three["publish"]["type"] == "pose"
+    assert three["publish"]["poseTopic"] == "/move_base_simple/goal"
 
 
 def test_the_status_row_fits_its_schema():

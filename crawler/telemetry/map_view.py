@@ -12,7 +12,7 @@ The map frame: x, y in metres from where the truck booted, heading 0 the
 boot heading, z up, the same handedness as base_link. Set the 3D panel's
 display frame to "map" and the scan, the truck outline and the map all line
 up; leave it on base_link and the map turns round the truck instead.
-deploy/foxglove-map.json is a layout that does the first.
+deploy/foxglove-drive.json's map panel does the first.
 """
 
 import math

@@ -1,0 +1,247 @@
+{
+  "configById": {
+    "Image!cam_depth": {
+      "synchronize": false,
+      "imageMode": {
+        "imageTopic": "/camera/depth",
+        "imageSchemaName": "foxglove.CompressedImage",
+        "rotation": 0,
+        "flipHorizontal": false,
+        "flipVertical": false
+      },
+      "foxglovePanelTitle": "Depth (8 Hz)"
+    },
+    "Image!cam_disparity": {
+      "synchronize": false,
+      "imageMode": {
+        "imageTopic": "/camera/disparity",
+        "imageSchemaName": "foxglove.CompressedImage",
+        "rotation": 0,
+        "flipHorizontal": false,
+        "flipVertical": false
+      },
+      "foxglovePanelTitle": "Disparity (8 Hz)"
+    },
+    "Image!cam_left": {
+      "synchronize": false,
+      "imageMode": {
+        "imageTopic": "/camera/rectified_left",
+        "imageSchemaName": "foxglove.CompressedImage",
+        "rotation": 0,
+        "flipHorizontal": false,
+        "flipVertical": false
+      },
+      "foxglovePanelTitle": "Rectified left (2 Hz)"
+    },
+    "3D!slam": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 12,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "map",
+      "scene": {
+        "transforms": {
+          "showLabel": false,
+          "axisSize": 0.4
+        }
+      },
+      "transforms": {
+        "frame:lidar": {
+          "visible": false
+        },
+        "frame:base_link": {
+          "visible": true
+        }
+      },
+      "topics": {
+        "/map": {
+          "visible": true,
+          "colorMode": "rgba-fields"
+        },
+        "/slam/path": {
+          "visible": true
+        },
+        "/lidar/scan": {
+          "visible": true,
+          "pointShape": "circle",
+          "pointSize": 2,
+          "decayTime": 0,
+          "colorMode": "flat",
+          "flatColor": "#ff7a1a"
+        },
+        "/lidar/truck": {
+          "visible": true
+        },
+        "/voxel/low": {
+          "visible": false
+        },
+        "/voxel/points": {
+          "visible": false,
+          "pointSize": 3,
+          "colorMode": "colormap",
+          "colorField": "z",
+          "colorMap": "turbo"
+        }
+      },
+      "layers": {
+        "grid": {
+          "visible": false,
+          "layerId": "foxglove.Grid",
+          "frameId": "map",
+          "size": 20,
+          "divisions": 20,
+          "lineWidth": 1,
+          "color": "#248eff",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      },
+      "foxglovePanelTitle": "SLAM map, the truck outline is the car (/map, /slam/path, scan in orange; voxels in the topic list)",
+      "publish": {
+        "type": "pose",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      }
+    },
+    "3D!lidar": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 4,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "base_link",
+      "scene": {
+        "transforms": {
+          "showLabel": false,
+          "axisSize": 0.15
+        }
+      },
+      "transforms": {
+        "frame:lidar": {
+          "visible": false
+        }
+      },
+      "topics": {
+        "/lidar/scan": {
+          "visible": true,
+          "pointShape": "circle",
+          "pointSize": 3,
+          "decayTime": 0,
+          "colorMode": "colormap",
+          "colorField": "range",
+          "colorMap": "turbo",
+          "minValue": 0.2,
+          "maxValue": 4
+        },
+        "/lidar/truck": {
+          "visible": true
+        }
+      },
+      "layers": {
+        "grid": {
+          "visible": true,
+          "layerId": "foxglove.Grid",
+          "frameId": "base_link",
+          "size": 10,
+          "divisions": 20,
+          "lineWidth": 1,
+          "color": "#248eff",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      },
+      "foxglovePanelTitle": "Live lidar, front is up (/lidar/scan, 0.5 m grid)"
+    }
+  },
+  "layout": {
+    "direction": "row",
+    "first": {
+      "direction": "column",
+      "first": "Image!cam_depth",
+      "second": {
+        "direction": "column",
+        "first": "Image!cam_disparity",
+        "second": "Image!cam_left",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 33.34
+    },
+    "second": {
+      "direction": "row",
+      "first": "3D!slam",
+      "second": "3D!lidar",
+      "splitPercentage": 62
+    },
+    "splitPercentage": 26
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  }
+}

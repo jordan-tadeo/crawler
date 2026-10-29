@@ -19,7 +19,7 @@ from crawler.telemetry import lidar_view as lv
 from crawler.telemetry import telemetry as tm
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LAYOUT = os.path.join(ROOT, "deploy", "foxglove-overview.json")
+LAYOUT = os.path.join(ROOT, "deploy", "foxglove-drive.json")
 
 
 def decode(message):
@@ -345,16 +345,12 @@ def ortho_screen_axes(camera):
     return up, right
 
 
-def test_the_bottom_right_pane_is_the_lidar_from_above():
+def test_the_drive_layout_has_the_lidar_from_above_beside_the_map():
     layout = json.load(open(LAYOUT))
     names = panels(layout["layout"])
-    assert "RawMessages!vehicle" not in names
-    assert "RawMessages!vehicle" not in layout["configById"]
     assert set(names) == set(layout["configById"])
-    column = layout["layout"]["second"]["second"]["second"]["second"]
-    assert column["first"] == "StateTransitions!diagnostics"
-    assert column["second"] == "3D!lidar"
-    assert column["splitPercentage"] <= 35, "the 3D panel gets most of it"
+    right = layout["layout"]["second"]
+    assert (right["first"], right["second"]) == ("3D!slam", "3D!lidar")
 
     cfg = layout["configById"]["3D!lidar"]
     assert cfg["followTf"] == "base_link"
