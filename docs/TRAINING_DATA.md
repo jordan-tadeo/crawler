@@ -331,12 +331,13 @@ with no `/footprint` rows is skipped and said so.
 - **Takeover**: an auto row where either group is `"pad"`. Only the group I
   had is a label, as always, and it is the command that went out, on
   record's scale: the trigger is scaled to the same caps. Every one of
-  those ticks is a decision, reverses included. Not labels: the release
+  those ticks is a decision, reverses included. Not a label: the release
   tail (the at-rest ticks that end a group's run, before it goes back to
-  the autopilot) and a throttle held off my trigger (`throttle` is not
-  `pad_throttle` scaled by the row's caps: on 2026-10-28 the floor held a
-  full RT pull at 0 for 0.8 s; the car no longer does that since
-  `2b38c7d`, and the rule stays for the drives from before).
+  the autopilot). A throttle held off my trigger (`throttle` is not
+  `pad_throttle` scaled by the row's caps, because the floor veto held my
+  forward: the car did that until `2b38c7d`) is labelled with what I
+  asked for, `pad_throttle` on the row's caps, not with the 0 that went
+  out.
 - **Manual after auto**: manual rows within `MANUAL_AFTER_AUTO_S` (5 s) of
   a switch out of auto, only while the throttle or steering is off rest,
   the throttle measured against the auto caps (manual drives the full

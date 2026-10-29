@@ -125,18 +125,24 @@ def test_the_release_tail_is_not_a_label_but_a_stop_inside_the_run_is():
     assert (s["steer_tails"], s["throttle_tails"]) == (5, 5)
 
 
-def test_a_throttle_held_off_my_trigger_is_not_a_label_but_my_steering_is():
+def test_a_throttle_held_off_my_trigger_is_labelled_with_my_trigger():
     # A full RT pull the car commanded 0 for: what reached the ESC is not
-    # what I asked for.
+    # what I asked for, so the label is my trigger on the row's caps.
     held = [row(1 + i, throttle=0.0, front=-0.5, steer_by="pad", throttle_by="pad",
                 pad_throttle=0.5 + 0.1 * i) for i in range(4)]
-    rows = [row(0)] + held + [mine(5, -0.8, 0.5), row(6)]
+    back = row(5, throttle=0.0, front=-0.5, steer_by="pad", throttle_by="pad",
+               pad_throttle=-0.5)
+    rows = [row(0)] + held + [back, mine(6, -0.8, 0.5), row(7)]
     session = footprint_session(at(rows))
     ticks, _, _ = align(session)
     held_ticks = ticks[1:5]
-    assert all(t.steer_label and not t.throttle_label for t in held_ticks)
-    assert ticks[5].throttle_label and ticks[5].steer_label
-    assert pd.intervention_summary(session)["held"] == 4
+    assert all(t.steer_label and t.throttle_label for t in held_ticks)
+    assert [t.action for t in held_ticks] == [pl.FORWARD] * 4
+    np.testing.assert_allclose([t.magnitude for t in held_ticks], [0.5, 0.6, 0.7, 0.8])
+    assert all(t.throttle == 0.0 for t in held_ticks)  # what went out stays on record
+    assert ticks[5].action == pl.REVERSE and ticks[5].magnitude == pytest.approx(0.5)
+    assert ticks[6].throttle_label and ticks[6].steer_label
+    assert pd.intervention_summary(session)["held"] == 5
 
 
 def test_two_takeovers_apart_are_two_segments():
@@ -250,11 +256,19 @@ def test_drive_logs_are_read_from_their_folder_and_a_manual_only_one_is_skipped(
     manual_only = pa.LegacyAdapter("crawler-2-001").finish()
     sessions = {"r.mcap": record_session("r"), "crawler-1-001.mcap": drive,
                 "crawler-2-001.mcap": manual_only}
-    monkeypatch.setattr(pd, "read_session",
-                        lambda path, adapter=None: (sessions[os.path.basename(path)], False))
+    asked = {}
+
+    def read(path, adapter=None):
+        asked[os.path.basename(path)] = adapter
+        return sessions[os.path.basename(path)], False
+    monkeypatch.setattr(pd, "read_session", read)
     out = tmp_path / "d.npz"
     assert pd.main([str(out), str(tmp_path / "r.mcap"), "--drive-logs", str(drives)]) == 0
     printed = capsys.readouterr().out
+    # A drive that starts in manual announces /camera/depth and /vehicle
+    # first and would settle on legacy: a drive log is read as footprint.
+    assert asked == {"r.mcap": None, "crawler-1-001.mcap": pa.FootprintAdapter.name,
+                     "crawler-2-001.mcap": pa.FootprintAdapter.name}
     assert "crawler-2-001: no /footprint rows" in printed
     assert "interventions: 4 takeover ticks" in printed
     a = pe.load(str(out))

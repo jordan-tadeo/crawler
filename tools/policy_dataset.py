@@ -161,7 +161,8 @@ MODE_WINDOW_S = 0.5
 MANUAL_AFTER_AUTO_S = 5.0
 # A takeover row whose throttle is further than this from my trigger scaled
 # by the row's caps had its throttle held back by something between my
-# finger and the ESC, and its throttle is not a label. Throttle units.
+# finger and the ESC (the floor veto, before 2b38c7d), and its throttle
+# label is what I asked for, not what went out. Throttle units.
 HELD_TOLERANCE = 0.01
 
 # Where a tick came from, as stored in the .npz "source" array (an index
@@ -305,22 +306,27 @@ def imu_features(commands, yaw=True):
 
 # ---- interventions: my hand on a drive the autopilot was making -----------
 
-def _held(cmd):
-    """An auto row whose throttle is not my trigger scaled by its caps.
-
-    Under a takeover the trigger is scaled exactly like record's (forward
-    by forward_limit, reverse by -reverse_limit), so a row that differs had
-    the throttle held back after my finger -- measured on 2026-10-28: a full
-    RT pull on a row the policy's floor held at 0 for 0.8 s. What reached
-    the ESC is then not what I asked for, and neither is a clean label.
-    """
+def _asked(cmd):
+    """The throttle my trigger asked for on a takeover row, on the row's
+    caps exactly like record's (forward by forward_limit, reverse by
+    -reverse_limit); None when the row has no pad throttle to read."""
     if cmd.mode != "auto" or cmd.throttle_by != pa.BY_PAD:
-        return False
+        return None
     pad = cmd.pad_throttle
     if not math.isfinite(pad) or not pa._valid_caps(cmd.forward_cap, cmd.reverse_cap):
-        return False
-    want = pad * cmd.forward_cap if pad > 0 else pad * -cmd.reverse_cap
-    return abs(want - cmd.throttle) > HELD_TOLERANCE
+        return None
+    return pad * cmd.forward_cap if pad > 0 else pad * -cmd.reverse_cap
+
+
+def _held(cmd):
+    """A takeover row whose throttle is not what my trigger asked for.
+
+    Measured on 2026-10-28: a full RT pull on a row the policy's floor held
+    at 0 for 0.8 s (fixed in 2b38c7d). What reached the ESC is then not what
+    I asked for, so the label is the asked value (_asked), not the command.
+    """
+    want = _asked(cmd)
+    return want is not None and abs(want - cmd.throttle) > HELD_TOLERANCE
 
 
 def _throttle_at_rest(cmd):
@@ -644,7 +650,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         if cmd.mode == "auto":
             steer_tail, throttle_tail, held = verdict
             steer_label = steer_label and not steer_tail
-            throttle_label = throttle_label and not (throttle_tail or held)
+            throttle_label = throttle_label and not throttle_tail
         if manual:
             source = SOURCE_MANUAL
         elif cmd.mode in pa.PAD_MODES:
@@ -654,7 +660,11 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         else:
             source = SOURCE_AUTO
 
-        action = pa.action_of(cmd.throttle)
+        # The throttle label: what went out, except on a held takeover row,
+        # where it is what my trigger asked for.
+        asked = _asked(cmd) if cmd.mode == "auto" and verdict[2] else None
+        label_throttle = cmd.throttle if asked is None else asked
+        action = pa.action_of(label_throttle)
         consecutive = prev_t is not None and (cmd.t_ns - prev_t) / 1e9 <= PREV_GAP_S
         if cmd.mode in pa.PAD_MODES:
             decision = True
@@ -682,7 +692,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         caps = fallback if manual else (cmd.forward_cap, cmd.reverse_cap)
         ticks.append(Tick(
             cmd.t_ns, fi, age, action,
-            pa.magnitude_of(cmd.throttle, *caps, fallback),
+            pa.magnitude_of(label_throttle, *caps, fallback),
             float(np.clip(cmd.front / pa.STEER_SCALE, -1.0, 1.0)),
             rule_action, float(rule_steer), decision, cmd.mode,
             steer_label, throttle_label,
@@ -981,8 +991,9 @@ def format_interventions(summary, ticks):
     line = (f"    interventions: takeover {s['takeover_ticks']} ticks in "
             f"{s['takeover_segments']} segments (steering only {s['steer_only']}, "
             f"throttle only {s['throttle_only']}, both {s['both']}); not labels: "
-            f"release tails steering {s['steer_tails']} / throttle {s['throttle_tails']}, "
-            f"throttle held off my trigger {s['held']}; kept {kept.get(SOURCE_TAKEOVER, 0)} "
+            f"release tails steering {s['steer_tails']} / throttle {s['throttle_tails']}; "
+            f"throttle held off my trigger {s['held']} (labelled with my trigger); "
+            f"kept {kept.get(SOURCE_TAKEOVER, 0)} "
             f"takeover ticks with a label")
     if s["auto_exits"] or s["manual_rows"]:
         line += (f"\n    manual after auto: {s['auto_exits']} switches, "
@@ -1050,8 +1061,13 @@ def main(argv=None):
     caps_by_session = {}
     toggles_by_session = {}
     for path in list(args.mcaps) + [p for p in drives if p not in args.mcaps]:
-        session, truncated = read_session(path, args.adapter)
-        if path in drive_set and session.adapter != pa.FootprintAdapter.name:
+        drive = path in drive_set
+        # A drive log is read as footprint whatever it announces first: one
+        # that starts in manual announces /camera/depth and /vehicle long
+        # before the first auto row, and would settle on legacy.
+        session, truncated = read_session(
+            path, args.adapter or (pa.FootprintAdapter.name if drive else None))
+        if drive and not session.commands:
             # Manual only, or a drive from before /footprint: nothing in it
             # is on the policy's input contract.
             line = f"{session.name}: no /footprint rows, nothing to learn from; skipped"
