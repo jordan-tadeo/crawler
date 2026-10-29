@@ -863,6 +863,9 @@ def test_the_map_grid_puts_each_pixel_where_the_map_has_it():
     codes = np.zeros((5, 3), np.uint8)          # 5 along x, 3 along y
     codes[4, 1] = gr.OCCUPIED
     codes[0, 2] = gr.FREE
+    # Something known in every row and column, so the crop to what has been
+    # seen (see test_live_bandwidth.py) leaves the window as it is.
+    codes[1, 0] = gr.FREE
     view = rn.MapView(t=0.0, version=1, x0=-1.0, y0=2.0, res=0.1, codes=codes)
     g = decode(tm.Telemetry.lidar_view_message("map", view, 10**18))
     assert g.frame_id == "map" and g.column_count == 5

@@ -133,10 +133,33 @@ INTERVALS = {
     "slam_status": 0.0,
     "map": 1.0,
     "slam_path": 2.0,
-    # With --voxel-map, once a second each: the mapper offers no faster.
-    "voxel_points": 1.0,
-    "voxel_low": 1.0,
+    # With --voxel-map, every two seconds each. The mapper offers once a
+    # second, but these are the two biggest messages there are and they
+    # change slowly.
+    "voxel_points": 2.0,
+    "voxel_low": 2.0,
 }
+
+# What the map channels (/map, /slam/path, /voxel/points, /voxel/low) may
+# cost together at their worst, in bytes a second: each at the biggest
+# message map_view.MAX_CELLS, voxel_view.LIVE_POINTS_MAX and the runner's
+# PATH_MAX allow, at its rate above. 304 KiB/s comes out of it. On top go
+# the cameras and the lidar, about 230 KiB/s, so everything open is under
+# 600 KiB/s at its worst -- down from 1.1 MiB/s and climbing, measured on
+# the 10-29 drive. Next to the router the car carried 750 KiB/s without
+# falling behind, but the house is a mesh, the car roams between nodes as
+# it drives, and two rooms away is not next to the router.
+MAP_CHANNELS_BUDGET = 384 * 1024
+
+# Messages the WebSocket server holds for one client before it drops the
+# oldest. The SDK's default is 1024, which is what made a slow link fall
+# behind instead of losing frames: all of it is queued and sent in order, so
+# a laptop held to 300 KiB/s against the car was 24 s behind within half a
+# minute and stayed there. Live, everything here is worth only its newest
+# value, so the oldest is the one to lose, and 64 is about half a second of
+# every channel at once. The recording is a sink of its own and loses
+# nothing to this.
+LIVE_BACKLOG = 64
 
 # Longest side of an image channel after downscaling, in pixels. The mono
 # cameras are 640x400, so this is a 2x reduction in each axis and a 4x
@@ -787,11 +810,13 @@ class Telemetry:
         if serve:
             try:
                 import foxglove
+                options = {"message_backlog_size": LIVE_BACKLOG}
+                options.update(self.server_options)
                 self._server = foxglove.start_server(
                     name="crawler",
                     host=self.host,
                     port=self.port,
-                    **self.server_options,
+                    **options,
                 )
                 self.serving = True
             except Exception as e:

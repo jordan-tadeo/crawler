@@ -497,6 +497,9 @@ def test_the_low_grid_puts_an_obstacle_where_the_map_has_it():
     codes = np.zeros((5, 3), np.uint8)              # 5 along x, 3 along y
     codes[4, 1] = vx.LOW_OBSTACLE
     codes[0, 2] = vx.LOW_FLOOR
+    # Something seen in every row and column, so the crop to what has been
+    # seen (see test_live_bandwidth.py) leaves the window as it is.
+    codes[1, 0] = vx.LOW_FLOOR
     view = vx.LowView(t=0.0, x0=-1.0, y0=2.0, res=0.05, codes=codes)
     g = decode(tm.Telemetry.lidar_view_message("voxel_low", view, 10**18))
     assert g.frame_id == "map" and g.column_count == 5

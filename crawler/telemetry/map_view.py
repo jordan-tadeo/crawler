@@ -2,7 +2,8 @@
 
   /map           foxglove.Grid in the map frame, once a second: the map
                  round the truck, 10 cm pixels, RGBA (unknown clear, free
-                 dark grey, occupied white)
+                 dark grey, occupied white), cropped to what has been seen
+                 and coarsened past MAX_CELLS so it cannot outgrow the wifi
   /tf            also carries map -> base_link, the SLAM pose, every scan
                  (the lidar's base_link -> lidar goes in the same message)
   /slam/path     foxglove.SceneUpdate in the map frame: where it has been
@@ -31,6 +32,68 @@ COLOURS[gr.OCCUPIED] = (240, 240, 240, 255)
 
 PATH_ID = "path"
 
+# The most cells a Grid message carries: 200 x 200, 160 KB of RGBA. The live
+# view is not compressed, so a picture of the whole map at full resolution
+# is a picture that grows with the drive -- the 40 m /map window is 640 KB at
+# 10 cm and /voxel/low was 625 KB every second from the first minute. Past
+# this the pixels get coarser instead: 10 cm becomes 20 cm, never a bigger
+# message.
+MAX_CELLS = 200 * 200
+
+
+def bounded(codes, x0, y0, res, max_cells=MAX_CELLS):
+    """uint8 codes [nx, ny] (0 is unknown, and higher wins) -> the same
+    picture as (codes, x0, y0, res) in at most max_cells cells.
+
+    Cropped to the cells that are not 0 first, which costs nothing to look
+    at: unknown is drawn clear. Then, only if it is still too big, `step`
+    cells to a pixel, each pixel the highest code in it -- occupied over
+    free over unknown, so a wall never thins out of the picture."""
+    codes = np.asarray(codes)
+    seen = codes > 0
+    rows, cols = np.flatnonzero(seen.any(1)), np.flatnonzero(seen.any(0))
+    if len(rows) == 0:
+        return codes[:1, :1], x0, y0, res
+    i0, i1, j0, j1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    codes = codes[i0:i1, j0:j1]
+    x0, y0 = x0 + i0 * res, y0 + j0 * res
+    nx, ny = codes.shape
+    step = 1
+    while -(-nx // step) * -(-ny // step) > max_cells:
+        step += 1
+    if step > 1:
+        px, py = -(-nx // step) * step, -(-ny // step) * step
+        pad = np.zeros((px, py), codes.dtype)
+        pad[:nx, :ny] = codes
+        codes = pad.reshape(px // step, step, py // step, step).max((1, 3))
+        res = res * step
+    return codes, float(x0), float(y0), float(res)
+
+
+def grid_rgba(codes, x0, y0, res, colours, log_time, z=0.0):
+    """uint8 codes [nx, ny] -> a foxglove.Grid in the map frame, under the
+    MAX_CELLS budget, coloured by `colours` (code -> RGBA)."""
+    from foxglove.messages import (Grid, PackedElementField,
+                                   PackedElementFieldNumericType, Pose,
+                                   Quaternion, Vector2, Vector3)
+    codes, x0, y0, res = bounded(codes, x0, y0, res)
+    nx, ny = codes.shape
+    u8 = PackedElementFieldNumericType.Uint8
+    return Grid(
+        timestamp=lv._stamp(log_time),
+        frame_id=MAP_FRAME,
+        pose=Pose(position=Vector3(x=x0, y=y0, z=z),
+                  orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)),
+        column_count=nx,
+        cell_size=Vector2(x=res, y=res),
+        row_stride=4 * nx,
+        cell_stride=4,
+        fields=[PackedElementField(name=n, offset=i, type=u8)
+                for i, n in enumerate(("red", "green", "blue", "alpha"))],
+        # rows along y, columns along x, four bytes a cell
+        data=colours[codes.T].tobytes(),
+    )
+
 
 def rgba(codes):
     """uint8 codes [nx, ny] -> the Grid's bytes: rows along y, columns along
@@ -40,24 +103,8 @@ def rgba(codes):
 
 def grid_message(view, log_time):
     """A runner.MapView as a foxglove.Grid."""
-    from foxglove.messages import (Grid, PackedElementField,
-                                   PackedElementFieldNumericType, Pose,
-                                   Quaternion, Vector2, Vector3)
-    nx, ny = view.codes.shape
-    u8 = PackedElementFieldNumericType.Uint8
-    return Grid(
-        timestamp=lv._stamp(log_time),
-        frame_id=MAP_FRAME,
-        pose=Pose(position=Vector3(x=view.x0, y=view.y0, z=-0.01),
-                  orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)),
-        column_count=nx,
-        cell_size=Vector2(x=view.res, y=view.res),
-        row_stride=4 * nx,
-        cell_stride=4,
-        fields=[PackedElementField(name=n, offset=i, type=u8)
-                for i, n in enumerate(("red", "green", "blue", "alpha"))],
-        data=rgba(view.codes),
-    )
+    return grid_rgba(view.codes, view.x0, view.y0, view.res, COLOURS,
+                     log_time, z=-0.01)
 
 
 def yaw_quaternion(yaw):

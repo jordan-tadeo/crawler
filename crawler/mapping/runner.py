@@ -48,8 +48,9 @@ OUTBOX = 64
 IMU_KEEP = 200
 
 # The /map picture: once a second, 10 cm pixels (two cells), at most
-# MAP_VIEW_HALF_M either side of the truck. 400 x 400 RGBA is 640 KB before
-# zstd, which takes the unknown and free runs down to almost nothing.
+# MAP_VIEW_HALF_M either side of the truck. 400 x 400 RGBA would be 640 KB,
+# and the live view is not compressed, so telemetry/map_view.py crops it to
+# what has been seen and coarsens it past map_view.MAX_CELLS on the way out.
 MAP_EVERY_S = 1.0
 MAP_STEP = 2
 MAP_VIEW_HALF_M = 20.0
