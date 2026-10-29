@@ -21,9 +21,10 @@ the truck and the goal, see build()):
            UNKNOWN_COST.
 
 The margin is the one number that trades doorways against scrapes. The
-footprint check needs CIRCLE_R_M + margin (0.161 + 0.06 m) at each circle
-centre, so the truck fits an opening of 0.44 m, and the middle of the truck
-is lethal within 0.196 m of anything. House doorways are 0.7 m and up.
+footprint check is the truck's own rectangle (footprint_clearance) clear by
+the margin, so the truck fits an opening of about 0.43 m (2 x (0.136 +
+0.06) plus the check's own 2 cm of slack a side), and the middle of the
+truck is lethal within 0.196 m of anything. House doorways are 0.7 m and up.
 """
 
 import math
@@ -35,6 +36,11 @@ from scipy import ndimage
 from crawler.nav import truck as tk
 
 MARGIN_M = 0.06
+# Under this the three-circle footprint check is redone against the
+# rectangle (footprint_clearance). Past the margin, the largest clearance
+# anything here asks for, so every pose a plan or a check could turn down
+# gets the rectangle's answer; a pose the circles already pass keeps theirs.
+RECT_CHECK_M = 0.08
 INSCRIBED_M = tk.HALF_WIDTH_M + MARGIN_M
 INFLATION_M = 0.6
 UNKNOWN_COST = 0.3
@@ -56,6 +62,7 @@ class CostMap(NamedTuple):
     margin: float
     inscribed: float
     version: object = None
+    pad: object = None     # dist and cost with a one-cell border: fast lookups
 
     @property
     def shape(self):
@@ -74,33 +81,79 @@ class CostMap(NamedTuple):
         nx, ny = self.dist.shape
         return (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
 
+    def _padded_cells(self, x, y):
+        nx, ny = self.dist.shape
+        ix = np.floor((np.asarray(x) - self.origin[0]) / self.res)
+        iy = np.floor((np.asarray(y) - self.origin[1]) / self.res)
+        # Anything outside lands on the border, which is 0 distance, 1 cost.
+        ix = np.clip(ix, -1, nx).astype(np.int64) + 1
+        iy = np.clip(iy, -1, ny).astype(np.int64) + 1
+        return ix, iy
+
     def dist_at(self, x, y):
         """Distance to the nearest solid cell at map points. Outside the
         window is 0: the planner never leaves the map it was given."""
-        ix, iy = self.world_to_cell(x, y)
-        ok = self.inside(ix, iy)
-        out = np.zeros(np.shape(ix), np.float32)
-        out[ok] = self.dist[ix[ok], iy[ok]]
-        return out
+        if self.pad is None:
+            ix, iy = self.world_to_cell(x, y)
+            ok = self.inside(ix, iy)
+            out = np.zeros(np.shape(ix), np.float32)
+            out[ok] = self.dist[ix[ok], iy[ok]]
+            return out
+        ix, iy = self._padded_cells(x, y)
+        return self.pad[0][ix, iy]
 
     def cost_at(self, x, y):
-        ix, iy = self.world_to_cell(x, y)
-        ok = self.inside(ix, iy)
-        out = np.ones(np.shape(ix), np.float32)
-        out[ok] = self.cost[ix[ok], iy[ok]]
-        return out
+        if self.pad is None:
+            ix, iy = self.world_to_cell(x, y)
+            ok = self.inside(ix, iy)
+            out = np.ones(np.shape(ix), np.float32)
+            out[ok] = self.cost[ix[ok], iy[ok]]
+            return out
+        ix, iy = self._padded_cells(x, y)
+        return self.pad[1][ix, iy]
 
     def footprint_clearance(self, x, y, yaw):
-        """The truck's least clearance at poses: the smallest of
-        dist - CIRCLE_R_M over the three circles. Negative is touching.
-        Vectorised over poses."""
-        x, y, yaw = (np.asarray(v, float) for v in (x, y, yaw))
+        """The truck's least clearance at poses, metres: the gap between its
+        outline and the nearest solid cell's centre, read off the distance
+        field at the cell each sample lands in, so good to about half a cell
+        (the margin is there for that, among other things). Negative is
+        touching. Vectorised over poses.
+
+        The three circles first (truck.CIRCLE_X_M); where they come out
+        under RECT_CHECK_M, the rectangle itself (truck.RECT_POINTS), and
+        the better of the two: both are lower bounds on the same gap, so
+        the larger is too."""
+        x, y, yaw = np.broadcast_arrays(*(np.asarray(v, float) for v in (x, y, yaw)))
+        shape = x.shape
+        x, y, yaw = x.ravel(), y.ravel(), yaw.ravel()
         c, s = np.cos(yaw), np.sin(yaw)
         worst = None
         for cx in tk.CIRCLE_X_M:
             d = self.dist_at(x + c * cx, y + s * cx) - tk.CIRCLE_R_M
             worst = d if worst is None else np.minimum(worst, d)
-        return worst
+        worst = np.asarray(worst, np.float64)
+        tight = worst < RECT_CHECK_M
+        if tight.any():
+            px, py = tk.RECT_POINTS[:, 0], tk.RECT_POINTS[:, 1]
+            xt, yt = x[tight][:, None], y[tight][:, None]
+            ct, st = c[tight][:, None], s[tight][:, None]
+            d = self.dist_at(xt + ct * px - st * py, yt + st * px + ct * py)
+            rect = d.min(-1) - tk.RECT_SLACK_M
+            worst[tight] = np.maximum(worst[tight], rect)
+        worst = worst.reshape(shape)
+        return worst if worst.ndim else float(worst)
+
+    def probe_clearance(self, x, y, yaw):
+        """The least distance to a solid cell over the floor-veto box ahead
+        of the bumper (truck.PROBE_POINTS), at poses. Vectorised."""
+        x, y, yaw = np.broadcast_arrays(*(np.asarray(v, float) for v in (x, y, yaw)))
+        shape = x.shape
+        x, y, yaw = x.ravel()[:, None], y.ravel()[:, None], yaw.ravel()[:, None]
+        c, s = np.cos(yaw), np.sin(yaw)
+        px, py = tk.PROBE_POINTS[:, 0], tk.PROBE_POINTS[:, 1]
+        d = self.dist_at(x + c * px - s * py, y + s * px + c * py).min(-1)
+        d = d.reshape(shape)
+        return d if d.ndim else float(d)
 
     def footprint_free(self, x, y, yaw, margin=None):
         m = self.margin if margin is None else margin
@@ -151,6 +204,8 @@ def build(view, margin=MARGIN_M, inflation=INFLATION_M,
     unknown = ~known
     cost = np.where(unknown, np.maximum(cost, unknown_cost), cost)
     cost[lethal] = 1.0
-    return CostMap(dist, lethal, cost.astype(np.float32), unknown, solid,
-                   known, res, origin, float(margin), float(inscribed),
-                   view.version)
+    cost = cost.astype(np.float32)
+    pad = (np.pad(dist, 1, constant_values=0.0),
+           np.pad(cost, 1, constant_values=1.0))
+    return CostMap(dist, lethal, cost, unknown, solid, known, res, origin,
+                   float(margin), float(inscribed), view.version, pad)

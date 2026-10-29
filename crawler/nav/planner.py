@@ -1,8 +1,9 @@
 """Paths the truck can drive: hybrid A* over arcs, forward and reverse.
 
 A plain grid A* hands back a path with corners in it, and this truck cannot
-turn on the spot: its tightest circle is about 0.59 m (truck.TURN_RADIUS_M,
-ESTIMATED), and with a lazy axle on loose ground it is wider than that. So
+turn on the spot: its tightest circle is 0.75 m on the weaker (right) side
+at full lock (truck.TURN_RADIUS_M, MEASURED), and with a lazy axle on loose
+ground it is wider than that. So
 the search moves the way the truck moves. Every expansion drives PRIM_STEP_M
 along an arc, at one of a handful of curvatures, forward or in reverse, and
 keeps the continuous pose it ends at. The closed set is binned (XY_BIN_M,
@@ -14,21 +15,44 @@ up at a quarter of its forward speed, and blind but for the lidar), and a
 change of direction costs SWITCH_PENALTY_M. So it reverses when the forward
 way round is longer than those costs, and not otherwise.
 
-The plan curvature is a fraction of the truck's full lock (PLAN_CURVATURE).
-The servo command for full lock is not full lock on the ground: on carpet,
-gravel or a slope an axle can turn 60% of what it is told. A path planned at
-the truck's best lock is a path it cannot follow on a bad day, so it plans
-at less than it has and the follower keeps the rest in hand to correct with.
+The plan curvature is a fraction of the truck's measured lock
+(PLAN_CURVATURE of truck.MAX_CURVATURE, the weaker side): 0.88, so a radius
+of 0.85 m. The follower keeps the other 12% in hand to correct with, and the
+learned gain (follower.GainEstimate) covers a surface that gives back less;
+a path planned at the best lock is one the truck cannot follow on a bad day,
+and one planned much wider than the truck can turn sends every turnaround
+into a hunt for room it does not need.
 
-The heuristic is a 2D search on the same cost map, coarsened (H_COARSEN),
-run from the goal outwards (grid_distances). It knows the walls, which a
-straight-line distance does not, so the search does not spend itself on the
-wrong side of one. It is weighted (H_WEIGHT), which trades a slightly longer
-path for far fewer expansions; MAX_EXPANSIONS bounds the search outright.
+Two heuristics, the larger taken. A 2D search on the same cost map,
+coarsened (H_COARSEN), run from the goal outwards (grid_distances): it knows
+the walls, which a straight-line distance does not, so the search does not
+spend itself on the wrong side of one. And the obstacle-free distance for a
+truck that cannot turn tighter than the plan radius (turn_distance): it
+knows a goal beside or behind the truck is a turn away, which the 2D one
+does not, and that is where a plain hybrid A* floods. Weighted (H_WEIGHT),
+which trades a slightly longer path for far fewer expansions.
+
+The analytic shot. Every SHOT_EVERY expansions within SHOT_M of the goal,
+the search tries the obstacle-free answer straight off: one arc at the plan
+radius, then straight to the goal, forward or in reverse, either way round
+(_shot). If that is clear by the margin all the way, it is the rest of the
+path, and the search ends there instead of creeping up on the goal a
+PRIM_STEP_M at a time.
+
+The floor veto. The camera holds any forward with something in a box
+FORWARD_FLOOR_MM past the bumper (truck.PROBE_POINTS), so a path that
+noses up to a wall before turning away from it is a path the car stops on
+and then backs out of. With Params.floor_probe (off by default), forward
+moves keep that box PROBE_CLEAR_M clear, except within PROBE_FREE_M of the
+goal.
+
+Bounded twice: MAX_EXPANSIONS outright, and a wall-clock deadline the caller
+can pass (the navigator's planning thread does), checked every 64.
 """
 
 import heapq
 import math
+import time
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -40,19 +64,39 @@ from crawler.nav import truck as tk
 
 PRIM_STEP_M = 0.2
 CURVATURE_STEPS = (-1.0, -0.5, 0.0, 0.5, 1.0)
-PLAN_CURVATURE = 0.7          # of truck.MAX_CURVATURE
+PLAN_CURVATURE = 0.88         # of truck.MAX_CURVATURE: R 0.85 m
 REVERSE_FACTOR = 3.0
 SWITCH_PENALTY_M = 1.0
 STEER_CHANGE_M = 0.05         # per unit of curvature fraction changed
 COST_WEIGHT = 2.0
 GOAL_TOL_M = 0.2
 GOAL_YAW_TOL = math.radians(30.0)
-XY_BIN_M = 0.1
-YAW_BINS = 72
+# 15 cm and 10 degrees. Halving either about doubles the search in a tight
+# spot (a three-point turn in a hallway: 4600 expansions at 10 cm / 5
+# degrees, 1960 at these) for paths that come out within a few percent of
+# the same length.
+XY_BIN_M = 0.15
+YAW_BINS = 36
 MAX_EXPANSIONS = 12000
 H_WEIGHT = 1.4
 H_COARSEN = 2
 SAMPLE_M = 0.05               # spacing of the poses handed to the follower
+SHOT_EVERY = 8
+SHOT_M = 5.0
+# Forward moves keep the floor-veto box (truck.PROBE_POINTS) this clear of
+# anything, except within PROBE_FREE_M of the goal, where arriving facing a
+# wall is the point. 1 cm: the box only has to be off solid cells (their
+# distance is 0, the next cell's is one cell).
+#
+# Off by default (Params.floor_probe). In the house sim it cost about 10
+# points of arrivals at both 5 cm and 1 cm, almost all "no path" in places
+# the truck does fit, while the floor holds it saves are about one back-out
+# an episode. Worth another look on the car, where a floor hold may cost
+# more than the sim's stand-in does.
+PROBE_CLEAR_M = 0.01
+PROBE_FREE_M = 0.6
+# A shot is only worth trying where the straight line to the goal is clear
+# of the lethal band: one cheap look along it first.
 
 
 class Params(NamedTuple):
@@ -69,6 +113,8 @@ class Params(NamedTuple):
     yaw_bins: int = YAW_BINS
     max_expansions: int = MAX_EXPANSIONS
     h_weight: float = H_WEIGHT
+    shot: bool = True
+    floor_probe: bool = False   # keep the floor-veto box off walls (off: see PROBE_CLEAR_M)
 
 
 class Path(NamedTuple):
@@ -223,6 +269,113 @@ def heuristic_field(cm, goal_xy, params=Params()):
     return g._replace(dist=d)
 
 
+def turn_distance(x, y, th, gx, gy, radius, reverse_factor=REVERSE_FACTOR,
+                  reverse=True):
+    """The shortest obstacle-free drive from poses (x, y, th) to the point
+    (gx, gy), any heading at the end, for a truck that turns no tighter than
+    `radius`: one arc then straight, forward or (at reverse_factor the cost)
+    in reverse, either way round. Vectorised over poses.
+
+    This is the turn-then-straight family of Reeds-Shepp paths, which is the
+    whole of the answer for a goal outside both turning circles; a goal
+    inside them is reached by a path with a cusp in it, which this family
+    does not have, and gets the straight-line distance times the reverse
+    factor instead (backing up to it is always one way there)."""
+    x, y, th = np.broadcast_arrays(*(np.asarray(v, float) for v in (x, y, th)))
+    dx, dy = gx - x, gy - y
+    c, s = np.cos(th), np.sin(th)
+    lx = c * dx + s * dy
+    ly = -s * dx + c * dy
+    R = float(radius)
+    best = np.hypot(lx, ly) * reverse_factor
+    # All four (direction, side) at once: the point mirrored into the
+    # forward-left case for each.
+    ds = np.array((1, 1, -1, -1) if reverse else (1, 1), float)
+    sides = np.array((1, -1, 1, -1) if reverse else (1, -1), float)
+    w = np.where(ds > 0, 1.0, reverse_factor)
+    shape = (len(ds),) + (1,) * lx.ndim
+    length = _turn_then_straight(ds.reshape(shape) * lx[None],
+                                 sides.reshape(shape) * ly[None], R)[0]
+    return np.minimum(best, (w.reshape(shape) * length).min(0))
+
+
+def _turn_then_straight(px, py, R):
+    """(length, arc angle, straight) of the left-turn-then-straight path from
+    the origin heading +x to the point (px, py). inf where the point is
+    inside the left circle."""
+    cx, cy = px, py - R                       # the point from the circle's centre
+    L = np.hypot(cx, cy)
+    inside = L < R - 1e-9
+    Ls = np.where(inside, R, L)
+    straight = np.sqrt(np.maximum(Ls * Ls - R * R, 0.0))
+    phi = np.arctan2(cy, cx)
+    # The truck starts at angle -pi/2 round the centre and goes anticlockwise
+    # to the tangent point whose tangent runs through the point.
+    t = phi - np.arccos(np.clip(R / Ls, -1.0, 1.0))
+    arc = np.mod(t + math.pi / 2, 2 * math.pi)
+    # A point dead ahead is an arc of 0, which rounding can make a lap.
+    arc = np.where(arc > 2 * math.pi - 1e-6, 0.0, arc)
+    length = np.where(inside, np.inf, R * arc + straight)
+    return length, arc, straight
+
+
+def _line_clear(cm, x, y, gx, gy, step=0.1):
+    n = max(2, int(math.ceil(math.hypot(gx - x, gy - y) / step)) + 1)
+    t = np.linspace(0.0, 1.0, n)
+    return bool((cm.dist_at(x + t * (gx - x), y + t * (gy - y)) >= cm.inscribed).all())
+
+
+def _shot(cm, x, y, th, gx, gy, kmax, p, need):
+    """The cheapest clear turn-then-straight path from (x, y, th) to the
+    goal: (cost, poses (n, 3), dirs, curv) or None. Clear means every pose
+    on it has footprint clearance `need`."""
+    R = 1.0 / kmax
+    c, s = math.cos(th), math.sin(th)
+    lx = c * (gx - x) + s * (gy - y)
+    ly = -s * (gx - x) + c * (gy - y)
+    options = []
+    for d in ((1, -1) if p.reverse else (1,)):
+        for side in (1, -1):
+            length, arc, straight = _turn_then_straight(np.float64(d * lx),
+                                                        np.float64(side * ly), R)
+            if not math.isfinite(float(length)):
+                continue
+            w = 1.0 if d > 0 else p.reverse_factor
+            options.append((w * float(length), d, side, float(arc), float(straight)))
+    options.sort()
+    for _, d, side, arc, straight in options:
+        k = side * kmax
+        n_arc = max(1, int(math.ceil(R * arc / SAMPLE_M)))
+        n_st = max(1, int(math.ceil(straight / SAMPLE_M)))
+        s_arc = d * R * arc * np.arange(1, n_arc + 1) / n_arc
+        ax, ay, ath = _arc(x, y, th, np.full(n_arc, k), s_arc)
+        s_st = d * straight * np.arange(1, n_st + 1) / n_st
+        bx, by, bth = _arc(float(ax[-1]), float(ay[-1]), float(ath[-1]),
+                           np.zeros(n_st), s_st)
+        px = np.concatenate([ax, bx])
+        py = np.concatenate([ay, by])
+        pth = np.concatenate([ath, bth])
+        # Every fourth pose first: most shots that fail, fail cheaply.
+        if not (cm.footprint_clearance(px[::4], py[::4], pth[::4]) >= need).all():
+            continue
+        if not (cm.footprint_clearance(px, py, pth) >= need).all():
+            continue
+        if d > 0 and p.floor_probe:
+            far = np.hypot(px - gx, py - gy) > PROBE_FREE_M
+            if far.any() and (cm.probe_clearance(px[far][::2], py[far][::2],
+                                                 pth[far][::2]) < PROBE_CLEAR_M).any():
+                continue
+        cost = cm.cost_at(px, py)
+        w = 1.0 if d > 0 else p.reverse_factor
+        total = (R * arc + straight) * w + p.cost_weight * float(cost.mean()) * (
+            R * arc + straight) + p.steer_change * 1.0
+        poses = np.stack([px, py, pth], 1)
+        dirs = np.full(len(px), d, int)
+        curv = np.concatenate([np.full(n_arc, k), np.zeros(n_st)])
+        return total, poses, dirs, curv
+    return None
+
+
 def _arc(x, y, th, k, s):
     """Poses s metres (signed) along curvature k from (x, y, th). Broadcasts."""
     th1 = th + k * s
@@ -238,11 +391,12 @@ def _wrap(a):
 
 
 def plan(cm, start, goal_xy, goal_yaw=None, params=Params(), h=None,
-         start_dir=0):
+         start_dir=0, deadline=None):
     """A Path from `start` (x, y, yaw) to within goal_tol of goal_xy, or
     None. `h` is a heuristic_field for this goal if the caller has one.
     `start_dir` is the way the truck is already moving (+1, -1 or 0); a
-    first move the other way pays the switch penalty."""
+    first move the other way pays the switch penalty. `deadline` is a
+    time.perf_counter() past which it gives up (None)."""
     p = params
     if h is None:
         h = heuristic_field(cm, goal_xy, p)
@@ -269,12 +423,20 @@ def plan(cm, start, goal_xy, goal_yaw=None, params=Params(), h=None,
     h0 = float(h.at(sx, sy))
     if not math.isfinite(h0):
         h0 = math.hypot(gx - sx, gy - sy) * 3.0
+    if goal_yaw is None:
+        h0 = max(h0, float(turn_distance(sx, sy, sth, gx, gy, 1.0 / kmax,
+                                         p.reverse_factor, p.reverse)))
 
-    def hval(xs, ys):
+    R = 1.0 / kmax
+
+    def hval(xs, ys, ths):
         v = h.at(xs, ys)
         bad = ~np.isfinite(v)
         if bad.any():
             v = np.where(bad, np.hypot(gx - xs, gy - ys) * 3.0, v)
+        if goal_yaw is None:
+            v = np.maximum(v, turn_distance(xs, ys, ths, gx, gy, R,
+                                            p.reverse_factor, p.reverse))
         return v
 
     def key(x, y, th):
@@ -287,7 +449,10 @@ def plan(cm, start, goal_xy, goal_yaw=None, params=Params(), h=None,
     heap = [(p.h_weight * h0, 0)]
     expansions = 0
     goal_node = None
+    tail = None
     while heap and expansions < p.max_expansions:
+        if deadline is not None and expansions % 64 == 0 and time.perf_counter() > deadline:
+            return None
         f, ni = heapq.heappop(heap)
         x, y, th, dprev, fprev, g, _, _ = nodes[ni]
         if g > best.get(key(x, y, th), math.inf) + 1e-9:
@@ -296,11 +461,32 @@ def plan(cm, start, goal_xy, goal_yaw=None, params=Params(), h=None,
                 goal_yaw is None or abs(_wrap(th - goal_yaw)) <= p.yaw_tol):
             goal_node = ni
             break
+        if (p.shot and goal_yaw is None and expansions % SHOT_EVERY == 0
+                and math.hypot(x - gx, y - gy) <= SHOT_M
+                and _line_clear(cm, x, y, gx, gy)):
+            near_start = math.hypot(x - sx, y - sy) < relax_r
+            shot = _shot(cm, x, y, th, gx, gy, kmax, p,
+                         need if near_start else cm.margin)
+            if shot is not None:
+                goal_node = ni
+                tail = shot
+                break
         expansions += 1
         ax, ay, ath = _arc(x, y, th, K, S)               # (P, 3)
         clear = cm.footprint_clearance(ax, ay, ath)       # (P, 3)
         near_start = math.hypot(x - sx, y - sy) < relax_r
         ok = (clear >= (need if near_start else cm.margin)).all(1)
+        # A forward move ending with the floor-veto box on something is one
+        # the car will stop; except on the last stretch to the goal.
+        fwd = ok & (pd > 0)
+        if p.floor_probe and fwd.any():
+            ex_, ey_ = ax[fwd, -1], ay[fwd, -1]
+            far = np.hypot(ex_ - gx, ey_ - gy) > PROBE_FREE_M
+            if far.any():
+                probe = cm.probe_clearance(ex_, ey_, ath[fwd, -1])
+                bad = far & (probe < PROBE_CLEAR_M)
+                idx = np.nonzero(fwd)[0]
+                ok[idx[bad]] = False
         if not ok.any():
             continue
         cost = cm.cost_at(ax, ay).mean(1)
@@ -310,7 +496,7 @@ def plan(cm, start, goal_xy, goal_yaw=None, params=Params(), h=None,
         switch = (pd != dprev) & (dprev != 0)
         step_g = step_g + np.where(switch, p.switch_penalty, 0.0)
         step_g = step_g + p.steer_change * np.abs(pf - fprev)
-        hs = hval(ex, ey)
+        hs = hval(ex, ey, eth)
         for j in np.nonzero(ok)[0]:
             g2 = g + float(step_g[j])
             kk = key(ex[j], ey[j], eth[j])
@@ -322,10 +508,10 @@ def plan(cm, start, goal_xy, goal_yaw=None, params=Params(), h=None,
             heapq.heappush(heap, (g2 + p.h_weight * float(hs[j]), len(nodes) - 1))
     if goal_node is None:
         return None
-    return _reconstruct(nodes, goal_node, prims, kmax, p, expansions)
+    return _reconstruct(nodes, goal_node, prims, kmax, p, expansions, tail)
 
 
-def _reconstruct(nodes, gi, prims, kmax, p, expansions):
+def _reconstruct(nodes, gi, prims, kmax, p, expansions, tail=None):
     chain = []
     i = gi
     while i >= 0:
@@ -351,6 +537,18 @@ def _reconstruct(nodes, gi, prims, kmax, p, expansions):
         # Snap to the node's own pose, so rounding never accumulates.
         poses[-1] = (node[0], node[1], node[2])
         length += p.step
+    cost = float(nodes[gi][5])
+    if tail is not None:
+        t_cost, t_poses, t_dirs, t_curv = tail
+        d_last = dirs[-1] if dirs else int(chain[-1][3])
+        if d_last and int(t_dirs[0]) != d_last:
+            t_cost += p.switch_penalty
+        poses.extend(tuple(float(v) for v in q) for q in t_poses)
+        dirs.extend(int(v) for v in t_dirs)
+        curv.extend(float(v) for v in t_curv)
+        length += float(np.sum(np.hypot(np.diff(t_poses[:, 0], prepend=poses[-len(t_poses) - 1][0]),
+                                        np.diff(t_poses[:, 1], prepend=poses[-len(t_poses) - 1][1]))))
+        cost += t_cost
     if not dirs:
         dirs, curv = [1], [0.0]
         poses.append(poses[0])
@@ -359,7 +557,7 @@ def _reconstruct(nodes, gi, prims, kmax, p, expansions):
     dirs_a = np.array(dirs, int)
     reverses = int(np.count_nonzero(np.diff(dirs_a) != 0))
     return Path(np.array(poses), dirs_a, np.array(curv), length,
-                float(nodes[gi][5]), expansions, reverses)
+                cost, expansions, reverses)
 
 
 def path_clearance(cm, path, start_index=0, ahead_m=None):

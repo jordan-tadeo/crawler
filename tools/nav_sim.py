@@ -61,13 +61,20 @@ DT = 0.02
 DECIDE_EVERY = 5                       # 10 Hz, AUTO_TICK_INTERVAL
 FORWARD_SPEED = dv.FORWARD_SPEED
 FORWARD_FLOOR_M = dv.FORWARD_FLOOR_MM / 1000.0
-PROBE_HALF_M = 0.153                   # the outermost probe at 400 mm
+PROBE_HALF_M = tk.FLOOR_PROBE_HALF_M    # the outermost probe at 400 mm
 STUCK_S = 1.0
 RECOVERY_COOLDOWN_S = 5.0
 BACKOUT_MIN_S = dv.BACKOUT_MIN_S
 BACKOUT_CAP_S = dv.REVERSE_SECONDS
 BACKOUT_OPEN_M = dv.BACKOUT_OPEN_MM / 1000.0
 SETTLE_S = dv.SETTLE_SECONDS
+
+# How much slower the Pi plans than this laptop: a plan's answer reaches
+# the simulated truck this many times its laptop time later (it stands still
+# meanwhile, unless it has a path already), and the planning budget is cut
+# by the same factor. ESTIMATED: 3-5x is the usual Pi 4 against an M-series
+# core for numpy-heavy Python; 3 is the kind end.
+PI_SLOWDOWN = 3.0
 
 LEVELS = ("ideal", "measured", "harsh", "axle60")
 SCENARIOS = ("goto", "goto_blank", "rove")
@@ -169,7 +176,10 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
         smap.fill_from(world)
     perr = nw.PoseError(rng)
     local = mv.LocalMap()
-    nav = nv.Navigator(params, seed=seed)
+    budget = params.plan_budget_s
+    nav = nv.Navigator(params._replace(
+        plan_budget_s=None if budget is None else budget / PI_SLOWDOWN),
+        seed=seed, planner=nv.InlinePlanner(PI_SLOWDOWN))
     if scenario == "rove":
         nav.rove()
         max_s = rove_s if max_s is None else max_s
@@ -212,7 +222,7 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
             else:
                 view = smap.view(est, 1.0)
                 plans_before = nav.plans
-                out = nav.tick(now, view, local, abs(truck.v))
+                out = nav.tick(now, view, local)
                 if nav.plans != plans_before:
                     plan_ms.append(nav.last_plan_ms)
                     if trace and nav.path is not None:
@@ -285,6 +295,8 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
         "rear_stops": safety.rear_stops,
         "min_clearance_m": round(float(min_clear), 3),
         "travel_m": round(truck.travel, 2), "plans": nav.plans,
+        "forecast_stops": nav.forecast_stops,
+        "why": next((e for _, e in reversed(nav.events) if e.startswith("gave up")), ""),
         "plan_ms_mean": round(float(np.mean(plan_ms)), 1) if plan_ms else 0.0,
         "plan_ms_max": round(float(np.max(plan_ms)), 1) if plan_ms else 0.0,
         "plan_ms": [round(float(v), 1) for v in plan_ms],

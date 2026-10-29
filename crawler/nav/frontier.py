@@ -15,8 +15,13 @@ its size, so a wide opening a little further on beats a crack next to the
 truck. Frontiers that failed before (no plan, or the truck got stuck going
 there) are on a blacklist and skipped.
 
-The point to drive to is the frontier cell the truck can reach most cheaply,
-which is on the near side of the opening, where the truck sees through it.
+The point to drive to starts as the frontier cell the truck can reach most
+cheaply, which is on the near side of the opening, where the truck sees
+through it -- and is then moved (snap_clear) to the reachable cell within
+SNAP_M of it with the most room round it, up to CLEAR_CAP_M. A frontier
+cell is often hard against a wall (the lidar sees past a door frame's edge
+first), and a goal there is a goal the truck can only reach by shaving the
+frame.
 """
 
 import math
@@ -33,6 +38,9 @@ BLACKLIST_M = 0.6
 # A frontier closer than this to the truck is one it is already looking
 # through; going there would not grow the map.
 MIN_DIST_M = 0.4
+SNAP_M = 0.5
+CLEAR_CAP_M = 0.5
+SNAP_COST = 0.3               # metres of clearance one metre of moving it costs
 
 
 class Frontier(NamedTuple):
@@ -89,7 +97,7 @@ def find(cm, pose, blacklist=(), min_cells=MIN_CELLS, size_credit=SIZE_CREDIT,
             continue
         dd = np.where(pick, d, np.inf)
         m = int(np.argmin(dd))
-        x, y = float(wx[a + m]), float(wy[a + m])
+        x, y = snap_clear(cm, reach, float(wx[a + m]), float(wy[a + m]))
         if any(math.hypot(x - bx, y - by) < BLACKLIST_M for bx, by in blacklist):
             continue
         size = cells * cm.res
@@ -97,3 +105,32 @@ def find(cm, pose, blacklist=(), min_cells=MIN_CELLS, size_credit=SIZE_CREDIT,
         out.append(Frontier(x, y, size, float(dd[m]), score, int(cells)))
     out.sort(key=lambda f: f.score)
     return out
+
+
+def snap_clear(cm, reach, x, y, snap_m=SNAP_M, cap=CLEAR_CAP_M, cost=SNAP_COST):
+    """(x, y) moved to the cell within snap_m with the most clearance (to
+    cap), less `cost` a metre moved, among those the truck can stand on
+    and reach. The point itself if none is better."""
+    ix, iy = cm.world_to_cell(x, y)
+    r = int(math.ceil(snap_m / cm.res))
+    nx, ny = cm.shape
+    x0, x1 = max(int(ix) - r, 0), min(int(ix) + r + 1, nx)
+    y0, y1 = max(int(iy) - r, 0), min(int(iy) + r + 1, ny)
+    if x0 >= x1 or y0 >= y1:
+        return x, y
+    ii, jj = np.mgrid[x0:x1, y0:y1]
+    ii, jj = ii.ravel(), jj.ravel()
+    off = np.hypot(ii - ix, jj - iy) * cm.res
+    clear = cm.dist[ii, jj]
+    wx, wy = cm.cell_to_world(ii, jj)
+    ok = ((off <= snap_m) & cm.known[ii, jj] & (clear >= cm.inscribed)
+          & np.isfinite(reach.at(wx, wy)))
+    if not ok.any():
+        return x, y
+    score = np.minimum(clear, cap) - cost * off
+    score = np.where(ok, score, -np.inf)
+    k = int(np.argmax(score))
+    here = min(float(cm.dist[ix, iy]), cap) if cm.inside(ix, iy) else -np.inf
+    if score[k] <= here:
+        return x, y
+    return float(wx[k]), float(wy[k])

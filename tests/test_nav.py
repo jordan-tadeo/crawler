@@ -183,14 +183,27 @@ def test_the_follower_converges_on_the_path_with_an_axle_at_60_percent():
     assert 0.45 < follower.gain.gain < 0.9
 
 
-def test_without_the_learned_gain_a_lazy_axle_still_converges_only_slower():
+def test_without_the_learned_gain_a_lazy_axle_still_converges():
     world = nw.room("box", (14.0, 4.0))
-    a = nw.Truck(world, (1.0, 2.5, 0.0), LAZY_AXLE, np.random.default_rng(0))
-    b = nw.Truck(world, (1.0, 2.5, 0.0), LAZY_AXLE, np.random.default_rng(0))
-    ea = run_follower(a, fl.Follower(straight_path(1.0, 12.5, 2.0)), 60)
-    eb = run_follower(b, fl.Follower(straight_path(1.0, 12.5, 2.0), adaptive=False), 60)
-    assert eb[-1] < 0.1
-    assert sum(ea[:40]) <= sum(eb[:40]) + 1e-9
+    truck = nw.Truck(world, (1.0, 2.5, 0.0), LAZY_AXLE, np.random.default_rng(0))
+    errs = run_follower(truck, fl.Follower(straight_path(1.0, 12.5, 2.0),
+                                           adaptive=False), 200)
+    assert max(errs[-10:]) < 0.05
+    assert truck.collisions == 0
+
+
+def test_the_gain_estimate_learns_how_much_of_the_steering_reaches_the_ground():
+    g = fl.GainEstimate()
+    sent, driven, step = 1.0, 0.6, 0.05
+    x = y = yaw = 0.0
+    for _ in range(80):
+        g.update((x, y, yaw))
+        g.remember((x, y, yaw), sent, 1)
+        th1 = yaw + driven * step
+        x += (math.sin(th1) - math.sin(yaw)) / driven
+        y -= (math.cos(th1) - math.cos(yaw)) / driven
+        yaw = th1
+    assert g.gain == pytest.approx(0.6, abs=0.01)
 
 
 def test_the_steering_command_inverts_the_measured_curve():
@@ -275,19 +288,26 @@ def test_a_goal_with_no_way_to_it_is_given_up_after_a_bounded_number_of_tries():
     assert nav.mode == nv.IDLE
 
 
-def test_no_progress_asks_for_the_back_out_then_gives_up():
+def test_no_progress_is_a_wait_then_the_back_out_then_it_gives_up():
     occ = walled(160, 80)
     nav = nv.Navigator()
     nav.set_goal(7.0, 2.0)
     pose = (1.0, 2.0, 0.0)
     recovers = 0
+    first_wait = first_recover = None
     for i in range(400):            # 40 s of a truck that never moves
-        out = nav.tick(T0 + 0.1 * i, view_of(occ, pose, version=1))
+        now = T0 + 0.1 * i
+        out = nav.tick(now, view_of(occ, pose, version=1))
+        if nav.status == nv.ST_WAIT and first_wait is None:
+            first_wait = now
         if out.recover:
             recovers += 1
-            nav.recovered(T0 + 0.1 * i)
+            first_recover = now if first_recover is None else first_recover
+            nav.recovered(now)
         if nav.status == nv.ST_FAILED:
             break
+    assert first_wait is not None and first_recover is not None
+    assert first_wait < first_recover
     assert recovers == nv.MAX_RECOVERS
     assert nav.status == nv.ST_FAILED
 
@@ -387,6 +407,236 @@ def test_the_server_options_turn_on_client_publish_with_json_only():
     assert opts["server_listener"] is goals
 
 
+# --- footprint, turn heuristic, planning thread, look-ahead ---------------------
+
+def circles_only(cm, x, y, yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return min(float(cm.dist_at(x + c * cx, y + s * cx)) - tk.CIRCLE_R_M
+               for cx in tk.CIRCLE_X_M)
+
+
+def test_the_footprint_is_the_rectangle_not_the_circles_past_the_bumper():
+    occ = np.zeros((80, 80), bool)
+    occ[40, :] = True                        # a wall across, from x = 2.0
+    cm = cmod.build(view_of(occ, (1.0, 1.0, 0.0)))
+    x = 2.0 - 0.05 - tk.FRONT_M               # the bumper 5 cm short of it
+    assert circles_only(cm, x, 2.0, 0.0) < 0.0      # the circles say touching
+    assert 0.0 < cm.footprint_clearance(x, 2.0, 0.0) <= 0.05 + RES
+
+
+def test_the_footprint_is_the_rectangle_not_the_circles_beside_the_truck():
+    occ = np.zeros((80, 80), bool)
+    occ[:, 40] = True                        # a wall along, from y = 2.0
+    cm = cmod.build(view_of(occ, (1.0, 1.0, 0.0)))
+    y = 2.0 - 0.01 - tk.HALF_WIDTH_M          # the side 1 cm off it
+    assert circles_only(cm, 2.0, y, 0.0) < 0.0
+    assert 0.0 < cm.footprint_clearance(2.0, y, 0.0) <= 0.01 + RES
+
+
+def test_something_inside_the_footprint_is_touching():
+    occ = np.zeros((80, 80), bool)
+    occ[40, 40] = True
+    cm = cmod.build(view_of(occ, (1.0, 1.0, 0.0)))
+    assert cm.footprint_clearance(2.0, 2.0, 0.3) < 0.0
+
+
+def test_the_turn_distance_knows_a_goal_behind_or_beside_is_a_turn_away():
+    R = 0.85
+    ahead = pl.turn_distance(0.0, 0.0, 0.0, 2.0, 0.0, R)
+    assert float(ahead) == pytest.approx(2.0, abs=1e-6)
+    beside = pl.turn_distance(0.0, 0.0, 0.0, 0.0, 2 * R, R, reverse=False)
+    assert float(beside) == pytest.approx(math.pi * R, abs=1e-6)
+    # 1 m behind: backing up (at three times the cost) beats a lap.
+    behind = pl.turn_distance(0.0, 0.0, 0.0, -1.0, 0.0, R, reverse_factor=3.0)
+    assert float(behind) == pytest.approx(3.0, abs=1e-6)
+    # Never less than the straight line.
+    rng = np.random.default_rng(1)
+    pts = rng.uniform(-3, 3, (200, 2))
+    d = pl.turn_distance(0.0, 0.0, 0.0, pts[:, 0], pts[:, 1], R)
+    assert (d >= np.hypot(pts[:, 0], pts[:, 1]) - 1e-9).all()
+
+
+def test_a_turnaround_in_open_floor_is_found_without_flooding_the_search():
+    occ = walled(120, 120)                    # 6 x 6 m, empty
+    cm = cmod.build(view_of(occ, (3.0, 3.0, 0.0)))
+    path = pl.plan(cm, (3.0, 3.0, 0.0), (3.0, 4.6))      # beside it, to the left
+    assert path is not None
+    assert path.expansions < 300
+    assert pl.path_clearance(cm, path) >= cm.margin
+    end = path.poses[-1]
+    assert math.hypot(end[0] - 3.0, end[1] - 4.6) <= pl.GOAL_TOL_M + 1e-9
+
+
+def test_the_turn_heuristic_steers_a_search_round_to_a_goal_behind():
+    # 2.5 m wide, goal 2 m straight behind, the analytic shot off so only
+    # the search is measured. The 2D distance alone says "go straight
+    # back"; the turn distance knows that is a turn away, and it is the
+    # difference between a few dozen expansions and a few hundred.
+    occ = np.ones((140, 50), bool)
+    occ[2:138, 2:48] = False
+    cm = cmod.build(view_of(occ, (5.5, 1.25, 0.0)))
+    path = pl.plan(cm, (5.5, 1.25, 0.0), (3.5, 1.25),
+                   params=pl.Params(max_expansions=20000, shot=False))
+    assert path is not None
+    assert path.expansions < 120
+    assert pl.path_clearance(cm, path) >= cm.margin
+
+
+def test_a_plan_never_drives_forward_with_the_floor_veto_box_on_a_wall():
+    # A wall 1.2 m ahead with a door in it 1.3 m to the left: the short way
+    # noses into the wall to make the turn, which is where the camera would
+    # hold the car. With the check on, the plan keeps the box off it, and
+    # only the box: the last stretch to the goal is exempt, and so is the
+    # start. (It is off by default; planner.PROBE_CLEAR_M says why.)
+    occ = walled(140, 120)
+    occ[44:46, :] = True
+    occ[44:46, 47:65] = False
+    start, goal = (1.0, 1.5, 0.0), (4.2, 2.8)
+    cm = cmod.build(view_of(occ, start))
+    path = pl.plan(cm, start, goal,
+                   params=pl.Params(max_expansions=20000, floor_probe=True))
+    assert path is not None
+    p = path.poses
+    m = ((path.dirs > 0)
+         & (np.hypot(p[:, 0] - goal[0], p[:, 1] - goal[1]) > pl.PROBE_FREE_M)
+         & (np.hypot(p[:, 0] - start[0], p[:, 1] - start[1]) > 0.3))
+    assert m.any()
+    assert cm.probe_clearance(p[m, 0], p[m, 1], p[m, 2]).min() >= pl.PROBE_CLEAR_M
+    # And the box itself: on the wall it reads 0, a metre short of it more.
+    assert cm.probe_clearance(1.6, 1.5, 0.0) == 0.0
+    assert cm.probe_clearance(0.8, 1.5, 0.0) > 0.3
+
+
+def test_the_plan_radius_is_most_of_the_measured_lock():
+    r = 1.0 / (tk.MAX_CURVATURE * pl.PLAN_CURVATURE)
+    assert tk.TURN_RADIUS_M == pytest.approx(0.75, abs=0.01)
+    assert 0.8 <= r <= 0.9
+
+
+class SlowPlans:
+    """pl.plan, a fixed time slower."""
+
+    def __init__(self, delay):
+        self.delay = delay
+        self.real = pl.plan
+
+    def __call__(self, *a, **k):
+        import time as _t
+        _t.sleep(self.delay)
+        return self.real(*a, **k)
+
+
+def test_a_slow_plan_never_holds_up_a_decision_and_it_stands_still_meanwhile(monkeypatch):
+    import time as _t
+    monkeypatch.setattr(pl, "plan", SlowPlans(0.4))
+    planner = nv.ThreadPlanner()
+    try:
+        nav = nv.Navigator(planner=planner)
+        nav.set_goal(7.0, 2.0)
+        v = view_of(walled(160, 80), (1.0, 2.0, 0.0), version=1)
+        t0 = _t.perf_counter()
+        out = nav.tick(T0, v)
+        assert _t.perf_counter() - t0 < 0.2
+        assert out.direction == 0
+        moved = None
+        for i in range(100):                  # at most 2 s
+            _t.sleep(0.02)
+            t1 = _t.perf_counter()
+            out = nav.tick(T0 + 0.1 * (i + 1), v)
+            assert _t.perf_counter() - t1 < 0.2
+            if out.direction != 0:
+                moved = i
+                break
+        assert moved is not None and moved >= 5   # not before the plan was in
+        assert out.direction == 1
+    finally:
+        planner.close()
+
+
+def test_a_plan_asked_for_before_a_new_goal_is_thrown_away():
+    planner = nv.InlinePlanner(delay_scale=1e6)     # answers arrive much later
+    nav = nv.Navigator(planner=planner)
+    nav.set_goal(7.0, 2.0)
+    v = view_of(walled(160, 80), (1.0, 2.0, 0.0), version=1)
+    nav.tick(T0, v)
+    assert planner.busy and nav.path is None
+    nav.set_goal(1.0, 3.5)
+    planner._pending = (T0, *planner._pending[1:])  # let it land now
+    nav.tick(T0 + 0.1, v)
+    assert nav.path is None
+
+
+def test_a_command_that_would_run_into_something_is_a_stop():
+    occ = walled(160, 80)
+    occ[60:62, :] = True                       # a wall at x = 3.0
+    nav = nv.Navigator()
+    cm = cmod.build(view_of(occ, (2.0, 2.0, 0.0)))
+    x = 3.0 - 0.3 - tk.FRONT_M                 # 30 cm short of it
+    toward = fl.Command(1, 1.0, 0.0)
+    away = fl.Command(-1, 1.0, 0.0)
+    assert nav._forecast_hits(cm, (x, 2.0, 0.0), toward, 0.5)
+    assert not nav._forecast_hits(cm, (x, 2.0, 0.0), away, 0.5)
+    assert not nav._forecast_hits(cm, (x - 1.0, 2.0, 0.0), toward, 0.5)
+
+
+def test_the_follower_aims_from_where_the_truck_will_be_not_where_it_was():
+    f = fl.Follower(straight_path(0.0, 6.0, 0.0), delay_s=0.3)
+    f._driving = (1, 1.0)                     # on a 1 m left circle now
+    x, y, yaw = f.predict((1.0, 0.0, 0.0), 0.5)
+    assert x == pytest.approx(1.0 + math.sin(0.15), abs=1e-6)
+    assert y == pytest.approx(1.0 - math.cos(0.15), abs=1e-6)
+    assert yaw == pytest.approx(0.15)
+    now = fl.Follower(straight_path(0.0, 6.0, 0.0), delay_s=0.0)
+    now._driving = (1, 1.0)
+    assert now.predict((1.0, 0.0, 0.0), 0.5) == (1.0, 0.0, 0.0)
+
+
+def opening_room():
+    """4 x 5 m known, a 1.5 m opening in the east wall onto unknown."""
+    occ = np.zeros((120, 100), bool)
+    known = np.zeros_like(occ)
+    known[:81, :] = True
+    occ[:81, 0] = occ[:81, -1] = occ[0, :] = True
+    occ[80, :] = True
+    occ[80, 30:60] = False
+    return occ, known
+
+
+def test_a_frontier_goal_is_moved_off_the_wall_it_was_found_against():
+    occ, known = opening_room()
+    pose = (2.0, 0.6, 0.0)
+    cm = cmod.build(view_of(occ, pose, known=known))
+    found = fr.find(cm, pose)
+    assert found
+    ix, iy = cm.world_to_cell(found[0].x, found[0].y)
+    assert cm.dist[ix, iy] >= 0.4             # not shaving the frame
+    # A point in the opening's bottom corner, 0.25 m off the jamb, comes
+    # out with room round it, and not further than SNAP_M.
+    reach = pl.grid_distances(cm, [pose[:2]], known_only=True)
+    x, y = fr.snap_clear(cm, reach, 4.025, 1.75)
+    ix, iy = cm.world_to_cell(x, y)
+    assert cm.dist[ix, iy] >= 0.45
+    assert math.hypot(x - 4.025, y - 1.75) <= fr.SNAP_M + 1e-9
+
+
+def test_a_blacklisted_frontier_comes_back_once_the_entry_expires():
+    occ, known = opening_room()
+    pose = (2.0, 2.0, 0.0)
+    v = view_of(occ, pose, known=known, version=1)
+    first = fr.find(cmod.build(v), pose)[0]
+    nav = nv.Navigator()
+    nav.rove()
+    nav.blacklist = [(first.x, first.y, T0 - 1.0)]
+    nav.tick(T0, v)
+    assert nav.target is None or math.hypot(nav.target[0] - first.x,
+                                            nav.target[1] - first.y) > fr.BLACKLIST_M
+    nav = nv.Navigator()
+    nav.rove()
+    nav.blacklist = [(first.x, first.y, T0 - nv.BLACKLIST_S - 1.0)]
+    nav.tick(T0, v)
+    assert nav.target == (first.x, first.y)
+
+
 # --- underneath it: the car's own safety layers ------------------------------------
 
 class FixedMap:
@@ -416,6 +666,11 @@ def test_the_navigators_forward_goes_out_capped_at_forward_speed():
     assert nd.MIN_FORWARD <= throttle <= d.forward_speed
     front, rear = d.controller.steerings[-1]
     assert rear == pytest.approx(-front)
+    # A forward speed set under the floor the navigator would otherwise
+    # lift a slow command to is still the cap.
+    out = nv.Output(1, 1.0, 0.0, False, nv.ST_DRIVING, "follow", False, None)
+    throttle, _, _ = nd.request_for(out, 0.2)
+    assert 0.0 < throttle <= 0.2
 
 
 def test_the_floor_still_holds_a_navigator_forward():

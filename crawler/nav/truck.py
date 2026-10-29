@@ -46,6 +46,7 @@ import math
 
 import numpy as np
 
+from crawler.autopilot import driver as dv
 from crawler.hardware import lidar as ld
 
 HALF_WIDTH_M = ld.HALF_WIDTH_MM / 1000.0
@@ -102,13 +103,46 @@ def front_for_curvature(curvature, max_turn=MAX_TURN):
     return float(np.clip(u, -max_turn, max_turn))
 
 
-# The footprint as three circles down the centre line: the rectangle cut into
-# three equal lengths, each covered by the circle through its corners. The
-# planner checks these against the distance field, which is three lookups
-# where a rectangle would be a polygon test.
+# The footprint, checked two ways against the distance field.
+#
+# First as three circles down the centre line: the rectangle cut into three
+# equal lengths, each covered by the circle through its corners. Three
+# lookups, and safe -- but each circle is wider than the truck (0.161 m
+# against a 0.136 m half-width) and the end ones reach 75 mm past each
+# bumper, so the circles see a truck 0.67 m long and 0.32 m wide. More
+# circles do not help: the overhang past the bumper is r - seg/2, and with
+# the width fixed it grows as the segments shrink.
+#
+# So a pose the circles call too close is checked again against the
+# rectangle itself (costmap.CostMap.footprint_clearance): the distance field
+# at RECT_POINTS, a grid over the outline RECT_STEP_M apart, edges included.
+# The least of those, less RECT_SLACK_M (no point of the rectangle is
+# further than that from a sample, and the distance changes no faster than
+# the point moves), is the rectangle's clearance, to the grid's resolution.
 _SEG = LENGTH_M / 3.0
 CIRCLE_X_M = tuple(REAR_M + _SEG * (i + 0.5) for i in range(3))
 CIRCLE_R_M = math.hypot(HALF_WIDTH_M, _SEG / 2.0)
+
+RECT_STEP_M = 0.03
+_nx = int(math.ceil(LENGTH_M / RECT_STEP_M)) + 1
+_ny = int(math.ceil(2 * HALF_WIDTH_M / RECT_STEP_M)) + 1
+_px, _py = np.meshgrid(np.linspace(REAR_M, FRONT_M, _nx),
+                       np.linspace(-HALF_WIDTH_M, HALF_WIDTH_M, _ny), indexing="ij")
+RECT_POINTS = np.stack([_px.ravel(), _py.ravel()], 1)
+RECT_SLACK_M = 0.5 * math.hypot(LENGTH_M / (_nx - 1), 2 * HALF_WIDTH_M / (_ny - 1))
+
+# The forward floor's reach, as the planner sees it: the box the camera's
+# floor veto (driver.ForwardFloorVeto) holds a forward for, from the bumper
+# out to driver.FORWARD_FLOOR_MM (363 mm at the 0.4 forward cap) and as wide
+# as its outermost probes (0.153 m a side at 400 mm). A forward path that
+# puts something in this box is one the veto will stop, so the planner keeps
+# it clear except on the last stretch to the goal (planner.PROBE_FREE_M).
+FLOOR_PROBE_M = dv.FORWARD_FLOOR_MM / 1000.0
+FLOOR_PROBE_HALF_M = 0.153
+_fx = np.arange(FRONT_M + 0.02, FRONT_M + FLOOR_PROBE_M + 1e-9, 0.03)
+_fy = np.linspace(-FLOOR_PROBE_HALF_M, FLOOR_PROBE_HALF_M, 7)
+_fx, _fy = np.meshgrid(_fx, _fy, indexing="ij")
+PROBE_POINTS = np.stack([_fx.ravel(), _fy.ravel()], 1)
 
 # Speed, MEASURED (see above).
 FORWARD_M_S_PER_THROTTLE = 2.28

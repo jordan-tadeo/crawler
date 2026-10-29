@@ -25,9 +25,13 @@ and the command is divided by it, so a truck on carpet that turns 70% of its
 command is soon asking for 1/0.7 of what it wants. Clamped (GAIN_MIN,
 GAIN_MAX), and only updated on turns big enough to measure.
 
-The lookahead grows with speed (LOOKAHEAD_S of travel past LOOKAHEAD_MIN_M),
-which is what absorbs servo lag: the 0.1-0.3 s a servo takes to get there is
-a few centimetres of travel the lookahead is already past.
+The lookahead grows with speed (LOOKAHEAD_S of travel past LOOKAHEAD_MIN_M).
+
+Delay. The pose a decision starts from is already old, and what it sends
+takes a while to land: MEASURED, the steering is a 0.10 s dead time and a
+0.12 s lag, and the pose is about a scan old. So the pursuit is worked out
+from where the truck will be DELAY_S on (predict()): the pose run forward
+along the curvature it is driving now, at the speed it is doing.
 """
 
 import math
@@ -48,6 +52,8 @@ SEARCH_AHEAD_M = 1.0
 CUSP_TOL_M = 0.12
 # The end of the path.
 GOAL_TOL_M = 0.2
+# Steering dead time 0.10 + lag 0.12 (MEASURED) + a scan's age of pose.
+DELAY_S = 0.3
 
 GAIN_MIN = 0.4
 GAIN_MAX = 1.3
@@ -120,8 +126,10 @@ class Follower:
     """Pure pursuit along one Path, a segment at a time."""
 
     def __init__(self, path=None, adaptive=True, lookahead_min=LOOKAHEAD_MIN_M,
-                 lookahead_s=LOOKAHEAD_S, goal_tol=GOAL_TOL_M):
+                 lookahead_s=LOOKAHEAD_S, goal_tol=GOAL_TOL_M, delay_s=DELAY_S):
         self.adaptive = adaptive
+        self.delay_s = delay_s
+        self._driving = (0, 0.0)      # (direction, curvature on the ground)
         self.lookahead_min = lookahead_min
         self.lookahead_s = lookahead_s
         self.goal_tol = goal_tol
@@ -129,6 +137,7 @@ class Follower:
         self.set_path(path)
 
     def set_path(self, path):
+        self._driving = (0, 0.0)
         self.path = path
         self.index = 0
         self.segment = 0
@@ -140,12 +149,27 @@ class Follower:
             return 0.0
         return max(0, len(self.path.poses) - 1 - self.index) * 0.05
 
+    def predict(self, pose, speed_m_s):
+        """Where the truck will be delay_s on, along the curvature it is
+        driving now, at speed_m_s (unsigned) the way it is going."""
+        d, k = self._driving
+        x, y, yaw = (float(v) for v in pose[:3])
+        if not d or speed_m_s <= 0.0 or self.delay_s <= 0.0:
+            return x, y, yaw
+        s = d * float(speed_m_s) * self.delay_s
+        th1 = yaw + k * s
+        if abs(k) < 1e-6:
+            return x + s * math.cos(yaw), y + s * math.sin(yaw), th1
+        return (x + (math.sin(th1) - math.sin(yaw)) / k,
+                y - (math.cos(th1) - math.cos(yaw)) / k, th1)
+
     def step(self, pose, speed_m_s=0.0, cap_m_s=0.42):
         """The Command for this decision off the pose, (x, y, yaw)."""
         path = self.path
         if path is None or not self._segments:
             return Command(0, 0.0, 0.0, done=True)
-        x, y, yaw = (float(v) for v in pose[:3])
+        measured = tuple(float(v) for v in pose[:3])
+        x, y, yaw = self.predict(measured, speed_m_s)
         a, b = self._segments[self.segment]
         poses = path.poses
         direction = int(path.dirs[min(a + 1, len(path.dirs) - 1)])
@@ -167,6 +191,7 @@ class Follower:
         along = ((x - end[0]) * ex + (y - end[1]) * ey) * direction
         tol = self.goal_tol if last_seg else CUSP_TOL_M
         if to_end <= tol or (along > 0 and to_end < 3 * tol) or self.index >= b - 1:
+            self._driving = (0, 0.0)
             if last_seg:
                 self.gain.reset()
                 return Command(0, 0.0, 0.0, done=True, index=self.index,
@@ -202,9 +227,11 @@ class Follower:
         # also gives once it is beside the truck.
         if lx * direction < 0 and abs(ly) < 1e-6:
             kappa = tk.MAX_CURVATURE
-        gain = self.gain.update((x, y, yaw)) if self.adaptive else 1.0
+        # The gain is measured on poses as they were, not as predicted.
+        gain = self.gain.update(measured) if self.adaptive else 1.0
         k_out = float(np.clip(kappa / gain, -tk.MAX_CURVATURE, tk.MAX_CURVATURE))
-        self.gain.remember((x, y, yaw), k_out, direction)
+        self.gain.remember(measured, k_out, direction)
+        self._driving = (direction, k_out * gain)
 
         frac = 1.0 - TURN_SLOWDOWN * min(abs(kappa) / tk.MAX_CURVATURE, 1.0)
         frac = min(frac, max(to_end / APPROACH_M, 0.0))

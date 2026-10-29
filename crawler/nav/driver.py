@@ -77,7 +77,10 @@ class NavDriver(dv.Driver):
             raise ValueError("nav needs a map source, and there is none")
         super().__init__(controller, oakd, lidar=lidar)
         self.map_source = map_source
-        self.nav = navigator if navigator is not None else nv.Navigator()
+        # The car plans on its own thread (navigator.ThreadPlanner), so a
+        # search never holds up a decision.
+        self.nav = (navigator if navigator is not None
+                    else nv.Navigator(planner=nv.ThreadPlanner()))
         self.floor_veto = dv.ForwardFloorVeto(self.forward_speed)
         self.last_output = None
         self.last_request = (0.0, 0.0, 0.0)
