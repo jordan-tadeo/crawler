@@ -57,10 +57,12 @@ Never losing the map. A tilt, a knock or a rollover only ever makes the pose
 uncertain: the map stays as it was. Only lost for RESEED_LOST_S (counted from
 when it was last rolled, so the time in a hand does not count) is a fresh map
 started from the scan in hand (Result.reseed "lost"), and even then the old
-one is kept on the shelf: every SHELF_EVERY scans the truck is relocalized
-against it, round where the fresh map has the truck, and when that is found
-(twice running, the same way) the fresh map is merged into the old one and
-the old one is the map again (Result.reseed "merged").
+one is kept on the shelf: the truck is relocalized against it, round where
+the fresh map has the truck, and when that is found (twice running, the same
+way) the fresh map is merged into the old one and the old one is the map
+again (Result.reseed "merged"). That search is done a piece at a time,
+SHELF_SHARE_S of it a scan (Slam._shelf_slice), never whole in one step:
+the fresh map is the one being driven on meanwhile.
 
 A map is young until it has had SEED_WRITES writes. A young map that a scan
 does not fit is started again from that scan (Result.reseed "young"), and
@@ -162,8 +164,21 @@ CONFIRM_DEG = 8.0
 # started from the scan in hand, the old one shelved. The search covers the
 # whole circle every 3 scans, so this is the window searched 25 times over.
 RESEED_LOST_S = 8.0
-# A shelved map is searched for every this many scans of the fresh one.
-SHELF_EVERY = 5
+# The search for the truck on a shelved map is done a piece at a time: a
+# heading scored (reloc.Search, about 5 ms on the Pi) or an ICP from a
+# candidate (30-40 ms). It may spend SHELF_SHARE_S a scan on average, and
+# stops once the step that runs it is SHELF_STEP_S long (Slam's clock, from
+# the step's start), after one piece at least. It used to be the whole of a
+# reloc.Search.step and its four ICPs every fifth scan, 370 ms on the Pi
+# (p1432, 2026-10-29), and the crop went stale behind each one
+# (egomap.STALE_S): the fresh map tracked every scan, the policy never had
+# it the MAP_BACK_S it waits for, and the car drove 16 minutes on its
+# fallback. A tracking step is about 30 ms there and a scan comes every 100.
+SHELF_SHARE_S = 0.015
+SHELF_STEP_S = 0.04
+# The search is drawn round the truck again once it is this far from where
+# it was drawn.
+SHELF_MOVE_M = 1.0
 # Under this many writes since the map started a scan that does not fit
 # starts it again instead of failing.
 SEED_WRITES = 5
@@ -206,6 +221,24 @@ class Result(NamedTuple):
     reseed: str = ""          # "young" / "lost": this scan started a fresh map
 
 
+class Shelf:
+    """A map a lost reseed put aside, and where the search for the truck on
+    it has got to (Slam._shelf_slice)."""
+
+    def __init__(self, grid, writes):
+        self.grid = grid
+        self.writes = writes        # its writes when it was put aside
+        self.search = None          # reloc.Search round the truck
+        self.tree = None            # the old map's hit means near it
+        self.tgt = None
+        self.batch = []             # (score, T) of the headings scored
+        self.headings = 0           # headings in the batch
+        self.todo = []              # T to ICP from, best first
+        self.circle = False         # a circle is done: pick once todo is
+        self.pending = None         # T the last circle picked
+        self.credit = 0.0           # seconds the search may still spend
+
+
 class Slam:
     """The map, the pose, and the step that moves them on."""
 
@@ -245,9 +278,8 @@ class Slam:
         # means it is not known. It orders the search and settles a fit with
         # a twin (reloc.Search.pick).
         self._lost_yaw = None
-        # A map put aside by a reseed: [grid, writes, search, pending
-        # transform, scans since the last try].
-        self._shelf = None
+        # A map put aside by a reseed and the search for the truck on it.
+        self._shelf: Optional[Shelf] = None
         self._tree = None
         self._tgt = None
         self._tree_at = None
@@ -417,7 +449,8 @@ class Slam:
             self._write(self.pose, allp[keep], on_line[keep])
             written = True
         if (self._shelf is not None and good and not self._reseed
-                and state in (TRACKING, TILTED) and self._try_shelf(p, nrm)):
+                and state in (TRACKING, TILTED)
+                and self._shelf_slice(p, nrm, t0)):
             self._reseed = "merged"
         self._refresh_target()
         self.last_t = t
@@ -461,8 +494,8 @@ class Slam:
         is there already), else it is cleared in place. The pose is kept, so
         the map frame goes on where it was."""
         if keep:
-            if self._shelf is None or self._map_writes > self._shelf[1]:
-                self._shelf = [self.grid, self._map_writes, None, None, 0]
+            if self._shelf is None or self._map_writes > self._shelf.writes:
+                self._shelf = Shelf(self.grid, self._map_writes)
             g = self.grid
             self.grid = gr.Grid(size=g.size, res=g.res, l_max=g.l_max,
                                 x0=float(self.pose[0]), y0=float(self.pose[1]),
@@ -542,48 +575,100 @@ class Slam:
         # how near it came.
         return best, False
 
-    def _try_shelf(self, p, nrm):
-        """Every SHELF_EVERY scans on a fresh map: look for the truck on the
-        shelved one, round where the fresh map has it. Found twice running
-        with the same old-from-new transform and the fresh map is merged in
-        and the old one is the map again. True if it was."""
+    def _shelf_slice(self, p, nrm, t0):
+        """On a fresh map with one on the shelf: the next pieces of the
+        search for the truck on the shelved one (_shelf_piece). Each step
+        adds SHELF_SHARE_S to what the search may spend, never banking more
+        than that, and every piece costs what it took on Slam's clock; the
+        pieces run while there is some left, and stop once the step (begun
+        at t0) is SHELF_STEP_S long, after one at least. True if the
+        shelved map was found and is the map again."""
         sh = self._shelf
-        sh[4] += 1
-        if sh[4] < SHELF_EVERY:
-            return False
-        sh[4] = 0
-        old = sh[0]
+        sh.credit = min(sh.credit + SHELF_SHARE_S, SHELF_SHARE_S)
+        first = True
+        while sh.credit > 0 and (first or self._clock() - t0 < SHELF_STEP_S):
+            first = False
+            t1 = self._clock()
+            done = self._shelf_piece(sh, p, nrm)
+            sh.credit -= self._clock() - t1
+            if done is not None:
+                return done
+        return False
+
+    def _shelf_piece(self, sh, p, nrm):
+        """One piece of the shelf's search, the first of these that is due:
+
+          draw the search (reloc.Search) and the old map's tree round the
+          truck, the first time and again once it is SHELF_MOVE_M off;
+          ICP from the next candidate of the last reloc.YAWS_PER_SCAN
+          headings scored, the best reloc.TOP_K of them;
+          once a circle's candidates are all fitted, the pick (as a lost
+          relocalization picks) and ICP from it (_shelf_pick);
+          else score the next heading.
+
+        A candidate is kept as the old-from-new transform (_between), the
+        one thing about it that does not change while the truck drives on,
+        and put back on the truck's pose of the scan that fits it. None to
+        go on, False to stop for this scan, True if it merged."""
         x, y, yaw = (float(v) for v in self.pose)
-        if sh[2] is None or math.hypot(sh[2].field.cx - x,
-                                       sh[2].field.cy - y) > 1.0:
-            sh[2] = rl.Search(old, x, y, yaw)
-        tgt = old.local_points(x, y, LOCAL_R_M + rl.SEARCH_R_M)
-        if len(tgt) < 50:
+        if sh.search is None or math.hypot(sh.search.field.cx - x,
+                                           sh.search.field.cy - y) > SHELF_MOVE_M:
+            sh.search = rl.Search(sh.grid, x, y, yaw)
+            tgt = sh.grid.local_points(
+                x, y, LOCAL_R_M + rl.SEARCH_R_M + SHELF_MOVE_M)
+            sh.tgt = tgt
+            sh.tree = cKDTree(tgt) if len(tgt) >= 50 else None
+            sh.batch, sh.headings, sh.todo, sh.circle = [], 0, [], False
+            return None
+        if sh.tree is None or sh.search.field.points == 0:
             return False
-        tree = cKDTree(tgt)
-        _, picked = self._candidates(sh[2], p, nrm, tree, tgt, yaw)
-        if not sh[2].swept:
+        if sh.todo:
+            c = mt.icp(p, nrm, sh.tree, sh.tgt,
+                       _apply(sh.todo.pop(0), self.pose), iters=25)
+            if c.converged:
+                sh.search.add(c.inliers, _between(c.pose, self.pose))
+            return None
+        if sh.circle:
+            sh.circle = False
+            return True if self._shelf_pick(sh, p, nrm) else None
+        cands = sh.search.step(p, yaw, per_scan=1, top_k=rl.PER_YAW)
+        if not cands and not sh.search.swept:
             return False
+        sh.batch += [(score, _between(cand, self.pose))
+                     for score, cand in cands]
+        sh.headings += 1
+        if sh.headings >= rl.YAWS_PER_SCAN or sh.search.swept:
+            sh.batch.sort(key=lambda b: -b[0])
+            sh.todo = [T for _, T in sh.batch[:rl.TOP_K]]
+            sh.batch, sh.headings = [], 0
+            sh.circle = sh.search.swept
+        return None
+
+    def _shelf_pick(self, sh, p, nrm):
+        """A circle of the shelf's search done: its pick, ICP from it on
+        this scan, and the merge if it is the transform the last circle
+        picked too. True if it merged."""
+        search = sh.search
+        search.fits = [(i, _apply(T, self.pose)) for i, T in search.fits]
+        picked = search.pick(RECOVER_MIN_INLIERS)
         if picked is None:
-            sh[3] = None
+            sh.pending = None
             return False
-        # Picked off the circle: ICP from it on this scan, so the pose and
-        # the transform are this scan's.
-        c = mt.icp(p, nrm, tree, tgt, picked, iters=25)
+        c = mt.icp(p, nrm, sh.tree, sh.tgt, picked, iters=25)
         if not (c.converged and c.inliers >= RECOVER_MIN_INLIERS):
-            sh[3] = None
+            sh.pending = None
             return False
         T = _between(c.pose, self.pose)
-        if sh[3] is None or not _close(T, sh[3]):
-            sh[3] = T
+        if sh.pending is None or not _close(T, sh.pending):
+            sh.pending = T
             return False
         # Found twice the same way: the fresh map into the old, and the old
         # one is the map.
-        merge(old, self.grid, T)
-        self.grid = old
+        merge(sh.grid, self.grid, T)
+        self.grid = sh.grid
         self.pose = np.array(c.pose, float)
         self._shelf = None
-        self._map_writes = sh[1] + self._map_writes
+        self._map_writes = sh.writes + self._map_writes
         self._tree = None
         self._tree_at = None
         self.vel[:] = 0.0
@@ -679,6 +764,13 @@ def _close(a, b, m=CONFIRM_M, deg=CONFIRM_DEG):
     """Two (x, y, yaw) within m metres and deg degrees of each other."""
     return (math.hypot(a[0] - b[0], a[1] - b[1]) <= m
             and abs(_wrap(a[2] - b[2])) <= math.radians(deg))
+
+
+def _apply(T, pose):
+    """T . pose: a pose in the new map's frame in the old one's."""
+    R = mt.rot(T[2])
+    xy = R @ np.asarray(pose[:2], float) + (T[0], T[1])
+    return np.array([xy[0], xy[1], _wrap(pose[2] + T[2])])
 
 
 def _between(old_pose, new_pose):

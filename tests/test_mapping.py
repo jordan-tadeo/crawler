@@ -513,7 +513,7 @@ def test_lost_too_long_starts_a_fresh_map_and_shelves_the_old_one():
     assert slam.reseeds == 1
     assert [r.reseed for r in out if r.reseed] == ["lost"]
     assert slam.grid is not old
-    assert slam._shelf is not None and slam._shelf[0] is old
+    assert slam._shelf is not None and slam._shelf.grid is old
     assert old.version == v and int((old.lo != 0).sum()) == cells, \
         "the shelved map is the old one as it was"
     k = next(k for k, r in enumerate(out) if r.reseed)
@@ -546,6 +546,115 @@ def test_a_fresh_map_is_merged_back_when_the_old_one_is_found():
     e_xy, e_yaw = err_vs_truth(out[-1]._replace(t=6.0))
     assert e_xy < 0.05 and e_yaw < math.radians(2), "back in the old frame"
     assert not np.allclose(slam.pose, off)
+
+
+class PiClock:
+    """A Slam clock that only moves for the work the Pi is slow at: an ICP
+    and a heading of a relocalization search, at what they cost on the car.
+    p1432, 2026-10-29: a tracking step 30 ms, a shelf try (30 headings, four
+    ICPs) 370 ms, a Mac about ten times faster. Nothing else costs
+    anything, so a test on it comes out the same on any machine."""
+    ICP_S = 0.030
+    HEADING_S = 0.004
+
+    def __init__(self, monkeypatch):
+        self.now = 0.0
+        icp, scores = sl.mt.icp, sl.rl.Field.scores
+
+        def slow_icp(*a, **k):
+            self.now += self.ICP_S
+            return icp(*a, **k)
+
+        def slow_scores(field, *a, **k):
+            self.now += self.HEADING_S
+            return scores(field, *a, **k)
+        monkeypatch.setattr(sl.mt, "icp", slow_icp)
+        monkeypatch.setattr(sl.rl.Field, "scores", slow_scores)
+
+    def __call__(self):
+        return self.now
+
+
+def live_map_back(slam, imu, pose_fn, scans, t0):
+    """The car's timing over `scans` revolutions: a scan every PERIOD into
+    the runner's inbox (rn.INBOX deep, the incoming one dropped when it is
+    full), stepped one at a time for as long as each step's Result.ms says,
+    and between them the policy's read of the newest crop every tick:
+    present when trusted and no older than egomap.STALE_S (egomap.encode).
+    Returns (seconds from t0 until the map had been present MAP_BACK_S
+    unbroken, which is when the policy hands the wheels back to the map
+    model, or None if it never was; the Results)."""
+    from crawler.autopilot import policy as pl
+    from crawler.mapping import egomap as em
+    free = t0
+    inbox = []
+    done = []               # (published at, Result)
+
+    def run(t_scan):
+        nonlocal free
+        for j in range(10):
+            imu.add(t_scan - PERIOD + (j + 1) * 0.01, (0.0, 0.0, 0.0), LEVEL)
+        res = slam.step(t_scan, scan_at(t_scan, pose_fn))
+        free = max(free, t_scan) + res.ms / 1000.0
+        done.append((free, res))
+    for k in range(scans):
+        t = t0 + (k + 1) * PERIOD
+        while inbox and max(free, inbox[0]) <= t:
+            run(inbox.pop(0))
+        if len(inbox) < rn.INBOX:
+            inbox.append(t)
+    since = None
+    for k in range(scans):
+        tick = t0 + (k + 1.5) * PERIOD
+        seen = [r for at, r in done if at <= tick]
+        ok = (bool(seen) and em.trusted(seen[-1])
+              and 0.0 <= tick - seen[-1].t <= em.STALE_S)
+        since = (tick if since is None else since) if ok else None
+        if since is not None and tick - since >= pl.MAP_BACK_S - 1e-3:
+            return tick - t0, [r for _, r in done]
+    return None, [r for _, r in done]
+
+
+def test_a_fresh_map_is_driven_on_while_the_old_one_is_searched_for(
+        monkeypatch):
+    # p1432, 2026-10-29: lost 8 s, a fresh map, the old one shelved and never
+    # found again. The fresh map tracked every scan, but every fifth step
+    # searched the shelf whole, 370 ms on the Pi, so the crop went stale
+    # (STALE_S) every half second, the map was never there the MAP_BACK_S
+    # the policy waits for, and the car drove the last 16 minutes of the
+    # drive on its map-free fallback.
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    old = slam.grid
+    slam._clock = PiClock(monkeypatch)
+    slam._start_over(keep=True)
+    # Six metres off: out of the search's reach, as the old map was on the
+    # car for the rest of that drive.
+    slam.pose = slam.pose + np.array([6.0, 0.0, math.radians(20)])
+    truth = path_pose(6.0)
+    back, out = live_map_back(slam, imu, lambda t: truth, 60, 6.0)
+    assert slam.grid is not old and slam._shelf is not None
+    assert back is not None and back <= 1.5, \
+        "the policy never had the fresh map back"
+    assert max(r.ms for r in out) <= 1000.0 * PERIOD, \
+        "a step longer than a revolution"
+
+
+def test_the_shelf_is_still_found_a_slice_a_step(monkeypatch):
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    old = slam.grid
+    slam._clock = PiClock(monkeypatch)
+    slam._start_over(keep=True)
+    slam.pose = slam.pose + np.array([0.5, -0.3, math.radians(20)])
+    truth = path_pose(6.0)
+    back, out = live_map_back(slam, imu, lambda t: truth, 300, 6.0)
+    assert [r.reseed for r in out if r.reseed] == ["merged"]
+    assert slam.merges == 1 and slam.grid is old and slam._shelf is None
+    e_xy, e_yaw = err_vs_truth(out[-1]._replace(t=6.0))
+    assert e_xy < 0.05 and e_yaw < math.radians(2), "back in the old frame"
 
 
 def test_a_map_that_does_not_fit_its_next_scan_is_started_again():
