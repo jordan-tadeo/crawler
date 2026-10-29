@@ -133,6 +133,9 @@ INTERVALS = {
     "slam_status": 0.0,
     "map": 1.0,
     "slam_path": 2.0,
+    # With --voxel-map, once a second each: the mapper offers no faster.
+    "voxel_points": 1.0,
+    "voxel_low": 1.0,
 }
 
 # Longest side of an image channel after downscaling, in pixels. The mono
@@ -588,9 +591,17 @@ SLAM_CHANNELS = {
     "slam_path": "/slam/path",
 }
 
+# The OAK-D's maps with --voxel-map, see voxel_view.py: the occupied voxels
+# as a foxglove.PointCloud and the low-obstacle layer as a foxglove.Grid, both
+# in the "map" frame, once a second each.
+VOXEL_CHANNELS = {
+    "voxel_points": "/voxel/points",
+    "voxel_low": "/voxel/low",
+}
+
 ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
             + tuple(RAW_DEPTH_CHANNELS) + tuple(LIDAR_VIEW_CHANNELS)
-            + tuple(SLAM_CHANNELS))
+            + tuple(SLAM_CHANNELS) + tuple(VOXEL_CHANNELS))
 
 # Everything the camera produces, which is what stops being written while
 # there is no pad: a file of nothing but pictures and IMU has no driving in it
@@ -601,7 +612,8 @@ ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
 CAMERA_KEYS = frozenset(("imu", "lidar", "slam_status") + tuple(IMAGE_CHANNELS)
                         + tuple(RAW_DEPTH_CHANNELS)
                         + tuple(LIDAR_VIEW_CHANNELS)
-                        + tuple(SLAM_CHANNELS))
+                        + tuple(SLAM_CHANNELS)
+                        + tuple(VOXEL_CHANNELS))
 
 
 class Telemetry:
@@ -745,6 +757,12 @@ class Telemetry:
                           "slam_path": SceneUpdateChannel}
             for key, topic in SLAM_CHANNELS.items():
                 self._channels[key] = slam_kinds[key](topic=topic)
+
+            from foxglove.channels import PointCloudChannel
+            voxel_kinds = {"voxel_points": PointCloudChannel,
+                           "voxel_low": GridChannel}
+            for key, topic in VOXEL_CHANNELS.items():
+                self._channels[key] = voxel_kinds[key](topic=topic)
 
         except Exception as e:
             self.error = str(e)
@@ -1057,7 +1075,8 @@ class Telemetry:
             channel.log(payload, log_time=log_time)
             return
 
-        if key in LIDAR_VIEW_CHANNELS or key in SLAM_CHANNELS:
+        if (key in LIDAR_VIEW_CHANNELS or key in SLAM_CHANNELS
+                or key in VOXEL_CHANNELS):
             message = self.lidar_view_message(key, payload, log_time)
             if message is not None:
                 channel.log(message, log_time=log_time)
@@ -1116,6 +1135,12 @@ class Telemetry:
         if key == "slam_path":
             from crawler.telemetry import map_view
             return map_view.path_scene(payload, log_time)
+        if key == "voxel_points":
+            from crawler.telemetry import voxel_view
+            return voxel_view.points_message(payload, log_time)
+        if key == "voxel_low":
+            from crawler.telemetry import voxel_view
+            return voxel_view.low_message(payload, log_time)
         return None
 
     @staticmethod

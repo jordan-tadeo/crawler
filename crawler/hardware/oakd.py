@@ -435,12 +435,33 @@ class OakD:
             raise
         if packet is None:
             return None
+        self._note_capture(label, packet)
         try:
             return packet.getFrame()
         except RuntimeError as e:
             if "enough data" not in str(e):
                 raise
             return frame_from_payload(packet, label)
+
+    def _note_capture(self, label, packet):
+        """Keep when the packet's frame was taken, for capture_time()."""
+        try:
+            t = packet.getTimestamp().total_seconds()
+        except Exception:
+            t = None
+        self.__dict__.setdefault("_captures", {})[label] = t
+
+    def capture_time(self, label):
+        """When the frame last handed out on `label` ("depth", ...) was
+        taken: the packet's getTimestamp(), in seconds. depthai syncs that
+        to the host's steady clock, which on Linux is the CLOCK_MONOTONIC
+        that time.monotonic() reads. None if there has been none or it had
+        no stamp.
+
+        The voxel map places a frame by this rather than by when the reader
+        got it: the frame is about 88 ms old by then (see CAPTURE_FPS) and
+        the truck has moved on."""
+        return self.__dict__.get("_captures", {}).get(label)
 
     def get_depth_frame(self):
         """Latest depth frame in millimetres, or None if none is waiting."""

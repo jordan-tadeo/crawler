@@ -1721,6 +1721,17 @@ def parse_args(argv=None):
         help="where the mapper runs: its own process (the default, it cannot "
              "hold the control loop's GIL) or a thread",
     )
+    # Off unless named, and mapping only. The OAK-D's depth as a 3D voxel map
+    # placed by the SLAM pose, and the low obstacles the roof lidar passes
+    # over (2.5D, under its plane), shown in Foxglove on /voxel/points and
+    # /voxel/low. Needs --slam. See crawler/mapping/voxel.py.
+    parser.add_argument(
+        "--voxel-map",
+        action="store_true",
+        help="map the OAK-D's depth in 3D and the low obstacles under the "
+             "lidar (needs --slam); shown in Foxglove on /voxel/points and "
+             "/voxel/low. Off unless given",
+    )
     return parser.parse_args(argv)
 
 
@@ -1824,6 +1835,19 @@ def main(argv=None):
                                tele=tele if channels_live else None,
                                slam=slam)
         lidar.start()
+    voxels = None
+    if args.voxel_map and slam is None:
+        log.log("warning", "Voxel", "--voxel-map needs --slam; not mapping")
+    elif args.voxel_map:
+        # Its own process. The reader hands it each depth frame and returns;
+        # a frame that comes while it is busy replaces the waiting one.
+        from crawler.mapping import voxel as vx
+        voxels = vx.VoxelMapper(slam, tele=tele if channels_live else None,
+                                logger=log)
+        voxels.start()
+        hub.depth_listeners.append(voxels.on_depth)
+        hub.imu_listeners.append(voxels.on_imu)
+        log.log("info", "Voxel", "Mapping the OAK-D's depth")
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           lidar=lidar, slam=slam)
 
@@ -1898,6 +1922,8 @@ def main(argv=None):
             # and the ESC reaching neutral.
             if lidar is not None:
                 lidar.close()
+            if voxels is not None:
+                voxels.close()
             if slam is not None:
                 slam.close()
             hub.close()
@@ -1934,6 +1960,8 @@ def main(argv=None):
         worker.join(timeout=5)
         if lidar is not None:
             lidar.close()
+        if voxels is not None:
+            voxels.close()
         if slam is not None:
             slam.close()
         hub.close()

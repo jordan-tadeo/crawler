@@ -70,7 +70,7 @@ def test_the_camera_stops_being_written_while_there_is_no_pad(monkeypatch):
     assert {"imu", "lidar", "depth", "disparity", "rectified_left",
             "depth_raw", "depth_small", "lidar_scan", "tf",
             "lidar_truck", "slam_status", "map",
-            "slam_path"} == set(tm.CAMERA_KEYS)
+            "slam_path", "voxel_points", "voxel_low"} == set(tm.CAMERA_KEYS)
     assert not {"controller", "vehicle", "diagnostics", "marks",
                 "footprint"} & set(tm.CAMERA_KEYS)
 

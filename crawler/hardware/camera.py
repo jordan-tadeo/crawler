@@ -221,6 +221,12 @@ class CameraHub:
         # (runner.SlamRunner.on_imu appends to a deque) and may not raise
         # into this thread.
         self.imu_listeners = []
+        # The same for depth: called with (monotonic time, frame, capture
+        # time or None) for every depth frame, on the reader thread. The voxel
+        # mapper (mapping/voxel.py) keeps the frame in a one-deep slot and
+        # returns. The frame is the one the driver's view holds too, so a
+        # listener must never write into it.
+        self.depth_listeners = []
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -406,6 +412,16 @@ class CameraHub:
                     for listener in self.imu_listeners:
                         try:
                             listener(now, packet)
+                        except Exception:
+                            pass
+                elif stream == "depth" and self.depth_listeners:
+                    try:
+                        captured = oakd.capture_time("depth")
+                    except Exception:
+                        captured = None
+                    for listener in self.depth_listeners:
+                        try:
+                            listener(now, packet, captured)
                         except Exception:
                             pass
 
