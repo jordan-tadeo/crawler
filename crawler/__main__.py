@@ -864,14 +864,28 @@ class AutoPilot:
         Never blocks and never raises. False can mean three different things
         and only one of them is permanent:
 
-          no hub at all, or the hub failed      -> unavailable, latched
+          no hub at all, or the hub closed      -> unavailable, latched
           the hub is still opening the device   -> try again in a moment
+          the camera would not open, or went    -> try again in a moment: the
+            away, and the hub is retrying          hub opens it again on its own
           Driver would not construct            -> unavailable, latched
         """
         if self.unavailable:
             return False
 
         hub = self.hub
+        if hub is not None and hub.state == camera.FAILED:
+            # Down, and the hub is opening it again on its own (camera.py,
+            # RETRY_FIRST_S). It used to latch auto unavailable here until a
+            # service restart. start() is a no-op while it retries.
+            hub.start()
+            self.logger.log("warning", "Mode",
+                            f"Camera is down ({hub.error or hub.state}), "
+                            "retrying - press START again once it is up")
+            print(f"[auto] camera down, retrying: {hub.error or hub.state}",
+                  file=sys.stderr)
+            return False
+
         if (self.driver is not None and hub is not None
                 and hub.state in (camera.OFF, camera.STARTING,
                                   camera.RELEASING)):

@@ -414,8 +414,9 @@ class OakD:
     # seconds, blocks whoever called it, and can raise halfway through and
     # leave the object half-built -- all of which is exactly what must never
     # happen on the thread that commands throttle. If the link dies, the
-    # getters return None, driver.tick() zeroes the throttle, and I restart
-    # the service.
+    # getters return None, driver.tick() zeroes the throttle, and the hub
+    # (camera.py) sees lost() or the depth stall and opens a new one on its
+    # own thread.
 
     def _try_frame(self, queue, label):
         """Newest frame off one queue, or None. Never waits, never raises.
@@ -474,6 +475,17 @@ class OakD:
     def get_rectified_left_frame(self):
         """Latest rectified left mono frame, or None if not enabled."""
         return self._try_frame(self.rectified_queue, "rectified left")
+
+    def lost(self):
+        """True once depthai has closed the device under me: its watchdog does
+        that when the USB link dies. camera.CameraHub asks twice a second and
+        opens a new one. Never raises."""
+        if self.closed:
+            return False
+        try:
+            return bool(self.device.isClosed())
+        except Exception:
+            return False
 
     def close(self):
         """Release the device. Safe to call twice."""

@@ -34,9 +34,11 @@ What a broken camera costs
 --------------------------
 Camera telemetry and auto mode. Never hand driving. depthai not installed, no
 camera plugged in, a udev rule missing, the USB link dying mid-run: all of it
-ends up as state == "failed" and an error string on /diagnostics. The control
-loop does not import this module, does not construct it, and never calls
-anything on it that can raise.
+ends up as state == "failed" and an error string on /diagnostics, and the hub
+keeps opening it again in the background until it is up. A camera that was
+up and went away is opened again the same way. The control loop does not
+import this module, does not construct it, and never calls anything on it
+that can raise.
 """
 
 import threading
@@ -63,6 +65,27 @@ from crawler.telemetry import telemetry as tm
 # Nothing here has to change if that cap moves. This interval only has to stay
 # well under one frame interval, and at 5 ms it has a factor of twelve.
 READ_INTERVAL = 0.005
+
+# A camera that would not open is opened again, on the opener thread, until
+# it is up: first RETRY_FIRST_S after the failure, doubling to RETRY_MAX_S.
+# The boot this is for: the OAK-D fell off USB at 15:08:30 and re-enumerated
+# ten seconds later, the one open in between failed with
+# X_LINK_DEVICE_NOT_FOUND, and auto was refused until I restarted the
+# service. A try that fails costs the opener thread a dai.Device() call and
+# nobody else anything, so there is no reason to ever stop.
+RETRY_FIRST_S = 2.0
+RETRY_MAX_S = 5.0
+# A failure is logged the first time, and after that at most this often with
+# a count, so a camera left unplugged is not a journal line every 5 s.
+RETRY_LOG_S = 60.0
+
+# Up, but gone: depthai closes the device when its link dies (lost()), and a
+# device that is open and sends no depth for this long is as good as gone.
+# Depth comes at 16 fps, so 5 s is 80 frames missing. Either way the device is
+# closed and opened again the same way a failed open is.
+STALL_S = 5.0
+# How often the reader asks the device whether it is still there.
+LOST_CHECK_S = 0.5
 
 # Longest the opener thread will sit in dai.Device() before giving up on it.
 # There is no timeout argument, so this is only a bound on how long I will
@@ -203,8 +226,9 @@ class CameraHub:
         self._views = {}
         self._views_lock = threading.Lock()
         self._stop = threading.Event()
+        # One thread opens the device, reads it, and opens it again when it
+        # fails or goes away (_open).
         self._opener = None
-        self._reader = None
         self._ready = threading.Event()
 
         # How long the last open took, start() to READY, in seconds. 0.0 until
@@ -237,6 +261,10 @@ class CameraHub:
         """
         if self.state in (STARTING, READY):
             return True
+        if self.state == FAILED and self._opener is not None \
+                and self._opener.is_alive():
+            # Already trying again on its own.
+            return True
         if self.state in (CLOSED, RELEASING):
             # RELEASING is not a refusal for good: the caller asks again once
             # the release thread has put it back to OFF.
@@ -264,45 +292,81 @@ class CameraHub:
         return self.state == READY
 
     def _open(self):
-        """The multi-second blocking construct, on a thread nobody waits on."""
-        try:
-            from crawler.hardware.oakd import OakD
-            oakd = OakD(rectified=self.rectified)
-        except BaseException as e:
-            # BaseException on purpose. depthai is a native extension and a
-            # bad one has taken this process down with things that are not
-            # Exception subclasses. Auto mode is not worth a dead car.
-            self.state = FAILED
-            self.error = f"{type(e).__name__}: {e}"
-            self._ready.set()
-            self._log("error", "Camera", f"OAK-D would not open: {self.error}")
-            return
+        """Open the device, read it, and open it again whenever it fails or
+        goes away. The opener thread, which nobody waits on, until close() or
+        release()."""
+        delay = RETRY_FIRST_S
+        failures = 0
+        next_log = 0.0
+        while not self._stop.is_set():
+            try:
+                from crawler.hardware.oakd import OakD
+                oakd = OakD(rectified=self.rectified)
+            except BaseException as e:
+                # BaseException on purpose. depthai is a native extension and
+                # a bad one has taken this process down with things that are
+                # not Exception subclasses. Auto mode is not worth a dead car.
+                if self._stop.is_set():
+                    break
+                failures += 1
+                self.error = f"{type(e).__name__}: {e}"
+                self.state = FAILED
+                self._ready.set()
+                now = time.monotonic()
+                if failures == 1:
+                    next_log = now + RETRY_LOG_S
+                    self._log("error", "Camera",
+                              f"OAK-D would not open: {self.error} -- trying "
+                              f"again every {RETRY_FIRST_S:g}-{RETRY_MAX_S:g} s")
+                elif now >= next_log:
+                    next_log = now + RETRY_LOG_S
+                    self._log("warning", "Camera",
+                              f"OAK-D still not open after {failures} tries: "
+                              f"{self.error}")
+                if self._stop.wait(delay):
+                    break
+                delay = min(delay * 2, RETRY_MAX_S)
+                continue
 
-        if self._stop.is_set():
-            # Shut down while we were still booting it.
+            if self._stop.is_set():
+                # Shut down while we were still booting it.
+                try:
+                    oakd.close()
+                except Exception:
+                    pass
+                self.state = CLOSED
+                self._ready.set()
+                return
+
+            self.oakd = oakd
+            self.open_seconds = time.monotonic() - self._start_requested
+            self.error = ""
+            self.state = READY
+            self._ready.set()
+            self._log("info", "Camera", f"OAK-D up in {self.open_seconds:.1f} s"
+                      + (" with the rectified stream" if self.rectified else "")
+                      + (f" after {failures} failed opens" if failures else ""))
+            failures = 0
+            delay = RETRY_FIRST_S
+
+            why = self._read_loop(oakd)
+            if why is None:
+                # Stopped: _shut() closes the device.
+                return
+
+            # Gone. Close it here, on this thread, and go round again.
+            self.oakd = None
             try:
                 oakd.close()
-            except Exception:
-                pass
-            self.state = CLOSED
-            self._ready.set()
-            return
-
-        self.oakd = oakd
-        self.open_seconds = time.monotonic() - self._start_requested
-
-        # The reader is started BEFORE the hub says READY. The other order
-        # left a window where a release() racing the open found a reader
-        # Thread that existed and had not been started, and join() raises on
-        # that.
-        self._reader = threading.Thread(
-            target=self._read_loop, name="camera-read", daemon=True)
-        self._reader.start()
-
-        self.state = READY
-        self._ready.set()
-        self._log("info", "Camera", f"OAK-D up in {self.open_seconds:.1f} s"
-                  + (" with the rectified stream" if self.rectified else ""))
+            except Exception as e:
+                print(f"[camera] close failed: {e}")
+            self.error = f"lost: {why}"
+            self.state = FAILED
+            self._log("warning", "Camera",
+                      f"OAK-D lost ({why}), opening it again")
+            self._start_requested = time.monotonic()
+            if self._stop.wait(RETRY_FIRST_S):
+                break
 
     def close(self):
         """Release the device. Safe to call twice, never raises."""
@@ -320,7 +384,7 @@ class CameraHub:
         RELEASING until that is done and OFF after, and start() refuses in
         between rather than racing it.
         """
-        if self.state not in (STARTING, READY):
+        if self.state not in (STARTING, READY, FAILED):
             return False
         self.state = RELEASING
         threading.Thread(target=self._release, name="camera-release",
@@ -340,10 +404,9 @@ class CameraHub:
         self._stop.set()
         self._ready.set()
 
-        for thread in (self._reader, self._opener):
-            if thread is not None and thread is not threading.current_thread():
-                thread.join(timeout=timeout)
-        self._reader = None
+        thread = self._opener
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
         self._opener = None
 
         oakd, self.oakd = self.oakd, None
@@ -372,8 +435,9 @@ class CameraHub:
 
     # ---- the reader thread -----------------------------------------------
 
-    def _read_loop(self):
-        """Drain every stream once and hand each packet to every view.
+    def _read_loop(self, oakd):
+        """Drain every stream once and hand each packet to every view, until
+        stopped (None) or the device is gone (why, a short string).
 
         Draining is not optional and is not gated on anybody watching: the
         driver needs depth, and a queue nobody reads fills up and stalls the
@@ -381,11 +445,26 @@ class CameraHub:
         and the JPEG encode -- and that happens on the telemetry thread, only
         for channels a Foxglove client is subscribed to. This thread hands
         over raw frames and does no image work at all.
+
+        It runs on the opener thread, which opens the device again when this
+        says it is gone.
         """
-        oakd = self.oakd
+        lost = getattr(oakd, "lost", None)
+        last_depth = time.monotonic()
+        next_check = last_depth + LOST_CHECK_S
 
         while not self._stop.is_set():
             now = time.monotonic()
+            if now >= next_check:
+                next_check = now + LOST_CHECK_S
+                try:
+                    gone = lost is not None and lost()
+                except Exception:
+                    gone = False
+                if gone:
+                    return "the device closed"
+                if now - last_depth > STALL_S:
+                    return f"no depth for {STALL_S:g} s"
 
             for stream, getter in (
                 ("depth", oakd.get_depth_frame),
@@ -404,6 +483,8 @@ class CameraHub:
 
                 if packet is None:
                     continue
+                if stream == "depth":
+                    last_depth = now
 
                 for view in self._view_list:
                     view._put(stream, packet)
@@ -428,6 +509,7 @@ class CameraHub:
                 self._offer(stream, packet, now)
 
             self._stop.wait(READ_INTERVAL)
+        return None
 
     def _offer(self, stream, packet, now):
         """Hand a frame to telemetry, if telemetry wants one.
