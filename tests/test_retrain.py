@@ -161,6 +161,64 @@ def test_a_good_session_is_not_junk():
     assert rt.junk_reasons(rt.STUB_BYTES, {**GOOD, "usable": rt.MIN_USABLE}) == []
 
 
+def test_an_excluded_run_is_out_in_every_segment_and_says_why(tmp_path):
+    """The exclude file: a run's prefix takes every segment of it, a comment
+    is a comment, and the rest of a good session's neighbours still train."""
+    ex = tmp_path / "exclude.txt"
+    ex.write_text("# takeovers I made because the car kept stopping\n\n"
+                  "crawler-20261029-174641Z-p1300 car kept stopping, 10-29\n"
+                  "crawler-20261029-175158Z-p1251\n")
+    rules = rt.pd.read_excludes(str(ex))
+    assert rules == [("crawler-20261029-174641Z-p1300", "car kept stopping, 10-29"),
+                     ("crawler-20261029-175158Z-p1251", "on the exclude list")]
+    mcap = tmp_path / "mcap"
+    mcap.mkdir()
+    for name in ("crawler-20261029-174641Z-p1300-001", "crawler-20261029-174641Z-p1300-002",
+                 "crawler-20261029-175158Z-p1251-001", "crawler-20261029-052302Z-p2120-001",
+                 "crawler-record-20261029-035203Z-p1092-001"):
+        recording(mcap, name)
+    (tmp_path / "cache").mkdir()
+    cands, _ = scan(mcap, tmp_path / "cache", decode=FakeDecode())
+    kept = rt.apply_filter(cands, rules)
+    assert sorted(c.name for c in kept) == ["crawler-20261029-052302Z-p2120-001",
+                                            "crawler-record-20261029-035203Z-p1092-001"]
+    out = {c.name: c.why for c in cands if c.why}
+    assert out["crawler-20261029-174641Z-p1300-002"] == ["excluded: car kept stopping, 10-29"]
+    assert rt.apply_filter(cands, rt.pd.read_excludes(str(tmp_path / "none.txt"))) \
+        and len(rt.apply_filter(cands, [])) == 5, "no file, nothing excluded"
+
+
+def test_a_plain_dataset_run_leaves_out_the_excluded_drive_logs(tmp_path, monkeypatch, capsys):
+    """policy_dataset.main reads the same file, so a run by hand leaves them
+    out too, before a single one is opened."""
+    ex = tmp_path / "exclude.txt"
+    ex.write_text("crawler-20261029-174641Z-p1300 car kept stopping\n")
+    drives = tmp_path / "drives"
+    drives.mkdir()
+    recording(drives, "crawler-20261029-174641Z-p1300-001")
+    recording(drives, "crawler-20261029-052302Z-p2120-001")
+    opened = []
+
+    class Empty:
+        commands = ()
+        name = "empty"
+
+    def read_session(path, adapter=None):
+        opened.append(os.path.basename(path))
+        return Empty(), False     # a drive with no rows: skipped, and on
+
+    monkeypatch.setattr(rt.pd, "read_session", read_session)
+    rec = recording(tmp_path, "crawler-20261029-174641Z-p1300-002")
+    try:   # with nothing to keep it may stop or write an empty set; either is fine
+        rt.pd.main([str(tmp_path / "out.npz"), rec, "--drive-logs", str(drives),
+                    "--exclude-file", str(ex)])
+    except (SystemExit, Exception):
+        pass
+    assert opened == ["crawler-20261029-052302Z-p2120-001.mcap"]
+    assert "crawler-20261029-174641Z-p1300-001.mcap: excluded (car kept stopping)" \
+        in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # What it grades against, and what it refuses.
 # ---------------------------------------------------------------------------

@@ -49,6 +49,10 @@ The junk rules. A session trains unless one of these says it is junk:
   no labels   fewer than MIN_USABLE decision ticks my hand labelled outside a
               BAD mark. 1.5 s: the shortest real manoeuvre in the set is a
               2.1 s back-up, and every session under the line has none at all.
+  excluded    its name starts with a prefix in ~/crawler-data/exclude.txt
+              (policy_dataset.EXCLUDE_FILE, --exclude-file): a drive I said
+              never to learn from, the takeovers I made because the car kept
+              stopping on 10-29 the first of them.
 
 The folds are policy_train.py's --blocks N, so the numbers are the ones a plain
 `policy_train.py --blocks 5` prints. The deployed model is graded as it is, a
@@ -332,9 +336,14 @@ def ensure_cache(cands, cache_dir, jobs=JOBS, decode=decode_into_cache):
     return todo
 
 
-def apply_filter(cands):
+def apply_filter(cands, excludes=()):
+    """The junk rules, and the exclude file's (policy_dataset.read_excludes):
+    a session I said never to learn from is out whatever is in it."""
     for c in cands:
         c.why = junk_reasons(c.size, c.stats)
+        why = pd.excluded(c.path, excludes)
+        if why is not None:
+            c.why.append(f"excluded: {why}")
     return [c for c in cands if not c.why]
 
 
@@ -578,6 +587,8 @@ def parse_args(argv):
     ap.add_argument("--models-dir", default=MODELS_DIR)
     ap.add_argument("--cache-dir", default=CACHE_DIR)
     ap.add_argument("--runs-dir", default=RUNS_DIR)
+    ap.add_argument("--exclude-file", default=pd.EXCLUDE_FILE,
+                    help="sessions never to learn from, one name prefix a line")
     ap.add_argument("--blocks", type=int, default=BLOCKS)
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--seed", type=int, default=0)
@@ -684,7 +695,7 @@ def main(argv=None):
           f"{stubs} too small to open")
     clock.lap("scan")
 
-    kept = apply_filter(cands)
+    kept = apply_filter(cands, pd.read_excludes(args.exclude_file))
     for c in cands:
         if c.why:
             print(f"  junk {c.name}: {'; '.join(c.why)}")

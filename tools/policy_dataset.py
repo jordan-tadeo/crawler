@@ -1013,6 +1013,44 @@ def drive_logs(directory):
     return sorted(p for p in found if not os.path.basename(p).startswith(RECORD_PREFIX))
 
 
+# The sessions never to learn from, whatever is in them: a data file beside
+# the recordings, never in the repo, because what it names is a recording.
+# One rule a line, "<name prefix> <why>", # for a comment. A prefix is a run
+# without its segment number (crawler-20261029-174641Z-p1300) so every
+# segment of that run goes, -001, -002 and on. Read by this file's main()
+# and by retrain.py's filter, so a plain policy_dataset.py run and a retrain
+# leave out the same sessions.
+EXCLUDE_FILE = os.environ.get("CRAWLER_EXCLUDE", "~/crawler-data/exclude.txt")
+
+
+def read_excludes(path=EXCLUDE_FILE):
+    """[(prefix, why)] off the exclude file; [] when there is none."""
+    path = os.path.expanduser(path) if path else ""
+    if not path or not os.path.exists(path):
+        return []
+    rules = []
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            prefix, _, why = line.partition(" ")
+            rules.append((prefix, why.strip() or "on the exclude list"))
+    return rules
+
+
+def excluded(path, rules):
+    """The why of the first rule whose prefix the session's name starts with,
+    else None."""
+    name = os.path.basename(path)
+    if name.endswith(".mcap"):
+        name = name[:-len(".mcap")]
+    for prefix, why in rules:
+        if name.startswith(prefix):
+            return why
+    return None
+
+
 def format_interventions(summary, ticks):
     """The report's interventions line for one session."""
     kept = Counter(t.source for t in ticks)
@@ -1050,6 +1088,8 @@ def main(argv=None):
                     help="comma list of recorded modes to label from "
                          "(default: auto for legacy files, record for new ones)")
     ap.add_argument("--max-age-ms", type=float, default=None)
+    ap.add_argument("--exclude-file", default=EXCLUDE_FILE,
+                    help=f"sessions never to learn from, one name prefix a line ({EXCLUDE_FILE})")
     ap.add_argument("--uncompressed", action="store_true",
                     help="write the .npz without zlib: about twice the disk, and "
                          "written in a second instead of fifteen (tools/retrain.py's cache)")
@@ -1083,6 +1123,13 @@ def main(argv=None):
     drives = [p for d in args.drive_logs for p in drive_logs(d)]
     if args.drive_logs and not drives:
         ap.error(f"no drive logs in {args.drive_logs}")
+    excludes = read_excludes(args.exclude_file)
+    for p in list(args.mcaps) + drives:
+        why = excluded(p, excludes)
+        if why is not None:
+            print(f"{os.path.basename(p)}: excluded ({why}); skipped")
+    args.mcaps = [p for p in args.mcaps if excluded(p, excludes) is None]
+    drives = [p for p in drives if excluded(p, excludes) is None]
     drive_set = set(drives)
     rules = None if args.no_idle_rules else IdleRules(
         args.steer_rest, args.parked_s, args.parked_edge_s, args.exit_reach_s,
