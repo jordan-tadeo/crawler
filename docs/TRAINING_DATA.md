@@ -457,7 +457,9 @@ the next gear goes on.
 `--mirror both` puts every batch in as it is and mirrored, side by side (the
 frame, the IMU's lateral signs, the scan's bins, the crop's columns, the
 goal's bearing, every steer label's sign), instead of `coin`, one or the
-other a batch.
+other a batch. On the scorecard, three seeds each, `both` came out worse
+than `coin` nearly everywhere (side 0.641 against 0.673, mirror_fail 0.440
+against 0.398), so goal3 is `coin`.
 
 `--map-act leaky --optimizer adamw` is the map branch that works. With ReLUs
 and Adam's L2 decay the branch died in every map model up to goal2: its
