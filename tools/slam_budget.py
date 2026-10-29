@@ -84,6 +84,38 @@ def stats(a):
             "max": round(float(a.max()), 2)}
 
 
+def live_check(slam, results):
+    """What the mapper made of the run: its states, writes and step time,
+    how far the pose wandered, the map's size, and the pose interface.
+    Counts only: the map itself is a picture of the house and stays put."""
+    from collections import Counter
+    from crawler.mapping import grid as gr
+    out = {"results_seen": len(results)}
+    if results:
+        xs = np.array([r.x for r in results])
+        ys = np.array([r.y for r in results])
+        out.update(
+            states=dict(Counter(r.state for r in results)),
+            why=dict(Counter(r.why for r in results)),
+            written=int(sum(r.written for r in results)),
+            step_ms=stats([r.ms for r in results]),
+            pose_spread_m=round(float(max(np.ptp(xs), np.ptp(ys))), 4),
+            yaw_spread_deg=round(float(np.degrees(np.ptp(
+                [r.yaw for r in results]))), 3))
+    view = slam.map()
+    if view is not None:
+        out.update(map_px=list(view.codes.shape),
+                   map_occupied=int((view.codes == gr.OCCUPIED).sum()),
+                   map_free=int((view.codes == gr.FREE).sum()))
+    p = slam.pose_stamped()
+    if p is not None:
+        out.update(pose_confidence=round(p.confidence, 3),
+                   pose_at_ok=slam.pose_at(p.t - 0.05) is not None)
+    st = slam.stats()
+    out.update(grid_grew=st.get("grid_grew"), grid_dropped=st.get("grid_dropped"))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--seconds", type=float, default=120.0)
@@ -123,6 +155,7 @@ def main(argv=None):
     time.sleep(3.0)
 
     ticks, passes, periods = [], [], []
+    results, seen_t = [], None
     stop = threading.Event()
     clock = time.monotonic
     t_end = clock() + a.seconds
@@ -139,6 +172,12 @@ def main(argv=None):
             passes.append(ms)
             if due:
                 ticks.append(ms)
+            if slam is not None:
+                # Outside the timed part: every result the mapper made.
+                res = slam.latest()
+                if res is not None and res.t != seen_t:
+                    seen_t = res.t
+                    results.append(res)
             stop.wait(cm.LOOP_INTERVAL)
     finally:
         out = {"slam": a.slam, "policy": os.path.basename(a.policy or "rules"),
@@ -152,6 +191,7 @@ def main(argv=None):
                        slam_results=st["results"], slam_errors=st["errors"],
                        imu_samples=st["imu_samples"],
                        slam_state=res.state if res else None)
+            out.update(live_check(slam, results))
         try:
             auto.stop()
         except Exception:
