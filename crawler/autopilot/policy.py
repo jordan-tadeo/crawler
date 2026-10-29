@@ -234,6 +234,7 @@ import numpy as np
 from crawler.autopilot import column_profile as cp
 from crawler.autopilot import driver as dv
 from crawler.autopilot import goal as gl
+from crawler.autopilot import policy_goal as pg
 from crawler.autopilot import policy_imu as pimu
 from crawler.autopilot import policy_lidar as pli
 from crawler.mapping import egomap as em
@@ -341,9 +342,12 @@ LIDAR_INPUT = "lidar"
 # em.SIZE, em.SIZE), crawler/mapping/egomap.py's crop of the SLAM grid,
 # drawn by the SLAM worker after every scan (SlamRunner.crop()).
 MAP_INPUT = "map"
+# The goal input, for a model whose sidecar says uses_goal: (1, pg.SIZE),
+# policy_goal.encode of the clicked goal against the crop fed the same run.
+GOAL_INPUT = "goal"
 # Every input this runtime knows how to feed. A graph wanting any other is
 # a model from newer code, and is refused rather than run on a guess.
-KNOWN_INPUTS = ("x", "prev", MODE_INPUT, IMU_INPUT, LIDAR_INPUT, MAP_INPUT)
+KNOWN_INPUTS = ("x", "prev", MODE_INPUT, IMU_INPUT, LIDAR_INPUT, MAP_INPUT, GOAL_INPUT)
 
 # The mode latch. 0.7 for 0.5 s: six ticks in a row at 10 Hz of a head that
 # clearly wants the other mode, not one tick of a coin flip. 2 s between
@@ -734,6 +738,27 @@ def check_map(meta, inputs, where="sidecar"):
                          f"this car cannot draw it")
     if not meta.get("uses_lidar", False):
         raise ValueError(f"{where}: uses_map without uses_lidar")
+    return True
+
+
+def check_goal(meta, inputs, where="sidecar"):
+    """The goal half of the contract -> uses_goal, as check_map. A uses_goal
+    model needs the input, a goal_layout equal to policy_goal.LAYOUT, and
+    uses_map too: the goal is a point on the map."""
+    inputs = set(inputs)
+    if not meta.get("uses_goal", False):
+        if GOAL_INPUT in inputs:
+            raise ValueError(f"{where}: the graph has a {GOAL_INPUT!r} input the "
+                             f"sidecar does not declare (no uses_goal)")
+        return False
+    if GOAL_INPUT not in inputs:
+        raise ValueError(f"{where}: uses_goal declared but the graph has no "
+                         f"{GOAL_INPUT!r} input")
+    layout = meta.get("goal_layout")
+    if layout != pg.LAYOUT:
+        raise ValueError(f"{where}: goal_layout {layout!r} != {pg.LAYOUT!r}")
+    if not meta.get("uses_map", False):
+        raise ValueError(f"{where}: uses_goal without uses_map")
     return True
 
 
@@ -1277,9 +1302,11 @@ class PolicyModel:
         # False for every model before the map input: never fed one, and
         # driven with the hand rules as before.
         self.uses_map = check_map(self.meta, input_names, meta_path)
+        # False for every model before the goal input: never fed one.
+        self.uses_goal = check_goal(self.meta, input_names, meta_path)
         self.path = path
 
-    def run(self, x, prev, mode=None, imu=None, lidar=None, map=None):
+    def run(self, x, prev, mode=None, imu=None, lidar=None, map=None, goal=None):
         feed = {"x": x, "prev": prev}
         if self.has_mode:
             feed[MODE_INPUT] = mode if mode is not None else encode_mode(False)
@@ -1290,6 +1317,8 @@ class PolicyModel:
             feed[LIDAR_INPUT] = lidar if lidar is not None else pli.missing()
         if self.uses_map:
             feed[MAP_INPUT] = map if map is not None else em.missing()
+        if self.uses_goal:
+            feed[GOAL_INPUT] = goal if goal is not None else pg.missing()
         values = self.session.run(self.output_names, feed)
         return dict(zip(self.output_names, values))
 
@@ -1362,6 +1391,11 @@ class PolicyDriver(dv.Driver):
             raise ValueError(f"{getattr(model, 'label', 'the model')} drives off the map: "
                              "start the car with --lidar --slam")
         self.last_map_present = False
+        # The goal input: self.goal.encode() of the crop the map input is off
+        # (goal.ClickGoal with --goal), on the map model only: the fallback
+        # has no map, so no goal, and the goal waits for the map to be back.
+        self.uses_goal = bool(getattr(model, "uses_goal", False)) and self.uses_map
+        self.last_goal_present = False
         # When the map last went in trusted and fresh; see _map_lost.
         self._map_good_at = None
         # Maps, not algorithms. With a map model every hand-written driving
@@ -1701,6 +1735,8 @@ class PolicyDriver(dv.Driver):
             # and whether the hand-written driving rules were on (off for a
             # map model).
             "policy_map_present": bool(self.uses_map and self.last_map_present),
+            # Whether a goal model was fed a goal this decision.
+            "policy_goal_present": bool(self.uses_goal and self.last_goal_present),
             "policy_hand_rules": bool(self.hand_rules),
             # Whether the map-free fallback drove this tick (the map lost).
             "policy_fallback": bool(self.on_fallback),
@@ -1746,6 +1782,11 @@ class PolicyDriver(dv.Driver):
         # First, so every row says it, whichever path the tick takes. A goal
         # that raises is the exception path: neutral, and auto parks.
         was = self.goal_reached
+        # A clicked goal (goal.ClickGoal) checks arrival off the newest crop
+        # first: the hold is the safety layer's, so it is judged every tick.
+        observe = getattr(self.goal, "observe", None)
+        if observe is not None and self.slam is not None:
+            observe(self.slam.crop())
         self.goal_reached = bool(self.goal.reached())
         if self.goal_reached != was:
             print("Goal reached - stopping." if self.goal_reached
@@ -1832,6 +1873,8 @@ class PolicyDriver(dv.Driver):
             return
 
         ego = None
+        crop = None
+        present = False
         if self.uses_map:
             alive = self._slam_alive()
             present = False
@@ -1881,6 +1924,13 @@ class PolicyDriver(dv.Driver):
             extra["lidar"] = pli.encode(bins)
         if self.uses_map and not self.on_fallback:
             extra["map"] = ego
+        self.last_goal_present = False
+        if self.uses_goal and not self.on_fallback:
+            # The goal off the same crop the map input is, and only with that
+            # crop going in: no map is no goal, as the model was trained.
+            g = self.goal.encode(crop) if present else pg.missing()
+            self.last_goal_present = bool(g[0, pg.PRESENT] > 0)
+            extra["goal"] = g
         started = time.perf_counter()
         if extra:
             outputs = self.model.run(x, prev, mode, **extra)

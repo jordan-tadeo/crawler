@@ -22,6 +22,14 @@ to the downsample.
   present whether the pose this crop is drawn at is one to trust: matched,
           tracking or tilted (see trusted). A crop that is not present goes
           in as no map.
+  x, y, yaw  the map pose it is drawn at (Result.x, .y, .yaw): what a goal
+          on the map is put in the truck's frame by (policy_goal.py), so the
+          goal and the crop are always off the same pose
+  frame   which map those coordinates are on. A reseed starts a fresh map
+          with an origin of its own (slam.py, Result.reseed "lost" or
+          "young"), so a point on the old map means nothing on it; "merged"
+          puts the old map back. 0 at boot, a new number every fresh map,
+          the old one again on a merge (EgoMap.after_step).
 
 The input
 ---------
@@ -56,6 +64,10 @@ class Crop(NamedTuple):
     present: bool
     codes: np.ndarray     # uint8 (SIZE, SIZE)
     trail: np.ndarray     # uint8 (SIZE, SIZE)
+    x: float = 0.0        # the map pose it is drawn at
+    y: float = 0.0
+    yaw: float = 0.0
+    frame: int = 0        # which map that pose is on (see the docstring)
 
 
 # The states a matched pose is good in. Tilted is the map's write gate, not
@@ -87,9 +99,26 @@ class EgoMap:
         self._u = U.ravel()
         self._v = V.ravel()
         self._tx, self._ty, self._tt = [], [], []
+        # The map frame (Crop.frame): the current one, the next new number,
+        # and the one a "lost" reseed put on the shelf for a merge to bring
+        # back.
+        self.frame = 0
+        self._next_frame = 1
+        self._shelved = None
+
+    def _follow_reseed(self, why):
+        if why == "lost":
+            self._shelved = self.frame
+            self.frame, self._next_frame = self._next_frame, self._next_frame + 1
+        elif why == "young":
+            # A young map started again: a new origin, the shelf as it was.
+            self.frame, self._next_frame = self._next_frame, self._next_frame + 1
+        elif why == "merged" and self._shelved is not None:
+            self.frame, self._shelved = self._shelved, None
 
     def after_step(self, grid, res) -> Crop:
         """The Result the step just made, and the grid it wrote: the crop."""
+        self._follow_reseed(getattr(res, "reseed", ""))
         if res.state not in ("rolled", "no_points"):
             self._tx.append(res.x)
             self._ty.append(res.y)
@@ -99,7 +128,8 @@ class EgoMap:
                 k = int(np.searchsorted(np.asarray(self._tt), res.t - self.trail_s))
                 del self._tx[:k], self._ty[:k], self._tt[:k]
         codes, trail = self.render(grid, res.x, res.y, res.yaw, res.t)
-        return Crop(float(res.t), trusted(res), codes, trail)
+        return Crop(float(res.t), trusted(res), codes, trail,
+                    float(res.x), float(res.y), float(res.yaw), int(self.frame))
 
     def render(self, grid, x, y, yaw, t):
         S, sub = self.size, self.sub

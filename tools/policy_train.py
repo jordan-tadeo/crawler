@@ -133,6 +133,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from crawler.autopilot import column_profile as cp  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
+from crawler.autopilot import policy_goal as pg  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
 from crawler.mapping import egomap as em  # noqa: E402
@@ -204,8 +205,12 @@ MAP_FEATURES = 32
 MAP_DROPOUT = 0.3
 
 
+# The goal branch's output width, before the present flag joins it.
+GOAL_FEATURES = 16
+
+
 def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION,
-                uses_lidar=False, uses_map=False, chunk=1):
+                uses_lidar=False, uses_map=False, chunk=1, uses_goal=False):
     import torch
     from torch import nn
 
@@ -219,6 +224,22 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     imu_width = pimu.size(imu_yaw) if uses_imu else 0
     lidar_width = LIDAR_FEATURES + 1 if uses_lidar else 0
     map_width = MAP_FEATURES + 1 if uses_map else 0
+    if uses_goal and not uses_map:
+        raise ValueError("a goal model needs the map: the goal is a point on it")
+    goal_width = GOAL_FEATURES + 1 if uses_goal else 0
+
+    class GoalBranch(nn.Module):
+        """(N, pg.SIZE) -> (N, GOAL_FEATURES + 1): one layer over the goal
+        vector (policy_goal.py), gated by its present flag as the map's is,
+        and present on to the trunk: no goal is exactly no goal features."""
+
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Sequential(nn.Linear(pg.SIZE, GOAL_FEATURES), nn.ReLU())
+
+        def forward(self, g):
+            present = g[:, pg.PRESENT:pg.PRESENT + 1]
+            return torch.cat([self.fc(g) * present, present], dim=1)
 
     class MapBranch(nn.Module):
         """(N, em.CHANNELS, 64, 64) -> (N, MAP_FEATURES + 1).
@@ -277,10 +298,12 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             # and its weights there never see a gradient. The IMU is only
             # wired in when it is used, so an old graph stays an old graph.
             self.trunk = nn.Sequential(
-                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width + lidar_width + map_width, 64),
+                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width + lidar_width
+                          + map_width + goal_width, 64),
                 nn.ReLU())
             self.lidar = LidarBranch() if lidar_width else None
             self.map = MapBranch() if map_width else None
+            self.goal = GoalBranch() if goal_width else None
             # A chunk model answers for this decision and the next chunk - 1:
             # offset i's gear logits at [3i, 3i + 3), its steer at i.
             self.logits = nn.Linear(64, len(pl.ACTIONS) * chunk)
@@ -297,16 +320,19 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
 
         def forward(self, features, prev, mode, *extra):
             # extra: imu if the model takes it, then lidar if it takes that,
-            # then the map, in the graph's input order.
+            # then the map, then the goal, in the graph's input order.
             extra = list(extra)
             imu = extra.pop(0) if imu_width else None
             lidar = extra.pop(0) if lidar_width else None
             ego = extra.pop(0) if map_width else None
+            goal = extra.pop(0) if goal_width else None
             parts = [features, prev, mode] + ([imu] if imu_width else [])
             if lidar_width:
                 parts.append(self.lidar(lidar))
             if map_width:
                 parts.append(self.map(ego))
+            if goal_width:
+                parts.append(self.goal(goal))
             h = self.trunk(torch.cat(parts, dim=1))
             steer = ((self.steer_dir(h), torch.sigmoid(self.steer_mag(h))) if direction
                      else (torch.tanh(self.steer(h)),))
@@ -347,6 +373,7 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     model.uses_imu = bool(uses_imu)
     model.uses_lidar = bool(uses_lidar)
     model.uses_map = bool(uses_map)
+    model.uses_goal = bool(uses_goal)
     model.imu_yaw = bool(imu_yaw)
     model.steer_head = steer_head
     model.chunk = int(chunk)
@@ -400,6 +427,10 @@ def load_maps(data, crops_dir):
     n = len(data["t_ns"])
     row = np.full(n, -1, np.int64)
     codes, trail, present = [], [], []
+    # The poses the crops are drawn at, for hindsight goals (policy_goal.py):
+    # a file from before they were written has none, and its rows never
+    # get a goal.
+    pose = {"log_t": [], "x": [], "y": [], "yaw": [], "frame": [], "posed": [], "sess": []}
     base = 0
     for sid, name in enumerate(names):
         path = os.path.join(crops_dir, name + ".npz")
@@ -414,6 +445,15 @@ def load_maps(data, crops_dir):
         codes.append(z["codes"])
         trail.append(z["trail"])
         present.append(z["present"])
+        m = len(z["log_t"])
+        posed = all(k in z.files for k in ("x", "y", "yaw", "frame"))
+        pose["log_t"].append(np.asarray(z["log_t"], float))
+        for k in ("x", "y", "yaw"):
+            pose[k].append(np.asarray(z[k], float) if posed else np.zeros(m))
+        pose["frame"].append(np.asarray(z["frame"], np.int64) if posed
+                             else np.zeros(m, np.int64))
+        pose["posed"].append(np.full(m, posed))
+        pose["sess"].append(np.full(m, sid, np.int64))
         base += len(z["log_t"])
     size = (em.SIZE, em.SIZE)
     data["map_row"] = row
@@ -423,7 +463,35 @@ def load_maps(data, crops_dir):
     has = row >= 0
     has[has] &= data["map_present"][row[has]]
     data["map_on"] = has
+    if codes:
+        g = {k: np.concatenate(v) for k, v in pose.items()}
+        g["present"] = data["map_present"] & g.pop("posed")
+        g["key"] = pg.sort_key(g["sess"], g["log_t"])
+        data["goal_poses"] = g
+    else:
+        data.pop("goal_poses", None)
     return int(has.sum())
+
+
+def goal_inputs(data, rows, map_shown, rng, no_goal_share=pg.NO_GOAL_SHARE,
+                k_s=None):
+    """Hindsight goals (policy_goal.hindsight_goals) for dataset ticks
+    `rows`, as the model is fed them: k drawn from [NEAR_S, FAR_S] unless
+    given, no goal where the tick's map is not shown to the model this time
+    (map_shown: no map, or blanked by the map dropout) -- the car has no
+    goal without the map -- and on no_goal_share of the rest."""
+    rows = np.asarray(rows)
+    n = len(rows)
+    g = data.get("goal_poses")
+    if g is None or n == 0:
+        return np.zeros((n, pg.SIZE), np.float32)
+    if k_s is None:
+        k_s = rng.uniform(pg.NEAR_S, pg.FAR_S, n)
+    ahead, left, ok = pg.hindsight_goals(data["map_row"][rows], k_s, g)
+    ok &= np.asarray(map_shown, bool)
+    if no_goal_share > 0:
+        ok &= rng.random(n) >= no_goal_share
+    return pg.encode_many(ahead, left, ok)
 
 
 def imu_inputs(data, tilt, yaw=True):
@@ -595,7 +663,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           imu_yaw=True, imu_tilt=False, steer_head=pl.STEER_REGRESSION,
           straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT,
           uses_lidar=False, lidar_dropout=LIDAR_DROPOUT, uses_map=False,
-          map_dropout=MAP_DROPOUT, chunk=1):
+          map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE):
     import torch
     from torch import nn
 
@@ -603,7 +671,10 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
     model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar, uses_map,
-                        chunk)
+                        chunk, uses_goal)
+    # The goals' draws on a generator of their own, so a model without the
+    # goal is trained on exactly the draws it always was.
+    goal_rng = np.random.default_rng([seed, 1])
     direction = steer_head == pl.STEER_DIRECTION
 
     idx = np.flatnonzero(train_mask)
@@ -675,11 +746,16 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 blank = lidar_blanks(lidar_on[b.numpy()], lidar_dropout, rng)
                 lb = torch.where(torch.from_numpy(blank)[:, None],
                                  torch.zeros(()), lidar[b])
-            mb = None
+            mb = gb = None
             if uses_map:
                 mb = map_inputs(data, idx[b.numpy()])
                 blank = lidar_blanks(map_on[b.numpy()], map_dropout, rng)
                 mb[blank] = 0.0
+                gb = None
+                if uses_goal:
+                    shown = map_on[b.numpy()] & ~blank
+                    gb = torch.from_numpy(goal_inputs(data, idx[b.numpy()], shown, goal_rng,
+                                                      no_goal_share))
                 mb = torch.from_numpy(mb)
             sb, db = steer[b], steer_dir[b]
             mirrored = torch.rand(1).item() < 0.5
@@ -690,8 +766,10 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                     xb, pb, ib = flip(xb, pb, ib, imu_yaw)
                 if mb is not None:
                     mb = torch.flip(mb, dims=[-1])   # egomap.mirror
+                if gb is not None:
+                    gb = gb * torch.from_numpy(pg.MIRROR)   # policy_goal.mirror
                 sb, db = flip_steer_labels(sb, db)
-            extra = [v for v in (ib, lb, mb) if v is not None]
+            extra = [v for v in (ib, lb, mb, gb) if v is not None]
             out = model(xb, pb, mode_in[b], *extra)
             logits, t_out, m_out = out[0], out[1], out[-1]
             tok, sok = throttle_ok[b], steer_ok[b]
@@ -764,6 +842,9 @@ def export(model, representation, out_path, meta):
     if getattr(model, "uses_map", False):
         args += (torch.zeros((1, em.CHANNELS, em.SIZE, em.SIZE)),)
         names.append(pl.MAP_INPUT)
+    if getattr(model, "uses_goal", False):
+        args += (torch.zeros((1, pg.SIZE)),)
+        names.append(pl.GOAL_INPUT)
     torch.onnx.export(
         model, args, out_path,
         input_names=names,
@@ -791,6 +872,14 @@ def map_meta(uses_map, dropout=MAP_DROPOUT):
         return {}
     return {"uses_map": True, **em.meta(), "map_dropout": float(dropout),
             "map_features": MAP_FEATURES}
+
+
+def goal_meta(uses_goal, no_goal_share=pg.NO_GOAL_SHARE):
+    """The goal half of the sidecar: what policy.check_goal reads."""
+    if not uses_goal:
+        return {}
+    return {"uses_goal": True, **pg.meta(), "goal_no_goal_share": float(no_goal_share),
+            "goal_features": GOAL_FEATURES}
 
 
 def lidar_meta(uses_lidar, dropout=LIDAR_DROPOUT):
@@ -939,6 +1028,14 @@ def main(argv=None):
                          "lidar session, with dropout in training. Needs --lidar")
     ap.add_argument("--map-dropout", type=float, default=MAP_DROPOUT,
                     help=f"with --map: the share of ticks with a map fed none (default {MAP_DROPOUT})")
+    ap.add_argument("--goal", action="store_true",
+                    help="feed a goal on the map in as an input of its own "
+                         "(crawler/autopilot/policy_goal.py), trained on hindsight goals: "
+                         "the truck's own pose a few seconds on. Needs --map, with crops "
+                         "that carry their poses (tools/map_crops.py)")
+    ap.add_argument("--no-goal-share", type=float, default=pg.NO_GOAL_SHARE,
+                    help="with --goal: the share of goal-able ticks fed no goal "
+                         f"(default {pg.NO_GOAL_SHARE})")
     ap.add_argument("--steer-head", choices=pl.STEER_HEADS, default=pl.STEER_REGRESSION,
                     help="regression: one tanh steer. direction: left/straight/right "
                          "plus how far, which cannot average two hard turns into straight")
@@ -1038,6 +1135,13 @@ def main(argv=None):
         if not with_map:
             print(f"--map {args.map}: no tick of {args.data} paired with a crop")
             return 1
+    if args.goal and not args.map:
+        print("--goal needs --map: the goal is a point on the map")
+        return 2
+    if args.goal and not bool(np.any(data["goal_poses"]["present"])):
+        print(f"--goal: no crop in {args.map} carries its pose; replay them again "
+              "with tools/map_crops.py")
+        return 1
 
     import torch
 
@@ -1051,7 +1155,8 @@ def main(argv=None):
                imu_tilt=args.imu_tilt, steer_head=args.steer_head,
                straight_band=args.straight_band, takeover_weight=args.takeover_weight,
                uses_lidar=args.lidar, lidar_dropout=args.lidar_dropout,
-               uses_map=bool(args.map), map_dropout=args.map_dropout, chunk=args.chunk)
+               uses_map=bool(args.map), map_dropout=args.map_dropout, chunk=args.chunk,
+               uses_goal=args.goal, no_goal_share=args.no_goal_share)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1185,6 +1290,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
                      getattr(args, "lidar_dropout", LIDAR_DROPOUT)),
         **map_meta(bool(getattr(args, "map", None)),
                    getattr(args, "map_dropout", MAP_DROPOUT)),
+        **goal_meta(bool(getattr(args, "goal", False)),
+                    getattr(args, "no_goal_share", pg.NO_GOAL_SHARE)),
         **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
                      getattr(args, "straight_band", STRAIGHT_BAND)),
         **chunk_meta(getattr(args, "chunk", 1), getattr(args, "ensemble_m", 0.0)),

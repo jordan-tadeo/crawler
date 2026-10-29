@@ -142,6 +142,11 @@ INTERVALS = {
     # navigator is following once a second.
     "nav_status": 0.5,
     "nav_path": 1.0,
+    # With --goal (autopilot/goal.ClickGoal): the clicked goal, where it is
+    # from the truck and whether it has arrived, twice a second, and its
+    # marker on the map once a second.
+    "goal_status": 0.5,
+    "goal_marker": 1.0,
 }
 
 # What the map channels (/map, /slam/path, /voxel/points, /voxel/low) may
@@ -548,6 +553,18 @@ JSON_SCHEMAS = {
         "distance_m": _NUM, "path_m": _NUM, "local_map": _BOOL,
         "plans": _INT, "plan_ms": _NUM, "goals": _INT, "dropped": _INT,
     }),
+    # The goal a goal model drives to, with --goal: goal.ClickGoal.status().
+    # The goal in the map frame and the map frame it was clicked on (frame,
+    # -1 with none) against the one the truck is on now (frame_now); on_map
+    # whether it can be placed off the newest crop; distance_m (-1 with none)
+    # and bearing_deg (counter-clockwise, left positive) from the truck;
+    # arrived, the safety layer's neutral hold within arrive_m; clicks
+    # taken and refused.
+    "goal_status": _schema("crawler.GoalStatus", {
+        "goal_set": _BOOL, "x": _NUM, "y": _NUM, "frame": _INT, "frame_now": _INT,
+        "on_map": _BOOL, "distance_m": _NUM, "bearing_deg": _NUM, "arrived": _BOOL,
+        "arrive_m": _NUM, "clicks": _INT, "refused": _INT,
+    }),
 }
 
 # The image channels, which do get a well-known schema: foxglove.CompressedImage,
@@ -596,6 +613,7 @@ JSON_TOPICS = {
     "lidar": "/lidar",
     "slam_status": "/slam/status",
     "nav_status": "/nav/status",
+    "goal_status": "/goal/status",
 }
 
 # Raw depth: the uint16 millimetres exactly as the driver scans them, as a
@@ -654,6 +672,9 @@ VOXEL_CHANNELS = {
 # nav_view.py, built on the publisher thread off pointnav.PointNavDriver.nav_path().
 NAV_CHANNELS = {
     "nav_path": "/nav/path",
+    # The clicked goal (--goal) as a disc in "map", nav_view.path_scene with
+    # the goal only; an empty payload clears it.
+    "goal_marker": "/goal/marker",
 }
 
 ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
@@ -1206,7 +1227,7 @@ class Telemetry:
         if key == "voxel_points":
             from crawler.telemetry import voxel_view
             return voxel_view.points_message(payload, log_time)
-        if key == "nav_path":
+        if key in ("nav_path", "goal_marker"):
             from crawler.telemetry import nav_view
             return nav_view.path_scene(payload, log_time)
         if key == "voxel_low":

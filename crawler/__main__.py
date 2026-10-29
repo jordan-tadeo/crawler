@@ -799,7 +799,7 @@ class AutoPilot:
 
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
                  slam=None, nav=False, map_source=None, goals=None,
-                 fallback_path=None):
+                 fallback_path=None, clicks=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -817,8 +817,14 @@ class AutoPilot:
         # map is lost, instead of neutral (policy.PolicyDriver, "fallback").
         self.fallback_path = fallback_path
         # Whether the car has arrived, for a learned driver's stop (goal.py).
-        # Never set yet; a person follower sets it on this object.
-        self.goal = goal.Goal()
+        # With --goal, the goal clicked in Foxglove (goal.ClickGoal): fed to
+        # a goal model, and the arrival hold. Else a flag nothing sets.
+        # --goal's click listener (nav/click.ClickGoals), drained into the
+        # goal every pass in every mode by goal_step(): a click before auto
+        # is the goal auto drives to.
+        self.clicks = clicks
+        self.goal = (goal.ClickGoal(say=logger.log) if clicks is not None
+                     else goal.Goal())
         # The roof lidar's reader with --lidar, else None: handed to the
         # driver for its rear stop, which only ever asks it latest().
         self.lidar = lidar
@@ -832,6 +838,25 @@ class AutoPilot:
         # Where the navigator's goals come from: click.ClickGoals, the
         # Foxglove listener, with --nav. None, no goals, so it stands still.
         self.goals = goals
+
+    def goal_step(self):
+        """--goal: the newest click onto the goal, placed off the newest crop,
+        and the arrival latch. Every pass, any mode. Never raises."""
+        if self.clicks is None:
+            return
+        try:
+            crop = self.slam.crop() if self.slam is not None else None
+            self.goal.poll(self.clicks, crop)
+        except Exception as e:
+            print(f"[goal] {e}", file=sys.stderr)
+
+    def goal_marker(self):
+        """/goal/marker's payload: the goal on the map the truck is on now,
+        or nothing, which clears the disc."""
+        st = self.goal.status()
+        if st["goal_set"] and st["frame"] == st["frame_now"]:
+            return {"goal": (st["x"], st["y"])}
+        return {}
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -951,6 +976,11 @@ class AutoPilot:
                             f"(sha256 {fallback.sha256[:12]})")
             print(f"[auto] fallback {fallback.label} sha256 {fallback.sha256}",
                   file=sys.stderr)
+        if self.clicks is not None and not model.uses_goal:
+            self.logger.log("warning", "Goal",
+                            f"{model.label} takes no goal: a click is shown and "
+                            "the arrival hold still stops the car there, but the "
+                            "model drives as it always has")
         return policy.PolicyDriver(self.command, view, model, goal=self.goal,
                                    lidar=self.lidar, slam=self.slam, fallback=fallback)
 
@@ -1394,6 +1424,10 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             if modes.mode == MANUAL and drove_last in ThrottleLatch.FROM:
                 latch.arm(drove_last)
             drove_last = modes.mode
+            # --goal: a click is taken in any mode and kept until replaced.
+            goal_step = getattr(autopilot, "goal_step", None)
+            if goal_step is not None:
+                goal_step()
             if modes.mode == MANUAL:
                 drive_manual(joystick, vecon, log, steer.split, latch)
             elif modes.mode == RECORD:
@@ -1516,6 +1550,12 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             if (getattr(nav_driver, "nav_path", None) is not None
                     and tele.wants("nav_path", now)):
                 tele.offer("nav_path", nav_driver.nav_path(), now)
+            # --goal: the clicked goal, from the truck, and its disc.
+            if getattr(autopilot, "clicks", None) is not None:
+                if tele.wants("goal_status", now):
+                    tele.offer("goal_status", autopilot.goal.status(), now)
+                if tele.wants("goal_marker", now):
+                    tele.offer("goal_marker", autopilot.goal_marker(), now)
 
             if tele.wants("diagnostics", now):
                 elapsed = now - window_started
@@ -1814,6 +1854,20 @@ def parse_args(argv=None):
              "hold there; until the first goal auto drives as without it "
              "(needs --slam; off unless given)",
     )
+    # Off unless named. A goal on the map for a goal model (autopilot/
+    # policy_goal.py): Foxglove's Publish pose tool on the 3D panel, in the
+    # map frame, on /move_base_simple/goal, taken in any mode and kept until
+    # the next click. The model does all the driving to it; the one rule is
+    # the arrival hold, neutral within policy_goal.ARRIVE_M until a new goal
+    # (autopilot/goal.py). /goal/status and /goal/marker say where it is.
+    # Needs --slam. Not with --nav: one thing reads the clicks.
+    parser.add_argument(
+        "--goal",
+        action="store_true",
+        help="take goals clicked in Foxglove on the SLAM map for a goal model "
+             "to drive to, holding neutral on arrival (needs --slam; off "
+             "unless given)",
+    )
     # Off unless named. The OAK-D's low obstacles (--voxel-map) as extra
     # solid cells in the navigator's map, never clearing a lidar cell. Off
     # because how often it sees things that are not there is not settled.
@@ -1824,7 +1878,10 @@ def parse_args(argv=None):
              "obstacles the camera sees under the lidar (advisory; off "
              "unless given)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.goal and args.nav:
+        parser.error("--goal and --nav both take the Foxglove clicks; give one")
+    return args
 
 
 def nav_goals(args, log):
@@ -1832,7 +1889,7 @@ def nav_goals(args, log):
     the start_server() arguments that let a client publish to it. (None,
     None) without --nav, or if the listener cannot be built -- then --nav
     has no goals and stands still, which the journal says."""
-    if not getattr(args, "nav", False):
+    if not (getattr(args, "nav", False) or getattr(args, "goal", False)):
         return None, None
     try:
         from crawler.nav import click
@@ -1985,11 +2042,19 @@ def main(argv=None):
         # late at p99 during a plan at the default 5 ms switch interval and
         # 12 ms at 1 ms, with the plans no slower.
         sys.setswitchinterval(NAV_SWITCH_INTERVAL_S)
+    if args.goal:
+        if slam is None:
+            log.log("warning", "Goal", "--goal needs --slam: a click has no map "
+                    "to go on, so every one is refused")
+        else:
+            log.log("info", "Goal", "Taking goals from Foxglove's Publish pose "
+                    "tool on /move_base_simple/goal, in the map frame")
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           fallback_path=args.fallback_policy,
                           lidar=lidar, slam=slam, nav=args.nav,
                           map_source=nav_map_source(args, slam, lidar, voxels, log),
-                          goals=goals)
+                          goals=goals if args.nav else None,
+                          clicks=goals if args.goal else None)
 
     # Who gets the device opened at startup, and who waits for it:
     #

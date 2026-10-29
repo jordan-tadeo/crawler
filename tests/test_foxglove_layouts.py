@@ -92,10 +92,24 @@ def test_the_drive_layout_is_pictures_and_the_telemetry_one_is_not():
     assert {cfg["imageMode"]["imageTopic"] for k, cfg in drive.items()
             if k.startswith("Image!")} == cams
     assert {"/map", "/lidar/scan", "/voxel/points", "/voxel/low",
-            "/nav/path"} <= set(drive["3D!slam"]["topics"])
-    # A click on the map says what the goto made of it.
-    assert any(cfg.get("topicPath") == "/nav/status" for cfg in drive.values())
+            "/goal/marker"} <= set(drive["3D!slam"]["topics"])
+    # The planner is not on the drive layout: the model drives to a click.
+    assert not any(t.startswith("/nav/") for cfg in drive.values()
+                   for t, _ in topics_read(cfg))
+    # A click on the map says where the goal is from the truck.
+    assert any(cfg.get("topicPath") == "/goal/status" for cfg in drive.values())
     assert not any(k.startswith(("Image!", "3D!")) for k in tele)
     read = {t for cfg in tele.values() for t, _ in topics_read(cfg)}
     assert read == {"/vehicle", "/controller", "/imu", "/diagnostics",
                     "/slam/status", "/footprint"}
+
+
+def test_a_click_on_the_drive_map_publishes_a_goal_pose_in_the_map_frame():
+    """The 3D map panel's Publish tool is the pose kind on the goal topic,
+    and the panel's display frame is the map, so a click arrives with
+    frame_id "map", which goal.ClickGoal takes as it is."""
+    drive = json.load(open(LAYOUTS[0]))["configById"]["3D!slam"]
+    assert drive["publish"]["type"] == "pose"
+    assert drive["publish"]["poseTopic"] == GOAL_TOPIC
+    assert drive["followTf"] == "map"
+    assert drive["topics"]["/goal/marker"]["visible"]

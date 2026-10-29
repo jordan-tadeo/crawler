@@ -1,0 +1,64 @@
+{
+  "input_contract": "depth_small",
+  "representation": "profile",
+  "actions": [
+    "forward",
+    "reverse",
+    "stop"
+  ],
+  "uses_prev_action": false,
+  "uses_lidar": true,
+  "lidar_layout": "bins72_5deg",
+  "lidar_size": 145,
+  "lidar_clip_mm": 4000.0,
+  "lidar_stale_s": 0.3,
+  "lidar_dropout": 0.3,
+  "lidar_features": 16,
+  "steer_head": "regression",
+  "outputs": [
+    "logits",
+    "throttle",
+    "steer",
+    "mode_logits"
+  ],
+  "steer_scale": 0.7,
+  "labels": "pad",
+  "train_sessions": [],
+  "val_sessions": [],
+  "good_weight": 2.0,
+  "takeover_weight": 1.0,
+  "epochs": 0,
+  "seed": 0,
+  "steer_modes": [
+    "unified",
+    "split"
+  ],
+  "mode_switch": {
+    "threshold": 0.7,
+    "dwell_s": 0.5,
+    "min_interval_s": 2.0
+  },
+  "mode_rear": {
+    "unified": "steering_pair(front)",
+    "split": 0.0
+  },
+  "mode_not_modelled": "split with the right stick on the rear (|rear| > split_rear_rest); the dataset drops those rows",
+  "mode_switch_weight": 10.0,
+  "note": "untrained, for the tests: profile + mode + lidar + map + goal",
+  "uses_map": true,
+  "map_layout": "ego64_10cm_trail60",
+  "map_size": 64,
+  "map_res_m": 0.1,
+  "map_trail_s": 60.0,
+  "map_stale_s": 0.3,
+  "map_dropout": 0.3,
+  "map_features": 32,
+  "uses_goal": true,
+  "goal_layout": "goal4_far8",
+  "goal_size": 4,
+  "goal_far_m": 8.0,
+  "goal_near_s": 3.0,
+  "goal_far_s": 15.0,
+  "goal_no_goal_share": 0.3,
+  "goal_features": 16
+}

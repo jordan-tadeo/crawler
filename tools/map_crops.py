@@ -15,6 +15,10 @@ Writes OUT_DIR/<run>.npz, one row per scan:
   present   egomap.trusted(Result)
   codes     uint8 (n, SIZE, SIZE)
   trail     uint8 (n, SIZE, SIZE)
+  x, y, yaw the pose each crop is drawn at (Crop.x, .y, .yaw), map metres
+            and radians: what policy_train.py --goal draws its hindsight
+            goals from (crawler/autopilot/policy_goal.py)
+  frame     Crop.frame, which map those are on
   layout    egomap.LAYOUT
 
 policy_train.py --map OUT_DIR pairs each dataset tick with the newest scan
@@ -52,6 +56,8 @@ def crops_of(d, raw_time=False):
     trail = np.zeros_like(codes)
     present = np.zeros(n, bool)
     t = np.zeros(n)
+    pose = np.zeros((n, 3))
+    frame = np.zeros(n, np.int64)
     k = 0
     for i in range(n):
         log_t = d["t"][i]
@@ -63,8 +69,11 @@ def crops_of(d, raw_time=False):
         res = slam.step(float(ts[i]), d["ranges"][i])
         crop = ego.after_step(slam.grid, res)
         codes[i], trail[i], present[i], t[i] = crop.codes, crop.trail, crop.present, crop.t
+        pose[i] = crop.x, crop.y, crop.yaw
+        frame[i] = crop.frame
     return dict(log_t=np.asarray(d["t"], float), t=t, present=present, codes=codes,
-                trail=trail, layout=np.array(em.LAYOUT))
+                trail=trail, x=pose[:, 0], y=pose[:, 1], yaw=pose[:, 2], frame=frame,
+                layout=np.array(em.LAYOUT))
 
 
 # The pairing lives in egomap (numpy only), so the trainer needs no scipy.

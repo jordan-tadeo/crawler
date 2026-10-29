@@ -150,7 +150,12 @@ def test_the_recording_and_the_car_draw_the_same_crop(monkeypatch, mode):
         np.testing.assert_array_equal(live[k].codes, offline["codes"][k])
         np.testing.assert_array_equal(live[k].trail, offline["trail"][k])
         assert live[k].present == offline["present"][k]
+        # The pose and map frame a goal is put in the truck's frame by
+        # (policy_goal.py): the hindsight goals' poses are the car's.
+        assert ((live[k].x, live[k].y, live[k].yaw, live[k].frame)
+                == (offline["x"][k], offline["y"][k], offline["yaw"][k], offline["frame"][k]))
     assert (offline["codes"][-1] == gr.OCCUPIED).any()
+    assert np.ptp(offline["x"]) > 0.1 or np.ptp(offline["y"]) > 0.1, "the truck moves"
 
 
 def test_a_tick_pairs_with_the_newest_crop_no_older_than_stale():

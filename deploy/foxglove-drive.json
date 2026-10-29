@@ -83,7 +83,7 @@
         "/slam/path": {
           "visible": true
         },
-        "/nav/path": {
+        "/goal/marker": {
           "visible": true
         },
         "/lidar/scan": {
@@ -130,7 +130,7 @@
           "order": 1
         }
       },
-      "foxglovePanelTitle": "SLAM map, the truck outline is the car (/map, /slam/path, scan in orange; voxels in the topic list)",
+      "foxglovePanelTitle": "SLAM map, the truck outline is the car; Publish pose (toolbar) on the map sets the goal, the green disc (/map, /slam/path, scan in orange; voxels in the topic list)",
       "publish": {
         "type": "pose",
         "poseTopic": "/move_base_simple/goal",
@@ -220,13 +220,13 @@
       },
       "foxglovePanelTitle": "Live lidar, front is up (/lidar/scan, 0.5 m grid)"
     },
-    "RawMessages!nav": {
+    "RawMessages!goal": {
       "diffEnabled": false,
       "diffMethod": "custom",
       "diffTopicPath": "",
       "showFullMessageForDiff": false,
-      "topicPath": "/nav/status",
-      "foxglovePanelTitle": "Goto"
+      "topicPath": "/goal/status",
+      "foxglovePanelTitle": "Goal"
     }
   },
   "layout": {
@@ -248,7 +248,7 @@
       "second": {
         "direction": "column",
         "first": "3D!lidar",
-        "second": "RawMessages!nav",
+        "second": "RawMessages!goal",
         "splitPercentage": 70
       },
       "splitPercentage": 62
