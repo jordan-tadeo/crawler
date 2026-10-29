@@ -582,11 +582,16 @@ def copy_model(entry, models_dir, stem, model_version):
 
 
 def session_hashes(names, mcap_dir=MCAP_DIR, hash_file=None):
-    """[{name, mcap_sha256}] with None for a session not on this Mac."""
+    """[{name, mcap_sha256}] with None for a session not on this Mac.
+
+    A record session is in mcap_dir; an auto drive a model learned my
+    takeovers from is in its drives/ folder (policy_dataset --drive-logs)."""
     hash_file = hash_file or pm.sha256_local
     out = []
     for name in names or []:
         path = os.path.join(mcap_dir, name + ".mcap")
+        if not os.path.isfile(path):
+            path = os.path.join(mcap_dir, "drives", name + ".mcap")
         out.append({"name": name,
                     "mcap_sha256": hash_file(path) if os.path.isfile(path) else None})
     return out

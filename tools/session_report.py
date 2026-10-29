@@ -71,6 +71,8 @@ def footprint_row(row):
         "steering_mode": str(row.get("steering_mode", "")),
         "nearest_mm": min(real) if real else None,
         "seq": int(_f(row.get("seq"), -1)),
+        "steer_by": str(row.get("steer_by", "")),
+        "throttle_by": str(row.get("throttle_by", "")),
     }
 
 
@@ -119,6 +121,17 @@ PAD_HOLE_S = 2.0
 
 # Modes the camera is open in, so the only modes depth can be asked about.
 DEPTH_MODES = ("auto", "record")
+
+# Corrections: my hand on an auto drive. Both numbers are policy_dataset's
+# (MANUAL_AFTER_AUTO_S, and IdleRules' steering rest with THROTTLE_DEADBAND),
+# copied for the same reason as the band below; a test holds them equal.
+MANUAL_AFTER_AUTO_S = 5.0
+DRIVING_THROTTLE = 0.005
+DRIVING_STEER = 0.12 * 0.7
+# One /footprint row is one 10 Hz decision; rows further apart than this are
+# two takeovers, not one.
+FOOTPRINT_TICK_S = 0.1
+TAKEOVER_GAP_S = 0.25
 
 # The verdict.
 MIN_DEPTH_MINUTES = 1.0       # less depth-mode time than this is too short
@@ -484,6 +497,42 @@ def summarise(ticks, depth, controller, ready_spans, depth_times, marks,
     }
 
 
+def corrections(ticks, rows, window_s=MANUAL_AFTER_AUTO_S):
+    """How much correction data an auto drive gave. Pure.
+
+    ticks are /vehicle; rows are (t, mode, steer_by, throttle_by) off
+    /footprint. A takeover segment is a run of auto rows with either group
+    "pad", rows no more than TAKEOVER_GAP_S apart; its time is its rows at
+    FOOTPRINT_TICK_S each. Manual after auto is /vehicle time in manual
+    within window_s of a switch out of auto, with the throttle or the
+    steering off rest -- the START-to-manual corrections, which have no
+    /footprint rows behind them.
+    """
+    durations = tick_durations(ticks)
+    auto_s = sum(dt for t, dt in zip(ticks, durations) if t.mode == "auto")
+    on = [(t, mode == "auto" and "pad" in (sb, tb)) for t, mode, sb, tb in sorted(rows)]
+    segments, prev = 0, None
+    for t, o in on:
+        if o and (prev is None or t - prev > TAKEOVER_GAP_S):
+            segments += 1
+        prev = t if o else None
+    manual_s, exits, since, last_mode = 0.0, 0, None, None
+    for tick, dt in zip(ticks, durations):
+        if tick.mode != "manual":
+            since = None
+        elif last_mode == "auto":
+            since = tick.t
+            exits += 1
+        last_mode = tick.mode
+        if (since is not None and tick.t - since <= window_s
+                and (abs(tick.throttle) > DRIVING_THROTTLE
+                     or abs(tick.steering_front) > DRIVING_STEER)):
+            manual_s += dt
+    return {"auto_s": auto_s, "takeover_segments": segments,
+            "takeover_s": sum(o for _, o in on) * FOOTPRINT_TICK_S,
+            "auto_exits": exits, "manual_after_auto_s": manual_s}
+
+
 def manual_reversing(events, manual_s):
     """The habit numbers for hand driving: (per minute, median duration,
     median mean-throttle, median peak-throttle). None where there are none."""
@@ -599,6 +648,7 @@ def read_session(path, want_jpeg_depth=True):
     channels, schemas = {}, {}
     vehicle, controller, diag, marks = [], [], [], []
     footprint, jpeg_depth = [], []
+    hands = []
     pad_diag = []
     seqs = []
     t_first = t_last = None
@@ -667,6 +717,7 @@ def read_session(path, want_jpeg_depth=True):
                     fp = footprint_row(row)
                     footprint.append((t, fp["nearest_mm"]))
                     seqs.append(fp["seq"])
+                    hands.append((t, fp["mode"], fp["steer_by"], fp["throttle_by"]))
         except Exception:
             truncated = True
 
@@ -702,6 +753,7 @@ def read_session(path, want_jpeg_depth=True):
         "depth_times": [t for t, _ in depth.samples],
         "marks": [(t - t0, r) for t, r in sorted(marks, key=lambda p: p[0])],
         "seq_gaps": gaps,
+        "hands": [(t - t0, m, sb, tb) for t, m, sb, tb in sorted(hands)],
     }
 
 
@@ -741,6 +793,17 @@ def render(session, stats):
     split = " / ".join(f"{m} {_mmss(s)}" for m, s in
                        sorted(stats["mode_s"].items(), key=lambda kv: -kv[1]))
     lines.append(f"  modes      {split}")
+    fix = corrections(session["ticks"], session.get("hands", []))
+    if fix["auto_s"] > 0:
+        lines.append(f"  corrections auto {fix['auto_s']:.0f} s; "
+                     f"{fix['takeover_segments']} takeover segments, "
+                     f"{fix['takeover_s']:.1f} s under my hand; manual after auto "
+                     f"{fix['manual_after_auto_s']:.1f} s driven in the "
+                     f"{MANUAL_AFTER_AUTO_S:.0f} s after {fix['auto_exits']} "
+                     f"switches"
+                     + ("" if any(m == "manual" for _, m, _, _ in session.get("hands", []))
+                        else " (manual writes no /footprint rows, so no picture to "
+                             "train on)"))
 
     fwd, rev, stop = stats["throttle_counts"]
     n = fwd + rev + stop

@@ -156,9 +156,27 @@ SPLIT_REAR_REST = 0.05
 MODE_LEAD_S = 0.5
 MODE_WINDOW_S = 0.5
 
+# Interventions. How long after a switch from auto to manual (START) my
+# driving still counts as a correction of what auto was doing.
+MANUAL_AFTER_AUTO_S = 5.0
+# A takeover row whose throttle is further than this from my trigger scaled
+# by the row's caps had its throttle held back by something between my
+# finger and the ESC, and its throttle is not a label. Throttle units.
+HELD_TOLERANCE = 0.01
+
+# Where a tick came from, as stored in the .npz "source" array (an index
+# into this). record: a RECORD session. auto: an auto row with no hand on
+# it, never a label. takeover: an auto row with a hand on at least one
+# group. manual_after_auto: manual inside MANUAL_AFTER_AUTO_S of leaving
+# auto, with the pad moving.
+SOURCES = ("record", "auto", "takeover", "manual_after_auto")
+SOURCE_RECORD, SOURCE_AUTO, SOURCE_TAKEOVER, SOURCE_MANUAL = SOURCES
+INTERVENTION_SOURCES = (SOURCE_TAKEOVER, SOURCE_MANUAL)
+
 DROP_REASONS = ("mode", "no frame", "stale", "pad", "bad command", "split rear",
+                "manual", "manual idle",
                 "idle lead", "idle trail", "exit reach", "handled", "parked")
-IDLE_REASONS = DROP_REASONS[6:]
+IDLE_REASONS = ("idle lead", "idle trail", "exit reach", "handled", "parked")
 
 
 class IdleRules(NamedTuple):
@@ -222,6 +240,7 @@ class Tick(NamedTuple):
     mode_switch: bool = False   # within MODE_WINDOW_S of a toggle
     imu: object = None          # (pimu.IMU_SIZE,) float32, the policy's IMU input
     imu_no_yaw: object = None   # (pimu.NO_YAW_SIZE,) float32, the same without yaw
+    source: str = SOURCE_RECORD  # one of SOURCES
 
 
 def _is_split(cmd):
@@ -284,6 +303,140 @@ def imu_features(commands, yaw=True):
             for cmd in commands]
 
 
+# ---- interventions: my hand on a drive the autopilot was making -----------
+
+def _held(cmd):
+    """An auto row whose throttle is not my trigger scaled by its caps.
+
+    Under a takeover the trigger is scaled exactly like record's (forward
+    by forward_limit, reverse by -reverse_limit), so a row that differs had
+    the throttle held back after my finger -- measured on 2026-10-28: a full
+    RT pull on a row the policy's floor held at 0 for 0.8 s. What reached
+    the ESC is then not what I asked for, and neither is a clean label.
+    """
+    if cmd.mode != "auto" or cmd.throttle_by != pa.BY_PAD:
+        return False
+    pad = cmd.pad_throttle
+    if not math.isfinite(pad) or not pa._valid_caps(cmd.forward_cap, cmd.reverse_cap):
+        return False
+    want = pad * cmd.forward_cap if pad > 0 else pad * -cmd.reverse_cap
+    return abs(want - cmd.throttle) > HELD_TOLERANCE
+
+
+def _throttle_at_rest(cmd):
+    """Nothing on the trigger and nothing on the wheels."""
+    pad = cmd.pad_throttle
+    finger = abs(pad) <= pa.THROTTLE_DEADBAND if math.isfinite(pad) else True
+    return finger and abs(cmd.throttle) <= pa.THROTTLE_DEADBAND
+
+
+def takeover_labels(commands, steer_rest=None):
+    """Per command (steer_tail, throttle_tail, held), off the whole stream.
+
+    A group stays "pad" for TAKEOVER_RELEASE_SECONDS (0.5 s) after I let go,
+    reading the stick's rest -- centre, or a throttle of 0. That tail is real
+    but it is where I stopped meaning anything, and a label off it teaches
+    "stop" or "straight" at exactly the moment auto took back over. So the
+    run of at-rest ticks that ends each of a group's pad runs is a tail and
+    not a label. A rest in the middle of a run (a stop between a reverse and
+    a forward) is kept: the run did not end there. Auto rows only; a record
+    or manual row is (False, False, False).
+    """
+    steer_rest = IdleRules().steer_rest if steer_rest is None else steer_rest
+    n = len(commands)
+    tails = {"steer": [False] * n, "throttle": [False] * n}
+    groups = (("steer", lambda c: c.steer_by == pa.BY_PAD,
+               lambda c: abs(c.front) <= steer_rest),
+              ("throttle", lambda c: c.throttle_by == pa.BY_PAD, _throttle_at_rest))
+    for name, by_pad, at_rest in groups:
+        tail = tails[name]
+        i = 0
+        while i < n:
+            if commands[i].mode != "auto" or not by_pad(commands[i]):
+                i += 1
+                continue
+            j = i
+            while (j + 1 < n and commands[j + 1].mode == "auto" and by_pad(commands[j + 1])
+                   and (commands[j + 1].t_ns - commands[j].t_ns) / 1e9 <= PREV_GAP_S):
+                j += 1
+            k = j
+            while k >= i and at_rest(commands[k]):
+                tail[k] = True
+                k -= 1
+            i = j + 1
+    return [(tails["steer"][i], tails["throttle"][i], _held(c))
+            for i, c in enumerate(commands)]
+
+
+def manual_window(stream, window_s=MANUAL_AFTER_AUTO_S, steer_rest=None):
+    """Per item of a time-ordered [(t_ns, mode, throttle, front)]:
+    (inside, driving). inside: manual, within window_s of the switch out of
+    auto that started it. driving: inside, and the throttle or the steering
+    off rest -- the window only counts while I am actually driving."""
+    steer_rest = IdleRules().steer_rest if steer_rest is None else steer_rest
+    out, since, prev_mode = [], None, None
+    for t_ns, mode, throttle, front in stream:
+        if mode != pa.MANUAL:
+            since = None
+        elif prev_mode == "auto":
+            since = t_ns
+        prev_mode = mode
+        inside = since is not None and (t_ns - since) / 1e9 <= window_s
+        driving = inside and (abs(throttle) > pa.THROTTLE_DEADBAND or abs(front) > steer_rest)
+        out.append((inside, driving))
+    return out
+
+
+def _seconds(times_ns, gap_s=PREV_GAP_S):
+    """Time covered by a set of samples: the gaps between neighbours, a gap
+    longer than gap_s counted as one sample's worth (the median gap)."""
+    t = np.sort(np.asarray(times_ns, dtype=np.int64)) / 1e9
+    if len(t) < 2:
+        return TICK_S * len(t)
+    d = np.diff(t)
+    step = float(np.median(d))
+    return float(np.where(d <= gap_s, d, step).sum() + step)
+
+
+def intervention_summary(session, rules=None):
+    """What a session's hand-on-auto data was, before any tick is dropped.
+
+    takeover_ticks / takeover_segments: auto rows with either group "pad",
+    and the runs of them. steer_only / throttle_only / both split those by
+    group. steer_tails / throttle_tails / held: the takeover_labels verdicts.
+    manual_rows: manual /footprint rows inside a MANUAL_AFTER_AUTO_S window
+    with the pad moving. manual_driven_s: the same window off /vehicle, which
+    every mode writes -- the correction there was, picture or not.
+    """
+    commands = session.commands
+    rest = (rules or IdleRules()).steer_rest
+    on = [c.mode == "auto" and pa.BY_PAD in (c.steer_by, c.throttle_by) for c in commands]
+    segments = sum(1 for i, o in enumerate(on)
+                   if o and not (i and on[i - 1]
+                                 and (commands[i].t_ns - commands[i - 1].t_ns) / 1e9 <= PREV_GAP_S))
+    verdicts = takeover_labels(commands, rest)
+    pad_s = [c.steer_by == pa.BY_PAD for c in commands]
+    pad_t = [c.throttle_by == pa.BY_PAD for c in commands]
+    windows = manual_window([(c.t_ns, c.mode, c.throttle, c.front) for c in commands],
+                            steer_rest=rest)
+    vwin = manual_window(list(session.vehicle), steer_rest=rest)
+    return {
+        "takeover_ticks": int(sum(on)),
+        "takeover_segments": int(segments),
+        "steer_only": int(sum(o and s and not t for o, s, t in zip(on, pad_s, pad_t))),
+        "throttle_only": int(sum(o and t and not s for o, s, t in zip(on, pad_s, pad_t))),
+        "both": int(sum(o and s and t for o, s, t in zip(on, pad_s, pad_t))),
+        "steer_tails": int(sum(o and v[0] for o, v in zip(on, verdicts))),
+        "throttle_tails": int(sum(o and v[1] for o, v in zip(on, verdicts))),
+        "held": int(sum(o and v[2] for o, v in zip(on, verdicts))),
+        "manual_rows": int(sum(d for _, d in windows)),
+        "manual_driven_s": _seconds([v[0] for v, (_, d) in zip(session.vehicle, vwin) if d],
+                                    gap_s=PREV_GAP_S) if any(d for _, d in vwin) else 0.0,
+        "auto_exits": int(sum(1 for a, b in zip(session.vehicle, session.vehicle[1:])
+                              if a[1] == "auto" and b[1] == pa.MANUAL)),
+    }
+
+
 def _rear_off_pair(cmd):
     """A unified command whose rear is not steering_pair(front)'s.
 
@@ -340,7 +493,11 @@ def idle_reasons(ticks, record_times_ns, rules=IdleRules()):
     writing rows, not where the last usable frame happened to be.
     """
     out = [""] * len(ticks)
-    idx = [i for i, t in enumerate(ticks) if t.mode in rules.modes]
+    # A manual-after-auto tick is already only the moving ones in a 5 s
+    # window (manual_window); lead, trail and parked are rules for a session
+    # of hand driving, which that window is not.
+    idx = [i for i, t in enumerate(ticks)
+           if t.mode in rules.modes and t.source != SOURCE_MANUAL]
     if not idx:
         return out
     tk = [ticks[i] for i in idx]
@@ -435,10 +592,26 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     modes = mode_labels(commands)
     imus = imu_features(commands)
     imus_no_yaw = imu_features(commands, yaw=False)
-    for cmd, (mode_in, steer_mode, mode_switch), imu, imu_no_yaw in zip(
-            commands, modes, imus, imus_no_yaw):
+    # Interventions, off the whole stream before any tick is dropped: a
+    # release tail ends where the group went back, wherever that row went.
+    footprint = session.adapter == pa.FootprintAdapter.name
+    rest = (rules or IdleRules()).steer_rest
+    takeovers = takeover_labels(commands, rest)
+    windows = manual_window([(c.t_ns, c.mode, c.throttle, c.front) for c in commands],
+                            steer_rest=rest)
+    for cmd, (mode_in, steer_mode, mode_switch), imu, imu_no_yaw, verdict, window in zip(
+            commands, modes, imus, imus_no_yaw, takeovers, windows):
         if cmd.mode not in session.label_modes:
             drops["mode"] += 1
+            prev_was_reverse = False
+            continue
+        manual = footprint and cmd.mode == pa.MANUAL
+        if manual and not window[0]:
+            drops["manual"] += 1
+            prev_was_reverse = False
+            continue
+        if manual and not window[1]:
+            drops["manual idle"] += 1
             prev_was_reverse = False
             continue
         if session.by_seq:
@@ -466,6 +639,21 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
             drops["split rear"] += 1
             continue
 
+        steer_label = cmd.steer_by == pa.BY_PAD
+        throttle_label = cmd.throttle_by == pa.BY_PAD
+        if cmd.mode == "auto":
+            steer_tail, throttle_tail, held = verdict
+            steer_label = steer_label and not steer_tail
+            throttle_label = throttle_label and not (throttle_tail or held)
+        if manual:
+            source = SOURCE_MANUAL
+        elif cmd.mode in pa.PAD_MODES:
+            source = SOURCE_RECORD
+        elif steer_label or throttle_label:
+            source = SOURCE_TAKEOVER
+        else:
+            source = SOURCE_AUTO
+
         action = pa.action_of(cmd.throttle)
         consecutive = prev_t is not None and (cmd.t_ns - prev_t) / 1e9 <= PREV_GAP_S
         if cmd.mode in pa.PAD_MODES:
@@ -478,28 +666,38 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
             decision = False
         else:
             decision = True
+        if source == SOURCE_TAKEOVER:
+            # My hand chose this tick, whatever the recover machine would
+            # have been doing: every one is a decision, as on the pad.
+            decision = True
         prev_was_reverse = action == pl.REVERSE
         prev_t = cmd.t_ns
 
         frame = session.frames[fi]
         rule_action = cmd.rule_action or frame.rule_action
         rule_steer = cmd.rule_steer if math.isfinite(cmd.rule_steer) else frame.rule_steer
+        # Manual drives the full range whatever it writes as its caps, so its
+        # throttle is measured against the auto caps it just left: the same
+        # speed is the same label, and anything past auto's cap is 1.0.
+        caps = fallback if manual else (cmd.forward_cap, cmd.reverse_cap)
         ticks.append(Tick(
             cmd.t_ns, fi, age, action,
-            pa.magnitude_of(cmd.throttle, cmd.forward_cap, cmd.reverse_cap, fallback),
+            pa.magnitude_of(cmd.throttle, *caps, fallback),
             float(np.clip(cmd.front / pa.STEER_SCALE, -1.0, 1.0)),
             rule_action, float(rule_steer), decision, cmd.mode,
-            cmd.steer_by == pa.BY_PAD, cmd.throttle_by == pa.BY_PAD,
+            steer_label, throttle_label,
             float(cmd.throttle), float(cmd.front), float(cmd.accel), float(cmd.gyro),
             cmd.autopilot == pa.AUTOPILOT_POLICY, mode_in, steer_mode, mode_switch,
-            imu, imu_no_yaw))
+            imu, imu_no_yaw, source))
         errors.append(age)
 
     if rules is not None:
-        record_times = [c.t_ns for c in commands if c.mode in rules.modes]
+        record_times = [c.t_ns for c in commands if c.mode in rules.modes
+                        and not (footprint and c.mode == pa.MANUAL)]
         why = idle_reasons(ticks, record_times, rules)
         if timeline is not None:
-            timeline.extend((t.t_ns, w) for t, w in zip(ticks, why) if t.mode in rules.modes)
+            timeline.extend((t.t_ns, w) for t, w in zip(ticks, why)
+                            if t.mode in rules.modes and t.source != SOURCE_MANUAL)
         kept = [(t, e) for t, e, w in zip(ticks, errors, why) if not w]
         for w in why:
             if w:
@@ -611,6 +809,8 @@ def to_arrays(sessions_ticks):
         "steer_label": np.array([r[2].steer_label for r in rows], dtype=bool),
         "throttle_label": np.array([r[2].throttle_label for r in rows], dtype=bool),
         "policy_drove": np.array([r[2].policy_drove for r in rows], dtype=bool),
+        # SOURCES indices: record, auto, takeover, manual_after_auto.
+        "source": np.array([SOURCES.index(r[2].source) for r in rows], dtype=np.int8),
         "mark": np.array([r[4] for r in rows], dtype=np.int8),
         # pl.STEER_MODES indices. See "The steering mode" above.
         "mode_in": np.array([r[2].mode_in for r in rows], dtype=np.int8),
@@ -761,11 +961,49 @@ def default_mcaps(pattern=DEFAULT_MCAPS):
     return sorted(glob.glob(os.path.expanduser(pattern)))
 
 
+# Where a pull leaves the auto drives (the rolling recordings), and the
+# record sessions' name, which a drive log never has.
+DEFAULT_DRIVE_LOGS = "~/crawler-data/mcap/drives"
+RECORD_PREFIX = "crawler-record-"
+
+
+def drive_logs(directory):
+    """Every crawler-*.mcap in a directory that is not a record session,
+    oldest name first."""
+    found = glob.glob(os.path.join(os.path.expanduser(directory), "crawler-*.mcap"))
+    return sorted(p for p in found if not os.path.basename(p).startswith(RECORD_PREFIX))
+
+
+def format_interventions(summary, ticks):
+    """The report's interventions line for one session."""
+    kept = Counter(t.source for t in ticks)
+    s = summary
+    line = (f"    interventions: takeover {s['takeover_ticks']} ticks in "
+            f"{s['takeover_segments']} segments (steering only {s['steer_only']}, "
+            f"throttle only {s['throttle_only']}, both {s['both']}); not labels: "
+            f"release tails steering {s['steer_tails']} / throttle {s['throttle_tails']}, "
+            f"throttle held off my trigger {s['held']}; kept {kept.get(SOURCE_TAKEOVER, 0)} "
+            f"takeover ticks with a label")
+    if s["auto_exits"] or s["manual_rows"]:
+        line += (f"\n    manual after auto: {s['auto_exits']} switches, "
+                 f"{s['manual_driven_s']:.1f} s driven inside {MANUAL_AFTER_AUTO_S:.0f} s "
+                 f"of one (/vehicle); {s['manual_rows']} /footprint rows there, "
+                 f"kept {kept.get(SOURCE_MANUAL, 0)}")
+        if s["manual_driven_s"] > 0 and not s["manual_rows"]:
+            line += (" -- the car writes no rows in manual, so none of that "
+                     "driving has a picture to learn from")
+    return line
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out")
     ap.add_argument("mcaps", nargs="*",
                     help=f"recordings (default: {DEFAULT_MCAPS})")
+    ap.add_argument("--drive-logs", action="append", default=[], metavar="DIR",
+                    help="also read every auto drive in DIR (crawler-*.mcap, not "
+                         f"record sessions; e.g. {DEFAULT_DRIVE_LOGS}) for my takeovers "
+                         f"and the {MANUAL_AFTER_AUTO_S:.0f} s of manual after I leave auto")
     ap.add_argument("--adapter", choices=sorted(pa.ADAPTERS), default=None,
                     help="force one; default picks off the topics in each file")
     ap.add_argument("--modes", default=None,
@@ -799,6 +1037,10 @@ def main(argv=None):
         args.mcaps = default_mcaps()
         if not args.mcaps:
             ap.error(f"no recordings given and none match {DEFAULT_MCAPS}")
+    drives = [p for d in args.drive_logs for p in drive_logs(d)]
+    if args.drive_logs and not drives:
+        ap.error(f"no drive logs in {args.drive_logs}")
+    drive_set = set(drives)
     rules = None if args.no_idle_rules else IdleRules(
         args.steer_rest, args.parked_s, args.parked_edge_s, args.exit_reach_s,
         args.handled_settle_s, args.handled_gyro, args.handled_accel, args.handled_margin_s)
@@ -807,8 +1049,15 @@ def main(argv=None):
     all_errors = []
     caps_by_session = {}
     toggles_by_session = {}
-    for path in args.mcaps:
+    for path in list(args.mcaps) + [p for p in drives if p not in args.mcaps]:
         session, truncated = read_session(path, args.adapter)
+        if path in drive_set and session.adapter != pa.FootprintAdapter.name:
+            # Manual only, or a drive from before /footprint: nothing in it
+            # is on the policy's input contract.
+            line = f"{session.name}: no /footprint rows, nothing to learn from; skipped"
+            print(line)
+            report.append(line)
+            continue
         if args.modes:
             session = session._replace(label_modes=tuple(args.modes.split(",")))
         verdict, caps = caps_verdict(session, args.include_other_caps)
@@ -844,6 +1093,9 @@ def main(argv=None):
         line += (f"\n    marks: {kinds.get('good', 0)} good, {kinds.get('bad', 0)} bad; "
                  f"pad ticks dropped by BAD {int((flags == MARK_BAD).sum())}, "
                  f"upweighted by GOOD {int((flags == MARK_GOOD).sum())}")
+        if session.adapter == pa.FootprintAdapter.name:
+            summary = intervention_summary(session, rules)
+            line += "\n" + format_interventions(summary, ticks)
         if timeline:
             judged = len(timeline)
             line += (f"\n    not driving: {judged} {'/'.join(rules.modes)} ticks judged, "
@@ -896,6 +1148,14 @@ def main(argv=None):
         "imu_features": list(pimu.FEATURES),
         "imu_no_yaw_features": list(pimu.NO_YAW_FEATURES),
         "imu_window": pimu.WINDOW,
+        # Where each tick came from: the "source" array indexes this.
+        # Intervention ticks are my hand correcting auto; policy_train.py
+        # --takeover-weight weights them.
+        "sources": list(SOURCES),
+        "intervention_sources": list(INTERVENTION_SOURCES),
+        "manual_after_auto_s": MANUAL_AFTER_AUTO_S,
+        "drive_logs": [s.name for s, ticks in kept
+                       if any(t.source != SOURCE_RECORD for t in ticks)],
         "imu_tilt": bool(len(arrays["imu"])
                          and arrays["imu"][:, pimu.FEATURES.index("tilt_valid")].any()),
         "alignment_ms_histogram": {"edges": hist_edges[:-1], "counts": hist},
@@ -903,6 +1163,13 @@ def main(argv=None):
     }
     np.savez_compressed(args.out, meta=json.dumps(meta), **arrays)
     counts = Counter(pl.ACTIONS[a] for a in arrays["action"][arrays["decision"]])
+    src = arrays["source"]
+    labelled = arrays["steer_label"] | arrays["throttle_label"]
+    print(f"interventions: {int((labelled & (src == SOURCES.index(SOURCE_TAKEOVER))).sum())} "
+          f"takeover ticks and "
+          f"{int((labelled & (src == SOURCES.index(SOURCE_MANUAL))).sum())} manual-after-auto "
+          f"ticks with a label, against "
+          f"{int((labelled & (src == SOURCES.index(SOURCE_RECORD))).sum())} record ticks")
     print(f"wrote {args.out}: {len(arrays['t_ns'])} ticks, "
           f"{int(arrays['decision'].sum())} decisions {dict(counts)}, "
           f"{len(arrays['frames'])} frames")

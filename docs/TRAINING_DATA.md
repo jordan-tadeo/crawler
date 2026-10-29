@@ -313,7 +313,41 @@ python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw
 python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu-no-yaw --imu-tilt   # + which way is up
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --steer-head direction   # left/straight/right + how far
 python tools/policy_eval.py data.npz models/policy.onnx --out report.md
+
+# + my takeovers on the auto drives, weighted 3x
+python tools/policy_dataset.py data.npz --drive-logs ~/crawler-data/mcap/drives
+python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --takeover-weight 3
+python tools/session_report.py --no-jpeg-depth ~/crawler-data/mcap/drives   # how much each drive gave
 ```
+
+### Learning from my takeovers
+
+`policy_dataset.py --drive-logs DIR` reads every auto drive in DIR (not the
+record sessions) alongside them, and tags every tick with where it came
+from (the `.npz` `source` array, `meta["sources"]`): `record`, `auto` (no
+hand on it, never a label), `takeover`, or `manual_after_auto`. A drive
+with no `/footprint` rows is skipped and said so.
+
+- **Takeover**: an auto row where either group is `"pad"`. Only the group I
+  had is a label, as always, and it is the command that went out, on
+  record's scale: the trigger is scaled to the same caps. Every one of
+  those ticks is a decision, reverses included. Not labels: the release
+  tail (the at-rest ticks that end a group's run, before it goes back to
+  the autopilot) and a throttle held off my trigger (`throttle` is not
+  `pad_throttle` scaled by the row's caps: on 2026-10-28 the floor held a
+  full RT pull at 0 for 0.8 s; the car no longer does that since
+  `2b38c7d`, and the rule stays for the drives from before).
+- **Manual after auto**: manual rows within `MANUAL_AFTER_AUTO_S` (5 s) of
+  a switch out of auto, only while the throttle or steering is off rest,
+  the throttle measured against the auto caps (manual drives the full
+  range). **The car writes no rows in manual today**, so there are none of
+  these yet; the dataset report and `session_report.py` say how many
+  seconds of that driving there were off `/vehicle`.
+
+`policy_train.py --takeover-weight W` (3 by default) counts an intervention
+tick W times in every head's loss and prints the share of each head's loss
+weight that comes off them. `--blocks` holds out record ticks only, so the
+folds are the record sessions' folds and every intervention trains in each.
 
 The dataset tool prints, per session, every tick it dropped and why, the
 not-driving spans (parked, idle, the reach for Y, the car in my hands) as a

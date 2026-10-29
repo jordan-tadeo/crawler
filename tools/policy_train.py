@@ -43,6 +43,18 @@ MODE_WINDOW_S of a toggle) count MODE_SWITCH_WEIGHT times in the mode loss.
 The input also goes straight to the mode logits as well as through the
 trunk, so "stay" is cheap to learn and the trunk's job is the exception.
 
+Interventions (policy_dataset's source array): a takeover tick is my hand
+correcting auto, and a manual-after-auto tick is the few seconds of driving
+right after I left it with START. Each is a mistake the model made on its
+own drive and what I did instead -- data a record session can only stumble
+into -- so each counts --takeover-weight times (TAKEOVER_WEIGHT) in every
+head's loss, on top of any GOOD mark. The per-group masks still hold: a
+takeover where I only steered is a steering label and nothing else. The
+trainer prints what share of each head's loss weight that comes to, since a
+weight on its own says nothing without the count it multiplies. --blocks
+holds out record ticks only, so the folds are the same folds as a dataset
+without drive logs, and every intervention trains in every fold.
+
 /marks on pad-driven ticks (policy_dataset.mark_flags): a tick in a BAD
 window is out of training (and out of the val numbers); a tick in a GOOD
 window counts --good-weight times in every head's loss. 2 by default: enough
@@ -101,6 +113,14 @@ from crawler.autopilot import policy_imu as pimu  # noqa: E402
 import policy_eval as pe  # noqa: E402
 
 GOOD_WEIGHT = 2.0
+# How much an intervention tick counts against a record tick. 77 takeover
+# ticks across the first three policy drives against about 7500 record
+# labels: at 3 they are about 3% of the loss, enough to be heard and not
+# enough to drown the sessions they correct.
+TAKEOVER_WEIGHT = 3.0
+# policy_dataset.SOURCES, by name: what the dataset's "source" array indexes.
+SOURCE_RECORD = "record"
+INTERVENTION_SOURCES = ("takeover", "manual_after_auto")
 # How much a tick inside a switch window counts in the mode loss. My one
 # session has 4 toggles and 36 window ticks against 1900; at 10 the window is
 # about a sixth of the mode loss, enough that the head cannot ignore it,
@@ -272,10 +292,61 @@ def tilt_of(want_tilt, meta_in):
     return True
 
 
-def tick_weights(data, idx, good_weight):
-    """Per training tick loss weight: good_weight inside a GOOD mark, else 1."""
-    return np.where(pe.marks_of(data)[idx] == pe.MARK_GOOD,
-                    float(good_weight), 1.0).astype(np.float32)
+def sources_of(data):
+    """Per tick its source name, every tick "record" in a dataset from
+    before there was a source array."""
+    names = data.get("meta", {}).get("sources")
+    if "source" not in data or not names:
+        return np.full(len(data["t_ns"]), SOURCE_RECORD, dtype=object)
+    return np.asarray(names, dtype=object)[np.asarray(data["source"], dtype=np.int64)]
+
+
+def intervention_ticks(data):
+    """Ticks that are my hand correcting auto: a takeover, or manual after it."""
+    return np.isin(sources_of(data), INTERVENTION_SOURCES)
+
+
+def tick_weights(data, idx, good_weight, takeover_weight=TAKEOVER_WEIGHT):
+    """Per training tick loss weight: good_weight inside a GOOD mark, times
+    takeover_weight on an intervention, else 1."""
+    good = np.where(pe.marks_of(data)[idx] == pe.MARK_GOOD, float(good_weight), 1.0)
+    fix = np.where(intervention_ticks(data)[idx], float(takeover_weight), 1.0)
+    return (good * fix).astype(np.float32)
+
+
+def loss_shares(data, train_mask, label_mode, good_weight, takeover_weight,
+                class_weights=None):
+    """What share of each head's loss weight comes off intervention ticks.
+
+    {head: (intervention ticks, all ticks, share)} for direction, throttle
+    and steering, over the training ticks where that head has a label. The
+    share is of the summed per-tick weight (and, for direction, the class
+    weight too), which is what the loss is an average over; it is a share
+    of the weight, not of the error, which depends on what the model gets
+    wrong.
+    """
+    idx = np.flatnonzero(train_mask)
+    w = tick_weights(data, idx, good_weight, takeover_weight).astype(np.float64)
+    fix = intervention_ticks(data)[idx]
+    steer_ok, throttle_ok = (m[idx] for m in pe.label_masks(data, label_mode))
+    action = np.asarray(data["action"])[idx]
+    cw = (np.asarray(class_weights, dtype=np.float64)[action] if class_weights is not None
+          else np.ones(len(idx)))
+    moving = throttle_ok & (action != pl.ACTIONS.index(pl.STOP))
+    out = {}
+    for head, ok, extra in (("direction", throttle_ok, cw), ("throttle", moving, 1.0),
+                            ("steering", steer_ok, 1.0)):
+        ww = (w * extra)[ok]
+        total = float(ww.sum())
+        out[head] = (int((fix & ok).sum()), int(ok.sum()),
+                     float(ww[fix[ok]].sum() / total) if total else 0.0)
+    return out
+
+
+def format_shares(shares, takeover_weight):
+    return (f"interventions at weight {takeover_weight:g}: " + "; ".join(
+        f"{head} {n} of {total} ticks, {share:.1%} of its loss weight"
+        for head, (n, total, share) in shares.items()))
 
 
 def mode_weights(data, idx, switch_weight=MODE_SWITCH_WEIGHT):
@@ -297,9 +368,17 @@ def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
     """[(held_out, guard)] boolean masks: n contiguous stretches of decision
     ticks, in session-then-time order, equal by count. `guard` is every tick
     of the held-out block's sessions within guard_s of it, the block too:
-    what a fold must not train on."""
+    what a fold must not train on.
+
+    Record ticks only, when the dataset has any: a drive log's ticks are
+    never held out, so the folds are the ones the record sessions alone
+    make, and an intervention trains in every fold."""
     order = np.lexsort((data["t_ns"], data["session"]))
-    order = order[data["decision"][order]]
+    keep = np.asarray(data["decision"], dtype=bool).copy()
+    record = sources_of(data) == SOURCE_RECORD
+    if (keep & record).any():
+        keep &= record
+    order = order[keep[order]]
     out = []
     for chunk in np.array_split(order, n):
         held = np.zeros(len(data["t_ns"]), dtype=bool)
@@ -317,7 +396,7 @@ def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
 def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False,
           imu_yaw=True, imu_tilt=False, steer_head=pl.STEER_REGRESSION,
-          straight_band=STRAIGHT_BAND):
+          straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT):
     import torch
     from torch import nn
 
@@ -340,7 +419,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     steer = torch.from_numpy(data["steer"][idx])
     steer_dir = torch.from_numpy(steer_classes(data["steer"][idx], straight_band))
     straight = pl.STEER_DIRS.index(pl.STRAIGHT)
-    w_all = torch.from_numpy(tick_weights(data, idx, good_weight))
+    w_all = torch.from_numpy(tick_weights(data, idx, good_weight, takeover_weight))
     w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
     steer_all, throttle_all = pe.label_masks(data, label_mode)
     steer_ok = torch.from_numpy(steer_all[idx])
@@ -562,6 +641,10 @@ def main(argv=None):
     ap.add_argument("--good-weight", type=float, default=GOOD_WEIGHT,
                     help="loss weight of a pad tick inside a GOOD /marks window "
                          f"(default {GOOD_WEIGHT}; BAD-window ticks are always left out)")
+    ap.add_argument("--takeover-weight", type=float, default=TAKEOVER_WEIGHT,
+                    help="loss weight of an intervention tick: a takeover, or manual "
+                         f"right after auto (default {TAKEOVER_WEIGHT}; build the dataset "
+                         "with policy_dataset.py --drive-logs DIR to have any)")
     ap.add_argument("--switch-weight", type=float, default=MODE_SWITCH_WEIGHT,
                     help="mode-loss weight of a tick inside a switch window "
                          f"(default {MODE_SWITCH_WEIGHT})")
@@ -611,7 +694,7 @@ def main(argv=None):
                good_weight=args.good_weight, switch_weight=args.switch_weight,
                uses_imu=args.imu, imu_yaw=not args.imu_no_yaw,
                imu_tilt=args.imu_tilt, steer_head=args.steer_head,
-               straight_band=args.straight_band)
+               straight_band=args.straight_band, takeover_weight=args.takeover_weight)
     tmp = os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -642,7 +725,11 @@ def main(argv=None):
         val_names, val_ids = [], []
         in_val = np.zeros(len(data["t_ns"]), dtype=bool)
     else:
-        val_names = args.val or [sessions[-1]]
+        # The last record session: a drive log's few labelled ticks are no
+        # val set, and there is no hand driving in the rest of it to grade.
+        src = sources_of(data)
+        record_ids = sorted({int(i) for i in np.asarray(data["session"])[src == SOURCE_RECORD]})
+        val_names = args.val or [sessions[record_ids[-1] if record_ids else -1]]
         unknown = [v for v in val_names if v not in sessions]
         if unknown:
             print(f"no such session {unknown}; have {sessions}")
@@ -664,12 +751,17 @@ def main(argv=None):
         print(f"tilt: an up vector on {tilt_ticks} of {int(train_mask.sum())} training ticks")
     model, weights = train(data, train_mask=train_mask, **fit)
     params = int(sum(p.numel() for p in model.parameters()))
+    shares = loss_shares(data, train_mask, args.labels, args.good_weight,
+                         args.takeover_weight, weights)
+    print(format_shares(shares, args.takeover_weight))
 
     meta = {**_base_meta(meta_in, args, val_ids, val_names), **mode_meta(args.switch_weight),
             "train_decisions": int(train_mask.sum()),
             "class_weights": weights,
             "good_marked_train_ticks": int((train_mask & (pe.marks_of(data) == pe.MARK_GOOD)).sum()),
             "bad_marked_left_out": int((data["decision"] & pe.bad_marked(data)).sum()),
+            "intervention_train_ticks": int((train_mask & intervention_ticks(data)).sum()),
+            "intervention_loss_share": {head: share for head, (_, _, share) in shares.items()},
             "parameters": params,
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **provenance_meta(argv, args.model_name)}
@@ -709,6 +801,7 @@ def _base_meta(meta_in, args, val_ids, val_names):
         "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids],
         "val_sessions": val_names,
         "good_weight": args.good_weight,
+        "takeover_weight": getattr(args, "takeover_weight", TAKEOVER_WEIGHT),
         "epochs": args.epochs,
         "seed": args.seed,
     }

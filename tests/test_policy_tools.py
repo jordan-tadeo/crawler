@@ -78,7 +78,10 @@ def test_a_missing_source_is_the_pad_in_record_and_the_autopilot_in_auto():
 
 
 def test_a_takeover_row_labels_only_the_group_the_pad_had():
-    session = footprint_session(driving(3, "auto", steer_by="pad", throttle_by="driver"))
+    # Off centre: a pad group at rest at the end of its run is a release
+    # tail (pd.takeover_labels), not a label.
+    session = footprint_session(driving(3, "auto", front=0.3, steer_by="pad",
+                                        throttle_by="driver"))
     ticks, drops, _ = align(session)
     assert len(ticks) == 3 and not drops
     assert all(t.steer_label and not t.throttle_label for t in ticks)
@@ -146,7 +149,8 @@ def test_align_drops_what_cannot_be_a_label_and_says_why():
     connected = [(0.0, True), (0.55, False), (0.65, True)]  # off across tick 6
     session = footprint_session(rows, frames=frames, connected=connected)
     ticks, drops, _ = align(session)
-    assert drops == {"mode": 1, "bad command": 1, "split rear": 1, "no frame": 1, "pad": 1}
+    # A manual row that is not right after auto (pd.manual_window) goes.
+    assert drops == {"manual": 1, "bad command": 1, "split rear": 1, "no frame": 1, "pad": 1}
     assert len(ticks) == 3
 
 
@@ -220,7 +224,7 @@ def test_a_verdicts_steer_is_put_in_the_same_units_as_a_label():
 
 def test_a_group_a_learned_policy_drove_is_never_a_label_even_for_any():
     rows = (driving(3, "auto", autopilot="rules")
-            + [(0.3 + i * 0.1, row(3 + i, "auto", autopilot="policy",
+            + [(0.3 + i * 0.1, row(3 + i, "auto", autopilot="policy", front=0.3,
                                    steer_by="pad" if i == 0 else "driver"))
                for i in range(3)])
     session = footprint_session(rows)
@@ -311,6 +315,7 @@ def test_a_mark_on_the_autopilots_driving_is_not_a_label_verdict():
     rows = driving(30, "auto")
     for t, r in rows[20:]:
         r["steer_by"] = "pad"  # a takeover from 2.0 s on
+        r["steering_front"] = 0.3
     session = footprint_session(rows, marks=[mark("bad", 2.4)])
     ticks, _, _ = align(session)
     flags = pd.mark_flags(ticks, session.marks)

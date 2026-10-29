@@ -54,6 +54,15 @@ FOOTPRINT_TOPICS = {
     "row": "/footprint",               # JSON, crawler.Footprint
     "controller": "/controller",
     "marks": "/marks",
+    # Every mode, 20 Hz: the only place a switch out of auto into manual
+    # shows, since manual writes no /footprint rows. Read for the mode and
+    # the command only (FOOTPRINT_VEHICLE).
+    "vehicle": "/vehicle",
+}
+FOOTPRINT_VEHICLE = {
+    "mode": "mode",
+    "throttle": "throttle",
+    "front": "steering_front",
 }
 FOOTPRINT_ROW = {
     "seq": "seq",
@@ -74,6 +83,11 @@ FOOTPRINT_ROW = {
     # autopilot) or "pad" (a hand on it). Only "pad" is a label.
     "steer_by": "steer_by",
     "throttle_by": "throttle_by",
+    # The trigger before scaling, -1..1, on a row the pad had the throttle
+    # (record, or a takeover); 0 otherwise. Scaled by the row's caps it is
+    # what the throttle should be, and a row where it is not is one where
+    # something between my finger and the ESC held the throttle back.
+    "pad_throttle": "pad_throttle",
     # "driver" is auto's own scan; "tap" is the footprint tap's, which is
     # every record row and every auto row while a recover owns the wheels.
     "source": "source",
@@ -104,8 +118,11 @@ DEPTH_SMALL_FORMAT = "png"
 # autopilot. Legacy keeps auto only (manual in those files is mostly a
 # parked car, and every legacy auto tick is driver/driver -- a smoke test).
 # Record-mode files keep record and auto, so a TAKEOVER hand in auto counts.
+# Manual too, for the few seconds after I leave auto (policy_dataset's
+# MANUAL_AFTER_AUTO_S): those are corrections as much as a takeover is. The
+# car writes no manual rows today, so this only matters once it does.
 LEGACY_LABEL_MODES = ("auto",)
-FOOTPRINT_LABEL_MODES = ("record", "auto")
+FOOTPRINT_LABEL_MODES = ("record", "auto", "manual")
 
 # Steering is learned in manual's units: a fraction of full lock, 0.7 of
 # servo travel (main.STEERING_LIMIT_PERC), which is what the pad commands
@@ -167,6 +184,7 @@ THROTTLE_DEADBAND = 0.5 * 0.05 * min(LEGACY_FORWARD_CAP, -LEGACY_REVERSE_CAP,
                                      RUNTIME_CAPS[0], -RUNTIME_CAPS[1])
 
 SPLIT = "split"
+MANUAL = "manual"
 
 # Who commanded a group of controls on one tick.
 BY_PAD = "pad"
@@ -209,6 +227,7 @@ class Command(NamedTuple):
     source: str = ""              # "driver" / "tap" on a /footprint row
     autopilot: str = ""           # "rules" / "policy" in auto, "" otherwise
     imu: tuple = ()               # FOOTPRINT_ROW["imu_row"] values, nan where absent
+    pad_throttle: float = float("nan")  # the trigger before scaling; nan when unknown
 
 
 def imu_magnitudes(payload):
@@ -241,6 +260,7 @@ class Session(NamedTuple):
     marks: list           # [(t_ns, dict)]
     label_modes: tuple
     by_seq: bool          # frames and commands share a seq
+    vehicle: tuple = ()   # [(t_ns, mode, throttle, front)] off /vehicle; footprint files only
 
 
 def _f(value, fallback=float("nan")):
@@ -294,10 +314,12 @@ def session_caps(session):
     the -1 placeholder on an auto row is "nobody said", not a cap. A legacy
     session is its commands' default, the legacy caps. Empty when nothing in
     the file says: a record-mode file of nothing but untouched auto.
+    A manual row is not asked: manual drives the full range whatever cap it
+    writes, and its throttle is measured against the auto caps around it.
     """
     found = []
     for cmd in session.commands:
-        if cmd.mode not in session.label_modes:
+        if cmd.mode not in session.label_modes or cmd.mode == MANUAL:
             continue
         if not _valid_caps(cmd.forward_cap, cmd.reverse_cap):
             continue
@@ -468,6 +490,7 @@ class FootprintAdapter:
         self.session_name = session_name
         self.label_modes = tuple(label_modes)
         self.commands, self.frames, self.connected, self.marks = [], [], [], []
+        self.vehicle = []
         self.bad_frames = 0
 
     def feed(self, topic, t_ns, payload):
@@ -489,7 +512,8 @@ class FootprintAdapter:
                 *imu_magnitudes(payload),
                 str(payload.get(r["source"]) or ""),
                 str(payload.get(r["autopilot"]) or ""),
-                tuple(_f(payload.get(k)) for k in r["imu_row"])))
+                tuple(_f(payload.get(k)) for k in r["imu_row"]),
+                _f(payload.get(r["pad_throttle"]))))
         elif topic == FOOTPRINT_TOPICS["depth"]:
             decoded = decode_depth_small(payload)
             if decoded is None:
@@ -501,13 +525,18 @@ class FootprintAdapter:
             self.connected.append((int(t_ns), bool(payload.get(LEGACY_CONNECTED, False))))
         elif topic == FOOTPRINT_TOPICS["marks"]:
             self.marks.append((int(t_ns), dict(payload)))
+        elif topic == FOOTPRINT_TOPICS["vehicle"]:
+            v = FOOTPRINT_VEHICLE
+            self.vehicle.append((int(t_ns), str(payload.get(v["mode"], "")),
+                                 _f(payload.get(v["throttle"]), 0.0),
+                                 _f(payload.get(v["front"]), 0.0)))
 
     def finish(self):
         by_seq = bool(self.frames) and all(f.seq >= 0 for f in self.frames)
         return Session(self.session_name, self.name, self.contract,
                        sorted(self.commands), sorted(self.frames, key=lambda f: f.t_ns),
                        sorted(self.connected), sorted(self.marks, key=lambda m: m[0]),
-                       self.label_modes, by_seq)
+                       self.label_modes, by_seq, tuple(sorted(self.vehicle)))
 
 
 ADAPTERS = {LegacyAdapter.name: LegacyAdapter, FootprintAdapter.name: FootprintAdapter}
