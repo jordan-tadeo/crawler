@@ -126,8 +126,13 @@ class ClickGoals:
     """A foxglove ServerListener that keeps the newest clicked goal.
 
     Only on_client_advertise, on_client_unadvertise and on_message_data do
-    anything; the rest of the listener protocol is foxglove's own defaults
-    (it calls only what is defined). Never raises into the server's thread.
+    anything. Never raises into the server's thread.
+
+    The SDK (0.30) calls on_subscribe and on_unsubscribe on whatever listener
+    it is given, for every channel every client opens or closes, and logs
+    "Callback failed: AttributeError" for each one the listener lacks: 16 of
+    them in the car's journal from one --nav run on 10-29. So those, and the
+    connection graph pair, are here and do nothing.
     """
 
     def __init__(self):
@@ -136,6 +141,18 @@ class ClickGoals:
         self._goal = None
         self.received = 0
         self.rejected = 0
+
+    def on_subscribe(self, client, channel):
+        return None
+
+    def on_unsubscribe(self, client, channel):
+        return None
+
+    def on_connection_graph_subscribe(self):
+        return None
+
+    def on_connection_graph_unsubscribe(self):
+        return None
 
     def on_client_advertise(self, client, channel):
         try:

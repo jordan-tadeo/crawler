@@ -1233,6 +1233,14 @@ def main(argv=None):
         print(f"map: a crop on {int((train_mask & data['map_on']).sum())} of "
               f"{int(train_mask.sum())} training ticks, {args.map_dropout:.0%} of them "
               f"blanked each batch")
+    if args.goal:
+        # A tick that can have a hindsight goal at all: one at NEAR_S on
+        # (the shortest k) is there. Fewer at longer k, near a file's end.
+        rows = np.flatnonzero(train_mask & data["map_on"])
+        _, _, ok = pg.hindsight_goals(data["map_row"][rows], pg.NEAR_S, data["goal_poses"])
+        print(f"goal: a hindsight goal possible on {int(ok.sum())} of {int(train_mask.sum())} "
+              f"training ticks, none on {args.no_goal_share:.0%} of them and on every "
+              f"map-blanked one, k drawn from {pg.NEAR_S:g}-{pg.FAR_S:g} s each batch")
     model, weights = train(data, train_mask=train_mask, **fit)
     params = int(sum(p.numel() for p in model.parameters()))
     shares = loss_shares(data, train_mask, args.labels, args.good_weight,

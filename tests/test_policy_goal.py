@@ -12,6 +12,7 @@ contract, and --goal in crawler/__main__.py.
 import json
 import math
 import pathlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -430,3 +431,19 @@ def test_a_click_for_a_model_without_the_goal_input_is_warned_about():
     mn, log, slam, pilot = _pilot(Clicks(), policy=FIXTURES / "policy-map.onnx")
     assert pilot.resume() is True
     assert any(subject == "Goal" and "takes no goal" in msg for _, subject, msg in log.lines)
+
+
+def test_the_click_listener_answers_every_callback_the_sdk_makes_without_asking():
+    """foxglove-sdk calls on_subscribe/on_unsubscribe on the listener for every
+    channel a client opens or closes, and logs "Callback failed" for each one
+    it lacks; the connection graph pair likewise. Every one is there, quiet."""
+    fw = pytest.importorskip("foxglove.websocket")
+    listener = ck.ClickGoals()
+    for name in ("on_subscribe", "on_unsubscribe", "on_client_advertise",
+                 "on_client_unadvertise", "on_message_data",
+                 "on_connection_graph_subscribe", "on_connection_graph_unsubscribe"):
+        assert hasattr(fw.ServerListener, name), name
+        assert callable(getattr(listener, name, None)), name
+    client, channel = SimpleNamespace(id=1), SimpleNamespace(id=2, topic="/x")
+    assert listener.on_subscribe(client, channel) is None
+    assert listener.on_unsubscribe(client, channel) is None
