@@ -124,6 +124,7 @@ from crawler.autopilot import column_profile as cp  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
+from crawler.mapping import egomap as em  # noqa: E402
 import policy_eval as pe  # noqa: E402
 
 GOOD_WEIGHT = 2.0
@@ -185,8 +186,15 @@ LIDAR_FEATURES = 16
 LIDAR_DROPOUT = 0.3
 
 
+# The map branch's output width, before the present flag joins it.
+MAP_FEATURES = 32
+# Map dropout, as the lidar's: the share of training ticks with a map that
+# are fed none, fresh every batch. Training only.
+MAP_DROPOUT = 0.3
+
+
 def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION,
-                uses_lidar=False):
+                uses_lidar=False, uses_map=False):
     import torch
     from torch import nn
 
@@ -195,6 +203,32 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     direction = steer_head == pl.STEER_DIRECTION
     imu_width = pimu.size(imu_yaw) if uses_imu else 0
     lidar_width = LIDAR_FEATURES + 1 if uses_lidar else 0
+    map_width = MAP_FEATURES + 1 if uses_map else 0
+
+    class MapBranch(nn.Module):
+        """(N, em.CHANNELS, 64, 64) -> (N, MAP_FEATURES + 1).
+
+        The egocentric SLAM crop (crawler/mapping/egomap.py): four strided
+        convs down to 4 x 4, a small linear layer, multiplied by present
+        (the last plane) as the lidar branch is, and present on to the
+        trunk: no map is exactly no map features.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv2d(em.CHANNELS - 1, 8, 5, stride=2, padding=2), nn.ReLU(),
+                nn.Conv2d(8, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Flatten())
+            self.fc = nn.Sequential(
+                nn.Linear(16 * (em.SIZE // 16) ** 2, MAP_FEATURES), nn.ReLU())
+
+        def forward(self, m):
+            present = m[:, em.PRESENT, 0, 0:1]
+            h = self.fc(self.conv(m[:, :em.PRESENT])) * present
+            return torch.cat([h, present], dim=1)
 
     class LidarBranch(nn.Module):
         """(N, pli.SIZE) -> (N, LIDAR_FEATURES + 1).
@@ -228,9 +262,10 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             # and its weights there never see a gradient. The IMU is only
             # wired in when it is used, so an old graph stays an old graph.
             self.trunk = nn.Sequential(
-                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width + lidar_width, 64),
+                nn.Linear(width + pl.PREV_SIZE + pl.MODE_SIZE + imu_width + lidar_width + map_width, 64),
                 nn.ReLU())
             self.lidar = LidarBranch() if lidar_width else None
+            self.map = MapBranch() if map_width else None
             self.logits = nn.Linear(64, len(pl.ACTIONS))
             self.throttle = nn.Linear(64, 1)
             if direction:
@@ -245,13 +280,16 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
 
         def forward(self, features, prev, mode, *extra):
             # extra: imu if the model takes it, then lidar if it takes that,
-            # in the graph's input order.
+            # then the map, in the graph's input order.
             extra = list(extra)
             imu = extra.pop(0) if imu_width else None
             lidar = extra.pop(0) if lidar_width else None
+            ego = extra.pop(0) if map_width else None
             parts = [features, prev, mode] + ([imu] if imu_width else [])
             if lidar_width:
                 parts.append(self.lidar(lidar))
+            if map_width:
+                parts.append(self.map(ego))
             h = self.trunk(torch.cat(parts, dim=1))
             steer = ((self.steer_dir(h), torch.sigmoid(self.steer_mag(h))) if direction
                      else (torch.tanh(self.steer(h)),))
@@ -291,6 +329,7 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     model = ImageNet() if representation == pl.IMAGE else ProfileNet()
     model.uses_imu = bool(uses_imu)
     model.uses_lidar = bool(uses_lidar)
+    model.uses_map = bool(uses_map)
     model.imu_yaw = bool(imu_yaw)
     model.steer_head = steer_head
     return model
@@ -322,6 +361,51 @@ def flip(x, prev, imu=None, imu_yaw=True, lidar=None):
     if lidar is not None:
         return torch.flip(x, dims=[-1]), prev, imu, pli.mirror(lidar)
     return torch.flip(x, dims=[-1]), prev, imu
+
+
+def map_inputs(data, rows):
+    """Dataset ticks -> their map input, egomap.encode_many over the crops
+    load_maps paired them with; a tick with none is all zeros."""
+    rows = np.asarray(rows)
+    ok = data["map_row"][rows] >= 0
+    r = np.where(ok, data["map_row"][rows], 0)
+    return em.encode_many(data["map_codes"][r], data["map_trail"][r],
+                          ok & data["map_present"][r])
+
+
+def load_maps(data, crops_dir):
+    """Pair every tick with egomap crops from tools/map_crops.py (one npz per
+    session, by name): data gains map_row (-1 with none), map_codes,
+    map_trail, map_present. A session with no file has no map, like a
+    session recorded before the lidar. Returns how many ticks have one."""
+    names = data["meta"]["sessions"]
+    n = len(data["t_ns"])
+    row = np.full(n, -1, np.int64)
+    codes, trail, present = [], [], []
+    base = 0
+    for sid, name in enumerate(names):
+        path = os.path.join(crops_dir, name + ".npz")
+        if not os.path.exists(path):
+            continue
+        z = np.load(path)
+        if str(z["layout"]) != em.LAYOUT:
+            raise ValueError(f"{path}: map layout {z['layout']}, this trainer draws {em.LAYOUT}")
+        ticks = np.flatnonzero(data["session"] == sid)
+        j = em.pair_ticks(z["log_t"], data["t_ns"][ticks] / 1e9)
+        row[ticks[j >= 0]] = base + j[j >= 0]
+        codes.append(z["codes"])
+        trail.append(z["trail"])
+        present.append(z["present"])
+        base += len(z["log_t"])
+    size = (em.SIZE, em.SIZE)
+    data["map_row"] = row
+    data["map_codes"] = np.concatenate(codes) if codes else np.zeros((1,) + size, np.uint8)
+    data["map_trail"] = np.concatenate(trail) if trail else np.zeros((1,) + size, np.uint8)
+    data["map_present"] = np.concatenate(present) if present else np.zeros(1, bool)
+    has = row >= 0
+    has[has] &= data["map_present"][row[has]]
+    data["map_on"] = has
+    return int(has.sum())
 
 
 def imu_inputs(data, tilt, yaw=True):
@@ -472,14 +556,15 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           good_weight=GOOD_WEIGHT, switch_weight=MODE_SWITCH_WEIGHT, uses_imu=False,
           imu_yaw=True, imu_tilt=False, steer_head=pl.STEER_REGRESSION,
           straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT,
-          uses_lidar=False, lidar_dropout=LIDAR_DROPOUT):
+          uses_lidar=False, lidar_dropout=LIDAR_DROPOUT, uses_map=False,
+          map_dropout=MAP_DROPOUT):
     import torch
     from torch import nn
 
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
-    model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar)
+    model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar, uses_map)
     direction = steer_head == pl.STEER_DIRECTION
 
     idx = np.flatnonzero(train_mask)
@@ -493,6 +578,9 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     lidar = torch.from_numpy(lidar_inputs(data)[idx]) if uses_lidar else None
     lidar_on = (np.asarray(data["lidar_present"], dtype=bool)[idx] if uses_lidar
                 else np.zeros(len(idx), dtype=bool))
+    # The map is encoded a batch at a time: every tick at once is 80 KB each.
+    map_on = (np.asarray(data["map_on"], dtype=bool)[idx] if uses_map
+              else np.zeros(len(idx), dtype=bool))
     mode = torch.from_numpy(data["steer_mode"][idx].astype(np.int64))
     action = torch.from_numpy(data["action"][idx].astype(np.int64))
     mag = torch.from_numpy(data["magnitude"][idx])
@@ -533,14 +621,22 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 blank = lidar_blanks(lidar_on[b.numpy()], lidar_dropout, rng)
                 lb = torch.where(torch.from_numpy(blank)[:, None],
                                  torch.zeros(()), lidar[b])
+            mb = None
+            if uses_map:
+                mb = map_inputs(data, idx[b.numpy()])
+                blank = lidar_blanks(map_on[b.numpy()], map_dropout, rng)
+                mb[blank] = 0.0
+                mb = torch.from_numpy(mb)
             sb, db = steer[b], steer_dir[b]
             if torch.rand(1).item() < 0.5:
                 if lb is not None:
                     xb, pb, ib, lb = flip(xb, pb, ib, imu_yaw, lb)
                 else:
                     xb, pb, ib = flip(xb, pb, ib, imu_yaw)
+                if mb is not None:
+                    mb = torch.flip(mb, dims=[-1])   # egomap.mirror
                 sb, db = flip_steer_labels(sb, db)
-            extra = [v for v in (ib, lb) if v is not None]
+            extra = [v for v in (ib, lb, mb) if v is not None]
             out = model(xb, pb, mode_in[b], *extra)
             logits, t_out, m_out = out[0], out[1], out[-1]
             tok, sok = throttle_ok[b], steer_ok[b]
@@ -587,6 +683,9 @@ def export(model, representation, out_path, meta):
     if getattr(model, "uses_lidar", False):
         args += (torch.zeros((1, pli.SIZE)),)
         names.append(pl.LIDAR_INPUT)
+    if getattr(model, "uses_map", False):
+        args += (torch.zeros((1, em.CHANNELS, em.SIZE, em.SIZE)),)
+        names.append(pl.MAP_INPUT)
     torch.onnx.export(
         model, args, out_path,
         input_names=names,
@@ -604,6 +703,16 @@ def imu_meta(uses_imu, tilt, yaw=True):
             "imu_scales": {"gyro_rad_s": pimu.GYRO_SCALE,
                            "accel_m_s2": pimu.ACCEL_SCALE, "clip": pimu.CLIP,
                            "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.GAP_S}}
+
+
+def map_meta(uses_map, dropout=MAP_DROPOUT):
+    """The map half of the sidecar: what policy.check_map reads. A uses_map
+    model drives with the hand-written driving rules off (policy.py,
+    PolicyDriver) and is refused on a car not running --slam."""
+    if not uses_map:
+        return {}
+    return {"uses_map": True, **em.meta(), "map_dropout": float(dropout),
+            "map_features": MAP_FEATURES}
 
 
 def lidar_meta(uses_lidar, dropout=LIDAR_DROPOUT):
@@ -737,6 +846,12 @@ def main(argv=None):
     ap.add_argument("--lidar-dropout", type=float, default=LIDAR_DROPOUT,
                     help="with --lidar: the share of training ticks with a scan fed "
                          f"none instead, fresh every batch (default {LIDAR_DROPOUT})")
+    ap.add_argument("--map", default=None, metavar="CROPS_DIR",
+                    help="feed the SLAM map in as an input of its own (crawler/mapping/"
+                         "egomap.py): the crops tools/map_crops.py replayed over each "
+                         "lidar session, with dropout in training. Needs --lidar")
+    ap.add_argument("--map-dropout", type=float, default=MAP_DROPOUT,
+                    help=f"with --map: the share of ticks with a map fed none (default {MAP_DROPOUT})")
     ap.add_argument("--steer-head", choices=pl.STEER_HEADS, default=pl.STEER_REGRESSION,
                     help="regression: one tanh steer. direction: left/straight/right "
                          "plus how far, which cannot average two hard turns into straight")
@@ -807,6 +922,19 @@ def main(argv=None):
     except ValueError as e:
         print(f"{args.data}: {e}")
         return 1
+    if args.map and not args.lidar:
+        print("--map needs --lidar: the map is built off the lidar, and a car "
+              "with a map always has the scan")
+        return 2
+    if args.map:
+        try:
+            with_map = load_maps(data, args.map)
+        except ValueError as e:
+            print(e)
+            return 1
+        if not with_map:
+            print(f"--map {args.map}: no tick of {args.data} paired with a crop")
+            return 1
 
     import torch
 
@@ -819,7 +947,8 @@ def main(argv=None):
                uses_imu=args.imu, imu_yaw=not args.imu_no_yaw,
                imu_tilt=args.imu_tilt, steer_head=args.steer_head,
                straight_band=args.straight_band, takeover_weight=args.takeover_weight,
-               uses_lidar=args.lidar, lidar_dropout=args.lidar_dropout)
+               uses_lidar=args.lidar, lidar_dropout=args.lidar_dropout,
+               uses_map=bool(args.map), map_dropout=args.map_dropout)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -892,6 +1021,10 @@ def main(argv=None):
         print(f"lidar: a scan on {int((train_mask & data['lidar_present']).sum())} of "
               f"{int(train_mask.sum())} training ticks, {args.lidar_dropout:.0%} of them "
               f"blanked each batch")
+    if args.map:
+        print(f"map: a crop on {int((train_mask & data['map_on']).sum())} of "
+              f"{int(train_mask.sum())} training ticks, {args.map_dropout:.0%} of them "
+              f"blanked each batch")
     model, weights = train(data, train_mask=train_mask, **fit)
     params = int(sum(p.numel() for p in model.parameters()))
     shares = loss_shares(data, train_mask, args.labels, args.good_weight,
@@ -909,6 +1042,8 @@ def main(argv=None):
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
                if args.lidar else {}),
+            **({"map_train_ticks": int((train_mask & data["map_on"]).sum())}
+               if args.map else {}),
             **provenance_meta(argv, args.model_name)}
     with torch.no_grad():
         export(model, args.representation, args.out, meta)
@@ -945,6 +1080,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
                    not getattr(args, "imu_no_yaw", False)),
         **lidar_meta(getattr(args, "lidar", False),
                      getattr(args, "lidar_dropout", LIDAR_DROPOUT)),
+        **map_meta(bool(getattr(args, "map", None)),
+                   getattr(args, "map_dropout", MAP_DROPOUT)),
         **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
                      getattr(args, "straight_band", STRAIGHT_BAND)),
         "steer_scale": pl.STEER_SCALE,

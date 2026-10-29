@@ -794,7 +794,8 @@ class AutoPilot:
     comparison.
     """
 
-    def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None):
+    def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
+                 slam=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -814,6 +815,9 @@ class AutoPilot:
         # The roof lidar's reader with --lidar, else None: handed to the
         # driver for its rear stop, which only ever asks it latest().
         self.lidar = lidar
+        # The SLAM runner with --slam, else None: a map model's input. A map
+        # model without it is auto unavailable (policy.PolicyDriver refuses).
+        self.slam = slam
 
     def resume(self):
         """Start or restart auto mode. True if it is running.
@@ -901,7 +905,7 @@ class AutoPilot:
                         f"sha256 {model.sha256[:12]})")
         print(f"[auto] policy {model.label} sha256 {model.sha256}", file=sys.stderr)
         return policy.PolicyDriver(self.command, view, model, goal=self.goal,
-                                   lidar=self.lidar)
+                                   lidar=self.lidar, slam=self.slam)
 
     def step(self, now, takeover=None, split=False):
         """One pass of auto mode. False means hand the wheels back to manual.
@@ -1821,7 +1825,7 @@ def main(argv=None):
                                slam=slam)
         lidar.start()
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
-                          lidar=lidar)
+                          lidar=lidar, slam=slam)
 
     # Who gets the device opened at startup, and who waits for it:
     #

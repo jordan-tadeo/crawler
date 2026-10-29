@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from crawler.autopilot import policy as pl  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
+from crawler.mapping import egomap as em  # noqa: E402
 
 FWD = pl.ACTIONS.index(pl.FORWARD)
 STOP = pl.ACTIONS.index(pl.STOP)
@@ -78,6 +79,18 @@ def imu_input(model, data, i):
     return pl.encode_imu(feats)
 
 
+def map_input(data, i):
+    """Tick i's map input for a model that takes one: the crop
+    policy_train.load_maps paired it with, through egomap.encode_many, or
+    no map (a dataset loaded without crops has none anywhere)."""
+    if "map_row" not in data:
+        return em.missing()
+    r = int(data["map_row"][i])
+    if r < 0 or not bool(data["map_present"][r]):
+        return em.missing()
+    return em.encode_many(data["map_codes"][r:r + 1], data["map_trail"][r:r + 1], [True])
+
+
 def lidar_input(data, i):
     """Tick i's lidar input for a model that takes one: its scan through
     policy_lidar.encode, the car's own function, or no scan where the tick
@@ -103,6 +116,8 @@ def _run(model, data, i, split=None):
         extra["imu"] = imu_input(model, data, i)
     if getattr(model, "uses_lidar", False):
         extra["lidar"] = lidar_input(data, i)
+    if getattr(model, "uses_map", False):
+        extra["map"] = map_input(data, i)
     if extra:
         return model.run(x, prev, mode, **extra)
     if mode is None:

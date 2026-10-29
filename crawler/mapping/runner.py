@@ -152,12 +152,17 @@ def _work(inbox, outbox, l_max, map_every_s):
     """The worker, thread or process: scans in, Results and MapViews out.
     None in the inbox ends it."""
     from crawler.mapping.clock import SensorClock
+    from crawler.mapping.egomap import EgoMap
     from crawler.mapping.imu import ImuTrack
     from crawler.mapping.slam import Slam
 
     imu = ImuTrack()
     kw = {} if l_max is None else {"l_max": int(l_max)}
     slam = Slam(imu=imu, **kw)
+    # The policy's crop of the map, drawn here after every step, on the
+    # grid the step just wrote: the same EgoMap tools/map_crops.py runs
+    # over a recording, so training and the car see the same picture.
+    ego = EgoMap()
     clock = SensorClock()
     next_map = 0.0
     lost_out = 0
@@ -190,6 +195,15 @@ def _work(inbox, outbox, l_max, map_every_s):
             # times a drive and a dropped scroll must not go unsaid.
             try:
                 outbox.put(("grid", g.grew, g.dropped, g.size), timeout=1.0)
+            except queue.Full:
+                pass
+        try:
+            outbox.put_nowait(("crop", ego.after_step(slam.grid, res)))
+        except queue.Full:
+            pass
+        except Exception as e:      # a crop that fails costs that crop
+            try:
+                outbox.put_nowait(("error", repr(e)))
             except queue.Full:
                 pass
         if host_t >= next_map:
@@ -244,6 +258,7 @@ class SlamRunner:
         self._latest = None
         self._latest_at = None
         self._map = None
+        self._crop = None
         self._path = []
         self._path_version = 0
         self._poses = deque(maxlen=POSE_KEEP)
@@ -372,6 +387,10 @@ class SlamRunner:
         r = self._latest
         return None if r is None else (r.x, r.y, r.yaw)
 
+    def crop(self):
+        """The newest egomap.Crop, drawn after the newest step, or None."""
+        return self._crop
+
     def map(self) -> Optional[MapView]:
         """The newest MapView, at most MAP_EVERY_S old, or None."""
         return self._map
@@ -424,6 +443,8 @@ class SlamRunner:
             self.results += 1
             self._extend_path(res)
             self._offer_result(res, now)
+        elif kind == "crop":
+            self._crop = item[1]
         elif kind == "map":
             self._map = item[1]
             tele = self.tele

@@ -228,6 +228,7 @@ from crawler.autopilot import driver as dv
 from crawler.autopilot import goal as gl
 from crawler.autopilot import policy_imu as pimu
 from crawler.autopilot import policy_lidar as pli
+from crawler.mapping import egomap as em
 
 # ---- the frame the model sees ----------------------------------------------
 
@@ -328,9 +329,13 @@ IMU_INPUT = "imu"
 # The lidar input, for a model whose sidecar says uses_lidar: (1, pli.SIZE),
 # built by policy_lidar.encode off LidarReader.latest().
 LIDAR_INPUT = "lidar"
+# The map input, for a model whose sidecar says uses_map: (1, em.CHANNELS,
+# em.SIZE, em.SIZE), crawler/mapping/egomap.py's crop of the SLAM grid,
+# drawn by the SLAM worker after every scan (SlamRunner.crop()).
+MAP_INPUT = "map"
 # Every input this runtime knows how to feed. A graph wanting any other is
 # a model from newer code, and is refused rather than run on a guess.
-KNOWN_INPUTS = ("x", "prev", MODE_INPUT, IMU_INPUT, LIDAR_INPUT)
+KNOWN_INPUTS = ("x", "prev", MODE_INPUT, IMU_INPUT, LIDAR_INPUT, MAP_INPUT)
 
 # The mode latch. 0.7 for 0.5 s: six ticks in a row at 10 Hz of a head that
 # clearly wants the other mode, not one tick of a coin flip. 2 s between
@@ -408,6 +413,11 @@ REVERSE_STEER = 0.7      # the commit's front servo command, my median reversing
 # there for a car the refractory keeps facing a wall. Mine to judge on the
 # floor.
 REVERSE_REFRACTORY_S = 1.5
+# A map model goes neutral ("map lost") after this long with no trusted crop
+# (tracking and matched) fresher than egomap.STALE_S, and stays there until
+# one comes back. Lost does not recover once the truck has moved off, so in
+# practice that is a park.
+MAP_LOST_S = 1.0
 # The side rule is the back-out's too, so it lives in driver.py, with these
 # three: a front past REVERSE_TURN_MIN is a turn (servo units), a turning
 # forward inside REVERSE_TURN_WINDOW_S sets the side, and with none it is
@@ -578,6 +588,28 @@ def check_lidar(meta, inputs, where="sidecar"):
     clip = meta.get("lidar_clip_mm")
     if not isinstance(clip, (int, float)) or abs(float(clip) - pli.CLIP_MM) > 1e-6:
         raise ValueError(f"{where}: lidar_clip_mm {clip!r} != {pli.CLIP_MM}")
+    return True
+
+
+def check_map(meta, inputs, where="sidecar"):
+    """The map half of the contract -> uses_map, as check_lidar. A uses_map
+    model needs the input, a map_layout equal to egomap.LAYOUT, and uses_lidar
+    too: the map is made off the lidar."""
+    inputs = set(inputs)
+    if not meta.get("uses_map", False):
+        if MAP_INPUT in inputs:
+            raise ValueError(f"{where}: the graph has a {MAP_INPUT!r} input the "
+                             f"sidecar does not declare (no uses_map)")
+        return False
+    if MAP_INPUT not in inputs:
+        raise ValueError(f"{where}: uses_map declared but the graph has no "
+                         f"{MAP_INPUT!r} input")
+    layout = meta.get("map_layout")
+    if layout != em.LAYOUT:
+        raise ValueError(f"{where}: map_layout {layout!r} != {em.LAYOUT!r}: "
+                         f"this car cannot draw it")
+    if not meta.get("uses_lidar", False):
+        raise ValueError(f"{where}: uses_map without uses_lidar")
     return True
 
 
@@ -975,9 +1007,12 @@ class PolicyModel:
             self.meta, input_names, meta_path)
         # False for every model before the lidar input: never fed one.
         self.uses_lidar = check_lidar(self.meta, input_names, meta_path)
+        # False for every model before the map input: never fed one, and
+        # driven with the hand rules as before.
+        self.uses_map = check_map(self.meta, input_names, meta_path)
         self.path = path
 
-    def run(self, x, prev, mode=None, imu=None, lidar=None):
+    def run(self, x, prev, mode=None, imu=None, lidar=None, map=None):
         feed = {"x": x, "prev": prev}
         if self.has_mode:
             feed[MODE_INPUT] = mode if mode is not None else encode_mode(False)
@@ -986,6 +1021,8 @@ class PolicyModel:
                                else np.zeros((1, pimu.size(self.imu_yaw)), dtype=np.float32))
         if self.uses_lidar:
             feed[LIDAR_INPUT] = lidar if lidar is not None else pli.missing()
+        if self.uses_map:
+            feed[MAP_INPUT] = map if map is not None else em.missing()
         values = self.session.run(self.output_names, feed)
         return dict(zip(self.output_names, values))
 
@@ -1006,7 +1043,7 @@ class PolicyDriver(dv.Driver):
     """
 
     def __init__(self, controller, oakd, model, downsample=None, goal=None,
-                 lidar=None):
+                 lidar=None, slam=None):
         super().__init__(controller, oakd, lidar=lidar)
         self.model = model
         # Whether the car has arrived: the only thing that lets a model stop
@@ -1049,6 +1086,31 @@ class PolicyDriver(dv.Driver):
         # (policy_lidar.live_bins off self.lidar), or no scan.
         self.uses_lidar = bool(getattr(model, "uses_lidar", False))
         self.last_lidar_present = False  # a real scan went into this tick's model run
+        # The map input: the SLAM runner's newest egomap crop each decision.
+        # A map model on a car not mapping is refused here, which is auto
+        # unavailable, never a map model driving blind on its rules off.
+        self.uses_map = bool(getattr(model, "uses_map", False))
+        self.slam = slam
+        if self.uses_map and slam is None:
+            raise ValueError(f"{getattr(model, 'label', 'the model')} drives off the map: "
+                             "start the car with --lidar --slam")
+        self.last_map_present = False
+        # When the map last went in trusted and fresh; see _map_lost.
+        self._map_good_at = None
+        # Maps, not algorithms. With a map model every hand-written driving
+        # rule below is off -- the reverse commit and its side rule, the
+        # refractory, the stop mask, the confidence speed scale, the standoff
+        # and STUCK back-outs and the hand-back lean, the mode latch's dwell
+        # -- and the model's own gear and steering drive in both directions.
+        # What stays is the safety layer, which only ever takes the throttle
+        # to 0: the floor's forward hold, the lidar rear stop, STUCK as a
+        # neutral, the reverse speed cap the rear stop's distance is set for,
+        # and neutral on no frame, a blind scan, a bad output or the mapper
+        # down. Every model before the map input keeps every rule.
+        self.hand_rules = not self.uses_map
+        if not self.hand_rules:
+            # The head's own answer every tick: over half, that mode.
+            self.mode = ModeLatch(0.5, 0.0, 0.0)
         # How sure the model is of what it commits, and the speed scale off
         # it. Reset with the latch, whenever auto stops.
         self.confidence = ConfidenceScale()
@@ -1083,6 +1145,26 @@ class PolicyDriver(dv.Driver):
         self._reset_standoff()
         self._turn_front = self._turn_at = None
         self._last_reverse_at = None
+        self._map_good_at = None
+
+    def _map_lost(self, good_t, now):
+        """A map model whose newest trusted crop (good_t, the time it was
+        drawn at, None when this tick's is not one) is over MAP_LOST_S old:
+        the mapper is lost or behind and the map it has is stale, so no
+        driving on it. The window starts at the first map tick after an
+        engage, and a shorter gap rides on the no-map input the model was
+        trained with."""
+        if good_t is not None:
+            self._map_good_at = good_t
+        elif self._map_good_at is None:
+            self._map_good_at = now
+        return now - self._map_good_at > MAP_LOST_S
+
+    def _slam_alive(self):
+        try:
+            return bool(self.slam.stats().get("alive", False))
+        except Exception:
+            return False
 
     def _refractory(self, now):
         """Inside REVERSE_REFRACTORY_S of the last autonomous reverse."""
@@ -1218,6 +1300,11 @@ class PolicyDriver(dv.Driver):
             # Whether a lidar model was fed a real scan this decision; false
             # on a tick the model did not run, and for a model with no lidar.
             "policy_lidar_present": bool(self.uses_lidar and self.last_lidar_present),
+            # Whether a map model was fed a trusted, fresh crop this decision,
+            # and whether the hand-written driving rules were on (off for a
+            # map model).
+            "policy_map_present": bool(self.uses_map and self.last_map_present),
+            "policy_hand_rules": bool(self.hand_rules),
         }
 
     def _recover(self, now, reason):
@@ -1255,6 +1342,7 @@ class PolicyDriver(dv.Driver):
         self.rear_stop = False
         # Only a tick that runs the model says whether a scan went in.
         self.last_lidar_present = False
+        self.last_map_present = False
         self.reverse_refractory = False
         # First, so every row says it, whichever path the tick takes. A goal
         # that raises is the exception path: neutral, and auto parks.
@@ -1314,6 +1402,12 @@ class PolicyDriver(dv.Driver):
             self._still_samples = 0
         elif self.stuck(imu, now):
             self.last_recovery_time = now
+            if not self.hand_rules:
+                # Safety, not a manoeuvre: the wheels stop, and the model,
+                # which can see the map, decides the way out next tick.
+                print("STUCK - neutral; the model has it.")
+                self._neutral("stuck")
+                return
             print("STUCK - backing up to recover.")
             self._recover(now, "stuck")
             return
@@ -1340,6 +1434,17 @@ class PolicyDriver(dv.Driver):
             bins = pli.live_bins(self.lidar)
             self.last_lidar_present = bins is not None
             extra["lidar"] = pli.encode(bins)
+        if self.uses_map:
+            if not self._slam_alive():
+                self._neutral("mapper down")
+                return
+            crop = self.slam.crop()
+            ego = em.encode(crop, now)
+            self.last_map_present = bool(ego[0, em.PRESENT, 0, 0] > 0)
+            if self._map_lost(crop.t if self.last_map_present else None, now):
+                self._neutral("map lost")
+                return
+            extra["map"] = ego
         started = time.perf_counter()
         if extra:
             outputs = self.model.run(x, prev, mode, **extra)
@@ -1371,7 +1476,7 @@ class PolicyDriver(dv.Driver):
             self._note(self.last_decision._replace(model_action=action))
             return
         model_action = action
-        stop_masked = action == STOP
+        stop_masked = action == STOP and self.hand_rules
         if stop_masked:
             # Not arrived, so not a stop. Only the direction changes; the
             # floor below still holds a forward, as it holds any other.
@@ -1389,7 +1494,7 @@ class PolicyDriver(dv.Driver):
         if self.reverse_commit:
             action, magnitude = REVERSE, self._commit_magnitude
             steer, rear = self._commit_front / STEER_SCALE, None
-        elif (action == REVERSE and self._prev[0] != REVERSE
+        elif (self.hand_rules and action == REVERSE and self._prev[0] != REVERSE
                 and not (self.human_throttle or self.human_steering)
                 and self._refractory(now) and not self.floor_veto.vetoes()):
             # Straight back into the reverse it just came out of: the rock.
@@ -1397,7 +1502,7 @@ class PolicyDriver(dv.Driver):
             # own steering; the floor below still holds it like any other.
             action = FORWARD
             self.reverse_refractory = True
-        elif (action == REVERSE and self._prev[0] != REVERSE
+        elif (self.hand_rules and action == REVERSE and self._prev[0] != REVERSE
                 and not (self.human_throttle or self.human_steering)):
             starting = True
             self._commit_since = now
@@ -1411,6 +1516,8 @@ class PolicyDriver(dv.Driver):
         # action. The floor's hold below is a 0 no scale touches, so the
         # scale only ever multiplies a moving throttle.
         scale = self.confidence.update(committed_confidence(outputs, action))
+        if not self.hand_rules:
+            scale = 1.0
         reason = "model commit" if self.reverse_commit else "model"
         if action == FORWARD and self.floor_veto.vetoes():
             # Blocks the forward, not the decision: the steering still goes
@@ -1419,7 +1526,7 @@ class PolicyDriver(dv.Driver):
             # Under my trigger the model's held forward never reaches the
             # wheels -- mine does, unheld -- so it is no standoff (the count
             # was reset above).
-            if not self.human_throttle:
+            if not self.human_throttle and self.hand_rules:
                 if self._standoff_since is None:
                     self._standoff_since = now
                 self.standoff_ticks += 1
@@ -1463,7 +1570,7 @@ class PolicyDriver(dv.Driver):
         # magnitude, steer and rear are already known finite and in range,
         # so none of these can exceed a cap or STEER_SCALE.
         front = steer * STEER_SCALE
-        if (action == FORWARD and rear is None
+        if (action == FORWARD and rear is None and self.hand_rules
                 and not (self.human_throttle or self.human_steering)):
             # Just handed back by a back-out: lean toward the side that
             # opened, on top of the model's steer, for HANDBACK_S. The bias
