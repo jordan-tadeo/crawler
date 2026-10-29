@@ -51,7 +51,12 @@ failure commands neutral. In the order they are checked:
   driver.REAR_STOP_CLEAR_MM of the
   rear bumper                       neutral, reason "rear stop"; never
                                     under my trigger, and with no fresh
-                                    scan it is the gyro's rear bumper only
+                                    scan it is the gyro's rear bumper only.
+                                    A map model's reverse is instead the
+                                    better of forward and stop by its own
+                                    logits, forward through the floor as
+                                    any forward is (reason "model rear
+                                    masked"); only its stop is the neutral
   anything raises                   neutral, then the exception goes on up
                                     to AutoPilot.step(), which parks auto
   the goal is reached               neutral, whatever the model said
@@ -1162,6 +1167,15 @@ def moving_action(outputs):
     return FORWARD if f >= r else REVERSE
 
 
+def forward_or_stop(outputs):
+    """The better of forward and stop by the model's action logits: what a
+    map model's reverse becomes when the rear stop cuts it. A tie is forward,
+    as argmax over all three is."""
+    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()[:len(ACTIONS)]
+    f, s = logits[ACTIONS.index(FORWARD)], logits[ACTIONS.index(STOP)]
+    return FORWARD if f >= s else STOP
+
+
 def model_label(meta, path):
     """The name a model drives under: "kblock 1.1" off a registered sidecar.
 
@@ -1912,13 +1926,32 @@ class PolicyDriver(dv.Driver):
                 self._turn_front, age, steer * STEER_SCALE)
             steer, rear = self._commit_front / STEER_SCALE, None
 
+        # A map model's reverse into something behind it. Cut to neutral, as
+        # the hand rules' is, it asked again every tick off the same scene:
+        # 174641Z held 9.5 s like that at p(reverse) 0.66 with the front clear
+        # to 800 mm, until I took over. So reverse is taken off the table and
+        # the better of the other two by its own logits drives, forward
+        # through the floor like any forward; a stop is the rear stop below,
+        # as before. Its magnitude and steering stand.
+        rear_masked = False
+        if (not self.hand_rules and action == REVERSE and not self.human_throttle
+                and dv.rear_blocked(self.rear_clearance)
+                and forward_or_stop(outputs) == FORWARD):
+            action, rear_masked = FORWARD, True
+            self.rear_stop = True
+            if not self._rear_said:
+                print(f"Rear stop - {self.rear_clearance:.0f} mm behind me, "
+                      "going forward instead.")
+            self._rear_said = True
+
         # Every neutral has returned by here, so this is a committed model
         # action. The floor's hold below is a 0 no scale touches, so the
         # scale only ever multiplies a moving throttle.
         scale = self.confidence.update(committed_confidence(outputs, action))
         if not self.hand_rules:
             scale = 1.0
-        reason = "model commit" if self.reverse_commit else "model"
+        reason = ("model commit" if self.reverse_commit
+                  else "model rear masked" if rear_masked else "model")
         if action == FORWARD and self.floor_veto.vetoes():
             # Blocks the forward, not the decision: the steering still goes
             # out, and next tick the model can choose to reverse.
@@ -1963,7 +1996,8 @@ class PolicyDriver(dv.Driver):
             self._neutral("rear stop")
             self.rear_stop = True
             return
-        self._rear_said = False
+        if not rear_masked:
+            self._rear_said = False
         if action == REVERSE and not self.human_throttle:
             self._last_reverse_at = now
 
@@ -2015,5 +2049,6 @@ class PolicyDriver(dv.Driver):
         self._prev = (action, magnitude, steer)
         self._note(Decision(action, magnitude, steer, rear, reason, throttle, front,
                             model_action if (stop_masked or self.reverse_commit
-                                             or self.reverse_refractory) else "",
+                                             or self.reverse_refractory
+                                             or rear_masked) else "",
                             stop_masked))

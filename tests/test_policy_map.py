@@ -394,8 +394,9 @@ def test_the_map_model_stops_when_it_says_stop_and_keeps_its_throttle_unscaled()
 
 
 def test_the_safety_layer_still_cuts_a_map_models_throttle():
-    # The rear stop: neutral, never the reverse.
-    model = MapStub(REVERSE, throttle=1.0)
+    # The rear stop: neutral, never the reverse, when the model's next best
+    # is a stop.
+    model = MapStub((0.0, 5.0, 1.0), throttle=1.0)
     near = int(dv.REAR_SELF_MM + dv.REAR_STOP_CLEAR_MM - 40)
     d = driver(model, FakeSlam(), lidar=reader(near))
     d.tick(T0)
@@ -418,6 +419,37 @@ def test_the_safety_layer_still_cuts_a_map_models_throttle():
     assert not d.recovering(T0 + 3.0), "no standoff back-out"
     assert d.controller.steerings[-1][0] == pytest.approx(0.5 * pl.STEER_SCALE), \
         "the model keeps its steering under the hold"
+
+
+def test_a_map_models_reverse_into_the_rear_stop_goes_forward_if_it_would():
+    # 174641Z: reverse at p 0.66 into something behind, the front clear to
+    # 800 mm, every tick for 9.5 s, each one cut to neutral. Forward was its
+    # next best on every one of them.
+    near = int(dv.REAR_SELF_MM + dv.REAR_STOP_CLEAR_MM - 40)
+    slam = FakeSlam()
+    d = driver(MapStub((1.0, 5.0, 0.0), throttle=0.8, steer=0.75), slam,
+               lidar=reader(near))
+    for k in range(20):
+        slam.at(T0 + k * 0.1)
+        d.tick(T0 + k * 0.1)
+    assert all(t > 0 for t in d.controller.throttles[-20:]), "it drives on"
+    dec = d.last_decision
+    assert dec.action == pl.FORWARD and dec.reason == "model rear masked"
+    assert dec.model_action == pl.REVERSE, "the row keeps what it asked"
+    assert d.rear_stop
+    assert d.controller.steerings[-1][0] == pytest.approx(0.75 * pl.STEER_SCALE)
+    # And the floor still holds it, as any forward.
+    wall = clear()
+    wall[150:350, 220:420] = 300
+    d = driver(MapStub((1.0, 5.0, 0.0)), FakeSlam(), depth=wall,
+               lidar=reader(near))
+    d.tick(T0)
+    assert d.controller.throttles[-1] == 0
+    assert d.last_decision.reason == "model floor"
+    # Nothing behind: the reverse it asked for.
+    d = driver(MapStub((1.0, 5.0, 0.0), throttle=1.0), FakeSlam())
+    d.tick(T0)
+    assert d.controller.throttles[-1] == dv.ESCAPE_SPEED
 
 
 # --- a chassis left sitting tilted is not a lost map ----------------------------------
