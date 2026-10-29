@@ -59,10 +59,10 @@ SCAN_STEP_DEG = 0.5
 SCAN_SLOTS = int(round(360.0 / SCAN_STEP_DEG))
 
 # The outline. The length is the two bumpers in lidar.py: the front one
-# estimated off a box, the back one inferred from the sensor being halfway
-# along. The width is a GUESS: nobody has measured it (lidar.HALF_WIDTH_MM is
-# None), and 300 mm is a typical 1/10 crawler body. It is there so I can tell
-# which way the truck faces, not to measure clearance against.
+# estimated off a box, the back one measured. The width is lidar.HALF_WIDTH_MM,
+# measured over the wheels; the 300 mm guess is only the fallback if that is
+# ever unset. It is there so I can tell which way the truck faces, not to
+# measure clearance against.
 TRUCK_FRONT_MM = ld.FRONT_BUMPER_X_MM
 TRUCK_REAR_MM = ld.REAR_BUMPER_X_MM
 TRUCK_WIDTH_GUESS_MM = 300.0

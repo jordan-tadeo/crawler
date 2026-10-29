@@ -126,7 +126,7 @@ bumper: it showed up at raw sensor angle 270, which `MOUNT` puts straight
 ahead. The near number has to land under `front`, then `right`. If it lands a
 quarter turn off, `--yaw` tries another mount yaw, and `MOUNT` in
 `crawler/hardware/lidar.py` is where it goes once it is right. The sensor
-sits at the middle of the car, which is the frame's origin, so its offset is
+sits on the cab roof on the centre line, which is the frame's origin, so its offset is
 0, 0. Then add `--lidar` to the
 service's ExecStart with `sudo systemctl edit crawler`, and `/lidar` is in
 every recording.

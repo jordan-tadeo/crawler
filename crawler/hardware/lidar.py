@@ -47,8 +47,8 @@ degrees, and the angle grows clockwise looking down on it.
 The car's frame
 ---------------
 Nothing in this repo had a 2D frame before this, so it gets the usual one: x
-forward, y left, origin at the middle of the car (on the centre line, halfway
-from the front of the truck to the back), bearings counter-clockwise
+forward, y left, origin at the lidar (on the cab roof, on the centre line; not
+necessarily halfway from the front of the truck to the back), bearings counter-clockwise
 from straight ahead seen from above (+90 is left, -90 right, 180 behind).
 That is the right-handed frame everything else in robotics uses, and it is
 the opposite handedness to the sensor's, which is the one thing to keep in
@@ -357,21 +357,24 @@ class Mount(NamedTuple):
 # gone those went to 1.4-4.7 m and nothing else moved by more than 10 mm.
 # So raw 270 is straight ahead, which is what yaw -90 clockwise says.
 #
-# Where: on the roof of the cab, on the centre line, halfway from the front
-# of the truck to the back. That is the car frame's origin by definition, so
-# the offset is 0, 0. Height is the cab top, unmeasured, and does not enter a
+# Where: on the roof of the cab, on the centre line. That is the car frame's
+# origin by definition, so the offset is 0, 0. The cab is not necessarily
+# halfway along: the front and rear bumpers below are each their own number. Height is the cab top, unmeasured, and does not enter a
 # 2D scan.
 MOUNT = Mount(yaw_deg=-90.0, x_mm=0.0, y_mm=0.0, upside_down=False)
 
 # The front bumper's x, mm, ESTIMATED off the same box: 575 seen less 305
-# from the bumper. The sensor being halfway along makes the rear bumper
-# about -270 too, but that is the owner's description, not a measurement.
-# A clearance stop is a range from the middle of the car less one of these.
+# from the bumper. Not measured yet.
+# The rear bumper's x, mm, MEASURED on the car: centre of the lidar to the
+# rear bumper, 9.75 in = 247.65 mm. So the lidar is about 22 mm nearer the
+# back than the front, going by the front estimate.
+# A clearance stop is a range from the lidar less one of these.
 FRONT_BUMPER_X_MM = 270.0
-REAR_BUMPER_X_MM = -270.0
-# TODO measure: half the truck's width over the bodywork, mm. Nothing in the
-# repo records it; side clearance needs it.
-HALF_WIDTH_MM = None
+REAR_BUMPER_X_MM = -247.65
+# Half the truck's width, mm, MEASURED on the car at the widest point, the
+# outside of the wheels: 10.7 in = 271.78 mm, half of that. Only the
+# visualiser's outline reads it; nothing steers or stops on side clearance.
+HALF_WIDTH_MM = 135.89
 
 
 def car_bearing_deg(angles_deg, mount=MOUNT):

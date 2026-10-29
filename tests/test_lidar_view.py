@@ -168,18 +168,25 @@ def test_the_truck_is_a_closed_outline_on_base_link_with_the_arrow_at_the_front(
     (line,) = e.lines
     assert line.type == 1                                      # LINE_LOOP
     corners = sorted((round(p.x, 3), round(p.y, 3)) for p in line.points)
-    assert corners == [(-0.27, -0.15), (-0.27, 0.15), (0.27, -0.15), (0.27, 0.15)]
+    # The measured rear bumper and width, the estimated front bumper.
+    assert corners == [(-0.248, -0.136), (-0.248, 0.136),
+                       (0.27, -0.136), (0.27, 0.136)]
     (tri,) = e.triangles
     tip, left, right = [(p.x, p.y) for p in tri.points]
     assert tip == pytest.approx((0.27, 0.0))
     assert left[0] == right[0] < tip[0], "it points forward, +x"
     assert left[1] == -right[1] > 0
-    assert -0.27 < left[0]
+    assert -0.248 < left[0]
 
 
 def test_a_measured_width_replaces_the_guess(monkeypatch):
     monkeypatch.setattr(ld, "HALF_WIDTH_MM", 120.0)
     assert {round(y, 3) for _, y in lv.truck_outline_m()} == {0.12, -0.12}
+
+
+def test_with_no_width_the_outline_falls_back_to_the_guess(monkeypatch):
+    monkeypatch.setattr(ld, "HALF_WIDTH_MM", None)
+    assert {round(y, 3) for _, y in lv.truck_outline_m()} == {0.15, -0.15}
 
 
 # ---- the reader, the channels and the recording ---------------------------------

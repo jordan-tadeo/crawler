@@ -1202,13 +1202,13 @@ def auto_reverse_throttle(throttle) -> float:
 # No lidar, a stale scan or nothing in the sector is exactly the old car: the
 # gyro bumper is still there, and is the only stop without a scan.
 #
-# The sector is narrow on purpose. The lidar is on the cab roof at the car's
-# middle; the rear wheels sit at about x -200, y +-150 (ESTIMATED off the
-# bumper and a ~300 mm width guess, HALF_WIDTH_MM is unmeasured), which is
-# bearing 180 -+ 37 at a range of 250, and the stock quadrant ("rear", +-45)
+# The sector is narrow on purpose. The lidar is on the cab roof on the centre
+# line; the rear wheels sit at about x -200 (ESTIMATED, the axle has not been
+# measured) and y +-136 (the outside of the wheels, HALF_WIDTH_MM, measured),
+# which is bearing 180 -+ 34 at a range of 242, and the stock quadrant ("rear", +-45)
 # would take them in if the scan plane ever came down to them. +-20 degrees
 # (nine 5-degree bins, so +-22.5 at the bin edges) holds the car's own width
-# at the bumper (+-150 mm is +-29 degrees at 270 mm, so most of it) and all
+# at the bumper (+-136 mm is +-29 degrees at 248 mm, so most of it) and all
 # of the path behind it from about 400 mm out, and stops short of the
 # wheels. It is the swept path of a straight reverse; a reverse at lock
 # swings the tail wider, and what is beside the tail is not in it. The width
@@ -1219,10 +1219,10 @@ REAR_STOP_SECTOR = (180.0, 20.0)
 # lidar is, is inside the car -- the roof mount, a cable, the bed's rails if
 # the plane catches them -- and never an obstacle, because nothing outside
 # can be nearer than the bodywork. Those returns are dropped before the
-# nearest is taken. Inside the sector the bodywork reaches 270-292 mm (270 /
-# cos 22.5); only 270 is inside on every bearing, so that is the line, and a
-# part of the car at 270-292 off-centre would read as an obstacle at the
-# bumper. REAR_BUMPER_X_MM is the owner's description, not a measurement.
+# nearest is taken. Inside the sector the bodywork reaches 248-268 mm (247.65
+# / cos 22.5); only 248 is inside on every bearing, so that is the line, and a
+# part of the car at 248-268 off-centre would read as an obstacle at the
+# bumper. REAR_BUMPER_X_MM is measured, 9.75 in from the lidar.
 REAR_SELF_MM = abs(_lidar.REAR_BUMPER_X_MM)
 
 # How near the bumper is too near: the 120 mm of margin I asked for, plus how

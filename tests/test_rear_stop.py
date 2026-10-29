@@ -234,6 +234,10 @@ def test_the_rear_clearance_is_from_the_bumper_and_drops_the_car_itself():
     assert dv.rear_clearance_mm(rear_bins(400)) == pytest.approx(400 - dv.REAR_SELF_MM)
     # Inside the bumper is the car: a self-hit, dropped, not a 0 clearance.
     assert dv.rear_clearance_mm(rear_bins(200)) is None
+    # The line is the measured bumper, 247.65 mm, not the old 270 guess: a
+    # return at 260 is outside the car.
+    assert dv.REAR_SELF_MM == pytest.approx(247.65)
+    assert dv.rear_clearance_mm(rear_bins(260)) == pytest.approx(260 - 247.65)
     both = rear_bins(200)
     both[ld.BINS // 2 + 1] = 500
     assert dv.rear_clearance_mm(both) == pytest.approx(500 - dv.REAR_SELF_MM)
@@ -276,7 +280,8 @@ def test_a_near_return_behind_stops_the_commit_with_neutral():
     assert d.last_decision.reason == "rear stop"
     row = fp.autopilot_fields(d, T0 + 0.1)
     assert row["rear_stop"] is True
-    assert row["rear_clearance_mm"] == pytest.approx(dv.REAR_STOP_CLEAR_MM - 40)
+    # Within a millimetre: a bin is whole mm and the bumper is not.
+    assert row["rear_clearance_mm"] == pytest.approx(dv.REAR_STOP_CLEAR_MM - 40, abs=1.0)
 
 
 def test_a_fresh_reverse_into_a_near_return_is_never_commanded():
