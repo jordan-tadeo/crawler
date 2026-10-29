@@ -176,7 +176,13 @@ once each, then switch between them from the Layouts menu.
   SLAM pose (`map -> base_link` on `/tf`), with the scan drawn on the walls.
   `/voxel/points` and `/voxel/low` are in its topic list, off until ticked.
   Its publish tool is set to a 2D pose on `/move_base_simple/goal`, which is
-  where `--nav` takes goals from. The lidar panel follows the truck, front up.
+  where `--goal` takes goals from: pick Publish pose in the map panel's
+  toolbar, press where the truck should go, drag, let go. A green disc on
+  `/goal/marker` marks it, and the Goal panel (`/goal/status`) says how far
+  and which way it is from the truck and whether it has arrived. A click is
+  taken in any mode and kept until the next one; a goal model drives to it
+  whenever auto drives, and within 0.25 m auto holds neutral until I click
+  somewhere else. The lidar panel follows the truck, front up.
 - `foxglove-telemetry.json`: commands, ESC, pad axes, IMU, loop health, SLAM
   fit and cost, the mode and SLAM state strips, and `/footprint` and
   `/diagnostics` raw.
