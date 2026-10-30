@@ -175,18 +175,38 @@ PATH_MAX_S = 20.0
 # back up.
 STAGE_DEG = 60.0
 BEHIND_DEG = 150.0
+# One passed as it is for being behind goes on passing until it is
+# BEHIND_HYST_DEG inside BEHIND_DEG: on the 2026-10-30 patrols half the
+# crossings of 150 came back across within a second (85 of 170 before the
+# staging went in, 12 of 26 after), each one swinging the bearing fed
+# between 60 and 150.
+BEHIND_HYST_DEG = 15.0
 
 
-def stage(bearing, stage_deg=STAGE_DEG, behind_deg=BEHIND_DEG):
+def _behind_rad(behind_deg, passing, hyst_deg):
+    return np.where(passing, math.radians(behind_deg - hyst_deg), math.radians(behind_deg))
+
+
+def stage(bearing, stage_deg=STAGE_DEG, behind_deg=BEHIND_DEG, passing=False,
+          hyst_deg=BEHIND_HYST_DEG):
     """A bearing (radians CCW from straight ahead; arrays broadcast) as it
     is fed: past stage_deg and short of behind_deg, stage_deg on its own
-    side; anything else as it is. stage_deg None: every bearing as it is."""
+    side; anything else as it is. stage_deg None: every bearing as it is.
+    passing (broadcasts too): the bearing before was passed as it is for
+    being behind (passes()), so this one is from hyst_deg short of
+    behind_deg."""
     b = np.asarray(bearing, float)
     if stage_deg is None:
         return b
-    lo, hi = math.radians(stage_deg), math.radians(behind_deg)
+    lo, hi = math.radians(stage_deg), _behind_rad(behind_deg, passing, hyst_deg)
     mag = np.abs(b)
     return np.where((mag > lo) & (mag < hi), np.copysign(lo, b), b)
+
+
+def passes(bearing, behind_deg=BEHIND_DEG, passing=False, hyst_deg=BEHIND_HYST_DEG):
+    """Whether stage() passes `bearing` as it is for being behind, given
+    `passing` for the one before: the `passing` to hand it the next."""
+    return np.abs(np.asarray(bearing, float)) >= _behind_rad(behind_deg, passing, hyst_deg)
 
 
 def lookahead_of(meta):

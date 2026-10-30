@@ -5,8 +5,10 @@ the model's path goals were drawn at (policy_goal.lookahead_of).
 The goal models steer the wrong way for a goal well round to the left, so a
 bearing past STAGE_DEG goes in as STAGE_DEG on its side until the point
 comes round; one BEHIND_DEG or more round goes in as it is, the turn-round
-being the model's. A replan that moves the point round a corner comes in at
-AIM_RATE_DPS, not in one decision; the truck's own turning is never held.
+being the model's, and goes on as it is to BEHIND_HYST_DEG inside that. A
+replan that moves the point round a corner comes in at AIM_RATE_DPS, not in
+one decision; the truck's own turning is never held, and neither is a new
+direction (more than AIM_SNAP_DEG round) or a new goal.
 """
 
 import json
@@ -56,6 +58,18 @@ def feed(p, deg, t, d=1.0, yaw=0.0):
     return p.encode(c, src), src, c
 
 
+# The goal the point turns on its way to, far off: the point picked moves
+# (a replan), the goal does not.
+GOAL = (5.0, 5.0, 0)
+
+
+def turn(p, deg, t, yaw=0.0):
+    """One decision with the point picked at deg off a truck at the origin
+    facing yaw, on the way to the same GOAL: the bearing fed."""
+    c = crop_at(0.0, 0.0, yaw, t=t)
+    return bearing(p._shape(c, pg.encode(c, at(deg)), GOAL))
+
+
 # --- staging -------------------------------------------------------------------------------
 
 def test_stage_feeds_a_sharp_bearing_as_the_band_edge_and_a_goal_behind_as_it_is():
@@ -65,6 +79,27 @@ def test_stage_feeds_a_sharp_bearing_as_the_band_edge_and_a_goal_behind_as_it_is
         want = side * np.array([0.0, 30.0, 59.0, 60.0, 60.0, 60.0, 150.0, 170.0, 180.0])
         np.testing.assert_allclose(got, want, atol=1e-9)
     np.testing.assert_allclose(pg.stage(np.radians(100.0), None), np.radians(100.0))
+
+
+def test_a_bearing_passed_as_it_is_goes_on_passing_to_the_hysteresis():
+    inside = pg.BEHIND_DEG - pg.BEHIND_HYST_DEG
+    for side in (1.0, -1.0):
+        for deg, was, fed, passing in ((inside + 1.0, True, inside + 1.0, True),
+                                       (inside + 1.0, False, 60.0, False),
+                                       (inside - 1.0, True, 60.0, False),
+                                       (pg.BEHIND_DEG, False, pg.BEHIND_DEG, True)):
+            b = np.radians(side * deg)
+            assert np.degrees(pg.stage(b, passing=was)) == pytest.approx(side * fed)
+            assert bool(pg.passes(b, passing=was)) is passing
+
+
+def test_a_bearing_hovering_on_the_behind_line_is_not_fed_60_and_150_by_turns():
+    p, _ = shaped()
+    hover = [152.0, 148.0, 147.0, 148.0, 151.0, 146.0, 148.0, 147.0]
+    got = [turn(p, deg, t=0.1 * k) for k, deg in enumerate(hover)]
+    np.testing.assert_allclose(got, hover, atol=1e-4)
+    # Clear of the hysteresis it is staged again, at the rate.
+    assert turn(p, 130.0, t=0.8) == pytest.approx(hover[-1] - pgo.AIM_RATE_DPS * 0.1, abs=1e-4)
 
 
 @pytest.mark.parametrize("side", [1.0, -1.0], ids=["left", "right"])
@@ -95,9 +130,9 @@ def test_a_goal_inside_the_band_or_behind_goes_in_untouched():
 
 def test_a_jump_of_the_point_comes_in_at_the_rate_and_gets_there():
     p, _ = shaped()
-    feed(p, 15.0, t=0.0)
+    turn(p, 15.0, t=0.0)
     step = pgo.AIM_RATE_DPS * 0.1
-    got = [bearing(feed(p, 55.0, t=0.1 * k)[0]) for k in range(1, 6)]
+    got = [turn(p, 55.0, t=0.1 * k) for k in range(1, 6)]
     assert got[0] == pytest.approx(15.0 + step)
     assert all(b - a <= step + 1e-4 for a, b in zip([15.0] + got, got))
     assert got[-1] == pytest.approx(55.0), "there once the rate has had the time"
@@ -114,9 +149,9 @@ def test_the_trucks_own_turning_is_never_held():
 
 def test_coming_round_from_a_goal_behind_turns_through_the_band_without_a_jump():
     p, _ = shaped()
-    g, _, _ = feed(p, 170.0, t=0.0)
-    assert bearing(g) == pytest.approx(170.0)
-    got = [bearing(feed(p, 30.0, t=0.1 * k)[0]) for k in range(1, 15)]
+    assert turn(p, 170.0, t=0.0) == pytest.approx(170.0)
+    assert 170.0 - 30.0 < pgo.AIM_SNAP_DEG, "round on its own side, not a new direction"
+    got = [turn(p, 30.0, t=0.1 * k) for k in range(1, 15)]
     prev = 170.0
     for b in got:
         assert abs(b - prev) <= pgo.AIM_RATE_DPS * 0.1 + 1e-4
@@ -126,11 +161,33 @@ def test_coming_round_from_a_goal_behind_turns_through_the_band_without_a_jump()
 
 def test_after_a_gap_the_point_is_fed_where_it_is():
     p, _ = shaped()
-    feed(p, -55.0, t=0.0)
+    turn(p, -55.0, t=0.0)
     gap = pgo.AIM_GAP_S + 0.05
     assert pgo.AIM_RATE_DPS * gap < 110.0, "more than the rate covers in the gap"
-    g, _, _ = feed(p, 55.0, t=gap)
+    assert turn(p, 55.0, t=gap) == pytest.approx(55.0)
+
+
+@pytest.mark.parametrize("side", [1.0, -1.0], ids=["left", "right"])
+def test_a_plan_flipped_from_behind_to_ahead_is_fed_at_once(side):
+    # A replan from a path behind to one dead ahead: held at the rate, the
+    # point fed swept round the back for a second and a half.
+    p, _ = shaped()
+    assert turn(p, side * 165.0, t=0.0) == pytest.approx(side * 165.0)
+    assert 180.0 > pgo.AIM_SNAP_DEG
+    assert turn(p, -side * 15.0, t=0.1) == pytest.approx(-side * 15.0)
+    # and from there on at the rate again
+    assert turn(p, side * 45.0, t=0.2) == pytest.approx(-side * 15.0 + side * pgo.AIM_RATE_DPS * 0.1)
+
+
+def test_a_new_goal_is_fed_at_once():
+    # The patrol moving on: the first bearing for the next waypoint is that
+    # waypoint's, not the last one's turned at the rate.
+    p, _ = shaped()
+    feed(p, 15.0, t=0.0)
+    g, _, _ = feed(p, 55.0, t=0.1)
     assert bearing(g) == pytest.approx(55.0)
+    g, _, _ = feed(p, -100.0, t=0.2)
+    assert bearing(g) == pytest.approx(-pgo.STAGE_DEG)
 
 
 def test_no_goal_forgets_the_last_bearing():

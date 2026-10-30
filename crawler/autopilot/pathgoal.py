@@ -106,7 +106,15 @@ the bearing fed turns on the map no faster than AIM_RATE_DPS from the last
 decision's, so a replan that moves the point round a corner (+15 to +120 in
 one tick at the 2026-10-30 hairpin) comes in over a second, not at once;
 the truck's own turning moves it freely. Coming round from a goal behind it
-turns through the staged band at that rate. Only the bearing changes:
+turns through the staged band at that rate. One passed as it is goes on
+passing to BEHIND_HYST_DEG inside BEHIND_DEG, so a bearing hovering on 150
+is not fed 60 and 150 by turns. The rate limit is for a point moving round
+a corner, not for a new direction: a bearing wanted more than AIM_SNAP_DEG
+round from the last one fed (a plan flipped from behind to ahead), and the
+first one for a new goal (the patrol moving on to its next waypoint), are
+fed at once. Held at the rate, each of those was fed pointing the old way
+for up to a second and a half, sometimes round the far side of the truck
+from the path. Only the bearing changes:
 present and distance are the point's own, and aim (/path/status, so
 tools/fed_goals.py) is moved to the bearing fed, the point the model got.
 """
@@ -132,6 +140,13 @@ AIM_RATE_DPS = 120.0
 # Decisions further apart than this are not rate-limited: the first one
 # after is fed where it points.
 AIM_GAP_S = 0.5
+# The bearing wanted further than this round from the last one fed is a
+# new direction, not a replan's step round a corner: it is fed at once, as
+# it is after a new goal (the patrol moving on). Held at the rate, a plan
+# that flipped from behind to dead ahead was fed pointing behind for over
+# a second (replayed 2026-10-30 patrols). Coming round from a goal behind
+# to one ahead on its own side is less than this and still turns at the rate.
+AIM_SNAP_DEG = 150.0
 PLAN_EVERY_S = 0.5
 REPLAN_MOVE_M = 0.2
 PAD_M = 3.0
@@ -453,6 +468,8 @@ class PathPlanner:
         self.aim_rate_dps = aim_rate_dps
         self._last_fed = None      # (map bearing fed, crop t, frame) of the last decision
         self._walking = False      # walking round from a goal behind
+        self._passing = False      # the last bearing picked was passed as it is, behind
+        self._shaped_goal = None   # the source's goal the last bearing fed was shaped for
         self.bearing_deg = 0.0     # the bearing fed this decision, truck frame
         self.raw_bearing_deg = 0.0  # the one picked, before staging and the rate limit
         self.staged = 0            # decisions fed other than the bearing picked
@@ -521,32 +538,45 @@ class PathPlanner:
         """The goal input this decision: the encoding of the point along the
         path, or the source's own (the goal itself) when there is none,
         staged and rate-limited (_shape)."""
-        return self._shape(crop, self._pick(crop, source))
+        g = self._pick(crop, source)
+        goal = getattr(source, "goal", None) if source is not None else None
+        return self._shape(crop, g, goal)
 
-    def _shape(self, crop, g):
+    def _shape(self, crop, g, goal=None):
         """The goal input g as it is fed: its bearing staged
-        (policy_goal.stage), then turned on the map no faster than
-        aim_rate_dps from the last decision's. Coming round from a goal
-        behind it turns through the staged band at that rate, and is
-        staged again once inside it. Present, distance and the encoding
-        are g's own; aim moves to the bearing fed at its own distance, so
-        /path/status (and tools/fed_goals.py off it) has the point the
-        model got."""
+        (policy_goal.stage, passing on from the last decision's), then
+        turned on the map no faster than aim_rate_dps from the last
+        decision's. Coming round from a goal behind it turns through the
+        staged band at that rate, and is staged again once inside it. A
+        bearing wanted more than AIM_SNAP_DEG round from the last one fed,
+        or the first for a new `goal` (the source's, the patrol's waypoint),
+        is fed at once. Present, distance and the encoding are g's own; aim
+        moves to the bearing fed at its own distance, so /path/status (and
+        tools/fed_goals.py off it) has the point the model got."""
         g = np.asarray(g, np.float32)
         if (g.shape != (1, pg.SIZE) or not g[0, pg.PRESENT] > 0 or crop is None
                 or not getattr(crop, "present", False)):
-            self._last_fed, self._walking = None, False
+            self._last_fed, self._walking, self._passing = None, False, False
+            self._shaped_goal = None
             self.bearing_deg = self.raw_bearing_deg = 0.0
             return g
+        goal = None if goal is None else (float(goal[0]), float(goal[1]), int(goal[2]))
+        new_goal = (goal is not None and self._shaped_goal is not None
+                    and not _same(goal, self._shaped_goal))
+        self._shaped_goal = goal
         raw = math.atan2(float(g[0, pg.SIN]), float(g[0, pg.COS]))
-        want = float(pg.stage(raw, self.stage_deg, self.behind_deg))
+        want = float(pg.stage(raw, self.stage_deg, self.behind_deg, self._passing))
+        self._passing = (self.stage_deg is not None
+                         and bool(pg.passes(raw, self.behind_deg, self._passing)))
         yaw, t, frame = float(crop.yaw), float(crop.t), int(getattr(crop, "frame", 0))
         heading = yaw + want
         last = self._last_fed
         if (self.aim_rate_dps is not None and last is not None and last[2] == frame
-                and 0.0 <= t - last[1] <= AIM_GAP_S):
-            step = math.radians(float(self.aim_rate_dps)) * (t - last[1])
-            heading = last[0] + max(-step, min(step, _wrap(heading - last[0])))
+                and 0.0 <= t - last[1] <= AIM_GAP_S and not new_goal):
+            turn = _wrap(heading - last[0])
+            if abs(turn) <= math.radians(AIM_SNAP_DEG):
+                step = math.radians(float(self.aim_rate_dps)) * (t - last[1])
+                heading = last[0] + max(-step, min(step, turn))
         fed = _wrap(heading - yaw)
         if self.stage_deg is not None:
             lim = math.radians(float(self.stage_deg))
