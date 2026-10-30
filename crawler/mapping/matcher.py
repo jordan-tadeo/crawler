@@ -31,6 +31,9 @@ WIDE_M, MID_M, TIGHT_M = 0.4, 0.2, 0.1
 
 # Fewer matched points than this and the fit is not a fit.
 MIN_MATCHES = 30
+# icp(stride=) thins the iterations only for a scan with this many points a
+# stride: never below 100 points iterated on.
+STRIDE_MIN_POINTS = 100
 
 # Degeneracy (Zhang, Kaess and Singh, "On degeneracy of optimization-based
 # state estimation problems", ICRA 2016). Each Gauss-Newton step is solved,
@@ -63,17 +66,29 @@ def rot(th):
     return np.array([[c, -s], [s, c]])
 
 
-def icp(src, nrm, tree, tgt, pose0, yaw_prior=None, sigma_yaw=None, iters=20):
+def icp(src, nrm, tree, tgt, pose0, yaw_prior=None, sigma_yaw=None, iters=20,
+        stride=1, give_up=0.0):
     """Fit the scan (src points, nrm normals, car frame) to the map.
 
     tree is a cKDTree over tgt (map points). yaw_prior, if given, is a soft
     pull towards that heading with standard deviation sigma_yaw (radians).
+
+    stride > 1 runs the iterations on every stride-th point (a scan of at
+    least STRIDE_MIN_POINTS a stride) and only the closing count of inliers
+    and residual on them all; give_up > 0 stops a fit whose share of points
+    within TIGHT_M is under it when the tight gate starts (after the wide
+    and mid ones), unconverged. Both are for the candidates of a
+    relocalization, most of which are the wrong place (see slam.py
+    CANDIDATE_STRIDE).
     """
     x, y, th = (float(v) for v in pose0)
     sched = [WIDE_M] * 3 + [MID_M] * 4 + [TIGHT_M] * max(iters - 7, 0)
     it = 0
     k = KERNEL_M
     held = 0
+    full_src, full_nrm = src, nrm
+    if stride > 1 and len(src) >= stride * STRIDE_MIN_POINTS:
+        src, nrm = src[::stride], nrm[::stride]
     for it, md in enumerate(sched):
         R = rot(th)
         q = src @ R.T + (x, y)
@@ -81,6 +96,9 @@ def icp(src, nrm, tree, tgt, pose0, yaw_prior=None, sigma_yaw=None, iters=20):
         m = np.isfinite(d)
         if m.sum() < MIN_MATCHES:
             return Fit((x, y, th), 0.0, np.inf, it, False, int(m.sum()), 0.0)
+        if give_up > 0.0 and it == 7 and m.mean() < give_up:
+            return Fit((x, y, th), float(m.mean()), np.inf, it, False,
+                       int(m.sum()), 0.0)
         qm = q[m]
         tm = tgt[j[m]]
         nw = nrm[m] @ R.T
@@ -108,6 +126,7 @@ def icp(src, nrm, tree, tgt, pose0, yaw_prior=None, sigma_yaw=None, iters=20):
         th += dx[2]
         if it >= 7 and abs(dx[0]) + abs(dx[1]) < 1e-4 and abs(dx[2]) < 1e-4:
             break
+    src, nrm = full_src, full_nrm
     R = rot(th)
     q = src @ R.T + (x, y)
     d, j = tree.query(q, distance_upper_bound=TIGHT_M, workers=1)

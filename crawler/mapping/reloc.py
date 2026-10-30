@@ -86,21 +86,34 @@ class Field:
         X, Y = np.meshgrid(u, u, indexing="ij")
         disc = X ** 2 + Y ** 2 <= r_m ** 2 + 1e-9
         self.offsets = np.stack([X[disc], Y[disc]], 1)
+        # The offsets are whole cells of the raster, so a point's cell at
+        # every offset is its cell at none plus the offset's cells: one
+        # flat index a point and one an offset, added. The raster is padded
+        # with 2k + 1 cells of zeros all round and a point's cell clipped into
+        # the padding, so a point off the raster scores 0 at every offset
+        # without a test per pair. 2.5 ms a scan (30 headings) on the Mac,
+        # was 12.
+        ki = np.rint(X[disc] / res).astype(np.int64)
+        kj = np.rint(Y[disc] / res).astype(np.int64)
+        self._pad = pad = 2 * k + 1
+        self._w = w = n + 2 * pad
+        flat = np.zeros((w, w), np.float32)
+        flat[pad:pad + n, pad:pad + n] = self.score
+        self._flat = flat.ravel()
+        self._koff = (ki * w + kj).astype(np.int32)
+        self._lo, self._hi = k, n - 1 + 2 * pad - k     # a cell's clip
 
     def scores(self, pts, yaw):
         """Score of every candidate offset at heading `yaw` (map radians)
         for car-frame points `pts` (m, 2): (len(offsets),) float32."""
         c, s = math.cos(yaw), math.sin(yaw)
         q = pts @ np.array([[c, s], [-s, c]])          # rotated, (m, 2)
-        wx = q[None, :, 0] + (self.cx + self.offsets[:, None, 0])
-        wy = q[None, :, 1] + (self.cy + self.offsets[:, None, 1])
-        i = np.floor((wx - self.x0) / self.res).astype(np.int32)
-        j = np.floor((wy - self.y0) / self.res).astype(np.int32)
-        ok = (i >= 0) & (i < self.n) & (j >= 0) & (j < self.n)
-        i = np.where(ok, i, 0)
-        j = np.where(ok, j, 0)
-        v = np.where(ok, self.score[i, j], 0.0)
-        return v.mean(1)
+        i = np.floor((q[:, 0] + (self.cx - self.x0)) / self.res)
+        j = np.floor((q[:, 1] + (self.cy - self.y0)) / self.res)
+        i = np.clip(i + self._pad, self._lo, self._hi).astype(np.int32)
+        j = np.clip(j + self._pad, self._lo, self._hi).astype(np.int32)
+        idx = self._koff[:, None] + (i * self._w + j)[None, :]
+        return self._flat[idx].mean(1, dtype=np.float32)
 
 
 def _angle(a):

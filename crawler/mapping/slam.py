@@ -227,6 +227,24 @@ RECOVER_MIN_INLIERS = 0.75
 # to within these.
 CONFIRM_M = 0.25
 CONFIRM_DEG = 8.0
+# A relocalization's candidates (reloc.Search's best few a scan, lost or
+# on the shelf) are fitted on every CANDIDATE_STRIDE-th point of the scan,
+# their inliers and residual counted on all of it, and one with under
+# CANDIDATE_GIVE_UP of its points within matcher.TIGHT_M once the wide and
+# mid gates are done is given up there, unconverged. The ICP that picks and
+# the one that confirms are on every point, to the end. Most candidates are
+# the wrong place: over 14001 candidate fits in replays of the 10-29 drives,
+# none that ended at RECOVER_MIN_INLIERS or over had been under 0.29 there,
+# and one that ended within AMBIGUOUS of it (0.67-0.75) had; a fifth of
+# them are. A lost step was 250-385 ms on the Pi (10-29 21:39), four of
+# these and a confirm at 30-35 ms each the most of it, so about three scans
+# in four were dropped while the truck was carried. With these and the
+# faster reloc.Field.scores a lost step takes half the time (37 ms to 18 on
+# the Mac, replaying 21:39), and over the 10-29 drives replayed at eight Pi
+# speeds the truck was lost 77 s in all against 91, and ended on its first
+# map in 22 runs of 56 against 16.
+CANDIDATE_STRIDE = 2
+CANDIDATE_GIVE_UP = 0.3
 # Lost this long, in scan time, without a relocalization, and a fresh map is
 # started from the scan in hand, the old one shelved. The search covers the
 # whole circle every 3 scans, so this is the window searched 25 times over.
@@ -936,7 +954,8 @@ class Slam:
         if this scan finished a circle, else None)."""
         best = None
         for _, cand in search.step(p, yaw_now):
-            c = mt.icp(p, nrm, tree, tgt, cand, iters=25)
+            c = mt.icp(p, nrm, tree, tgt, cand, iters=25,
+                       stride=CANDIDATE_STRIDE, give_up=CANDIDATE_GIVE_UP)
             if c.converged:
                 search.add(c.inliers, c.pose)
                 if best is None or c.inliers > best.inliers:
@@ -1034,7 +1053,8 @@ class Slam:
             return False
         if sh.todo:
             c = mt.icp(p, nrm, sh.tree, sh.tgt,
-                       _apply(sh.todo.pop(0), self.pose), iters=25)
+                       _apply(sh.todo.pop(0), self.pose), iters=25,
+                       stride=CANDIDATE_STRIDE, give_up=CANDIDATE_GIVE_UP)
             if c.converged:
                 sh.search.add(c.inliers, _between(c.pose, self.pose))
             return None
