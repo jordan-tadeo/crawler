@@ -348,8 +348,9 @@ def show(files, state, pid, open_paths, what="recordings"):
     total = sum(f.size for f in files)
     print(f"  {len(files)} {what}, {mib(total)}")
     for f in files:
-        flag = "LIVE " if f.live else ("     " if f.closed else "nofoot")
-        print(f"  {flag:<6} {mib(f.size):>11}  {f.name}"
+        # unclosed = no MCAP footer: the writer died before close()
+        flag = "LIVE" if f.live else ("" if f.closed else "unclosed")
+        print(f"  {flag:<8} {mib(f.size):>11}  {f.name}"
               + (f"  ({f.live_why})" if f.live else ""))
 
 

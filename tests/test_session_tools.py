@@ -221,6 +221,24 @@ def test_a_copy_at_the_same_size_is_already_here(tmp_path):
     assert not pm.already_have(f, str(tmp_path))
 
 
+def test_the_listing_calls_a_footerless_file_unclosed(capsys):
+    """No footer means the writer never closed it, not a missing topic."""
+    live = pm.RemoteFile(f"{D}/live.mcap", 3, 0, False)
+    live.live = True
+    files = [live, pm.RemoteFile(f"{D}/cut.mcap", 3, 0, False),
+             pm.RemoteFile(f"{D}/done.mcap", 3, 0, True)]
+    pm.show(files, "active", 1, set())
+    out = capsys.readouterr().out.splitlines()
+    rows = {n: next(line for line in out if n in line)
+            for n in ("live.mcap", "cut.mcap", "done.mcap")}
+    assert rows["cut.mcap"].split()[0] == "unclosed"
+    assert rows["live.mcap"].split()[0] == "LIVE"
+    assert rows["done.mcap"].split()[0] != "unclosed"
+    assert "nofoot" not in "".join(rows.values())
+    # the size column still lines up
+    assert len({line.index("MiB") for line in rows.values()}) == 1
+
+
 
 # ---------------------------------------------------------------------------
 # --records-only
