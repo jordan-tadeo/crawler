@@ -513,6 +513,9 @@ JSON_SCHEMAS = {
         # whether it ended or refused a reverse this decision.
         "rear_clearance_mm": _NUM,
         "rear_stop": _BOOL,
+        # --lidar-near: front bumper to the nearest return in the path
+        # ahead, mm, -1 with the switch off or no fresh scan.
+        "front_lidar_clearance_mm": _NUM,
     }),
     # One revolution of the roof lidar, see crawler/hardware/lidar.py. bins
     # is lidar.BINS nearest ranges in mm from the middle of the car, bin i

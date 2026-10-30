@@ -1566,6 +1566,158 @@ CREEP_STOP_CLEAR_MM = 150.0
 CREEP_FLOOR_MM = CREEP_STOP_CLEAR_MM + LENS_TO_FRONT_BUMPER_MM
 
 
+# ---- the near field: the roof lidar where the camera cannot measure ----------
+#
+# The line above is the camera's, and the camera is what holds it there: the
+# stereo pair clamps at STEREO_NEAR_MM, 131 mm off the bumper, and nothing in
+# the pipeline moves that. Extended disparity is already on and 640x400 is
+# already the smallest mono mode (oakd.py); the one lever left, disparity
+# shift, does not work with the RGB align at all, per the DepthAI StereoDepth
+# docs, and at the shift it would take to read 110 mm it stops seeing past
+# about 0.35 m. So under the clamp the stop comes off the roof lidar's front
+# arc instead, which reads to 30 mm (lidar.MIN_RANGE_MM) and whose front
+# bumper is 263 mm out.
+#
+# Only where the lidar sees what the camera does. The lidar sweeps one plane
+# at cab height (ESTIMATED 0.30 m, mapping/scan.py) and the probes' band, this
+# close, covers about 135-195 mm off the ground, so the two see the same thing
+# only when it is a face that spans both: a wall, a box, a chair seat. A rock
+# or a shoe sits under the plane, the lidar reads past it, and that probe
+# keeps the camera's line. So per probe the camera holds (NEAR under
+# CREEP_FLOOR_MM, or latched blind out of an approach, as before), and the
+# lidar takes the probe over only if it has a return in that probe's lane no
+# further than LIDAR_AGREE_MM past where the camera puts the thing. Then the
+# lidar's own line decides it: anything in the path inside that line holds
+# the creep, whether the camera sees it or not. Off the goal3 and goal4 drives (003550Z,
+# 011928Z, 5811 NEAR readings under 300 mm with a fresh scan): the lidar has a
+# return in the lane 99% of the time, lidar less camera is median -1 mm
+# (p25 -17, p75 +36), and within 30 mm or nearer 71% of the time. The 29%
+# where it reads further are the things it cannot see, and they stay the
+# camera's.
+#
+# The line, off the front bumper: the creep's measured overrun (CREEP_OVERRUN_MM,
+# a tick of creep included), the travel a lidar return can be older than a
+# camera frame by at the creep's ESTIMATED speed, and the same margin. A
+# return is up to a revolution old when the scan closes, and the scan up to
+# LIDAR_NEAR_MAX_AGE_S old when it is read; a frame is FRAME_AGE_S old and up
+# to a decision old. (0.1 + 0.12 - 0.088 - 0.1) x 210 = 6.7 mm, so 78 + 6.7
+# + 40 = 124.7. The lidar's own +-8 mm on a contact (driver "The rear stop")
+# is inside the margin.
+#
+# Off unless --lidar-near: the line is measured on the creep's camera stops,
+# and the lidar's on the floor is mine to judge. The pan-tilt mount planned
+# for the hood must stay out of bearings -33 to +33 at the scan plane's
+# height, or it is the nearest thing ahead.
+LIDAR_NEAR_FIELD = False
+LIDAR_NEAR_MAX_AGE_S = 0.12
+LIDAR_REVOLUTION_S = 0.1
+# A decision's length, main.AUTO_TICK_INTERVAL (the driver cannot import it).
+DECISION_S = 0.1
+LIDAR_EXTRA_AGE_MM = max(0.0, ((LIDAR_REVOLUTION_S + LIDAR_NEAR_MAX_AGE_S)
+                               - (FRAME_AGE_S + DECISION_S))
+                         * ground_speed_mm_s(CREEP_SPEED))
+LIDAR_CREEP_STOP_CLEAR_MM = CREEP_OVERRUN_MM + LIDAR_EXTRA_AGE_MM + CREEP_MARGIN_MM
+# How much further than the camera the lidar may read and still be seeing the
+# same thing: the lens-to-lidar offset scatters 228-246 mm over the drives
+# (LENS_X_MM) and a probe is quantised to a disparity level; 30 mm takes in
+# 71% of the readings above. Wider lets a short thing in front of a tall one
+# hand the stop to the tall one, so it is kept tight.
+LIDAR_AGREE_MM = 30.0
+# The path ahead, half its width: the footprint the probes are sized to.
+FRONT_PATH_HALF_MM = HALF_TRACK_MM + FOOTPRINT_MARGIN_MM
+
+
+def probe_band_y(i, distance_mm, n=PROBE_COLUMNS):
+    """(y_lo, y_hi), mm, car frame (+y left), of probe i at `distance_mm` off
+    the lens. The probes tile a span sized to FRONT_PATH_HALF_MM at
+    CLEARANCE_MM (footprint_geometry), so it scales with the distance; probe 0
+    is the image's left, the car's left."""
+    half = FRONT_PATH_HALF_MM * float(distance_mm) / CLEARANCE_MM
+    width = 2.0 * half / n
+    hi = half - i * width
+    return hi - width, hi
+
+
+_BIN_BEARINGS = np.radians(_lidar.bin_bearings())
+_BIN_HALF = np.radians(_lidar.BIN_DEG / 2.0)
+
+
+def front_band_clearance_mm(bins, y_lo, y_hi) -> float:
+    """mm past the front bumper to the nearest lidar return in the lane
+    y_lo..y_hi ahead of the car, or inf. Pure.
+
+    A bin holds its nearest return somewhere on a 5 degree arc at its range
+    (0 is no return), so it counts if any of that arc crosses the lane, at
+    the nearest x the crossing part reaches: its end furthest off the axis.
+    A lane narrower than the arc, a probe's at the clamp, is still crossed.
+    Returns at or behind the bumper line are inside the car, or beside it,
+    and never ahead of it.
+    """
+    if bins is None:
+        return np.inf
+    try:
+        r = np.asarray(bins, dtype=np.float64)
+        if r.ndim != 1 or r.size != _BIN_BEARINGS.size:
+            return np.inf
+    except Exception:
+        return np.inf
+    ok = (np.isfinite(r) & (r > 0)
+          & (np.abs(_BIN_BEARINGS) < np.pi / 2 - _BIN_HALF))
+    if not ok.any():
+        return np.inf
+    r = r[ok]
+    a0 = _BIN_BEARINGS[ok] - _BIN_HALF
+    a1 = _BIN_BEARINGS[ok] + _BIN_HALF
+    # Ahead of the car y = r sin(a) climbs with a: the lane is an angle range.
+    lo = np.maximum(a0, np.arcsin(np.clip(y_lo / r, -1.0, 1.0)))
+    hi = np.minimum(a1, np.arcsin(np.clip(y_hi / r, -1.0, 1.0)))
+    cross = lo <= hi
+    if not cross.any():
+        return np.inf
+    off_axis = np.maximum(np.abs(lo[cross]), np.abs(hi[cross]))
+    x = r[cross] * np.cos(off_axis)
+    x = x[x > _lidar.FRONT_BUMPER_X_MM]
+    return float(x.min() - _lidar.FRONT_BUMPER_X_MM) if x.size else np.inf
+
+
+def creep_near_field_vetoes(latch, scan, bins, floor_mm=None) -> bool:
+    """Hold the creep, with the lidar's front arc in `bins`? Pure.
+
+    The camera's veto (forward_floor_vetoes at the creep's line) per probe,
+    except that a probe the lidar agrees with is decided on the lidar's line
+    (LIDAR_CREEP_STOP_CLEAR_MM). Anything in the path inside that line holds
+    too, camera or not. No bins is the camera's veto exactly.
+    """
+    if floor_mm is None:
+        floor_mm = CREEP_FLOOR_MM
+    if bins is None:
+        return forward_floor_vetoes(latch, scan, floor_mm=floor_mm)
+    if scan is None:
+        return True
+    if front_band_clearance_mm(bins, -FRONT_PATH_HALF_MM,
+                               FRONT_PATH_HALF_MM) < LIDAR_CREEP_STOP_CLEAR_MM:
+        return True
+    n = len(scan.reason)
+    latched = latch.latched if len(latch.latched) == n else (False,) * n
+    for i in range(n):
+        near = scan.reason[i] == NEAR and float(scan.distance_mm[i]) < floor_mm
+        if not (near or latched[i]):
+            continue
+        # Where the camera puts it. At the clamp or blind it is somewhere
+        # nearer than the clamp, so the clamp is the furthest it can be.
+        if scan.reason[i] == NEAR:
+            z = max(float(scan.distance_mm[i]), STEREO_NEAR_MM)
+        else:
+            z = STEREO_NEAR_MM
+        camera = z - LENS_TO_FRONT_BUMPER_MM
+        lidar = front_band_clearance_mm(bins, *probe_band_y(i, z, n))
+        if lidar > camera + LIDAR_AGREE_MM:
+            return True        # not what the lidar sees: the camera's line
+    # Every probe's lane is inside the path, so the path's check above is
+    # already the lidar's line for each one that agrees.
+    return False
+
+
 class FloorLatch(NamedTuple):
     """What the forward veto remembers. Immutable; the functions below make
     the next one.
@@ -1763,6 +1915,12 @@ class ForwardFloorVeto:
         speed = self.forward_speed if forward_speed is None else forward_speed
         return forward_floor_vetoes(self.latch, self.scan, speed, floor_mm)
 
+    def creep_vetoes(self, bins=None) -> bool:
+        """Hold the creep: at CREEP_FLOOR_MM on the camera, or with a fresh
+        lidar front arc in `bins`, on the near field
+        (creep_near_field_vetoes). None is the camera alone."""
+        return creep_near_field_vetoes(self.latch, self.scan, bins)
+
 
 class Driver:
     def __init__(self, controller, oakd, lidar=None):
@@ -1777,6 +1935,10 @@ class Driver:
         # refused a reverse on it. Read-only bookkeeping for /footprint.
         self.rear_clearance = None
         self.rear_stop = False
+        # --lidar-near: the creep's near field (see "the near field"). The
+        # last front-arc clearance it read, for /footprint, None for none.
+        self.lidar_near = LIDAR_NEAR_FIELD
+        self.front_lidar_clearance = None
 
         self.last_recovery_time = 0.0
         self.recovery_cooldown = 5.0  # seconds before the stuck check re-arms
@@ -2163,12 +2325,31 @@ class Driver:
         self.rear_clearance = clearance
         return clearance
 
+    def front_lidar_bins(self):
+        """The lidar's bins for the creep's near field, or None: the switch
+        off, no lidar, or no scan within LIDAR_NEAR_MAX_AGE_S. Never raises,
+        never waits. Remembers the path's clearance for /footprint."""
+        bins = None
+        if self.lidar_near and self.lidar is not None:
+            try:
+                scan = self.lidar.latest(max_age=LIDAR_NEAR_MAX_AGE_S)
+                bins = getattr(scan, "bins", None) if scan is not None else None
+            except Exception:
+                bins = None
+        c = (front_band_clearance_mm(bins, -FRONT_PATH_HALF_MM, FRONT_PATH_HALF_MM)
+             if bins is not None else None)
+        self.front_lidar_clearance = c if c is not None and math.isfinite(c) else None
+        return bins
+
     def rear_fields(self):
-        """What /footprint records about the rear stop on this decision."""
+        """What /footprint records about the rear stop on this decision, and
+        the front arc's clearance when the near field read one."""
         c = self.rear_clearance
+        f = self.front_lidar_clearance
         return {
             "rear_clearance_mm": float(c) if c is not None else -1.0,
             "rear_stop": bool(self.rear_stop),
+            "front_lidar_clearance_mm": float(f) if f is not None else -1.0,
         }
 
     def _backout_drive(self):

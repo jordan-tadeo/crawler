@@ -2214,9 +2214,12 @@ class PolicyDriver(dv.Driver):
                   else "model rear masked" if rear_masked else "model")
         held = action == FORWARD and self.floor_veto.vetoes()
         if (held and not self.hand_rules
-                and not self.floor_veto.vetoes(floor_mm=dv.CREEP_FLOOR_MM)):
+                and not self.floor_veto.creep_vetoes(self.front_lidar_bins())):
             # Held at the cap, clear at the creep: the creep (see
-            # CREEP_THROTTLE), never faster than the model asked.
+            # CREEP_THROTTLE), never faster than the model asked. With
+            # --lidar-near, under the stereo clamp the creep's line is the
+            # lidar's where it sees what the camera does (driver.py, "the
+            # near field"); only ever a later cut of the model's throttle.
             throttle = min(slowed_throttle(self.forward_speed * magnitude, scale,
                                            MOVING_FLOOR_FORWARD), CREEP_THROTTLE)
             reason = CREEP_REASON

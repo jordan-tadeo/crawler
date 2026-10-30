@@ -804,8 +804,13 @@ class AutoPilot:
 
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
                  slam=None, nav=False, map_source=None, goals=None,
-                 fallback_path=None, clicks=None, patrol_store=None):
+                 fallback_path=None, clicks=None, patrol_store=None,
+                 lidar_near=False):
         self.vecon = vecon
+        # --lidar-near: the creep's stop under the stereo clamp comes off the
+        # lidar's front arc (driver.py, "the near field"). Set on every
+        # driver this builds.
+        self.lidar_near = bool(lidar_near)
         self.logger = logger
         self.driver = None
         self.unavailable = False
@@ -1009,8 +1014,14 @@ class AutoPilot:
                             f"{model.label} takes no goal: a click is shown and "
                             "the arrival hold still stops the car there, but the "
                             "model drives as it always has")
-        return policy.PolicyDriver(self.command, view, model, goal=self.goal,
-                                   lidar=self.lidar, slam=self.slam, fallback=fallback)
+        d = policy.PolicyDriver(self.command, view, model, goal=self.goal,
+                                lidar=self.lidar, slam=self.slam, fallback=fallback)
+        # Only the policy creeps, so only it reads the near field.
+        d.lidar_near = self.lidar_near and self.lidar is not None
+        if d.lidar_near:
+            self.logger.log("info", "Mode", "The creep stops on the lidar under "
+                            "the camera's near clamp, where the two agree")
+        return d
 
     def step(self, now, takeover=None, split=False):
         """One pass of auto mode. False means hand the wheels back to manual.
@@ -1843,6 +1854,16 @@ def parse_args(argv=None):
              "port or 'auto' (the default when the flag is bare). Off unless "
              "given",
     )
+    # Off unless named. Needs --lidar and a map policy: under the stereo pair's
+    # near clamp, the creep's stop comes off the lidar's front arc where the
+    # lidar sees what the camera does (driver.py, "the near field").
+    parser.add_argument(
+        "--lidar-near",
+        action="store_true",
+        help="let the policy's creep stop on the lidar (124.7 mm off the "
+             "bumper) instead of the camera's clamp (150), where the two "
+             "agree; needs --lidar. Off unless given",
+    )
     # Off unless named, and mapping only: nothing reads the pose to drive
     # yet. Builds the room's map from the lidar as the truck goes, on a
     # worker of its own, and shows it in Foxglove (/map, /slam/path,
@@ -2134,7 +2155,8 @@ def main(argv=None):
                           goals=goals if args.nav else None,
                           clicks=goals if args.goal else None,
                           patrol_store=(patrol.Store(lg.log_path(PATROL_FILE))
-                                        if args.goal else None))
+                                        if args.goal else None),
+                          lidar_near=args.lidar_near)
 
     # Who gets the device opened at startup, and who waits for it:
     #

@@ -119,6 +119,8 @@ AUTOPILOT_FIELDS = {
     # The rear stop off the roof lidar (driver.py, "The rear stop").
     "rear_clearance_mm": -1.0,   # rear bumper to the nearest return behind; -1 none / no fresh scan
     "rear_stop": False,          # the rear stop ended or refused a reverse this decision
+    # --lidar-near (driver.py, "the near field"): the front arc's path clearance.
+    "front_lidar_clearance_mm": -1.0,  # front bumper to the nearest return in the path; -1 off / none
 }
 
 
