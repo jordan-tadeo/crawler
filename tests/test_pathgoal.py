@@ -247,6 +247,26 @@ def test_the_point_is_the_farthest_one_in_sight_so_a_corner_is_not_cut():
     assert len(within) and all(not sees(p._plan.cm, (0.0, 1.2), q) for q in within)
 
 
+def test_in_a_gap_one_cell_wide_at_the_wide_clearance_the_point_is_not_on_top_of_the_truck():
+    # A corridor whose middle row of cells is the only one the wide
+    # clearance keeps, the truck one cell off it (2026-10-30 p1200: fed a
+    # point 0.26 to 0.54 m off for 40 s, 10 m of path to go).
+    view = world([(1.0, -3.0, 5.0, -0.2), (1.0, 0.3, 5.0, 3.0)])
+    p, _ = planner(view)
+    crop = crop_at(1.5, -0.05, 0.0)
+    p.encode(crop, Source((4.5, 0.05, 0)))
+    cm = p._plan.cm
+    assert p.fed == "subgoal"
+    assert cm.inscribed == pytest.approx(tk.HALF_WIDTH_M + pgo.WIDE_MARGIN_M)
+    ax, ay = p.aim
+    assert math.hypot(ax - 1.5, ay + 0.05) >= pgo.LOS_NEAR_SHARE * pgo.LOOKAHEAD_M
+    assert sees(cm, (1.5, -0.05), (ax, ay), pgo.LOS_CLEAR_M), "at the truck's own fit"
+    # In the open the plan's own clearance still decides.
+    p, _ = planner(world([WALL]))
+    p.encode(crop_at(0.0, 0.0, 0.0), Source((4.0, 0.0, 0)))
+    assert sees(p._plan.cm, (0.0, 0.0), p.aim)
+
+
 def test_in_a_clear_line_and_close_the_model_is_fed_the_goal_itself_exactly():
     p, _ = planner(world([WALL]))
     src = Source((1.0, 0.5, 0))

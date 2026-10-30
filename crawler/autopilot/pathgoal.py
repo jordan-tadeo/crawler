@@ -77,7 +77,11 @@ Each decision, off the newest plan and the crop the model is fed:
   the path point nearest the truck, then the farthest point at most
   LOOKAHEAD_M on along the path that the truck can see in a straight line
   (no wall within the plan's own clearance of the line, wide or narrow).
-  LOOKAHEAD_M 1.5 m is inside
+  Seen less than LOS_NEAR_SHARE of the lookahead on at the wide, as far
+  as it sees at the truck's own fit (LOS_CLEAR_M) instead, if farther: a
+  gap one cell wide at the wide clearance, the truck a cell off its
+  middle, is otherwise a point a few tenths of a metre off for as long as
+  the truck stays there. LOOKAHEAD_M 1.5 m is inside
   what the goal head was trained on: hindsight goals 3 to 15 s ahead, on
   the ticks the truck was moving in, are 0.9 m at the 25th percentile and
   1.9 m at the median (maps-pose, all drives to 2026-10-29).
@@ -165,6 +169,12 @@ NARROW_MARGIN_M = cmap.MARGIN_M
 # the truck drives the chord, not the path. The plan's own clearance (its
 # cost map's inscribed), this when there is none to hand.
 LOS_CLEAR_M = cmap.INSCRIBED_M
+# A point in sight at the plan's clearance nearer than this share of the
+# lookahead along the path is looked past at the truck's own fit
+# (LOS_CLEAR_M): in a gap only one cell wide at the wide clearance, the
+# truck a cell off its middle saw 0.26 to 0.54 m of a 10 m path, and was
+# fed that for 40 s (2026-10-30 p1200).
+LOS_NEAR_SHARE = 0.5
 LOS_STEP_M = 0.05
 # The first of the line this close to the truck is where it already is.
 LOS_SKIP_M = 0.2
@@ -379,12 +389,28 @@ def subgoal(plan, pose, lookahead_m=LOOKAHEAD_M, j=0):
     # lookahead, if that is less): a path that comes back the way it went
     # is not fed as a point on top of the truck.
     floor = min(math.hypot(pts[hi][0] - p[0], pts[hi][1] - p[1]), 0.5 * lookahead_m)
-    for k in range(last, k0, -1):
-        if k > hi and math.hypot(pts[k][0] - p[0], pts[k][1] - p[1]) < floor:
-            continue
-        if line_clear(plan.cm, p, pts[k]):
-            return float(pts[k][0]), float(pts[k][1]), kind(k)
-    k = min(k0 + 1, end)
+
+    def farthest(clear_m):
+        for k in range(last, k0, -1):
+            if k > hi and math.hypot(pts[k][0] - p[0], pts[k][1] - p[1]) < floor:
+                continue
+            if line_clear(plan.cm, p, pts[k], clear_m):
+                return k
+        return None
+
+    k = farthest(None)
+    # Seen no farther than a short way on at the plan's clearance: as far
+    # as the truck's own fit sees, if that is farther. The plan's narrow
+    # clearance is the truck's own fit already.
+    near = cum[k0] + LOS_NEAR_SHARE * lookahead_m
+    wide = float(getattr(plan.cm, "inscribed", LOS_CLEAR_M))
+    fit = min(wide, LOS_CLEAR_M)
+    if fit < wide and (k is None or cum[k] < near):
+        k2 = farthest(fit)
+        if k2 is not None and (k is None or k2 > k):
+            k = k2
+    if k is None:
+        k = min(k0 + 1, end)
     return float(pts[k][0]), float(pts[k][1]), kind(k)
 
 
