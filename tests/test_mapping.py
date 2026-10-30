@@ -559,10 +559,12 @@ class PiClock:
 
     def __init__(self, monkeypatch):
         self.now = 0.0
+        self.icps = 0
         icp, scores = sl.mt.icp, sl.rl.Field.scores
 
         def slow_icp(*a, **k):
             self.now += self.ICP_S
+            self.icps += 1
             return icp(*a, **k)
 
         def slow_scores(field, *a, **k):
@@ -655,6 +657,86 @@ def test_the_shelf_is_still_found_a_slice_a_step(monkeypatch):
     assert slam.merges == 1 and slam.grid is old and slam._shelf is None
     e_xy, e_yaw = err_vs_truth(out[-1]._replace(t=6.0))
     assert e_xy < 0.05 and e_yaw < math.radians(2), "back in the old frame"
+
+
+# The synthetic room with its right and top walls half a metre further out
+# and the box moved across: from where the truck stands in it, the old map
+# fits about half the scan, a good fit (GOOD_INLIERS) too poor to write
+# (WRITE_MIN_INLIERS), the same at every seed the retries start from. On the
+# car (p1201, 2026-10-29) the truck was carried back to the start, the pose
+# stayed behind at a spot that fitted 0.45, and it sat there tracking for
+# the five minutes the recording went on, nothing written.
+MOVED = [((-3.0, -2.0), (4.0, -2.0)), ((4.6, -2.0), (4.6, 3.0)),
+         ((4.0, 3.6), (-3.0, 3.6)), ((-3.0, 3.0), (-3.0, -2.0)),
+         ((-1.0, 1.0), (-0.4, 1.0)), ((-0.4, 1.0), (-0.4, 1.4)),
+         ((-0.4, 1.4), (-1.0, 1.4)), ((-1.0, 1.4), (-1.0, 1.0)),
+         ((-1.5, -0.8), (-1.5, 0.4)), ((2.5, -2.0), (2.5, -1.2))]
+
+
+def stand_in(slam, imu, pose, segs, scans, t0, up=LEVEL):
+    """`scans` revolutions standing still at `pose` in the room `segs`."""
+    out = []
+    for k in range(scans):
+        t = t0 + (k + 1) * PERIOD
+        for j in range(10):
+            imu.add(t - PERIOD + (j + 1) * 0.01, (0.0, 0.0, 0.0), up)
+        out.append(slam.step(t, scan_at(t, lambda tt: pose, segs)))
+    return out
+
+
+def test_a_poor_fit_is_retried_inside_a_revolution(monkeypatch):
+    # p1201: every scan of the half fit was retried from all eleven seeds,
+    # about 400 ms on the Pi, so three scans in four were dropped and the
+    # truck being carried was not followed.
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    clock = slam._clock = PiClock(monkeypatch)
+    seeds = len(sl.RESEED_DEG) + len(sl.RESEED_SHIFT_M)
+    out, after = [], set()
+    for k in range(seeds):
+        out += stand_in(slam, imu, path_pose(6.0), MOVED, 1, 6.0 + k * PERIOD)
+        after.add(slam._seed_next)
+    assert all(r.matched and r.why == "few inliers" for r in out), \
+        [(r.state, r.why, round(r.inliers, 2)) for r in out]
+    assert max(r.ms for r in out) <= 1000.0 * PERIOD, \
+        "a step longer than a revolution"
+    # Each scan's own fit and at least one seed, and over as many scans as
+    # there are seeds every one of them is tried: the retries go on round
+    # the list from where the last scan stopped, never only the first.
+    assert clock.icps >= 2 * seeds, clock.icps
+    assert after == set(range(seeds)), sorted(after)
+
+
+def test_a_fit_too_poor_to_write_for_long_is_lost_and_searched_for():
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    old = slam.grid
+    n = int((sl.POOR_LOST_S + sl.RESEED_LOST_S) / PERIOD) + 20
+    out = stand_in(slam, imu, path_pose(6.0), MOVED, n, 6.0)
+    lost = next(k for k, r in enumerate(out) if r.state == sl.LOST)
+    assert lost * PERIOD <= sl.POOR_LOST_S + 2 * PERIOD, lost
+    assert not any(r.written for r in out[:lost])
+    # The relocalization cannot do better than half here either, so after
+    # RESEED_LOST_S a fresh map, the old one on the shelf, and it is written.
+    assert [r.reseed for r in out if r.reseed] == ["lost"]
+    assert slam._shelf is not None and slam._shelf.grid is old
+    k = next(k for k, r in enumerate(out) if r.reseed)
+    assert sum(r.written for r in out[k:]) > 0.9 * len(out[k:])
+
+
+def test_a_poor_fit_while_tilted_is_not_counted_towards_lost():
+    # Up a rock the plane sees the floor and the fit is poor for as long as
+    # the climb takes: tilted, not lost (the map must never be lost to a
+    # tilt), however long that is.
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    n = int(2 * sl.POOR_LOST_S / PERIOD)
+    out = stand_in(slam, imu, path_pose(6.0), MOVED, n, 6.0,
+                   up=tilted_up(sl.WRITE_MAX_PITCH_DEG + 2.0))
+    assert all(r.state == sl.TILTED for r in out)
 
 
 def test_a_map_that_does_not_fit_its_next_scan_is_started_again():
@@ -777,6 +859,53 @@ def test_the_runner_maps_the_room_on_its_worker(monkeypatch, mode):
     finally:
         r.close()
     assert not r.stats()["alive"]
+
+
+def map_times(n_scans, monkeypatch, cells=None):
+    """The worker over n_scans of the room a revolution apart: the scan
+    times of the /map pictures it hands out, every picture `cells` big if
+    given."""
+    if cells is not None:
+        real = rn.map_view
+
+        def big(slam, t, **kw):
+            v = real(slam, t, **kw)
+            return None if v is None else v._replace(
+                codes=np.full((cells, 1), gr.OCCUPIED, np.uint8))
+        monkeypatch.setattr(rn, "map_view", big)
+    inbox, outbox = queue.Queue(), queue.Queue()
+    for k in range(n_scans):
+        t = (k + 1) * PERIOD
+        inbox.put((t, None, scan_at(t), [], None))
+    inbox.put(None)
+    rn._work(inbox, outbox, None, rn.MAP_EVERY_S)
+    out = []
+    while not outbox.empty():
+        item = outbox.get()
+        if item[0] == "map":
+            out.append(item[1].t)
+    return out
+
+
+def test_the_map_picture_comes_twice_a_second(monkeypatch):
+    # 10-29 p1201: once a second, and the telemetry's own one second gate
+    # on top ate one in fifteen to the scan clock's jitter, two seconds
+    # between pictures while the scan in the next panel went at ten.
+    times = map_times(41, monkeypatch)
+    gaps = np.diff(times)
+    assert len(times) >= 8, times
+    assert gaps.max() <= rn.MAP_EVERY_S + PERIOD + 1e-6, gaps
+    from crawler.telemetry import telemetry as tm
+    assert tm.INTERVALS["map"] <= rn.MAP_EVERY_S - 2 * PERIOD, \
+        "the live gate can eat a picture the runner made"
+
+
+def test_a_map_picture_too_big_for_twice_a_second_comes_slower(monkeypatch):
+    from crawler.telemetry import map_view as mv
+    times = map_times(41, monkeypatch, cells=mv.MAX_CELLS)
+    gaps = np.diff(times)
+    assert gaps.min() >= 4 * mv.MAX_CELLS / rn.MAP_BYTES_S - 1e-6, gaps
+    assert gaps.max() <= 4 * mv.MAX_CELLS / rn.MAP_BYTES_S + PERIOD + 1e-6
 
 
 @pytest.mark.parametrize("nav_half_m", [None, rn.NAV_HALF_M])

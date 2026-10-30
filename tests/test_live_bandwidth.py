@@ -147,7 +147,12 @@ def test_the_maps_together_fit_the_wifi_budget_at_their_worst():
         "slam_path": mv.path_scene([(0.1 * i, 0.0) for i in range(rn.PATH_MAX + 1)],
                                    10**18),
     }
-    rate = {key: len(msg.encode()) / tm.INTERVALS[key]
+    # /map's pictures are spaced by the runner, by their size
+    # (runner.map_interval); the live gate under it only stops a burst.
+    every = dict(tm.INTERVALS)
+    every["map"] = max(every["map"], rn.map_interval(
+        explored_map(int(2 * rn.MAP_VIEW_HALF_M / 0.1)).codes))
+    rate = {key: len(msg.encode()) / every[key]
             for key, msg in worst.items()}
     assert sum(rate.values()) <= tm.MAP_CHANNELS_BUDGET, {
         k: round(v / 1024) for k, v in rate.items()}

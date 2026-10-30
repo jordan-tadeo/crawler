@@ -13,7 +13,10 @@ the scan it is given. The order on every revolution:
      LOCAL_R_M, with the IMU heading as a soft prior. A fit under
      RESEED_BELOW (70%) inliers is tried again from the last pose at heading
      offsets out to +-35 degrees and from the prediction moved 25 cm each way,
-     and the best one kept.
+     and the best one kept. The retries stop once the step has taken
+     RETRY_STEP_S, and the next poor scan carries on from the seed after the
+     last one tried, so a slow Pi still gets through all of them over a few
+     revolutions instead of falling behind the lidar.
      A fit whose heading is more than BAND_YAW_DEG off the IMU's, or whose
      position is more than BAND_M off the prediction, is not believed: the
      prediction is kept and the scan counts as a failed fit. Along a
@@ -38,8 +41,9 @@ The states (Result.state):
   tilted     past the pitch or roll gate: matched, not written
   rolled     past ROLL_DEG, upside down or on its side or in a hand: the pose
              is frozen and nothing is matched or written
-  lost       MAX_FAILS fits in a row failed, or it just came back from
-             rolled. The pose is in doubt; the map is not. Nothing is
+  lost       MAX_FAILS fits in a row failed, or it fitted too poorly to
+             write (under WRITE_MIN_INLIERS) for POOR_LOST_S of level
+             driving, or it just came back from rolled. The pose is in doubt; the map is not. Nothing is
              written, and every scan relocalizes against the map
              (_relocalize): a correlative search (reloc.py) over x, y and
              heading within reloc.SEARCH_R_M of the frozen pose, the
@@ -154,6 +158,14 @@ RESEED_SHIFT_M = ((0.25, 0.0), (-0.25, 0.0), (0.0, 0.25), (0.0, -0.25))
 # settle half a wall off, at 0.52, and the whole of the rest of the drive
 # carried the 27 cm.
 RESEED_BELOW = 0.7
+# The retries stop once the step is this long on Slam's clock, after one
+# seed at least, and the next poor scan goes on round the seeds from the one
+# after the last it tried. All eleven every scan was about 400 ms on the Pi
+# (p1201, 2026-10-29, a seed's ICP 30-35 ms there): the truck was being
+# carried, three scans in four were dropped behind the retries, and the pose
+# was left behind on a spot that fitted half. On the Mac all eleven take
+# under 40 ms, so a replay there tries them all as before.
+RETRY_STEP_S = 0.06
 
 # The write gates. Pitch and roll separately (imu.ImuTrack.pitch_roll):
 # pitch tips the plane into the floor ahead and behind, roll into it to the
@@ -191,6 +203,17 @@ TREE_WRITES = 5
 ROLL_DEG = 60.0
 # This many failed fits in a row and the pose is not believed any more.
 MAX_FAILS = 10
+# Nor is it after this many seconds of level scans whose fits are good
+# (GOOD_INLIERS) but too poor to write (WRITE_MIN_INLIERS), with no fit good
+# enough to write between them; tilted scans pause the count, so a climb is
+# never lost to it. Such a fit is the pose on the wrong spot of the map,
+# and lost is what searches the map for the right one: p1201 (2026-10-29)
+# fitted 0.45 for the last five minutes of the recording, wrote nothing, and
+# was never lost; 201721 fitted 0.4-0.6 for 25 s before it failed outright,
+# and the search found it at 0.94 eight seconds later. Over the replays of
+# five 10-29 drives the longest run of them anywhere else was 3.2 s, the
+# next 2.7.
+POOR_LOST_S = 3.0
 # Lost: how good a relocalized fit must be to end it.
 RECOVER_MIN_INLIERS = 0.75
 # A confirmed fit is one ICP from the candidate on the next scan agrees with
@@ -405,6 +428,10 @@ class Slam:
         self.scans = 0
         self.writes = 0
         self.retries = 0
+        # The seed the next poor fit's retries start from (_match), and the
+        # seconds of level poor fits in a row (_poor_too_long).
+        self._seed_next = 0
+        self._poor_s = 0.0
         self.recoveries = 0
         self.last_points = None
         # Dead reckoning since the last good fit, on the current map: the
@@ -497,6 +524,7 @@ class Slam:
 
         fit = None
         recovered = False
+        poor_out = False
         if not self.started:
             newpose, good = pose.copy(), True
             self.started = True
@@ -517,7 +545,7 @@ class Slam:
                   and t - self._lost_since >= RESEED_LOST_S - 1e-9):
                 self._reseed = "lost"
         else:
-            fit = self._match(p, nrm, pred, imu_rate is not None, dt)
+            fit = self._match(p, nrm, pred, imu_rate is not None, dt, t0)
             good = fit.converged and fit.inliers >= GOOD_INLIERS
             newpose = np.array(fit.pose)
             if not good and fit.inliers < TRUST_INLIERS:
@@ -534,6 +562,9 @@ class Slam:
                 self.banded += 1
             if not good and self._map_writes < SEED_WRITES:
                 self._reseed = "young"
+            elif good and self._poor_too_long(fit, dt):
+                good = False
+                poor_out = True
 
         trusted = (good and not self._reseed
                    and (recovered or last_t is None
@@ -554,9 +585,10 @@ class Slam:
         if self._tree is not None and not good and not self.lost:
             self.fails += 1
             self.vel *= 0.5
-            if self.fails >= MAX_FAILS:
+            if self.fails >= MAX_FAILS or poor_out:
                 self.lost = True
                 self._lost_since = t
+                self._poor_s = 0.0
                 # The failing scans went on the IMU's heading (pred), so it
                 # is still the gyro's from here.
                 self._lost_yaw = (float(newpose[2]) if imu_rate is not None
@@ -616,21 +648,45 @@ class Slam:
 
     # ---- the parts -------------------------------------------------------
 
-    def _match(self, p, nrm, pred, have_prior, dt):
+    def _match(self, p, nrm, pred, have_prior, dt, t0=None):
+        """ICP from the prediction, and from the seeds if that fits under
+        RESEED_BELOW: as many as fit in the step's RETRY_STEP_S (begun at
+        t0, Slam's clock), one at least, going on round them from where the
+        last poor scan stopped."""
         sig = math.radians(SIGMA_YAW_DEG) * max(dt / 0.1, 1.0)
         yp = pred[2] if have_prior else None
         fit = mt.icp(p, nrm, self._tree, self._tgt, pred, yp, sig)
         if fit.converged and fit.inliers >= RESEED_BELOW:
+            self._seed_next = 0
             return fit
         self.retries += 1
         best = fit
-        for seed in self._seeds(pred):
+        seeds = list(self._seeds(pred))
+        start = self._seed_next % len(seeds)
+        for k in range(len(seeds)):
+            if (k and t0 is not None
+                    and self._clock() - t0 >= RETRY_STEP_S):
+                break
+            seed = seeds[(start + k) % len(seeds)]
+            self._seed_next = (start + k + 1) % len(seeds)
             c = mt.icp(p, nrm, self._tree, self._tgt, seed, iters=25)
             if c.converged and c.inliers > best.inliers + 0.05:
                 best = c
             if best.converged and best.inliers >= RESEED_BELOW:
+                self._seed_next = 0
                 break
         return best
+
+    def _poor_too_long(self, fit, dt):
+        """Whether a good fit ends POOR_LOST_S of level scans fitted too
+        poorly to write, with none good enough to write between them."""
+        if fit.inliers >= WRITE_MIN_INLIERS:
+            self._poor_s = 0.0
+            return False
+        pitch, roll = self._att
+        if not (pitch > self.write_max_pitch or roll > self.write_max_roll):
+            self._poor_s += min(max(dt, 0.0), BAND_MAX_GAP_S)
+        return self._poor_s >= POOR_LOST_S - 1e-9
 
     def _seeds(self, pred):
         """Where to start again from when a fit is poor: the last pose at
@@ -670,6 +726,7 @@ class Slam:
         self._search = None
         self._pending = None
         self.fails = 0
+        self._poor_s = 0.0
         self.vel[:] = 0.0
         self._map_writes = 0
         self.reseeds += 1

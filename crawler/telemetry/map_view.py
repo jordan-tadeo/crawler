@@ -1,6 +1,7 @@
 """The SLAM map as Foxglove's 3D panel wants it, with --slam.
 
-  /map           foxglove.Grid in the map frame, once a second: the map
+  /map           foxglove.Grid in the map frame, twice a second (once
+                 when it is as big as it gets, runner.map_interval): the map
                  round the truck, 10 cm pixels, RGBA (unknown clear, free
                  dark grey, occupied white), cropped to what has been seen
                  and coarsened past MAX_CELLS so it cannot outgrow the wifi

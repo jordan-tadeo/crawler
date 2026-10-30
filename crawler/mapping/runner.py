@@ -18,7 +18,7 @@ the default is a measurement, see tools/slam_bench.py --jitter.
 What comes back (the outbox) is read by a pump thread here, which keeps the
 newest Result, the newest MapView and the path, and offers the Foxglove
 messages: /slam/status every scan, /tf (map -> base_link) every scan, /map
-and /slam/path at their INTERVALS. The pump never blocks anything either:
+when _work makes one (map_interval) and /slam/path at its INTERVALS. The pump never blocks anything either:
 telemetry's offer() is drop-oldest.
 
 Nothing here commands the truck. latest(), pose() and map() are the reads a
@@ -47,11 +47,17 @@ OUTBOX = 64
 # IMU samples held between scans: 88 a second live, so two seconds' worth.
 IMU_KEEP = 200
 
-# The /map picture: once a second, 10 cm pixels (two cells), at most
-# MAP_VIEW_HALF_M either side of the truck. 400 x 400 RGBA would be 640 KB,
-# and the live view is not compressed, so telemetry/map_view.py crops it to
-# what has been seen and coarsens it past map_view.MAX_CELLS on the way out.
-MAP_EVERY_S = 1.0
+# The /map picture: 10 cm pixels (two cells), at most MAP_VIEW_HALF_M either
+# side of the truck. 400 x 400 RGBA would be 640 KB, and the live view is
+# not compressed, so telemetry/map_view.py crops it to what has been seen
+# and coarsens it past map_view.MAX_CELLS on the way out. Twice a second,
+# or as much slower as keeps it under MAP_BYTES_S (map_interval): the
+# biggest picture there can be, MAX_CELLS of RGBA, once a second as it
+# always was, so the worst it costs the wifi is what it was. A house so far
+# is 150 x 65 pixels, 40 KB, and at once a second the map stepped a second
+# at a time beside a scan going at ten (p1201, 2026-10-29).
+MAP_EVERY_S = 0.5
+MAP_BYTES_S = 160_000
 MAP_STEP = 2
 MAP_VIEW_HALF_M = 20.0
 
@@ -162,6 +168,15 @@ def map_view(slam, t, step=MAP_STEP, half_m=MAP_VIEW_HALF_M):
                    y0=float(y0), res=g.res * step, codes=codes)
 
 
+def map_interval(codes, every_s=MAP_EVERY_S, bytes_s=MAP_BYTES_S):
+    """Seconds until the next /map picture after one of `codes` (a
+    MapView's): every_s, or longer for a picture whose message would put
+    /map over bytes_s. The message is at most map_view.MAX_CELLS of RGBA."""
+    from crawler.telemetry import map_view as mv
+    cells = min(int(np.asarray(codes).size), mv.MAX_CELLS)
+    return max(every_s, 4.0 * cells / bytes_s)
+
+
 def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
           nav_every_s=NAV_EVERY_S):
     """The worker, thread or process: scans in, Results and MapViews out.
@@ -228,6 +243,7 @@ def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
             next_map = host_t + map_every_s
             view = map_view(slam, t)
             if view is not None:
+                next_map = host_t + map_interval(view.codes, map_every_s)
                 try:
                     outbox.put_nowait(("map", view))
                 except queue.Full:
@@ -439,7 +455,7 @@ class SlamRunner:
         return self._crop
 
     def map(self) -> Optional[MapView]:
-        """The newest MapView, at most MAP_EVERY_S old, or None."""
+        """The newest MapView, at most map_interval() old, or None."""
         return self._map
 
     def nav_map(self) -> Optional[MapView]:

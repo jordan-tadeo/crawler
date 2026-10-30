@@ -128,10 +128,13 @@ INTERVALS = {
     "tf": 0.0,
     "lidar_truck": 1.0,
     # With --slam. The status and the map -> base_link half of /tf come once
-    # per matched scan; the map picture once a second (the runner only makes
-    # one that often anyway) and the path every two.
+    # per matched scan; the path every two seconds. The map picture is
+    # spaced by the runner (runner.map_interval: twice a second, slower when
+    # it is big), so this only stops a burst. At 1.0, the runner's own rate
+    # then, it ate one picture in fifteen to the scan clock's jitter and the
+    # map stood still two seconds (p1201, 2026-10-29).
     "slam_status": 0.0,
-    "map": 1.0,
+    "map": 0.25,
     "slam_path": 2.0,
     # With --voxel-map, every two seconds each. The mapper offers once a
     # second, but these are the two biggest messages there are and they
