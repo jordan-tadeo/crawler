@@ -107,6 +107,13 @@ AUTOPILOT_FIELDS = {
     "policy_map_present": False,
     # A map model had handed the wheels to its map-free fallback (the map lost).
     "policy_fallback": False,
+    # The tilt veto (driver.TiltVeto): the direction it blocked ("" none),
+    # the tilt and side gap it read (-1 none), and whether the model's answer
+    # was the blocked direction and its next best drove instead.
+    "tilt_veto": "",
+    "tilt_veto_deg": -1.0,
+    "tilt_veto_gap_mm": -1.0,
+    "policy_tilt_masked": False,
     # A goal model was fed a goal this decision, and what it was the encoding
     # of: "goal" the goal itself, "subgoal" a point along the path to it
     # (pathgoal.py), "none".

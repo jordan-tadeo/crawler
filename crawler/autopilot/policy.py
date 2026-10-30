@@ -507,6 +507,10 @@ FLOOR_REASON = "model floor"
 # model's ever is). Said like a floor hold, once it has held a second, so a
 # car the model parks says that in the journal too.
 MODEL_STOP_REASON = "model stop"
+# The tilt veto (driver.TiltVeto) left the model nothing it would rather do
+# than stop. Said like a floor hold, once it has held a second; the veto's
+# own engage line is the one that says it started.
+TILT_REASON = "tilt veto"
 
 
 class StopLog:
@@ -532,7 +536,8 @@ class StopLog:
         self._quiet = {}        # reason -> stops of it started and not said
 
     def _delay(self, reason):
-        return self.floor_after_s if reason in (FLOOR_REASON, MODEL_STOP_REASON) else 0.0
+        return (self.floor_after_s if reason in (FLOOR_REASON, MODEL_STOP_REASON, TILT_REASON)
+                else 0.0)
 
     def taken(self, now):
         """My hand took the throttle: a stop it ends is said, as a takeover."""
@@ -1223,6 +1228,9 @@ class Decision(NamedTuple):
     # masked, or any answer on a tick the goal was reached. "" otherwise.
     model_action: str = ""
     stop_masked: bool = False
+    # The model's answer was the direction the tilt veto blocked, and the
+    # best of what was left drove instead.
+    tilt_masked: bool = False
 
 
 def _in(value, low, high):
@@ -1388,6 +1396,20 @@ def forward_or_stop(outputs):
     logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()[:len(ACTIONS)]
     f, s = logits[ACTIONS.index(FORWARD)], logits[ACTIONS.index(STOP)]
     return FORWARD if f >= s else STOP
+
+
+def tilt_open_action(outputs, blocked, hand_rules=False):
+    """What drives when the model's answer is `blocked`, the direction the
+    tilt veto took off the table (driver.TiltVeto): the better of the other
+    two by the model's own logits, so it is the model's next choice and not
+    a manoeuvre. A tie goes to the moving direction, as argmax's order does.
+    With the hand rules a stop is never committed (the stop mask), so it is
+    the other direction. Only on outputs read_output() has passed."""
+    if hand_rules:
+        return REVERSE if blocked == FORWARD else FORWARD
+    logits = np.asarray(outputs["logits"], dtype=np.float64).ravel()[:len(ACTIONS)]
+    rest = [a for a in ACTIONS if a != blocked]
+    return max(rest, key=lambda a: logits[ACTIONS.index(a)])
 
 
 def model_label(meta, path):
@@ -1617,6 +1639,13 @@ class PolicyDriver(dv.Driver):
         self._rear_said = False
         # Why the car is stopped, in the journal (StopLog).
         self.stop_log = StopLog()
+        # The tilt veto (driver.TiltVeto): one direction off the table while
+        # the chassis leans against something. AutoPilot sets enabled off
+        # --no-tilt-veto, and pad_throttle, what my trigger is putting on the
+        # wheels (None when it is not mine), each tick as human_throttle.
+        self.tilt_veto = dv.TiltVeto()
+        self.pad_throttle = None
+        self._tilt_said_error = False
         # The fallback (FALLBACK, by MAP_BACK_S): a map-free model a map model hands
         # the wheels to while the map is lost, instead of neutral. Each model
         # is a slot of its own inputs and its own chunk blend; only the active
@@ -1708,6 +1737,7 @@ class PolicyDriver(dv.Driver):
         for slot in self._slots.values():
             slot["imu_features"].reset()
         self.stop_log.reset()
+        self.tilt_veto.reset()
 
     def _stop_detail(self):
         """What the journal line for a stop carries besides its reason: the
@@ -1921,6 +1951,11 @@ class PolicyDriver(dv.Driver):
             "policy_hand_rules": bool(self.hand_rules),
             # Whether the map-free fallback drove this tick (the map lost).
             "policy_fallback": bool(self.on_fallback),
+            # The tilt veto (driver.TiltVeto): the direction it blocked this
+            # decision ("" for none), the tilt and side gap it read (-1 for
+            # none), and whether the model's answer was the blocked one.
+            **self.tilt_veto.fields(),
+            "policy_tilt_masked": bool(d.tilt_masked) if d is not None else False,
         }
 
     def _recover(self, now, reason):
@@ -1950,6 +1985,32 @@ class PolicyDriver(dv.Driver):
                 self.floor_veto.note_throttle(throttle, now)
         except Exception:
             pass
+        try:
+            # The direction the wheels were told, which is mine under my trigger.
+            mine = self.human_throttle and self.pad_throttle is not None
+            self.tilt_veto.note_throttle(self.pad_throttle if mine else throttle, now)
+        except Exception:
+            pass
+
+    def _tilt_update(self, now):
+        """The tilt veto's decision, off the fresh up vector the IMU input is
+        built from and the newest fresh lidar scan. Never raises: a veto that
+        breaks lets go, and the car drives as it did before there was one."""
+        try:
+            up = pimu.up_of(pimu.row_fields(self._imu_sample, self._imu_at, now))
+            self.tilt_veto.update(now, up, pli.live_bins(self.lidar))
+        except Exception as e:
+            self.tilt_veto.reset()
+            if not self._tilt_said_error:
+                print(f"Tilt veto off for now: {type(e).__name__}: {e}")
+                self._tilt_said_error = True
+
+    def _tilt_blocked(self):
+        """The action the tilt veto blocks this tick, or None. Never my
+        trigger's: the throttle is mine then, as it is past the floor."""
+        if self.human_throttle:
+            return None
+        return {1: FORWARD, -1: REVERSE}.get(self.tilt_veto.blocked)
 
     def _tick(self, now):
         self._now = now
@@ -1972,6 +2033,19 @@ class PolicyDriver(dv.Driver):
         if self.goal_reached != was:
             print("Goal reached - stopping." if self.goal_reached
                   else "Goal no longer reached - driving on.")
+        if self._phase is not None:
+            # The back-out returns before the frame and the IMU are read, so
+            # read the IMU here: off a stale up the veto would read no tilt
+            # and let go of the very reverse it is for.
+            imu = self.camera.get_imu_sample()
+            if imu is not None:
+                self._imu_sample, self._imu_at = imu, now
+            self._tilt_update(now)
+            if (self._phase == dv._PHASE_REVERSE and self._tilt_blocked() == REVERSE):
+                # The hand rules' back-out is a reverse the veto has blocked:
+                # it ends here, at 0, and settles as any other end does.
+                print("Tilt veto - ending the back-out's reverse.")
+                self._end_reverse(now, dv.EXIT_TILT)
         if self.recovering(now):
             # The back-out's reverse, then its settle at 0, as the veto's
             # record of what the wheels were told, and the scan it made, so
@@ -2008,6 +2082,8 @@ class PolicyDriver(dv.Driver):
         imu = self.camera.get_imu_sample()
         if imu is not None:
             self._imu_sample, self._imu_at = imu, now
+        self._tilt_update(now)
+        tilt_blocked = self._tilt_blocked()
         # Every tick with a frame pushes, blind and stuck ones too, so the
         # window is the last half second of the car and not of the model.
         # The idle model's window keeps up too, so a switch hands it the
@@ -2039,6 +2115,11 @@ class PolicyDriver(dv.Driver):
                 # Safety, not a manoeuvre: the wheels stop, and the model,
                 # which can see the map, decides the way out next tick.
                 print("STUCK - neutral; the model has it.")
+                self._neutral("stuck")
+                return
+            if tilt_blocked == REVERSE:
+                # The back-out would be the reverse the tilt veto blocks.
+                print("STUCK - neutral; the tilt veto blocks the back-out.")
                 self._neutral("stuck")
                 return
             print("STUCK - backing up to recover.")
@@ -2165,6 +2246,14 @@ class PolicyDriver(dv.Driver):
             # Not arrived, so not a stop. Only the direction changes; the
             # floor below still holds a forward, as it holds any other.
             action = moving_action(outputs)
+        # The tilt veto. The direction it blocks is off the table and the
+        # model's own next best drives (tilt_open_action): the other
+        # direction, or a map model's stop if it would rather. Masked here,
+        # before the commit, the refractory and the rear mask, so none of
+        # them can put the blocked direction back.
+        tilt_masked = tilt_blocked is not None and action == tilt_blocked
+        if tilt_masked:
+            action = tilt_open_action(outputs, tilt_blocked, self.hand_rules)
         # A per-gear model's steer is already its head for this gear
         # (read_output decodes a stop on moving_action's); it is read again
         # below once the refractory and the rear mask have had their say.
@@ -2175,7 +2264,8 @@ class PolicyDriver(dv.Driver):
         # starts one. 1 ms of slack, as the mode latch has, so seven ticks
         # 0.1 s apart make 0.7.
         if (self.reverse_commit
-                and now - self._commit_since >= REVERSE_COMMIT_S - 1e-3):
+                and (now - self._commit_since >= REVERSE_COMMIT_S - 1e-3
+                     or tilt_blocked == REVERSE)):
             self._end_commit()
         starting = False
         if self.reverse_commit:
@@ -2183,7 +2273,8 @@ class PolicyDriver(dv.Driver):
             steer, rear = self._commit_front / STEER_SCALE, None
         elif (self.hand_rules and action == REVERSE and self._prev[0] != REVERSE
                 and not (self.human_throttle or self.human_steering)
-                and self._refractory(now) and not self.floor_veto.vetoes()):
+                and self._refractory(now) and not self.floor_veto.vetoes()
+                and tilt_blocked != FORWARD):
             # Straight back into the reverse it just came out of: the rock.
             # The way forward is not held, so forward it is, on the model's
             # own steering; the floor below still holds it like any other.
@@ -2210,7 +2301,7 @@ class PolicyDriver(dv.Driver):
         rear_masked = False
         if (not self.hand_rules and action == REVERSE and not self.human_throttle
                 and dv.rear_blocked(self.rear_clearance)
-                and forward_or_stop(outputs) == FORWARD):
+                and forward_or_stop(outputs) == FORWARD and tilt_blocked != FORWARD):
             action, rear_masked = FORWARD, True
             self.rear_stop = True
             if not self._rear_said:
@@ -2228,7 +2319,9 @@ class PolicyDriver(dv.Driver):
         if not self.hand_rules:
             scale = 1.0
         reason = ("model commit" if self.reverse_commit
-                  else "model rear masked" if rear_masked else "model")
+                  else "model rear masked" if rear_masked
+                  else TILT_REASON if tilt_masked and action == STOP
+                  else "model tilt masked" if tilt_masked else "model")
         held = action == FORWARD and self.floor_veto.vetoes()
         if (held and not self.hand_rules
                 and not self.floor_veto.creep_vetoes(self.front_lidar_bins())):
@@ -2251,7 +2344,8 @@ class PolicyDriver(dv.Driver):
                 if self._standoff_since is None:
                     self._standoff_since = now
                 self.standoff_ticks += 1
-                if now - self._standoff_since >= STANDOFF_S - 1e-3:
+                if (now - self._standoff_since >= STANDOFF_S - 1e-3
+                        and tilt_blocked != REVERSE):
                     # Neither side is giving way. Back out the way STUCK
                     # does, then the model has the car again.
                     self.last_recovery_time = now
@@ -2312,6 +2406,11 @@ class PolicyDriver(dv.Driver):
         if action == REVERSE and not self.human_throttle:
             self._last_reverse_at = now
 
+        # The tilt veto's last word: whatever path got here, the blocked
+        # direction's throttle does not go out. A 0, never a skipped write.
+        if tilt_blocked is not None and self.tilt_veto.blocks(throttle):
+            throttle, reason = 0.0, TILT_REASON
+
         # Steering first, as the autopilot orders them; main.DriverCommand
         # holds both and AutoPilot.step() writes them once.
         self.controller.set_steering(*pair)
@@ -2319,6 +2418,8 @@ class PolicyDriver(dv.Driver):
         self._commanded(throttle, now)
         if reason == "model floor":
             self._say_stop(FLOOR_REASON)
+        elif reason == TILT_REASON:
+            self._say_stop(TILT_REASON)
         elif throttle == 0.0 and action == STOP:
             self._say_stop(MODEL_STOP_REASON)
         else:
@@ -2341,5 +2442,5 @@ class PolicyDriver(dv.Driver):
         self._note(Decision(action, magnitude, steer, rear, reason, throttle, front,
                             model_action if (stop_masked or self.reverse_commit
                                              or self.reverse_refractory
-                                             or rear_masked) else "",
-                            stop_masked))
+                                             or rear_masked or tilt_masked) else "",
+                            stop_masked, tilt_masked))

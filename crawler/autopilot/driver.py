@@ -1275,6 +1275,220 @@ def rear_blocked(clearance) -> bool:
     None -- no fresh scan, or nothing behind -- is never blocked."""
     return clearance is not None and clearance < REAR_STOP_CLEAR_MM
 
+
+# ---- the tilt veto: one direction off the table on a lean against a wall ----
+#
+# Every tip with the lidar on went the same way: the chassis rolled or
+# pitched past 20 degrees with something within a few cm of a side, and
+# 0.3-1.6 s later it was past 45 and on its side. So while the tilt is over
+# TILT_VETO_DEG and the lidar has seen a side gap under TILT_GAP_MM inside
+# the last TILT_GAP_WINDOW_S, the direction the car was going when it
+# started is taken off the table: the model, not this, picks from what is
+# left (policy.PolicyDriver), and the other direction stays fully the
+# model's. It only ever takes away one direction's throttle. It never
+# steers, never blocks both, never stops auto or the patrol, and lets go the
+# tick the trigger clears.
+#
+# Tilt is the up vector's angle off level, mapping/imu.tilt_deg (what the
+# SLAM tilt gates use), off the same fresh up the IMU input is fed
+# (policy_imu.up_of). The side gap is the nearest return beside the body:
+# within the bumpers plus TILT_GAP_CORNER_MM, and outside HALF_WIDTH_MM, the
+# outside of the wheels. Those are the tip analysis' definitions, so its
+# numbers carry over.
+#
+# MEASURED, replayed on every tick of the 26 drives with the lidar (117 min
+# of driving, 13 tips), at those numbers: it engaged before all 13, and on
+# today's two (180107Z, 181316Z) 0.90 and 0.81 s before the 45 degree
+# crossing, both times on a forward. 0.64 engagements a minute, 0.53 a
+# minute away from a tip, median 0.6 s long. Absolute tilt, as here,
+# fires a little more than the analysis' tilt off each session's own upright
+# (0.44 a minute): the camera sits about 2 degrees off level, and the car
+# has no session upright to take.
+#
+# The release is the hysteresis: under TILT_RELEASE_DEG, no side gap inside
+# the window, or no fresh tilt at all. 15 is the knee: releasing at 18
+# re-engaged four episodes that 15 holds as one (66 against 62), and 12 or 10
+# merge nothing more and only make the long ones longer. The car can lean
+# 15 to 20 along a wall for a while (17 s once, 042006Z at 21:32, driving on
+# along it), and the veto is on for all of that: forward blocked, reverse
+# the model's.
+#
+# Which direction: the sign of the last throttle that went out inside
+# TILT_DIR_WINDOW_S before it engaged, my trigger's included, and it stays
+# that one until release. Nothing moving in that window is nothing blocked
+# (1 of 75 episodes).
+TILT_VETO_DEG = 20.0
+TILT_RELEASE_DEG = 15.0
+TILT_GAP_MM = 50.0
+TILT_GAP_WINDOW_S = 2.0
+TILT_GAP_CORNER_MM = 60.0
+TILT_DIR_WINDOW_S = 2.0
+# The journal: one line when it engages and one when it lets go, at most one
+# engage line every TILT_LOG_EVERY_S; the ones in between are counted and
+# said with the next.
+TILT_LOG_EVERY_S = 5.0
+# On unless --no-tilt-veto.
+TILT_VETO_ON = True
+
+
+def tilt_deg(up):
+    """Degrees off level for a unit up vector (device axes), or NaN for none.
+    mapping/imu.tilt_deg, with None and junk as NaN instead of raising."""
+    try:
+        if up is None or len(up) != 3:
+            return math.nan
+        ux, uy, uz = (float(v) for v in up)
+    except (TypeError, ValueError):
+        return math.nan
+    n = math.sqrt(ux * ux + uy * uy + uz * uz)
+    if not (math.isfinite(n) and n > 0.5):
+        return math.nan
+    return math.degrees(math.acos(max(-1.0, min(1.0, -ux / n))))
+
+
+def side_gap_mm(bins):
+    """mm from the outside of the wheels to the nearest return beside the
+    body, either side, or None (no bins, nothing beside it). Pure. Beside is
+    within the bumpers plus TILT_GAP_CORNER_MM fore and aft and outside
+    HALF_WIDTH_MM; `bins` are a Scan's car-frame bins, 0 for no return."""
+    try:
+        r = np.asarray(bins, dtype=np.float64)
+        if r.ndim != 1 or r.size == 0:
+            return None
+        a = np.radians(np.arange(r.size) * (360.0 / r.size))
+        ok = np.isfinite(r) & (r > 0)
+        x, y = r * np.cos(a), r * np.sin(a)
+        half = float(_lidar.HALF_WIDTH_MM)
+        beside = (ok & (x > _lidar.REAR_BUMPER_X_MM - TILT_GAP_CORNER_MM)
+                  & (x < _lidar.FRONT_BUMPER_X_MM + TILT_GAP_CORNER_MM)
+                  & (np.abs(y) >= half))
+    except Exception:
+        return None
+    if not beside.any():
+        return None
+    return float((np.abs(y[beside]) - half).min())
+
+
+class TiltVeto:
+    """The tilt veto's state. One per driver; update() once a decision.
+
+    blocked is +1 (forward), -1 (reverse) or 0 (nothing): only ever one sign,
+    and 0 the tick the trigger clears. It never commands anything itself.
+    """
+
+    def __init__(self, say=print, enabled=TILT_VETO_ON):
+        self.say = say
+        self.enabled = bool(enabled)
+        self.reset()
+
+    def reset(self):
+        self.engaged = False
+        self.blocked = 0
+        self.since = None
+        self.tilt = math.nan
+        self.gap = None          # this decision's side gap, mm, None for none
+        self.gap_min = None      # the nearest inside the window while engaged
+        self._gap_at = None      # when a gap under TILT_GAP_MM was last seen
+        self._gap_seen = None
+        self._move_sign = 0
+        self._move_at = None
+        self._said_at = None
+        self._said_this = False
+        self._quiet = 0
+
+    def note_throttle(self, throttle, now):
+        """A throttle that went out. Only its sign and when are kept."""
+        try:
+            t = float(throttle)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(t) and t != 0.0 and now is not None:
+            self._move_sign = 1 if t > 0 else -1
+            self._move_at = now
+
+    def blocks(self, throttle) -> bool:
+        """True for a throttle whose sign is the blocked direction."""
+        try:
+            t = float(throttle)
+        except (TypeError, ValueError):
+            return False
+        return bool(self.blocked) and t * self.blocked > 0
+
+    def update(self, now, up, bins):
+        """One decision: the fresh up vector (None for none) and the newest
+        fresh lidar bins (None for none). Returns blocked."""
+        self.tilt = tilt_deg(up)
+        self.gap = side_gap_mm(bins) if bins is not None else None
+        if self.gap is not None and self.gap < TILT_GAP_MM:
+            self._gap_at = now
+            self._gap_seen = self.gap
+        recent = (self._gap_at is not None
+                  and 0.0 <= now - self._gap_at <= TILT_GAP_WINDOW_S + 1e-6)
+        if not self.enabled:
+            self._release(now, "")
+            return 0
+        tilt = self.tilt
+        if self.engaged:
+            if not (math.isfinite(tilt) and tilt >= TILT_RELEASE_DEG and recent):
+                why = (f"tilt {tilt:.1f} deg" if math.isfinite(tilt) and tilt < TILT_RELEASE_DEG
+                       else "no tilt reading" if not math.isfinite(tilt)
+                       else f"no side gap under {TILT_GAP_MM:.0f} mm for "
+                            f"{TILT_GAP_WINDOW_S:.0f} s")
+                self._release(now, why)
+            else:
+                self.gap_min = min(self.gap_min, self._gap_seen)
+        elif math.isfinite(tilt) and tilt > TILT_VETO_DEG and recent:
+            self.engaged = True
+            self.since = now
+            self.gap_min = self._gap_seen
+            fresh = (self._move_at is not None
+                     and 0.0 <= now - self._move_at <= TILT_DIR_WINDOW_S + 1e-6)
+            self.blocked = self._move_sign if fresh else 0
+            self._say_engage(now)
+        return self.blocked
+
+    @property
+    def direction(self):
+        return {1: "forward", -1: "reverse"}.get(self.blocked, "")
+
+    def _say(self, text):
+        try:
+            self.say(text)
+        except Exception:
+            pass
+
+    def _say_engage(self, now):
+        what = (f"{self.direction} blocked" if self.blocked
+                else "nothing moving to block")
+        if self._said_at is not None and now - self._said_at < TILT_LOG_EVERY_S - 1e-6:
+            self._quiet += 1
+            self._said_this = False
+            return
+        more = f", {self._quiet} more since the last line" if self._quiet else ""
+        self._quiet = 0
+        self._say(f"Tilt veto - {what}: tilt {self.tilt:.1f} deg, side gap "
+                  f"{self.gap_min:.0f} mm{more}")
+        self._said_at = now
+        self._said_this = True
+
+    def _release(self, now, why):
+        if self.engaged and self._said_this:
+            self._say(f"Tilt veto released after {now - self.since:.1f} s - {why}")
+        self.engaged = False
+        self.blocked = 0
+        self.since = None
+        self.gap_min = None
+        self._said_this = False
+
+    def fields(self):
+        """What /footprint records about it this decision."""
+        return {
+            "tilt_veto": self.direction,
+            "tilt_veto_deg": float(self.tilt) if math.isfinite(self.tilt) else -1.0,
+            "tilt_veto_gap_mm": float(self.gap) if self.gap is not None else -1.0,
+        }
+
+
 # How open "open" is. The rules reverse on anything inside CLEARANCE_MM and
 # the policy's floor holds at FORWARD_FLOOR_MM, so a back-out that ended the
 # moment the fan cleared 400 mm would hand back a car one tick from reversing
@@ -1338,6 +1552,8 @@ EXIT_BUMPER = "bumper"
 EXIT_CAP = "cap"
 EXIT_NO_FRAME = "no frame"
 EXIT_ABORT = "abort"
+# The tilt veto blocking reverse (TiltVeto): the policy's hand rules only.
+EXIT_TILT = "tilt"
 
 # What started one.
 BACKOUT_STUCK = "stuck"

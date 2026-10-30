@@ -810,8 +810,11 @@ class AutoPilot:
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
                  slam=None, nav=False, map_source=None, goals=None,
                  fallback_path=None, clicks=None, patrol_store=None,
-                 lidar_near=False, path=None, person=None):
+                 lidar_near=False, path=None, person=None, tilt_veto=True):
         self.vecon = vecon
+        # --no-tilt-veto turns the policy's tilt veto off (driver.TiltVeto).
+        # Set on every policy driver this builds.
+        self.tilt_veto = bool(tilt_veto)
         # --lidar-near: the creep's stop under the stereo clamp comes off the
         # lidar's front arc (driver.py, "the near field"). Set on every
         # driver this builds.
@@ -1045,6 +1048,9 @@ class AutoPilot:
                 self.logger.log("info", "Path", f"{model.label} was trained on path goals "
                                 f"{want:g} m along: the point fed is {want:g} m along the path")
                 d.path.lookahead_m = want
+        d.tilt_veto.enabled = self.tilt_veto
+        if not self.tilt_veto:
+            self.logger.log("warning", "Mode", "The tilt veto is off (--no-tilt-veto)")
         # Only the policy creeps, so only it reads the near field.
         d.lidar_near = self.lidar_near and self.lidar is not None
         if d.lidar_near:
@@ -1084,6 +1090,10 @@ class AutoPilot:
                 self._next_tick = now + AUTO_TICK_INTERVAL
                 self.driver.human_throttle = bool(
                     takeover is not None and takeover.throttle)
+                # What my trigger is putting on the wheels, for the tilt
+                # veto's which-way-was-it-going (policy.PolicyDriver).
+                self.driver.pad_throttle = (self._pad_throttle(takeover)
+                                            if self.driver.human_throttle else None)
                 # The pad's side of a learned driver's steering mode (see
                 # policy.PolicyDriver): my SteerMode, and whether my hand has
                 # the steering. The rules driver never reads either.
@@ -1913,6 +1923,16 @@ def parse_args(argv=None):
     # Off unless named. Needs --lidar and a map policy: under the stereo pair's
     # near clamp, the creep's stop comes off the lidar's front arc where the
     # lidar sees what the camera does (driver.py, "the near field").
+    # On unless named off. A policy driver blocks the direction it was going
+    # while the chassis leans past 20 degrees with something at a side
+    # (autopilot/driver.py, "the tilt veto"); the other direction stays the
+    # model's.
+    parser.add_argument(
+        "--no-tilt-veto",
+        dest="tilt_veto",
+        action="store_false",
+        help="turn off the policy's tilt veto (on by default)",
+    )
     parser.add_argument(
         "--lidar-near",
         action="store_true",
@@ -2285,6 +2305,7 @@ def main(argv=None):
                           patrol_store=(patrol.Store(lg.log_path(PATROL_FILE))
                                         if args.goal else None),
                           lidar_near=args.lidar_near, path=path_planner,
+                          tilt_veto=args.tilt_veto,
                           person=follow_person(args, pantilt, lidar, slam, hub, log))
 
     # Who gets the device opened at startup, and who waits for it:

@@ -505,6 +505,14 @@ JSON_SCHEMAS = {
         # whether it had handed the wheels to its map-free fallback.
         "policy_map_present": _BOOL,
         "policy_fallback": _BOOL,
+        # The tilt veto (autopilot/driver.py, TiltVeto): the direction it
+        # blocked (forward / reverse, "" for none), the tilt in degrees and
+        # the side gap in mm it read (-1 for none), and whether the model
+        # asked for the blocked direction and its next best drove instead.
+        "tilt_veto": _STR,
+        "tilt_veto_deg": _NUM,
+        "tilt_veto_gap_mm": _NUM,
+        "policy_tilt_masked": _BOOL,
         # Whether a goal model was fed a goal, and what it was the encoding
         # of: goal (the goal itself), subgoal (a point along the path to it,
         # autopilot/pathgoal.py) or none.
