@@ -30,7 +30,11 @@ Using it, with --goal. Foxglove's Publish pose tool on the map panel sends
           tool to draw a polyline on a non-ROS connection.
 
 Arriving. A waypoint is passed once the truck is within PASS_M of it, and the
-next one is the goal from that decision on. The last of a "once" wants
+next one is the goal from that decision on; or, with the path planner, once
+it has gone by it round the corner (pathgoal.gone_by, told through
+passed()). The planner is told the waypoints after the current one
+(ahead) and plans through them, so the point the model is fed bends round
+to the next before this one is reached. The last of a "once" wants
 ARRIVE_M, and then the arrival hold holds the car there, as for a single
 goal. dwell_s, 0 unless set, holds neutral that long at each waypoint first.
 "loop" goes from the last back to the first, a lap each time round;
@@ -90,6 +94,9 @@ TIMEOUT_S = 120.0
 CLOCK_STEP_MAX_S = 0.5
 TRACE_M = 1.0
 MAX_WAYPOINTS = 100
+# The waypoints after the current one the path planner is told of
+# (pathgoal.MAX_AHEAD plans through no more).
+AHEAD_MAX = 3
 # The restart check: the boot map's walls against the saved ones.
 MATCH_SHARE = 0.6
 MIN_WALLS = 50
@@ -220,6 +227,7 @@ class Patrol(gl.Goal):
         self.direction = 1
         self.laps = 0
         self.skipped = 0
+        self.passed_on_path = 0       # passed by the path planner, not PASS_M
         self.refused = 0
         self.restored = False
         self._in_row = 0              # skips since the last arrival
@@ -261,6 +269,45 @@ class Patrol(gl.Goal):
             return None
         place = self.current_place()
         return None if place is None else (place[0], place[1], self.frame_now)
+
+    @property
+    def ahead(self):
+        """[(x, y, frame)]: the waypoints after the current one, in the
+        order they will be driven, up to AHEAD_MAX, so the path planner
+        (pathgoal.py) can carry the point it feeds on round the corner
+        before this one is passed. Nothing at the last stop of a "once",
+        with a dwell (every waypoint is a stop), or with no goal now."""
+        if self.use != "patrol" or self.goal is None or self.dwell_s > 0.0:
+            return []
+        out = []
+        i, direction = self.index, self.direction
+        n = len(self.points)
+        for _ in range(AHEAD_MAX):
+            if n == 1 or (self.mode == "once" and i >= n - 1):
+                break
+            i, direction = self._next(i, direction)
+            place = self.points[i].places.get(self.frame_now)
+            if place is None:
+                break
+            out.append((place[0], place[1], self.frame_now))
+        return out
+
+    def passed(self, goal, crop=None):
+        """The path planner says the truck has gone by `goal` (cut the
+        corner wide of PASS_M). Passed as on PASS_M if it is the current
+        waypoint and not a stop; True if it was."""
+        if self.use != "patrol" or self.holding() or self.dwell_s > 0.0 or self._last_stop():
+            return False
+        g = self.goal
+        if g is None or goal is None or int(goal[2]) != int(g[2]) or math.hypot(
+                float(goal[0]) - g[0], float(goal[1]) - g[1]) > 0.05:
+            return False
+        self._in_row = 0
+        self.passed_on_path += 1
+        self._advance()
+        if crop is not None and getattr(crop, "present", False):
+            self._measure(crop)
+        return True
 
     def holding(self):
         return (self._dwell_until is not None) or self.finished or not self.running
@@ -554,25 +601,28 @@ class Patrol(gl.Goal):
                       "holding neutral until start")
             self._save()
             return
-        i = self.index
-        if self.mode == "loop":
-            i = (i + 1) % n
-            if i == 0:
-                self.laps += 1
-                self._log("info", f"Lap {self.laps} of {n} waypoints done, "
-                          f"{self.skipped} skipped so far")
-        elif self.mode == "patrol":
-            if not 0 <= i + self.direction < n:
-                self.direction = -self.direction
-            i += self.direction
-            if i == 0:
-                self.laps += 1
-                self._log("info", f"Lap {self.laps} there and back done, "
-                          f"{self.skipped} skipped so far")
-        else:
-            i += 1
+        i, self.direction = self._next(self.index, self.direction)
+        if i == 0 and self.mode == "loop":
+            self.laps += 1
+            self._log("info", f"Lap {self.laps} of {n} waypoints done, "
+                      f"{self.skipped} skipped so far")
+        elif i == 0 and self.mode == "patrol":
+            self.laps += 1
+            self._log("info", f"Lap {self.laps} there and back done, "
+                      f"{self.skipped} skipped so far")
         self.index = i
         self._reset_clock()
+
+    def _next(self, i, direction):
+        """(index, direction) after waypoint i, not at a last stop."""
+        n = len(self.points)
+        if self.mode == "loop":
+            return (i + 1) % n, direction
+        if self.mode == "patrol":
+            if not 0 <= i + direction < n:
+                direction = -direction
+            return i + direction, direction
+        return i + 1, direction
 
     def _reset_clock(self):
         self._wp_time, self._best, self._since_best = 0.0, math.inf, 0.0
@@ -720,7 +770,8 @@ class Patrol(gl.Goal):
                 "running": bool(self.running), "tracing": bool(self.tracing),
                 "index": int(self.index), "number": int(self.index + 1) if self.points else 0,
                 "count": len(self.points), "laps": int(self.laps),
-                "skipped": int(self.skipped), "x": float(x), "y": float(y),
+                "skipped": int(self.skipped),
+                "passed_on_path": int(self.passed_on_path), "x": float(x), "y": float(y),
                 "frame_now": -1 if self.frame_now is None else int(self.frame_now),
                 "on_map": bool(have and self.present), "distance_m": float(d),
                 "approx": e > 0.0, "approx_m": e, "restored": bool(self.restored),

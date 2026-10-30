@@ -795,6 +795,16 @@ class FollowSwitch(gl.Goal):
     def single(self):
         return self.patrol.single
 
+    @property
+    def ahead(self):
+        # A person or a search target has no next goal known; the patrol's.
+        return [] if self.following else getattr(self.patrol, "ahead", [])
+
+    def passed(self, goal, crop=None):
+        if self.following or not hasattr(self.patrol, "passed"):
+            return False
+        return self.patrol.passed(goal, crop)
+
     def reached(self):
         return self.person.reached() if self.following else self.patrol.reached()
 

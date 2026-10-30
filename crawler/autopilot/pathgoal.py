@@ -19,6 +19,12 @@ far). The single click (goal.ClickGoal), the patrol's current waypoint
 (patrol.Patrol) and a person to follow are all one: PathPlanner reads
 `goal` off the one AutoPilot holds, whatever it is, and never anything else.
 
+Two more, both optional: `ahead`, the goals that come after `goal` in
+order (the patrol's next waypoints; nothing for a click, a person or a
+search target, which have no next one known), and `passed(goal, crop)`,
+told when the plan says the truck has gone by `goal` (True if the source
+moved on). A source without them is planned to as before.
+
 The plan
 --------
 On the SLAM runner's /map picture (runner.MapView, 10 cm pixels, made twice
@@ -44,6 +50,22 @@ been seen:
             from the truck. The goal and the truck are each snapped to the
             nearest cell the search can stand in, within SNAP_M.
 
+Through the waypoints after it. The plan runs on from the goal through
+`ahead`, a leg at a time (the same search, the leg's own window), until
+it is LOOKAHEAD_M past the goal or MAX_AHEAD goals on, so the point fed
+carries on round a corner made of waypoints before the truck gets to the
+first one, instead of sitting on the waypoint until it is passed and then
+swinging up to 180 degrees to the next. A leg with no way through ends the
+plan there. A plan made through the next goal is still used once the
+source has moved on to it, from its next leg, until the new one is in.
+
+Passed. The source passes a goal as it always has (the patrol's PASS_M),
+and the plan passes it too: once the truck is within PASS_NEAR_M of it and
+nearer the path after it than the path up to it by PASS_SIDE_M, the truck
+has cut the corner and gone by, and source.passed() is told. A goal the path
+comes back from the way it went (the end of a there-and-back, a dead end)
+is never passed this way: both are the same distance off.
+
 On a thread, never in the control loop: every PLAN_EVERY_S at most (2 Hz),
 when the map, the truck (REPLAN_MOVE_M) or the goal has changed since the
 last plan; a new goal is planned at once.
@@ -60,8 +82,11 @@ Each decision, off the newest plan and the crop the model is fed:
   the ticks the truck was moving in, are 0.9 m at the 25th percentile and
   1.9 m at the median (maps-pose, all drives to 2026-10-29).
 
-and the goal itself, exact, when the goal is within LOOKAHEAD_M in a clear
-line, or that far along the path is the goal. With no plan to use, the
+The nearest point is looked for only on the leg to the goal the source
+is on (and BACK_M before it), so a path that doubles back is not jumped
+along. The goal itself, exact, when there is nothing after it and the goal
+is within LOOKAHEAD_M in a clear line, or that far along the path is the
+goal. With no plan to use, the
 goal itself too, and /path/status says why: no map yet, no way through,
 the goal or the truck boxed in, a plan gone STALE_S old, the truck more
 than OFF_PATH_M off it, or a goal on another map frame.
@@ -99,6 +124,17 @@ LOS_CLEAR_M = cmap.INSCRIBED_M
 LOS_STEP_M = 0.05
 # The first of the line this close to the truck is where it already is.
 LOS_SKIP_M = 0.2
+# Through the goals after this one: no more than MAX_AHEAD of them, and
+# no more once the plan is lookahead_m past the goal.
+MAX_AHEAD = 3
+# Passed on the path: within PASS_NEAR_M of the goal and nearer the path
+# after it than the path up to it by PASS_SIDE_M (more than a 10 cm cell).
+PASS_NEAR_M = 1.0
+PASS_SIDE_M = 0.15
+# On a leg after the first, the nearest point is looked for from this far
+# back along the path before the goal it starts at, so the switch to it is
+# made from where the truck is, not jumped ahead.
+BACK_M = 0.6
 STALE_S = 3.0
 OFF_PATH_M = 1.0
 # A goal moved more than this is a new goal: planned at once.
@@ -121,6 +157,29 @@ class GoalSource(Protocol):
     def encode(self, crop) -> np.ndarray:
         """Its own goal input against this crop (policy_goal.encode)."""
 
+    # Optional:
+    #   ahead -> [(x, y, frame)], the goals after `goal`, in order
+    #   passed(goal, crop) -> bool, the plan says the truck has gone by `goal`
+
+
+def _ahead(source, frame):
+    """The source's goals after its goal on `frame`, up to MAX_AHEAD, as
+    (x, y, frame); () for a source with none."""
+    try:
+        got = getattr(source, "ahead", None)
+    except Exception:
+        return ()
+    out = []
+    for a in got or ():
+        if a is None or int(a[2]) != frame or len(out) >= MAX_AHEAD:
+            break
+        out.append((float(a[0]), float(a[1]), int(a[2])))
+    return tuple(out)
+
+
+def _same(a, b):
+    return (a[2] == b[2] and math.hypot(a[0] - b[0], a[1] - b[1]) <= GOAL_MOVED_M)
+
 
 class Plan(NamedTuple):
     goal: tuple             # (x, y, frame) planned to
@@ -133,6 +192,8 @@ class Plan(NamedTuple):
     why: str                # "" with a path, else why there is none
     ms: float               # wall time to make it
     cpu_ms: float           # this thread's CPU time to make it
+    route: tuple = ()       # (goal, then the goals after it planned through)
+    vias: tuple = ()        # each route goal's index in points
 
 
 def _window(view, start, goal, pad=PAD_M):
@@ -233,25 +294,105 @@ def line_clear(cm, a, b, clear_m=None, step=LOS_STEP_M, skip_m=LOS_SKIP_M):
     return bool((cm.dist_at(x, y) >= clear_m).all())
 
 
-def subgoal(plan, pose, lookahead_m=LOOKAHEAD_M):
+def _leg(plan, j):
+    """(lo, hi) indices into plan.points of the leg to route goal j: from
+    the truck for the first, from BACK_M before goal j - 1 after that."""
+    pts, cum = plan.points, plan.cum
+    vias = plan.vias or (len(pts) - 1,)
+    hi = int(vias[j])
+    if j == 0:
+        return 0, hi
+    lo = int(np.searchsorted(cum, cum[int(vias[j - 1])] - BACK_M, side="left"))
+    return min(lo, hi), hi
+
+
+def subgoal(plan, pose, lookahead_m=LOOKAHEAD_M, j=0):
     """(x, y, kind) of the point to feed off `plan` from truck map point
-    `pose`, kind "subgoal" or "goal" (the goal itself), or (None, None, why)."""
+    `pose`, on the way to route goal j (0, the plan's goal), kind "subgoal"
+    or "goal" (the goal itself, with nothing after it), or
+    (None, None, why)."""
     pts, cum = plan.points, plan.cum
     p = np.asarray(pose[:2], float)
-    d = np.hypot(pts[:, 0] - p[0], pts[:, 1] - p[1])
-    k0 = int(np.argmin(d))
-    if d[k0] > OFF_PATH_M:
+    lo, hi = _leg(plan, j)
+    d = np.hypot(pts[lo:hi + 1, 0] - p[0], pts[lo:hi + 1, 1] - p[1])
+    k0 = lo + int(np.argmin(d))
+    if d[k0 - lo] > OFF_PATH_M:
         return None, None, "off the path"
+    end = len(pts) - 1
+    last_goal = len(plan.route or (None,)) - 1 == j
+
+    def kind(k):
+        return "goal" if (k == end and last_goal) else "subgoal"
+
     reach = cum[k0] + lookahead_m
     last = int(np.searchsorted(cum, reach, side="right")) - 1
-    last = max(min(last, len(pts) - 1), k0)
+    last = max(min(last, end), k0)
+    # Past the goal, a point no nearer the truck than the goal (or half the
+    # lookahead, if that is less): a path that comes back the way it went
+    # is not fed as a point on top of the truck.
+    floor = min(math.hypot(pts[hi][0] - p[0], pts[hi][1] - p[1]), 0.5 * lookahead_m)
     for k in range(last, k0, -1):
+        if k > hi and math.hypot(pts[k][0] - p[0], pts[k][1] - p[1]) < floor:
+            continue
         if line_clear(plan.cm, p, pts[k]):
-            if k == len(pts) - 1:
-                return float(pts[k][0]), float(pts[k][1]), "goal"
-            return float(pts[k][0]), float(pts[k][1]), "subgoal"
-    k = min(k0 + 1, len(pts) - 1)
-    return float(pts[k][0]), float(pts[k][1]), ("goal" if k == len(pts) - 1 else "subgoal")
+            return float(pts[k][0]), float(pts[k][1]), kind(k)
+    k = min(k0 + 1, end)
+    return float(pts[k][0]), float(pts[k][1]), kind(k)
+
+
+def gone_by(plan, pose, j=0, near_m=PASS_NEAR_M, side_m=PASS_SIDE_M):
+    """Whether the truck at map point `pose` has gone by route goal j on
+    `plan`: within near_m of it, and nearer the path after it (up to the
+    next goal) than the path up to it by side_m. False for the last goal
+    on the plan, and for a path that comes back from it the way it went."""
+    route, vias = plan.route or (), plan.vias or ()
+    if plan.points is None or j >= len(route) - 1:
+        return False
+    p = np.asarray(pose[:2], float)
+    g = route[j]
+    if math.hypot(g[0] - p[0], g[1] - p[1]) > near_m:
+        return False
+    pts = plan.points
+    lo, hi = _leg(plan, j)
+    before = np.hypot(pts[lo:hi + 1, 0] - p[0], pts[lo:hi + 1, 1] - p[1]).min()
+    nxt = int(vias[j + 1])
+    if nxt <= hi:
+        return False
+    after = np.hypot(pts[hi + 1:nxt + 1, 0] - p[0], pts[hi + 1:nxt + 1, 1] - p[1]).min()
+    return bool(after < before - side_m)
+
+
+def _cum(pts):
+    return np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+
+
+def plan_route(view, start, route, lookahead_m=LOOKAHEAD_M, **kw):
+    """(points, cum, CostMap, why, route, vias): a path from map point
+    `start` through each (x, y, frame) of `route` in turn, a find_path leg
+    each, stopped once it runs lookahead_m past route[0] or at the first
+    leg with no way through after the first. route and vias are the goals
+    it went through and each one's index in points. The first leg's
+    CostMap (its clearance is what /path/status says, and the line of sight
+    is checked on it). points None with no first leg, why its reason."""
+    pts, why, cm = find_path(view, start, route[0][:2], **kw)
+    if pts is None:
+        return None, None, cm, why, (route[0],), ()
+    legs, vias = [pts], [len(pts) - 1]
+    done = [route[0]]
+    past = 0.0
+    for a, b in zip(route, route[1:]):
+        if past >= lookahead_m:
+            break
+        more, _, _ = find_path(view, a[:2], b[:2], **kw)
+        if more is None:
+            break
+        more = more[1:]
+        legs.append(more)
+        vias.append(vias[-1] + len(more))
+        done.append(b)
+        past += float(_cum(np.vstack([legs[-2][-1:], more]))[-1])
+    pts = np.vstack(legs)
+    return pts, _cum(pts), cm, "", tuple(done), tuple(vias)
 
 
 class _Request(NamedTuple):
@@ -259,6 +400,7 @@ class _Request(NamedTuple):
     pose: tuple             # (x, y, yaw) on that frame
     frame_since: float      # the first crop time on this frame
     seq: int                # bumped when the goal moves
+    route: tuple = ()       # goal, then the source's goals after it
 
 
 class PathPlanner:
@@ -285,6 +427,7 @@ class PathPlanner:
         self._frame_since = 0.0
         self._seq = 0
         self._last_goal = None
+        self._last_route = ()
         self._done = None          # (seq, pose, map_t, made) of the last plan made
         # The last decision's choice, for /path/status and /path.
         self.fed = "none"          # "subgoal" | "goal" | "none"
@@ -292,6 +435,8 @@ class PathPlanner:
         self.aim = None            # (x, y) fed, map frame
         self.plans = 0
         self.failed = 0
+        self.passes = 0            # goals passed on the path (gone_by)
+        self._at = (None, 0)       # (plan, route goal) the last decision was on
         self.ms_total = 0.0
         self.cpu_total = 0.0
         self.ms_max = 0.0
@@ -310,17 +455,18 @@ class PathPlanner:
         if frame != self._frame:
             self._frame, self._frame_since = frame, float(crop.t)
         g = (float(goal[0]), float(goal[1]), int(goal[2]))
-        if (self._last_goal is None or g[2] != self._last_goal[2]
-                or math.hypot(g[0] - self._last_goal[0], g[1] - self._last_goal[1])
-                > GOAL_MOVED_M):
+        route = (g,) + _ahead(source, g[2])
+        if (self._last_goal is None or len(route) != len(self._last_route)
+                or not all(_same(a, b) for a, b in zip(route, self._last_route))):
             self._seq += 1
             self._last_goal = g
+            self._last_route = route
             new = True
         else:
             new = False
         with self._lock:
             self._req = _Request(g, (float(crop.x), float(crop.y), float(crop.yaw)),
-                                 self._frame_since, self._seq)
+                                 self._frame_since, self._seq, route)
         if self.background:
             self._ensure_thread()
             if new:
@@ -341,20 +487,36 @@ class PathPlanner:
             self._choose("none", "goal on another map", None)
             return source.encode(crop)
         pose = (float(crop.x), float(crop.y))
-        # In a straight clear line and close: the goal itself, no plan needed.
         with self._lock:
             plan = self._plan
         if plan is not None and plan.goal[2] != frame:
             plan = None
+        j = self._on(plan, goal)
+        # Gone by the goal on the path: the source moves on, and the same
+        # plan is used from its next leg until the new one is in.
+        if (j is not None and not self._usable(plan, goal)
+                and callable(getattr(source, "passed", None)) and gone_by(plan, pose, j)):
+            if source.passed(goal, crop):
+                self.passes += 1
+                goal = getattr(source, "goal", None)
+                if goal is None:
+                    self._choose("none", "no goal", None)
+                    return source.encode(crop)
+                j = self._on(plan, goal)
+        # In a straight clear line and close, with nothing after it: the goal
+        # itself, no plan needed. With goals after it, the path on round.
+        alone = not _ahead(source, frame)
         near = math.hypot(goal[0] - pose[0], goal[1] - pose[1]) <= self.lookahead_m
-        if near and plan is not None and plan.cm is not None and line_clear(plan.cm, pose, goal):
+        if (alone and near and plan is not None and plan.cm is not None
+                and line_clear(plan.cm, pose, goal)):
             self._choose("goal", "in sight", (goal[0], goal[1]))
             return source.encode(crop)
         why = self._usable(plan, goal)
         if why:
             self._choose("goal", why, (goal[0], goal[1]))
             return source.encode(crop)
-        x, y, kind = subgoal(plan, pose, self.lookahead_m)
+        self._at = (plan, j)
+        x, y, kind = subgoal(plan, pose, self.lookahead_m, j)
         if x is None:
             self._choose("goal", kind, (goal[0], goal[1]))
             return source.encode(crop)
@@ -364,10 +526,24 @@ class PathPlanner:
         self._choose("subgoal", "", (x, y))
         return pg.encode(crop, (x, y, frame))
 
+    def _on(self, plan, goal):
+        """Which of plan's route goals `goal` is (0 its own), or None. On
+        from the one the last decision was on with the same plan, as a loop
+        of two waypoints plans through the same goal twice."""
+        if plan is None or goal is None:
+            return None
+        g = (float(goal[0]), float(goal[1]), int(goal[2]))
+        since = self._at[1] if self._at[0] is plan else 0
+        route = plan.route or (plan.goal,)
+        for j in range(since, len(route)):
+            if _same(route[j], g):
+                return j
+        return None
+
     def _usable(self, plan, goal):
         if plan is None:
             return "no plan yet"
-        if math.hypot(plan.goal[0] - goal[0], plan.goal[1] - goal[1]) > GOAL_MOVED_M:
+        if self._on(plan, goal) is None:
             return "planning to the new goal"
         if plan.points is None:
             return plan.why
@@ -444,20 +620,19 @@ class PathPlanner:
                 # Said, not counted as a plan: the first map is planned on at once.
                 with self._lock:
                     self._plan = Plan(req.goal, req.pose[:2], now, -1.0, None, None,
-                                      None, why, 0.0, 0.0)
+                                      None, why, 0.0, 0.0, (req.goal,), ())
                 self._done = None
             return
         if not self._due(req, view):
             return
         t0, c0 = time.perf_counter(), time.thread_time()
-        pts, why, cm = find_path(view, req.pose[:2], req.goal[:2])
+        pts, cum, cm, why, route, vias = plan_route(view, req.pose[:2],
+                                                    req.route or (req.goal,),
+                                                    self.lookahead_m)
         ms = (time.perf_counter() - t0) * 1000.0
         cpu = (time.thread_time() - c0) * 1000.0
-        cum = None
-        if pts is not None:
-            cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
         self._set(Plan(req.goal, req.pose[:2], now, float(view.t), pts, cum, cm, why,
-                       ms, cpu), req, float(view.t))
+                       ms, cpu, route, vias), req, float(view.t))
 
     def _set(self, plan, req, map_t):
         self.plans += 1
@@ -491,7 +666,9 @@ class PathPlanner:
                 "plan_cpu_ms_mean": self.cpu_total / n,
                 "plans": int(self.plans), "failed": int(self.failed),
                 "lookahead_m": self.lookahead_m,
-                "clear_m": float(plan.cm.inscribed) if have else -1.0}
+                "clear_m": float(plan.cm.inscribed) if have else -1.0,
+                "route_n": len(plan.route) if have else 0,
+                "passes": int(self.passes)}
 
     def marker(self):
         """/path's payload: the path from the truck on, and the point fed.

@@ -619,7 +619,8 @@ JSON_SCHEMAS = {
     # (a click is the goal) or "patrol"; state empty / paused / driving /
     # dwell / finished / tracing (or goal); mode once / loop / patrol;
     # index the current waypoint from 0 and number from 1 (0 with none),
-    # count of them, laps done, skipped so far. x, y the current one on the
+    # count of them, laps done, skipped so far, passed_on_path those passed
+    # going round the corner on the path (pathgoal.gone_by). x, y the current one on the
     # map the truck is on (frame_now), on_map whether it is placed there,
     # distance_m from the truck (-1 with none), approx and approx_m as for
     # the goal. restored: the list came back from before a restart;
@@ -630,7 +631,7 @@ JSON_SCHEMAS = {
     "patrol_status": _schema("crawler.PatrolStatus", {
         "use": _STR, "state": _STR, "mode": _STR, "running": _BOOL, "tracing": _BOOL,
         "index": _INT, "number": _INT, "count": _INT, "laps": _INT, "skipped": _INT,
-        "x": _NUM, "y": _NUM, "frame_now": _INT, "on_map": _BOOL, "distance_m": _NUM,
+        "passed_on_path": _INT, "x": _NUM, "y": _NUM, "frame_now": _INT, "on_map": _BOOL, "distance_m": _NUM,
         "approx": _BOOL, "approx_m": _NUM, "restored": _BOOL, "pending": _BOOL,
         "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
     }),
@@ -645,13 +646,15 @@ JSON_SCHEMAS = {
     # time, with the mean and max over the run; plans made and failed;
     # lookahead_m, how far along the path the point is; clear_m the
     # truck-middle-to-wall clearance the plan was found at (0.266 wide,
-    # 0.196 narrow through a tight gap; -1 with none).
+    # 0.196 narrow through a tight gap; -1 with none); route_n the goals
+    # the plan runs through (the goal and the patrol's next waypoints, 0
+    # with none); passes, goals the truck went by on the path (gone_by).
     "path_status": _schema("crawler.PathStatus", {
         "fed": _STR, "why": _STR, "aim_x": _NUM, "aim_y": _NUM, "path": _BOOL,
         "plan_why": _STR, "length_m": _NUM, "age_s": _NUM, "plan_ms": _NUM,
         "plan_cpu_ms": _NUM, "plan_ms_mean": _NUM, "plan_ms_max": _NUM,
         "plan_cpu_ms_mean": _NUM, "plans": _INT, "failed": _INT,
-        "lookahead_m": _NUM, "clear_m": _NUM,
+        "lookahead_m": _NUM, "clear_m": _NUM, "route_n": _INT, "passes": _INT,
     }),
     # Following a person, with --goal and --pantilt: follow.PersonGoal.
     # follow_status(). active the Follow switch; state off / waiting (on,
