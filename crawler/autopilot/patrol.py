@@ -50,13 +50,16 @@ gathered into one line a link.
 
 Across a restart. With a store, the list is written on every change (on a
 thread, never in the control loop), with the walls of the map it is on. The
-SLAM map is not saved, so a restart is a new map 0 with its origin wherever
-the truck boots, and the only way the old list means anything on it is the
-truck booting where the old map 0 did. So nothing is restored until the
-first map comes up and its walls are checked against the saved ones
-(MATCH_SHARE of them within one cell); a match restores it paused, anything
-else clears it with a journal line, as does a list that was on a map other
-than 0 (a fresh map after a reseed cannot come back after a restart).
+SLAM map is saved too (mapping/mapfile.py) and comes back as map 0 in the
+frame it was saved in, so the old list is on it again; without that file
+(the first boot, --no-slam-map-file, a file that would not load) a restart
+is a new map 0 with its origin wherever the truck boots. Either way nothing
+is restored until the first map comes up and its walls are checked against
+the saved ones (MATCH_SHARE of them within one cell); a match restores it
+paused, anything else clears it with a journal line, as does a list that
+was on a map other than 0 (a fresh map after a reseed comes back after a
+restart only as map 0, if it was the one saved, so its old number means
+nothing).
 """
 
 import json

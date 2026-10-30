@@ -84,6 +84,13 @@ and the heading alone cannot tell a wrong place: a merge is only made if
 the fresh map's walls land on the shelf's walls, not its open floor
 (SHELF_AGREE).
 
+Across a restart. The map worth keeping (Slam.kept: the bigger of the
+current one and the shelf's) is saved by the runner to a file every few
+seconds and on a clean stop (mapfile.py), and on boot the Slam starts lost
+on it (Slam.restore): found round where it was saved, it is the map again,
+in the same frame, as if nothing had happened; not found in RESEED_LOST_S,
+it goes on the shelf and is searched for from the fresh map like any other.
+
 How a fresh map sits on the one before it. A fresh map goes on from the
 pose the truck was last believed at, which after a loss is where it froze,
 not where it is, so a point on the old map is not the same point on the new
@@ -531,6 +538,9 @@ class Slam:
         elif self._tree is None:
             newpose, good = pred, False
         elif self.lost:
+            if self._lost_since is None:
+                # Restored from a file (restore()): lost from the first scan.
+                self._lost_since = t
             self._carry_yaw(imu_rate, dt)
             fit, good = self._relocalize(p, nrm, pred, self._lost_yaw)
             newpose = np.array(fit.pose) if good else pose.copy()
@@ -731,6 +741,58 @@ class Slam:
         self._map_writes = 0
         self.reseeds += 1
         return shelved
+
+    # ---- across a restart (mapfile.py) ------------------------------------
+
+    def kept(self):
+        """(grid, pose, writes) of the map worth keeping across a restart:
+        the bigger, by writes, of the current one and the one on the shelf,
+        with where the truck is (reckoned to be) on it. After a loss the
+        shelf is the long map and the current one is seconds old."""
+        sh = self._shelf
+        if sh is not None and sh.writes >= self._map_writes:
+            return sh.grid, tuple(self._on_shelf(sh)), int(sh.writes)
+        return (self.grid, tuple(float(v) for v in self.pose),
+                int(self._map_writes))
+
+    def snapshot(self):
+        """A mapfile.Snapshot of kept(), or None for a map too young to be
+        one (SEED_WRITES) or with nothing observed."""
+        from crawler.mapping import mapfile
+        grid, pose, writes = self.kept()
+        if writes < SEED_WRITES:
+            return None
+        return mapfile.snapshot_of(grid, pose, writes)
+
+    def restore(self, snap):
+        """Before the first scan: the map of a mapfile.Snapshot is the map,
+        and the truck is lost on it round the pose it was saved at, so the
+        first scans search for it there (reloc.py, every heading: nothing
+        says which way it faces now). Not found inside RESEED_LOST_S, it is
+        shelved as any lost map is and searched for from the fresh map,
+        reckoned where it was saved, the heading unknown, and owed
+        LINK_ROLLED_M for being moved while it was off. False, and nothing
+        changed, if the map has no walls near that pose to match against."""
+        grid = snap.grid()
+        x, y = float(snap.pose[0]), float(snap.pose[1])
+        if len(grid.local_points(x, y, LOCAL_R_M)) < 50:
+            return False
+        self.grid = grid
+        self.pose = np.array(snap.pose, float)
+        self.vel[:] = 0.0
+        self.started = True
+        self.lost = True
+        self._lost_since = None     # the first scan's time (step())
+        self._lost_yaw = None
+        self._search = None
+        self._pending = None
+        self._map_writes = int(snap.writes)
+        self._dr_reset(self.pose)
+        self._dr_blind = True
+        self._dr_rolled = 1
+        self._tree = None
+        self._refresh_target()
+        return True
 
     # ---- dead reckoning, for Result.link ---------------------------------
 

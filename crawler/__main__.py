@@ -106,6 +106,10 @@ RECORD_HOLD_SECONDS = 1.0
 # when they come back). Under log/, which is untracked.
 PATROL_FILE = "log/patrol.json"
 
+# --slam's map, kept across a restart (mapping/mapfile.py says how). Under
+# log/ too: a map is a floor plan of the house, never for the repo.
+SLAM_MAP_FILE = "log/slam_map.npz"
+
 # The camera view the autopilot's driver reads. The footprint tap reads the
 # same one (never takes from it) for the frame behind each auto decision.
 AUTO_VIEW = "auto"
@@ -1914,6 +1918,13 @@ def parse_args(argv=None):
         help="where the mapper runs: its own process (the default, it cannot "
              "hold the control loop's GIL) or a thread",
     )
+    parser.add_argument(
+        "--no-slam-map-file",
+        action="store_true",
+        help=f"start the map from nothing and keep nothing: by default --slam "
+             f"saves the map to {SLAM_MAP_FILE} as it goes and starts from it "
+             f"on the next boot",
+    )
     # Off unless named, and mapping only. The OAK-D's depth as a 3D voxel map
     # placed by the SLAM pose, and the low obstacles the roof lidar passes
     # over (2.5D, under its plane), shown in Foxglove on /voxel/points and
@@ -2176,7 +2187,9 @@ def main(argv=None):
                 mode=args.slam_worker, logger=log,
                 tele=tele if channels_live else None,
                 nav_half_m=slam_runner.NAV_HALF_M if args.nav else None,
-                speed=commanded_speed)
+                speed=commanded_speed,
+                map_path=(None if args.no_slam_map_file
+                          else lg.log_path(SLAM_MAP_FILE)))
             slam.start()
             hub.imu_listeners.append(slam.on_imu)
             log.log("info", "SLAM", f"Mapping on a {args.slam_worker}")

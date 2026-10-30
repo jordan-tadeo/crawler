@@ -15,6 +15,8 @@ The parts
   slam.py     Slam.step(), one scan: predict, de-skew, match, gate, write
   runner.py   SlamRunner: Slam on a worker beside the control loop, and
               the Foxglove messages (telemetry/map_view.py draws them)
+  mapfile.py  the map on disk (log/slam_map.npz): saved as it goes and on
+              a clean stop, restored on boot for the truck to find itself on
 
 tools/slam_replay.py runs the same Slam over a recording; tools/slam_bench.py
 times it on the Pi.
@@ -55,8 +57,9 @@ What it does not do
 No loop closure: the error of a long drive is never taken back out, only
 kept small. Slam._write(pose, points) is the one place a scan enters the
 map, which is where a pose graph would log scans to re-render from.
-No relocalisation: a truck carried somewhere else while lost recovers its
-heading only, near the pose it froze at.
+Relocalisation only near where the truck froze (reloc.SEARCH_R_M, or the
+shelf's reckoned doubt): a truck carried further than that while lost is
+not found until it drives back near.
 The map keeps everything inside 205 m a side; past that it scrolls and
 forgets, and says so in the log as an error.
 """

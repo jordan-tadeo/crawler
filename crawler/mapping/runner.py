@@ -88,6 +88,10 @@ RESEED_LOG_EVERY_S = 5.0
 OWN_TF_S = 1.0
 
 
+# How long close() waits for the worker to finish, its last map save (a
+# couple of seconds at most, mapfile.Saver.flush) included.
+CLOSE_WAIT_S = 3.0
+
 # Poses kept for pose_at(): ten seconds of scans.
 POSE_KEEP = 100
 # How far past the newest scan pose_at() still answers with it: a depth
@@ -179,11 +183,129 @@ def map_interval(codes, every_s=MAP_EVERY_S, bytes_s=MAP_BYTES_S):
     return max(every_s, 4.0 * cells / bytes_s)
 
 
+def _say_out(outbox, level, text):
+    try:
+        outbox.put_nowait(("say", level, text))
+    except Exception:
+        pass
+
+
+def _restore(slam, map_path, outbox):
+    """The map saved by the last run (mapfile.py) into slam before its first
+    scan, and a line in the journal either way but the first boot."""
+    from crawler.mapping import mapfile
+    snap, why = mapfile.load(map_path)
+    if snap is None:
+        if why != "no map file":
+            _say_out(outbox, "warning", f"The saved map is ignored ({why}); "
+                     "starting a new one")
+        return
+    if not slam.restore(snap):
+        _say_out(outbox, "warning", "The saved map is ignored (no walls near "
+                 "where it says the truck was); starting a new one")
+        return
+    age = time.time() - snap.saved_at if snap.saved_at > 0 else float("nan")
+    n, m = snap.lo.shape
+    _say_out(outbox, "info",
+             f"Restored the map saved {_ago(age)}: {snap.writes} scans, "
+             f"{n * snap.res:.0f} x {m * snap.res:.0f} m; looking for my "
+             f"place on it round ({snap.pose[0]:.1f}, {snap.pose[1]:.1f})")
+
+
+def _ago(s):
+    if not math.isfinite(s) or s < 0:
+        return "at some point"
+    if s < 120:
+        return f"{s:.0f} s ago"
+    if s < 7200:
+        return f"{s / 60:.0f} min ago"
+    return f"{s / 3600:.1f} h ago"
+
+
+class _MapKeeper:
+    """When the worker saves the map: every mapfile.SAVE_EVERY_S of scan
+    host time while the kept map (Slam.kept) has changed or the truck on it
+    has moved, and once more at the end. The snapshot is taken here, on the
+    worker, and written on the Saver's thread."""
+
+    def __init__(self, slam, path, outbox):
+        from crawler.mapping import mapfile
+        self.mapfile = mapfile
+        self.slam = slam
+        self.outbox = outbox
+        self.saver = mapfile.Saver(path)
+        self.next_at = None
+        self.seen = None            # (id(grid), version, pose) last saved
+        self.said_saves = 0
+        self.said_errors = 0
+
+    def tick(self, host_t):
+        if self.next_at is None:
+            self.next_at = host_t + self.mapfile.SAVE_EVERY_S
+        if host_t < self.next_at:
+            return
+        self.next_at = host_t + self.mapfile.SAVE_EVERY_S
+        self.save()
+
+    def save(self, force=False):
+        self._report()
+        grid, pose, _ = self.slam.kept()
+        seen = self.seen
+        if (not force and seen is not None and seen[0] == id(grid)
+                and seen[1] == grid.version
+                and not self.mapfile.moved(seen[2], pose)):
+            return
+        snap = self.slam.snapshot()
+        if snap is None:
+            return
+        self.seen = (id(grid), grid.version, pose)
+        self.saver.offer(snap)
+
+    def close(self, timeout=2.0):
+        """The last save, waited for up to `timeout` seconds."""
+        try:
+            self.save()
+        except Exception:
+            pass
+        self.saver.flush(timeout)
+        self._report()
+
+    def _report(self):
+        s = self.saver
+        if s.errors > self.said_errors:
+            if self.said_errors == 0:
+                _say_out(self.outbox, "warning", "Could not save the map to "
+                         f"{s.path}: {s.last_error}")
+            self.said_errors = s.errors
+        if s.saves and not self.said_saves:
+            _say_out(self.outbox, "info", f"Saving the map to {s.path} "
+                     f"({s.last_bytes / 1024:.0f} KiB, {s.last_ms:.0f} ms), "
+                     f"every {self.mapfile.SAVE_EVERY_S:g} s while it changes")
+        self.said_saves = s.saves
+
+
+def _stop_on_signals(stop):
+    """In a worker process, SIGTERM and SIGINT end the loop through `stop`
+    instead of killing it, so the map is saved: systemd sends SIGTERM to
+    every process of the service at once, the worker as well as main().
+    Does nothing on a thread (only the main thread may set handlers)."""
+    import signal
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, lambda *_: stop.set())
+        except (ValueError, OSError):
+            pass
+
+
 def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
-          nav_every_s=NAV_EVERY_S):
+          nav_every_s=NAV_EVERY_S, map_path=None):
     """The worker, thread or process: scans in, Results and MapViews out.
     None in the inbox ends it. With nav_half_m, a full-resolution MapView
-    for the navigator too, every nav_every_s."""
+    for the navigator too, every nav_every_s. With map_path, the map is
+    restored from it before the first scan and saved to it as it goes and
+    at the end (mapfile.py)."""
     from crawler.mapping.clock import SensorClock
     from crawler.mapping.egomap import EgoMap
     from crawler.mapping.imu import ImuTrack
@@ -192,6 +314,17 @@ def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
     imu = ImuTrack()
     kw = {} if l_max is None else {"l_max": int(l_max)}
     slam = Slam(imu=imu, **kw)
+    keeper = None
+    stop = threading.Event()
+    if map_path is not None:
+        try:
+            _restore(slam, map_path, outbox)
+        except Exception as e:      # never in the way of mapping at all
+            slam = Slam(imu=imu, **kw)
+            _say_out(outbox, "warning", f"The saved map is ignored ({e!r}); "
+                     "starting a new one")
+        keeper = _MapKeeper(slam, map_path, outbox)
+        _stop_on_signals(stop)
     # The policy's crop of the map, drawn here after every step, on the
     # grid the step just wrote: the same EgoMap tools/map_crops.py runs
     # over a recording, so training and the car see the same picture.
@@ -202,9 +335,16 @@ def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
     lost_out = 0
     grid_seen = (0, 0)
     while True:
-        item = inbox.get()
-        if item is None:
+        try:
+            item = inbox.get(timeout=0.25)
+        except queue.Empty:
+            item = False
+        if item is None or stop.is_set():
+            if keeper is not None:
+                keeper.close()
             return
+        if item is False:
+            continue
         host_t, stamp_ms, ranges, rows = item[:4]
         speed = item[4] if len(item) > 4 else None
         for r in rows:
@@ -232,6 +372,11 @@ def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
                 outbox.put(("grid", g.grew, g.dropped, g.size), timeout=1.0)
             except queue.Full:
                 pass
+        if keeper is not None:
+            try:
+                keeper.tick(host_t)
+            except Exception as e:      # a save that fails costs that save
+                _say_out(outbox, "warning", f"Could not save the map: {e!r}")
         try:
             outbox.put_nowait(("crop", ego.after_step(slam.grid, res)))
         except queue.Full:
@@ -269,7 +414,8 @@ class SlamRunner:
 
     def __init__(self, mode=MODE_THREAD, tele=None, logger=None, mount=None,
                  l_max=None, inbox=INBOX, map_every_s=MAP_EVERY_S,
-                 clock=time.monotonic, nav_half_m=None, speed=None):
+                 clock=time.monotonic, nav_half_m=None, speed=None,
+                 map_path=None):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
         if mount is None:
@@ -291,6 +437,9 @@ class SlamRunner:
         # truck has got to while it is lost with it (slam.py, "How a fresh
         # map sits on the one before it"). main() asks the throttle.
         self.speed = speed
+        # Where the map is kept across a restart (mapfile.py), or None to
+        # start from nothing every time and keep nothing.
+        self.map_path = None if map_path is None else str(map_path)
 
         self._imu = deque(maxlen=IMU_KEEP)
         self._imu_lock = threading.Lock()
@@ -334,14 +483,14 @@ class SlamRunner:
             self._inbox = ctx.Queue(maxsize=self.inbox_size)
             self._outbox = ctx.Queue(maxsize=OUTBOX)
             args = (self._inbox, self._outbox, self.l_max, self.map_every_s,
-                    self.nav_half_m)
+                    self.nav_half_m, NAV_EVERY_S, self.map_path)
             self._worker = ctx.Process(target=_work, args=args, name="slam",
                                        daemon=True)
         else:
             self._inbox = queue.Queue(maxsize=self.inbox_size)
             self._outbox = queue.Queue(maxsize=OUTBOX)
             args = (self._inbox, self._outbox, self.l_max, self.map_every_s,
-                    self.nav_half_m)
+                    self.nav_half_m, NAV_EVERY_S, self.map_path)
             self._worker = threading.Thread(target=_work, args=args,
                                             name="slam", daemon=True)
         if self.mode == MODE_PROCESS:
@@ -353,7 +502,9 @@ class SlamRunner:
         self._pump.start()
 
     def close(self):
-        """Stop the worker and the pump. Never raises, waits a second at most."""
+        """Stop the worker and the pump. Never raises. Waits CLOSE_WAIT_S at
+        most for the worker, which saves the map on its way out, and a
+        second or two more if it has to be terminated."""
         self._stop.set()
         worker, self._worker = self._worker, None
         if worker is None:
@@ -369,7 +520,7 @@ class SlamRunner:
         except Exception:
             pass
         try:
-            worker.join(timeout=1.0)
+            worker.join(timeout=CLOSE_WAIT_S)
             if self.mode == MODE_PROCESS and worker.is_alive():
                 worker.terminate()
                 worker.join(timeout=1.0)
@@ -536,6 +687,8 @@ class SlamRunner:
                       f"The map is {size * 0.05:.0f} m a side and lost cells "
                       f"to a scroll ({dropped} so far)" if dropped > was else
                       f"The map grew to {size * 0.05:.0f} m a side")
+        elif kind == "say":
+            self._say(item[1], item[2])
         elif kind == "error":
             self.errors += 1
             if not self._said_error and self.logger is not None:
