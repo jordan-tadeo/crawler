@@ -1,0 +1,95 @@
+#!/bin/bash
+# Bring up the car's own access point when none of its known WiFi networks is
+# around, and go back to a known network once one shows up again.
+#
+# Known networks are every NetworkManager wifi profile in infrastructure mode
+# with autoconnect on, tried in autoconnect-priority order. NetworkManager
+# connects to those by itself; this loop only covers the gap when it can't.
+#
+# brcmfmac (Pi 4) allows a managed and an AP interface together only on one
+# channel, and NetworkManager will not scan while wlan0 is an AP. So the only
+# way to look for a known network is to drop the AP for a scan. That is done
+# only when no station is associated, so a phone on the hotspot is never cut off.
+set -u
+
+AP_PROFILE=${AP_PROFILE:-crawler-hotspot}
+IFACE=${IFACE:-wlan0}
+GRACE=${GRACE:-60}       # seconds without a client network before the AP comes up
+RECHECK=${RECHECK:-150}  # seconds between looks for a known network while on the AP
+TICK=${TICK:-10}
+IW=/usr/sbin/iw
+
+log() { echo "$*"; }
+
+active_con() { nmcli -g GENERAL.CONNECTION device show "$IFACE" 2>/dev/null; }
+dev_state()  { nmcli -g GENERAL.STATE device show "$IFACE" 2>/dev/null | cut -d' ' -f1; }
+stations()   { "$IW" dev "$IFACE" station dump 2>/dev/null | grep -c '^Station'; }
+
+# "priority<TAB>profile<TAB>ssid" for every known client network, best first.
+known_profiles() {
+    nmcli -t -f NAME,TYPE,AUTOCONNECT,AUTOCONNECT-PRIORITY connection show \
+    | while IFS=: read -r name type ac prio; do
+        [ "$type" = 802-11-wireless ] && [ "$ac" = yes ] && [ "$name" != "$AP_PROFILE" ] || continue
+        mode=$(nmcli -g 802-11-wireless.mode connection show "$name")
+        [ -z "$mode" ] || [ "$mode" = infrastructure ] || continue
+        ssid=$(nmcli -g 802-11-wireless.ssid connection show "$name")
+        printf '%s\t%s\t%s\n' "$prio" "$name" "$ssid"
+    done | sort -t"$(printf '\t')" -k1,1nr
+}
+
+start_ap() {
+    log "no known network for ${GRACE}s, bringing up $AP_PROFILE"
+    nmcli --wait 30 connection up "$AP_PROFILE" >/dev/null 2>&1 \
+        && log "$AP_PROFILE is up" || log "could not bring up $AP_PROFILE"
+}
+
+# Drop the AP, scan, and join the best known network in range. If none is,
+# put the AP straight back.
+try_return() {
+    log "no stations on $AP_PROFILE, dropping it to scan"
+    nmcli connection down "$AP_PROFILE" >/dev/null 2>&1
+    sleep 3
+    visible=$(nmcli -t -f SSID device wifi list ifname "$IFACE" --rescan yes 2>/dev/null)
+    while IFS="$(printf '\t')" read -r prio name ssid; do
+        [ -n "$name" ] || continue
+        if printf '%s\n' "$visible" | grep -qxF -- "$ssid"; then
+            log "known network '$ssid' in range, joining $name"
+            if nmcli --wait 40 connection up "$name" >/dev/null 2>&1; then
+                log "joined $name"
+                return 0
+            fi
+            log "could not join $name"
+        fi
+    done < <(known_profiles)
+    # NetworkManager may have joined one by itself during the scan.
+    [ "$(dev_state)" = 100 ] && [ "$(active_con)" != "$AP_PROFILE" ] && return 0
+    log "no known network in range"
+    start_ap
+}
+
+last_client=$(date +%s)
+last_check=0
+log "watching $IFACE (grace ${GRACE}s, recheck ${RECHECK}s)"
+while true; do
+    now=$(date +%s)
+    con=$(active_con)
+    if [ "$con" = "$AP_PROFILE" ]; then
+        if (( now - last_check >= RECHECK )); then
+            n=$(stations)
+            if (( n == 0 )); then
+                try_return
+            else
+                log "$n station(s) on $AP_PROFILE, not scanning"
+            fi
+            last_check=$(date +%s)
+            last_client=$last_check
+        fi
+    elif [ "$(dev_state)" = 100 ] && [ -n "$con" ]; then
+        last_client=$now
+    elif (( now - last_client >= GRACE )); then
+        start_ap
+        last_check=$(date +%s)
+        last_client=$last_check
+    fi
+    sleep "$TICK"
+done

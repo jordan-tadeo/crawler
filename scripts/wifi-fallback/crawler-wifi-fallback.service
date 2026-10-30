@@ -1,0 +1,13 @@
+[Unit]
+Description=Crawler WiFi fallback access point
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/crawler-wifi-fallback
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
