@@ -213,23 +213,102 @@ def test_it_sticks_to_the_person_it_follows_when_somebody_else_is_nearer():
     assert g.goal == held and g.ignored == 1
 
 
-def test_nobody_for_lost_s_is_no_goal_and_a_hold_and_a_new_sighting_ends_it():
+def test_on_with_nobody_waits_then_searches_and_a_sighting_follows_at_once():
     g, s, poses = goal_with()
-    assert g.reached() and g.state() == "searching", "on, nobody yet: hold"
+    g.observe(crop_at(t=0.0))
+    assert g.reached() and g.state() == "waiting", "on, nobody yet: hold a moment"
+    g.observe(crop_at(t=fl.WAIT_S + 0.1))
+    assert g.state() == "searching"
+    assert g.reached() and g.goal is None, "no map to search: hold"
     poses.at = [(t, 0.0, 0.0, 0.0) for t in np.arange(0.0, 10.0, 0.5)]
-    g.lidar.scan = wall_and([(3.0, 0.0)], t=1.0)
-    s.see([person_box(3.0, 0.0)], 1.0)
-    g.poll(crop_at(t=1.0))
-    assert g.state() == "following" and not g.reached()
-    g.poll(crop_at(t=1.0 + fl.LOST_S - 0.1))
-    assert g.goal is not None, "held a moment"
-    g.poll(crop_at(t=1.0 + fl.LOST_S + 0.1))
-    assert g.state() == "lost" and g.goal is None and g.reached()
-    assert not g.encode(crop_at()).any(), "present 0"
     g.lidar.scan = wall_and([(3.0, 0.0)], t=6.0)
     s.see([person_box(3.0, 0.0)], 6.0)
     g.poll(crop_at(t=6.0))
     assert g.state() == "following" and not g.reached()
+    assert g.goal[:2] == pytest.approx((3.0, 0.0), abs=0.15)
+
+
+def test_a_person_standing_unseen_in_the_lidar_is_still_followed_until_they_go():
+    # Seen once at 1.0 m (inside the gap), then the camera misses them: the
+    # lidar still has them at the point, so the gap holds; they walk off,
+    # the point is empty, and it chases where they were.
+    g, s, poses = goal_with()
+    poses.at = [(t, 0.0, 0.0, 0.0) for t in np.arange(0.0, 30.0, 0.5)]
+    g.lidar.scan = wall_and([(1.0, 0.0)], t=1.0)
+    s.see([person_box(1.0, 0.0)], 1.0)
+    g.poll(crop_at(t=1.0))
+    assert g.state() == "gap" and g.reached()
+    for t in (3.0, 6.0, 12.0):
+        g.lidar.scan = wall_and([(1.0, 0.0)], t=t)
+        g.poll(crop_at(t=t))
+        assert g.state() == "gap" and g.reached() and g.confirmed, t
+    g.lidar.scan = wall_and([(2.5, 1.5)], t=13.0)
+    g.poll(crop_at(t=13.0))
+    assert g.state() == "chasing" and not g.reached()
+    assert g.goal[:2] == pytest.approx(g.point[:2]), "one sighting: no walk to carry on"
+
+
+def test_unseen_and_gone_it_chases_where_they_were_plus_their_capped_walk():
+    g, s, poses = goal_with(scan=wall_and([]))
+    poses.at = [(t, 0.0, 0.0, 0.0) for t in np.arange(0.0, 30.0, 0.5)]
+    for t, y in ((1.0, 0.0), (2.0, 0.5)):
+        g.lidar.scan = wall_and([(2.5, y)], t=t)
+        s.see([person_box(2.5, y)], t)
+        g.poll(crop_at(t=t))
+    vx, vy = g.walk()
+    assert abs(vx) < 0.2 and 0.2 < vy < 0.6, "about 0.5 m/s to the left, smoothed"
+    g.lidar.scan = wall_and([], t=2.5)
+    g.poll(crop_at(t=2.0 + fl.FRESH_S + 0.1))
+    assert g.state() == "chasing" and not g.reached()
+    chase = g.goal
+    assert chase[1] > g.point[1] + 0.2, "carried on the way they walked"
+    assert math.hypot(chase[0] - g.point[0], chase[1] - g.point[1]) <= fl.EXTRAP_MAX_M + 1e-9
+    g.poll(crop_at(t=6.0))
+    assert g.goal == chase, "fixed once the chase begins, so the plan holds"
+    assert not g.encode(crop_at(t=6.0))[0, pg.PRESENT] == 0.0
+    # CHASE_S on: the search, first down the bearing they were seen on.
+    g.poll(crop_at(t=2.0 + fl.FRESH_S + 0.1 + fl.CHASE_S + 0.1))
+    assert g.state() == "searching" and g.search.kind == "along"
+    tx, ty, _ = g.goal
+    px, py, _ = g.point
+    assert math.hypot(tx, ty) == pytest.approx(math.hypot(px, py) + 2.0, abs=0.05)
+    assert math.atan2(ty, tx) == pytest.approx(math.atan2(py, px), abs=0.02)
+
+
+def test_arriving_at_the_chase_point_starts_the_search_at_once():
+    g, s, poses = goal_with(scan=wall_and([]))
+    poses.at = [(t, 0.0, 0.0, 0.0) for t in np.arange(0.0, 30.0, 0.5)]
+    g.lidar.scan = wall_and([(2.0, 0.0)], t=1.0)
+    s.see([person_box(2.0, 0.0)], 1.0)
+    g.poll(crop_at(t=1.0))
+    g.lidar.scan = wall_and([], t=3.0)
+    g.poll(crop_at(t=3.0))
+    assert g.state() == "chasing"
+    g.poll(crop_at(x=1.7, t=4.0))
+    assert g.state() == "searching" and g.search.kind == "along" and not g.reached()
+
+
+def test_a_sighting_while_chasing_or_searching_is_followed_again_and_said_once():
+    said = []
+    s, poses = Sightings(), Poses()
+    g = fl.PersonGoal(CAM, sightings=s, lidar=Lidar(wall_and([])), pose_at=poses,
+                      say=lambda level, who, text: said.append(text))
+    g.command({"cmd": "on"})
+    poses.at = [(t, 0.0, 0.0, 0.0) for t in np.arange(0.0, 40.0, 0.5)]
+    g.lidar.scan = wall_and([(3.0, 0.0)], t=1.0)
+    s.see([person_box(3.0, 0.0)], 1.0)
+    g.poll(crop_at(t=1.0))
+    g.lidar.scan = wall_and([], t=2.0)
+    for t in np.arange(3.0, 20.0, 0.1):
+        g.poll(crop_at(t=float(t)))
+    assert g.state() == "searching"
+    assert sum("Chasing" in x for x in said) == 1, said
+    assert sum(x.startswith("Searching: the person") for x in said) == 1, said
+    g.lidar.scan = wall_and([(3.2, 0.3)], t=20.0)
+    s.see([person_box(3.2, 0.3)], 20.0)
+    g.poll(crop_at(t=20.0))
+    assert g.state() == "following" and g.goal[:2] == pytest.approx((3.2, 0.3), abs=0.2)
+    assert not g.search.active
 
 
 def test_the_gap_holds_inside_gap_m_and_lets_go_past_resume_m():
@@ -298,10 +377,11 @@ def test_a_followed_person_is_a_goal_source_the_planner_paths_round_a_wall_to():
     fed = p.encode(crop_at(t=1.0), sw)
     assert p.status()["path"] and p.fed == "subgoal"
     assert not np.allclose(fed, sw.encode(crop_at(t=1.0)))
-    # Lost: no goal, nothing planned, and the switch's own none is fed.
-    g.observe(crop_at(t=1.0 + fl.LOST_S + 0.5))
-    assert sw.goal is None
-    assert not p.encode(crop_at(t=1.0 + fl.LOST_S + 0.5), sw).any()
+    # Gone (the lidar has nobody there): the chase point is the goal, planned too.
+    g.lidar.scan = wall_and([], t=4.0)
+    g._keep_scan()
+    g.observe(crop_at(t=4.0))
+    assert g.state() == "chasing" and sw.goal[:2] == pytest.approx(g.point[:2])
 
 
 def test_the_listener_puts_follow_commands_in_the_queue():
@@ -463,8 +543,42 @@ def test_a_simulated_follow_keeps_the_gap_behind_a_walking_person_and_stops_when
     assert r.fed > 0
 
 
-def test_a_simulated_follow_holds_when_the_person_walks_out_of_view():
-    # Steps round behind the truck at 8 s: out of the camera, lost, and held.
-    r = simulate(20.0, lambda t: (3.0, 0.0) if t < 8.0 else (-2.0, 0.0))
-    assert r.goal.state() == "lost" and r.driver.goal_reached
-    assert not r.goal.encode(r.driver.slam.crop()).any()
+def test_a_simulated_follow_chases_and_searches_when_the_person_walks_out_of_view():
+    # Steps round behind the truck at 8 s: out of the camera. It does not
+    # hold with no goal any more: it drives to where they were, then on.
+    # With no map to pick an edge off (this sim has none), it holds once
+    # it has been down their bearing; test_search has the map.
+    r = simulate(30.0, lambda t: (3.0, 0.0) if t < 8.0 else (-2.0, 0.0))
+    assert r.goal.state() == "searching" and r.goal.search.arrived == 1
+    assert r.truck[0] > 3.5, "it went to where they were last seen, and on"
+
+
+def test_the_walk_away_of_the_drive_drives_after_them():
+    # The drive of 2026-10-30 21:26 local, as the recording has it: seen at
+    # 0.68 m straight ahead, 0.48 m at +18, unseen 3.9 s, 0.95 m at +61,
+    # 1.04 m at +62 1.6 s later, then they walked off past the edge of the
+    # frame (it ends near +70) and were never seen again. Every sighting
+    # inside the gap. The truck must drive after them, the way they went.
+    def walk(t):
+        if t < 1.5:
+            return 0.68 + CAM.x_m, 0.0
+        if t < 5.4:
+            r, b = 0.48, 18.0
+        elif t < 7.0:
+            r, b = 0.95, 61.0
+        elif t < 8.6:
+            r, b = 1.04, 62.0
+        else:
+            r, b = 1.04 + 0.8 * (t - 8.6), 62.0 + min(30.0, 15.0 * (t - 8.6))
+        b = math.radians(b)
+        return CAM.x_m + r * math.cos(b), r * math.sin(b)
+    r = simulate(20.0, walk, every=0.96)
+    assert r.goal.state() in ("chasing", "searching", "following"), r.goal.state()
+    assert not r.driver.goal_reached
+    x, y = r.truck
+    print(f"\nwalk-away: truck at ({x:.2f}, {y:.2f}), {r.holds} holds of "
+          f"{len(r.gaps)}, state {r.goal.state()}")
+    # Before: held all 200 decisions and never moved off (0, 0).
+    assert r.holds < 0.75 * len(r.gaps)
+    assert math.hypot(x, y) > 0.5, "it drove"
+    assert y > 0.3, "the way they went (left)"

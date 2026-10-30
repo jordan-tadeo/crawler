@@ -7,7 +7,9 @@ the bearing's sin and cos), exactly as a clicked goal is. Nothing here
 steers and nothing turns the truck toward anybody; by the owner's ruling only
 the model ever owns the wheels. The one thing it adds to the wheels is a
 hold, the same neutral as the arrival hold (reached()): inside the follow gap,
-and with the person lost.
+and with nowhere to point the goal (nobody seen yet, or a search with no map
+to pick from). With the person gone it chases where they were and then
+searches (autopilot/search.py), which is only ever choosing the goal too.
 
 Where a person is
 -----------------
@@ -42,9 +44,38 @@ the one nearest the last point within GATE_M (plus WALK_M_S for each second
 since), so somebody walking past does not take over. Nobody in the gate is
 a sighting of someone else, and the followed point stays where it was.
 
-Lost: nobody placed for LOST_S, and the goal input goes to none (present
-0) and the truck holds neutral until the person is seen again. It does not
-drive on without a goal, which the model would.
+When they are not seen
+----------------------
+The detector misses a person it can see often: on the drive of 2026-10-30
+(04:25-04:27Z, follow on) it answered every 0.96 s (median; p90 1.59 s,
+the rate governor's slowest 2.0 s) and found the person in 16 of 90
+answers, and after an answer that found them the next one did too only 6
+times in 15 (20 of 55 over the whole recording). Boxes at a metre were
+partial people at the frame's edges. So a person standing in view goes
+unseen for 3 s or more about one re-sighting in five (8 of the 41
+hit-to-hit gaps under 10 s), and the old 3 s "lost" fired on that. What
+counts is whether they are still where they were seen, so it asks:
+
+  following  seen within FRESH_S, or since then the newest lidar scan has
+             returns within PRESENT_R_M of the point (somebody standing
+             there, unseen by the camera), for up to CONFIRM_MAX_S. With no
+             lidar, FRESH_NO_LIDAR_S. The goal is the point and the gap
+             holds, as ever.
+  chasing    gone from the point: the goal is where they were, carried on by
+             the walk their last few sightings make (TRACK_S of them, at
+             most EXTRAP_S of it and EXTRAP_MAX_M), fixed when the chase
+             begins. Until CHASE_ARRIVE_M of it or CHASE_S since the chase
+             began. No gap hold: the person is not there to keep it from.
+  searching  no person for longer than that, or never one since Follow on
+             (after WAIT_S): search.Search picks the goal, first their
+             point carried EXTEND_M on down the bearing they were seen on,
+             then the edges of the map. A hold only when it has nowhere to
+             go yet.
+
+This is what the walk-away of 21:26 local was: every sighting was inside
+the gap (0.44 to 1.33 m), the gap only lets go when a sighting is past
+RESUME_M, the person walked off the side of the frame before one was, and
+the truck held neutral for 52 s.
 
 The follow gap: within GAP_M of the person the truck holds neutral, as at a
 clicked goal's ARRIVE_M; it drives again once the person is RESUME_M off.
@@ -70,8 +101,27 @@ from crawler.autopilot import policy_goal as pg
 GAP_M = 1.2
 # ...until the person is this far off again.
 RESUME_M = 1.6
-# Nobody placed for this long: lost, no goal, neutral.
-LOST_S = 3.0
+# A sighting this recent is the person, where they were seen...
+FRESH_S = 1.5
+# ...this, with no lidar to look at the place with.
+FRESH_NO_LIDAR_S = 4.0
+# Past FRESH_S: lidar returns (MIN_HITS) this close to the point are them
+# standing there unseen, for up to this long since the sighting.
+PRESENT_R_M = 0.45
+CONFIRM_MAX_S = 20.0
+# Gone from the point: where they were, plus their walk, until this long
+# since the chase began, or the truck is this close to it.
+CHASE_S = 10.0
+CHASE_ARRIVE_M = 0.5
+# Their walk: off the sightings of the last TRACK_S, at least MIN_TRACK_DT_S
+# apart end to end, at most WALK_M_S fast; carried on for at most EXTRAP_S
+# and EXTRAP_MAX_M.
+TRACK_S = 4.0
+MIN_TRACK_DT_S = 0.5
+EXTRAP_S = 2.0
+EXTRAP_MAX_M = 1.0
+# Follow on with nobody seen: this long for the detector before searching.
+WAIT_S = 3.0
 # A followed person can move this far between sightings and still be them...
 GATE_M = 1.0
 # ...plus this for every second since the last.
@@ -221,35 +271,42 @@ class OakdRange:
 
 class PersonGoal(gl.Goal):
     """The followed person's place on the SLAM map, as a goal, and the
-    follow gap. Control loop only: the vision runner's thread only ever
-    swaps its Sighting, which poll() reads.
+    follow gap; the chase after them and the search for them when they are
+    gone. Control loop only: the vision runner's thread only ever swaps its
+    Sighting, which poll() reads.
 
     sightings  something with sighting() -> runner.Sighting or None
     lidar      something with latest() -> lidar.Scan or None (LidarReader)
     pose_at    t -> a pose with .x .y .yaw (mapping runner.pose_at), or None:
                the truck's map pose at a monotonic time
     oakd       optional (bearing_deg off the truck, t) -> metres or None
+    map_view   optional () -> runner.MapView or None, for the search
     """
 
     def __init__(self, camera, sightings=None, lidar=None, pose_at=None,
-                 oakd=None, gap_m=GAP_M, resume_m=RESUME_M, lost_s=LOST_S,
+                 oakd=None, gap_m=GAP_M, resume_m=RESUME_M, map_view=None,
                  say=None):
+        from crawler.autopilot import search as sr
         super().__init__()
         self.cam = camera
         self.sightings = sightings
         self.lidar = lidar
         self.pose_at = pose_at
         self.oakd = oakd
-        self.gap_m, self.resume_m, self.lost_s = float(gap_m), float(resume_m), float(lost_s)
+        self.gap_m, self.resume_m = float(gap_m), float(resume_m)
         self.arrive_m = self.gap_m
         self._say = say
+        self.search = sr.Search(map_view=map_view, say=say)
         self.active = False
+        self.mode = "off"           # off / waiting / following / gap / chasing / searching
         self.point = None           # (x, y, frame) on the map, or None
         self.seen_t = None          # the frame time it was last placed at
+        self.seen_from = None       # the truck's (x, y) then, on point's frame
+        self.chase = None           # (x, y, frame) chased to, or None
         self.now = None             # the newest crop's time
         self.frame_now = None
         self.present = False
-        self.last = None            # (distance, bearing) from the newest crop
+        self.last = None            # (distance, bearing) to the goal from the newest crop
         self.pose = None            # the newest present crop's (x, y, yaw)
         self.source = ""            # what the last placed distance came off
         self.people = 0             # people in the newest sighting
@@ -257,12 +314,18 @@ class PersonGoal(gl.Goal):
         self.unplaced = 0
         self.ignored = 0            # sightings of somebody else
         self.acquired = 0
+        self.confirmed = False      # the lidar sees somebody at the point
+        self._on_t = None
         self._gap = False
+        self._chase_done = False
+        self._chase_t = None
+        self._track = collections.deque()   # (t, x, y) raw placed points, point's frame
         self._seq = 0               # the newest egomap.Link taken
         self._sighting_seq = None
         self._scans = collections.deque(maxlen=SCANS_KEPT)
         self._scan_t = None
-        self._lost_said = True
+        self._spot = (None, None, False)    # (scan t, point, taken)
+        self._said_mode = "off"
 
     def _log(self, level, text):
         print(text)
@@ -285,10 +348,17 @@ class PersonGoal(gl.Goal):
         on = (not self.active) if name == "toggle" else name == "on"
         if on and not self.active:
             self.active = True
-            self.point, self.seen_t, self._gap, self._lost_said = None, None, False, False
+            self.point, self.seen_t, self.seen_from = None, None, None
+            self.chase, self._chase_done, self._gap = None, False, False
+            self._track.clear()
+            self.search.reset()
+            self._on_t = None
+            self.mode = self._said_mode = "waiting"
             self._log("info", "Follow on: the nearest person is the goal")
         elif not on and self.active:
             self.active = False
+            self.search.reset()
+            self.mode = self._said_mode = "off"
             self._log("info", "Follow off")
         return True
 
@@ -297,20 +367,27 @@ class PersonGoal(gl.Goal):
     @property
     def goal(self):
         """(x, y, frame) the model drives to now, or None."""
-        if not self.active or self.lost():
+        if not self.active:
             return None
-        return self.point
+        if self.mode in ("following", "gap"):
+            return self.point
+        if self.mode == "chasing":
+            return self.chase
+        if self.mode == "searching":
+            return self.search.target
+        return None
 
     def lost(self):
-        return (self.point is None or self.seen_t is None or self.now is None
-                or self.now - self.seen_t > self.lost_s)
+        """Not following anybody where they were seen."""
+        return self.mode not in ("following", "gap")
 
     def reached(self):
-        """Neutral while following and inside the gap, or with nobody to
-        follow. Off, never: the switch hands the wheels back to the patrol."""
+        """Neutral inside the gap, while waiting for a first sighting, and
+        searching with nowhere to go. Off, never: the switch hands the
+        wheels back to the patrol."""
         if not self.active:
             return False
-        return self.lost() or self._gap
+        return self.goal is None or self.mode == "gap"
 
     def encode(self, crop):
         g = self.goal
@@ -326,6 +403,12 @@ class PersonGoal(gl.Goal):
             self._take_sighting(crop)
         self.observe(crop)
 
+    def age(self):
+        """Seconds since the person was last placed, or None."""
+        if self.seen_t is None or self.now is None:
+            return None
+        return self.now - self.seen_t
+
     def observe(self, crop):
         if crop is not None:
             self.now = float(getattr(crop, "t", 0.0))
@@ -334,25 +417,147 @@ class PersonGoal(gl.Goal):
             if getattr(crop, "present", False):
                 self.pose = (crop.x, crop.y, crop.yaw)
         self.present = bool(crop is not None and getattr(crop, "present", False))
+        if self.active:
+            self._decide(crop)
         g = self.goal
-        db = pg.distance_bearing(crop, g) if (g is not None and self.present) else None
-        self.last = db
-        if not self.active:
+        self.last = (pg.distance_bearing(crop, g)
+                     if (g is not None and self.present) else None)
+        if self.active and self.mode in ("following", "gap") and self.last is not None:
+            d = self.last[0]
+            if not self._gap and d <= self.gap_m:
+                self._gap = True
+            elif self._gap and d >= self.resume_m:
+                self._gap = False
+            self.mode = "gap" if self._gap else "following"
+        self._say_mode()
+
+    def _decide(self, crop):
+        """The mode off the sighting's age, the lidar at the point, and the
+        chase."""
+        if self.now is not None and self._on_t is None:
+            self._on_t = self.now
+        age = self.age()
+        if self.point is None or age is None:
+            if self.mode == "searching":
+                self.search.step(crop)
+            elif self.now is not None and self.now - self._on_t >= WAIT_S:
+                self._begin_search(crop)
+            else:
+                self.mode = "waiting"
             return
-        if self.lost():
-            if not self._lost_said and self.point is not None:
-                self._log("info", f"Person lost for {self.lost_s:g} s - holding "
-                          "neutral until they are seen again")
-                self._lost_said = True
-            self._gap = False
+        if self._is_there(age, crop):
+            if self.mode not in ("following", "gap"):
+                self.mode = "gap" if self._gap else "following"
             return
-        if db is None:
+        self._gap = False
+        if self.mode in ("following", "gap", "waiting") and not self._chase_done:
+            self.chase = self._chase_point()
+            self._chase_t = self.now
+            self.mode = "chasing"
+        if self.mode == "chasing":
+            near = (self.present and self.chase is not None
+                    and self.chase[2] == self.frame_now
+                    and math.hypot(self.chase[0] - crop.x, self.chase[1] - crop.y)
+                    <= CHASE_ARRIVE_M)
+            if near or self.now - self._chase_t > CHASE_S or self.chase is None:
+                self._chase_done = True
+                self._begin_search(crop)
             return
-        d = db[0]
-        if not self._gap and d <= self.gap_m:
-            self._gap = True
-        elif self._gap and d >= self.resume_m:
-            self._gap = False
+        if self.mode != "searching":
+            self._begin_search(crop)
+            return
+        self.search.step(crop)
+
+    def _is_there(self, age, crop):
+        """Whether the person is still where they were seen: seen just now,
+        or the lidar has somebody at the point."""
+        self.confirmed = False
+        fresh = FRESH_S if self.lidar is not None else FRESH_NO_LIDAR_S
+        if age <= fresh:
+            return True
+        if age > CONFIRM_MAX_S or crop is None or not self.present:
+            return False
+        if self.point[2] != self.frame_now:
+            return False
+        self.confirmed = self._spot_taken(crop)
+        return self.confirmed
+
+    def _spot_taken(self, crop):
+        """MIN_HITS returns of the newest scan within PRESENT_R_M of the
+        point, off this crop's pose. Once per scan."""
+        scan = self._scans[-1] if self._scans else None
+        if scan is None:
+            return False
+        if self._spot[0] == scan.t and self._spot[1] == self.point:
+            return self._spot[2]
+        taken = False
+        pts = lidar_points(scan)
+        if pts is not None:
+            x, y = pts
+            keep = np.hypot(x, y) > NEAR_M
+            c, s = math.cos(crop.yaw), math.sin(crop.yaw)
+            mx = crop.x + c * x[keep] - s * y[keep]
+            my = crop.y + s * x[keep] + c * y[keep]
+            near = np.hypot(mx - self.point[0], my - self.point[1]) <= PRESENT_R_M
+            taken = int(near.sum()) >= MIN_HITS
+        self._spot = (scan.t, self.point, taken)
+        return taken
+
+    def walk(self):
+        """(vx, vy) m/s off the track, or (0, 0)."""
+        if len(self._track) < 2:
+            return 0.0, 0.0
+        t0, x0, y0 = self._track[0]
+        t1, x1, y1 = self._track[-1]
+        dt = t1 - t0
+        if dt < MIN_TRACK_DT_S:
+            return 0.0, 0.0
+        vx, vy = (x1 - x0) / dt, (y1 - y0) / dt
+        v = math.hypot(vx, vy)
+        if v > WALK_M_S:
+            vx, vy = vx * WALK_M_S / v, vy * WALK_M_S / v
+        return vx, vy
+
+    def _chase_point(self):
+        if self.point is None:
+            return None
+        vx, vy = self.walk()
+        age = self.age() or 0.0
+        dx, dy = vx * min(age, EXTRAP_S), vy * min(age, EXTRAP_S)
+        r = math.hypot(dx, dy)
+        if r > EXTRAP_MAX_M:
+            dx, dy = dx * EXTRAP_MAX_M / r, dy * EXTRAP_MAX_M / r
+        return (self.point[0] + dx, self.point[1] + dy, self.point[2])
+
+    def _begin_search(self, crop):
+        hint = None
+        if self.point is not None and self.seen_from is not None:
+            hint = (self.seen_from, self.point[:2], self.point[2])
+        self.mode = "searching"
+        self._say_mode()
+        self.search.start(crop, hint)
+        self.search.step(crop)
+
+    def _say_mode(self):
+        if self.mode == self._said_mode:
+            return
+        was, self._said_mode = self._said_mode, self.mode
+        age = self.age()
+        if self.mode == "following":
+            if was in ("chasing", "searching", "waiting"):
+                return  # the sighting said it
+            text = "Following: the person is past the gap again"
+        elif self.mode == "gap":
+            text = f"Holding the gap: the person is within {self.gap_m:g} m"
+        elif self.mode == "chasing":
+            text = (f"Chasing where the person was last seen, {age:.1f} s ago"
+                    if age is not None else "Chasing where the person was last seen")
+        elif self.mode == "searching":
+            text = ("Searching: nobody seen since Follow on" if self.point is None
+                    else "Searching: the person is gone from where they were seen")
+        else:
+            return
+        self._log("info", text)
 
     def _keep_scan(self):
         if self.lidar is None:
@@ -401,9 +606,10 @@ class PersonGoal(gl.Goal):
             placed.append((pose[0] + c * ax - sn * ay, pose[1] + sn * ax + c * ay, source))
         if not placed:
             return
-        follow = self.point is not None and not self.lost() and self.point[2] == frame
+        age = max(s.t - self.seen_t, 0.0) if self.seen_t is not None else None
+        follow = (self.point is not None and self.point[2] == frame
+                  and age is not None and self.mode in ("following", "gap", "chasing"))
         if follow:
-            age = max(s.t - self.seen_t, 0.0)
             gate = GATE_M + WALK_M_S * age
             near = min(placed, key=lambda p: math.hypot(p[0] - self.point[0],
                                                        p[1] - self.point[1]))
@@ -413,17 +619,30 @@ class PersonGoal(gl.Goal):
             k = SMOOTH
             x = self.point[0] + k * (near[0] - self.point[0])
             y = self.point[1] + k * (near[1] - self.point[1])
+            if self.mode not in ("following", "gap"):
+                self._log("info", f"Following again: seen {math.hypot(x - pose[0], y - pose[1]):.1f} m "
+                          f"off after {age:.1f} s (distance off the {near[2]})")
         else:
             near = min(placed, key=lambda p: math.hypot(p[0] - pose[0], p[1] - pose[1]))
             x, y = near[0], near[1]
             self.acquired += 1
+            self._track.clear()
             self._log("info", f"Following a person {math.hypot(x - pose[0], y - pose[1]):.1f} m "
                       f"off (distance off the {near[2]})")
         self.point = (x, y, frame)
         self.seen_t = s.t
+        self.seen_from = (pose[0], pose[1])
         self.source = near[2]
         self.placed += 1
-        self._lost_said = False
+        self._track.append((s.t, near[0], near[1]))
+        while self._track and s.t - self._track[0][0] > TRACK_S:
+            self._track.popleft()
+        if self.mode not in ("following", "gap"):
+            self.mode = "following"
+            self._said_mode = "following"
+            self._gap = False
+        self.chase, self._chase_done = None, False
+        self.search.reset()
 
     def _pose_at(self, t, crop):
         if self.pose_at is not None:
@@ -464,25 +683,28 @@ class PersonGoal(gl.Goal):
             if L.seq <= self._seq:
                 continue
             self._seq = L.seq
+            self.search.follow(L)
+            c, s = math.cos(L.yaw), math.sin(L.yaw)
+
+            def tf(x, y):
+                return c * x - s * y + L.x, s * x + c * y + L.y
+            if self.chase is not None and self.chase[2] == L.frm:
+                self.chase = (*tf(self.chase[0], self.chase[1]), L.to)
             if self.point is None or self.point[2] != L.frm:
                 continue
-            x, y, _ = self.point
-            c, s = math.cos(L.yaw), math.sin(L.yaw)
-            self.point = (c * x - s * y + L.x, s * x + c * y + L.y, L.to)
+            self.point = (*tf(self.point[0], self.point[1]), L.to)
+            if self.seen_from is not None:
+                self.seen_from = tf(*self.seen_from)
+            self._track = collections.deque((t, *tf(x, y)) for t, x, y in self._track)
 
     # ---- out ------------------------------------------------------------------------
 
     def state(self):
-        if not self.active:
-            return "off"
-        if self.point is None:
-            return "searching"
-        if self.lost():
-            return "lost"
-        return "gap" if self._gap else "following"
+        """off / waiting / following / gap / chasing / searching."""
+        return self.mode if self.active else "off"
 
     def status(self):
-        """/goal/status while following: the person, in goal.ClickGoal's schema."""
+        """/goal/status while following: the goal, in goal.ClickGoal's schema."""
         g = self.goal
         d, b = self.last if self.last is not None else (-1.0, 0.0)
         x, y, frame = g if g is not None else (0.0, 0.0, -1)
@@ -503,19 +725,27 @@ class PersonGoal(gl.Goal):
         g = self.goal
         d, b = self.last if self.last is not None else (-1.0, 0.0)
         x, y, frame = self.point if self.point is not None else (0.0, 0.0, -1)
+        gx, gy = (g[0], g[1]) if g is not None else (0.0, 0.0)
         tx, ty, tyaw = self.pose if self.pose is not None else (0.0, 0.0, 0.0)
         enc = self.encode(crop).reshape(-1) if crop is not None else pg.missing().reshape(-1)
-        age = (self.now - self.seen_t) if (self.now is not None and self.seen_t is not None) else -1.0
+        age = self.age()
+        se = self.search
         return {"active": bool(self.active), "state": self.state(),
                 "x": float(x), "y": float(y), "frame": int(frame),
                 "frame_now": -1 if self.frame_now is None else int(self.frame_now),
+                "goal_x": float(gx), "goal_y": float(gy),
                 "distance_m": float(d) if g is not None else -1.0,
                 "bearing_deg": float(math.degrees(b)) if g is not None else 0.0,
-                "seen_age_s": float(age), "source": self.source,
+                "seen_age_s": float(age) if age is not None else -1.0,
+                "source": self.source, "confirmed": bool(self.confirmed),
                 "people": int(self.people), "placed": int(self.placed),
                 "unplaced": int(self.unplaced), "ignored": int(self.ignored),
                 "acquired": int(self.acquired), "holding": bool(self.reached()),
-                "gap_m": self.gap_m, "resume_m": self.resume_m, "lost_s": self.lost_s,
+                "search_kind": se.kind if self.mode == "searching" else "",
+                "search_targets": int(se.targets), "search_arrived": int(se.arrived),
+                "search_skipped": int(se.skipped), "frontiers": int(se.frontiers),
+                "gap_m": self.gap_m, "resume_m": self.resume_m,
+                "fresh_s": FRESH_S, "chase_s": CHASE_S,
                 "goal_input": [float(v) for v in enc],
                 "truck_x": float(tx), "truck_y": float(ty),
                 "truck_yaw_deg": float(math.degrees(tyaw))}
@@ -527,7 +757,6 @@ class PersonGoal(gl.Goal):
             return {}
         return {"person": (self.point[0], self.point[1]), "lost": bool(self.lost()),
                 "gap_m": self.gap_m}
-
 
 class _Events:
     def __init__(self, events):

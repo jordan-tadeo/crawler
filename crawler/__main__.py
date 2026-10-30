@@ -2043,7 +2043,8 @@ def follow_person(args, pantilt, lidar, slam, hub, log):
             hub.depth_listeners.append(oakd.on_depth)
         person = follow.PersonGoal(cam, sightings=pantilt, lidar=lidar,
                                    pose_at=getattr(slam, "pose_at", None),
-                                   oakd=oakd, say=log.log)
+                                   oakd=oakd, map_view=getattr(slam, "map", None),
+                                   say=log.log)
         log.log("info", "Follow", "Follow on and off on /follow/cmd; the "
                 f"person is the goal, holding {person.gap_m:g} m off")
         return person

@@ -652,22 +652,33 @@ JSON_SCHEMAS = {
         "lookahead_m": _NUM,
     }),
     # Following a person, with --goal and --pantilt: follow.PersonGoal.
-    # follow_status(). active the Follow switch; state off / searching /
-    # following / gap / lost; x, y the person on map frame `frame` (-1 with
-    # nobody yet) against frame_now; distance_m and bearing_deg from the
-    # truck (-1 / 0 with no goal); seen_age_s since the frame they were last
-    # placed off; source the distance's (lidar / oakd / box); people in the
-    # newest sighting; placed, unplaced (no distance), ignored (somebody
-    # else) and acquired counts; holding the neutral hold (gap or lost);
-    # gap_m, resume_m, lost_s the rule's numbers; goal_input the model's
-    # goal input as fed (policy_goal: present, dist/FAR_M, sin, cos); and
-    # the truck's map pose on the same frame.
+    # follow_status(). active the Follow switch; state off / waiting (on,
+    # nobody seen yet) / following / gap (holding the follow gap) / chasing
+    # (driving to where they were last seen) / searching (search.Search
+    # picks the goal); x, y the person on map frame `frame` (-1 with
+    # nobody yet) against frame_now; goal_x, goal_y the goal fed (the
+    # person, the chase point or the search target); distance_m and
+    # bearing_deg to it from the truck (-1 / 0 with no goal); seen_age_s
+    # since the frame they were last placed off; source the distance's
+    # (lidar / oakd / box); confirmed the lidar still has somebody at their
+    # point past fresh_s; people in the newest sighting; placed, unplaced
+    # (no distance), ignored (somebody else) and acquired counts; holding
+    # the neutral hold; search_kind (along / frontier / wander, "" when not
+    # searching), search_targets picked, arrived and skipped this search,
+    # frontiers at the last pick; gap_m, resume_m, fresh_s, chase_s the
+    # rule's numbers; goal_input the model's goal input as fed
+    # (policy_goal: present, dist/FAR_M, sin, cos); and the truck's map
+    # pose on the same frame.
     "follow_status": _schema("crawler.FollowStatus", {
         "active": _BOOL, "state": _STR, "x": _NUM, "y": _NUM, "frame": _INT,
-        "frame_now": _INT, "distance_m": _NUM, "bearing_deg": _NUM,
-        "seen_age_s": _NUM, "source": _STR, "people": _INT, "placed": _INT,
+        "frame_now": _INT, "goal_x": _NUM, "goal_y": _NUM,
+        "distance_m": _NUM, "bearing_deg": _NUM,
+        "seen_age_s": _NUM, "source": _STR, "confirmed": _BOOL,
+        "people": _INT, "placed": _INT,
         "unplaced": _INT, "ignored": _INT, "acquired": _INT, "holding": _BOOL,
-        "gap_m": _NUM, "resume_m": _NUM, "lost_s": _NUM,
+        "search_kind": _STR, "search_targets": _INT, "search_arrived": _INT,
+        "search_skipped": _INT, "frontiers": _INT,
+        "gap_m": _NUM, "resume_m": _NUM, "fresh_s": _NUM, "chase_s": _NUM,
         "goal_input": {"type": "array", "items": _NUM},
         "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
     }),
