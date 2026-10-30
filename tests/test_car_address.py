@@ -36,8 +36,10 @@ ADDRESS = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 # Addresses that mean something other than "the car". 0.0.0.0 is the bind
 # address telemetry listens on and 127.0.0.1 is this machine; neither one is a
-# lease and neither one can move.
-NOT_A_LEASE = {"0.0.0.0", "127.0.0.1", "255.255.255.255"}
+# lease and neither one can move. 10.42.0.1 is the car's own hotspot
+# (scripts/wifi-fallback/install.sh sets it, NetworkManager shared mode): the
+# car hands it to itself, so it is fixed by design and not a lease either.
+NOT_A_LEASE = {"0.0.0.0", "127.0.0.1", "255.255.255.255", "10.42.0.1"}
 
 
 def read(name):
