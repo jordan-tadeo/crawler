@@ -137,6 +137,19 @@ def test_a_record_file_that_announces_the_legacy_topics_first_is_not_legacy():
     assert pa.pick_adapter(early, settled=True) is pa.LegacyAdapter
 
 
+def test_a_drive_that_announces_the_policy_topics_late_is_read_off_its_summary():
+    # A drive parked in another mode first: by the time /footprint is
+    # announced the legacy topics have long settled the stream pick.
+    early = {"/camera/depth", "/vehicle", "/controller", "/imu"}
+    full = early | {"/policy/depth_small", "/footprint"}
+    assert pd.choose_adapter(None, full, early, settled=True) is pa.FootprintAdapter
+    # A finished legacy file is legacy at once; no summary falls back to the stream.
+    assert pd.choose_adapter(None, early, set(), settled=False) is pa.LegacyAdapter
+    assert pd.choose_adapter(None, None, early, settled=False) is None
+    assert pd.choose_adapter(None, None, early, settled=True) is pa.LegacyAdapter
+    assert pd.choose_adapter("legacy", full, full, settled=True) is pa.LegacyAdapter
+
+
 # --- what is dropped ----------------------------------------------------------
 
 def test_align_drops_what_cannot_be_a_label_and_says_why():

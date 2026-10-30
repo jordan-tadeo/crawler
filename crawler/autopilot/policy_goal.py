@@ -147,6 +147,60 @@ def hindsight_goals(rows, k_s, poses):
     return np.where(ok, a, 0.0), np.where(ok, l, 0.0), ok
 
 
+# Path goals (path_goals): the goal the car's planner feeds, a point this far
+# along the path ahead (pathgoal.LOOKAHEAD_M), drawn off the truck's own path.
+PATH_M = 1.5
+# A scan-to-scan pose step under this is SLAM's jitter, not travel: a parked
+# truck must not walk PATH_M off its own noise.
+PATH_STEP_DEADBAND_M = 0.005
+# The path is looked along no further than this: a truck parked longer has
+# nowhere it is going.
+PATH_MAX_S = 20.0
+
+
+def path_progress(poses):
+    """Distance travelled along each session's crop poses, metres, with the
+    dead band; a frame change (a reseed) or a session change restarts no
+    count but no step across one counts either."""
+    x, y = np.asarray(poses["x"], float), np.asarray(poses["y"], float)
+    step = np.hypot(np.diff(x), np.diff(y))
+    same = ((np.diff(poses["sess"]) == 0) & (np.diff(poses["frame"]) == 0) &
+            poses["present"][1:] & poses["present"][:-1])
+    step = np.where(same, np.maximum(step - PATH_STEP_DEADBAND_M, 0.0), 0.0)
+    return np.concatenate([[0.0], np.cumsum(step)])
+
+
+def path_goals(rows, dist_m, poses, max_s=PATH_MAX_S):
+    """Path goals for crop rows `rows` (-1: none): the truck's own pose once
+    it has gone dist_m further along its path, in row r's frame -- the point
+    the planner's lookahead would sit on had it planned the path the truck
+    then drove. Behind is kept: a truck about to back up has it behind.
+
+    poses as hindsight_goals, plus "progress" (path_progress). A row gets no
+    goal when its crop is not trusted, when the truck does not go dist_m
+    within max_s on the same session and frame, or the pose there is not
+    trusted. -> (ahead, left, ok), (N,) each."""
+    rows = np.asarray(rows, np.int64)
+    d = np.broadcast_to(np.asarray(dist_m, float), rows.shape)
+    n = len(poses["log_t"])
+    ok = rows >= 0
+    r = np.where(ok, rows, 0)
+    prog = poses["progress"]
+    # progress never falls, so within a session the first row d further on
+    # is a search; another session's rows only follow, and are refused.
+    j = np.searchsorted(prog, prog[r] + d, side="left")
+    j = np.maximum(j, r + 1)
+    ok &= j < n
+    j = np.where(j < n, j, 0)
+    sess, frame, present = poses["sess"], poses["frame"], poses["present"]
+    t = np.asarray(poses["log_t"], float)
+    ok &= (sess[j] == sess[r]) & (frame[j] == frame[r]) & present[r] & present[j]
+    ok &= (t[j] - t[r]) <= max_s
+    a, l = relative((poses["x"][r], poses["y"][r], poses["yaw"][r]),
+                    poses["x"][j], poses["y"][j])
+    return np.where(ok, a, 0.0), np.where(ok, l, 0.0), ok
+
+
 def sort_key(sess, log_t):
     """The one order hindsight_goals searches: session, then time (seconds;
     a session is never 1e6 s long)."""

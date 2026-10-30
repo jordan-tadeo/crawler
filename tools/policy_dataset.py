@@ -880,6 +880,35 @@ def to_arrays(sessions_ticks):
 ANNOUNCE_MESSAGES = 2000
 
 
+def summary_topics(path):
+    """Every topic a finished recording's summary lists, or None when it has
+    none (cut off mid-chunk) or it cannot be read."""
+    try:
+        from mcap.reader import make_reader
+        with open(path, "rb") as f:
+            summary = make_reader(f).get_summary()
+    except Exception:
+        return None
+    if summary is None or not summary.channels:
+        return None
+    return {c.topic for c in summary.channels.values()}
+
+
+def choose_adapter(adapter_name, summary, announced, settled):
+    """The adapter class for a recording, or None to keep reading.
+
+    adapter_name forces it. Otherwise a summary's full channel list decides:
+    a drive that sat parked in another mode for minutes announces the policy
+    topics thousands of messages in, long after the legacy ones settled a
+    stream-only pick. Without a summary, the topics announced so far do, and
+    the stream rule (pick_adapter's settled) applies."""
+    if adapter_name:
+        return pa.ADAPTERS[adapter_name]
+    if summary is not None:
+        return pa.pick_adapter(summary) or pa.LegacyAdapter
+    return pa.pick_adapter(announced, settled)
+
+
 def read_session(path, adapter_name=None):
     """One MCAP file -> a Session. Survives a file cut off mid-chunk.
 
@@ -898,6 +927,7 @@ def read_session(path, adapter_name=None):
     adapter = None
     pending = []
     truncated = False
+    summary = summary_topics(path)
 
     def decode(channel, data):
         if channel.message_encoding == "json":
@@ -925,8 +955,7 @@ def read_session(path, adapter_name=None):
                     if adapter is None:
                         topics = {c.topic for c in channels.values()}
                         settled = len(pending) >= ANNOUNCE_MESSAGES
-                        cls = (pa.ADAPTERS[adapter_name] if adapter_name
-                               else pa.pick_adapter(topics, settled))
+                        cls = choose_adapter(adapter_name, summary, topics, settled)
                         # Wait for enough channels to know the recording's kind,
                         # but not forever: one is never announced in some files.
                         if cls is None and not settled:
@@ -946,8 +975,7 @@ def read_session(path, adapter_name=None):
         except Exception as e:
             truncated = f"{type(e).__name__}"
     if adapter is None:
-        cls = (pa.ADAPTERS[adapter_name] if adapter_name
-               else pa.pick_adapter({c.topic for c in channels.values()}))
+        cls = choose_adapter(adapter_name, summary, {c.topic for c in channels.values()}, True)
         adapter = (cls or pa.LegacyAdapter)(name)
         for m in pending:
             ch = channels[m.channel_id]

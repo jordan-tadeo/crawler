@@ -627,27 +627,77 @@ def load_maps(data, crops_dir):
         g = {k: np.concatenate(v) for k, v in pose.items()}
         g["present"] = data["map_present"] & g.pop("posed")
         g["key"] = pg.sort_key(g["sess"], g["log_t"])
+        g["progress"] = pg.path_progress(g)
         data["goal_poses"] = g
     else:
         data.pop("goal_poses", None)
     return int(has.sum())
 
 
+# Path goals (--goal-path-m): the share drawn nearer than the lookahead.
+PATH_NEAR_SHARE = 0.25
+
+
+def load_fed_goals(data, fed_dir):
+    """Pair every tick with the goal the car was fed (tools/fed_goals.py, one
+    npz per session, by name): data gains fed_ok, fed_ahead, fed_left.
+    Returns how many ticks have one."""
+    import fed_goals as fg
+    names = data["meta"]["sessions"]
+    n = len(data["t_ns"])
+    ok = np.zeros(n, bool)
+    ahead = np.zeros(n)
+    left = np.zeros(n)
+    for sid, name in enumerate(names):
+        path = os.path.join(fed_dir, name + ".npz")
+        if not os.path.exists(path):
+            continue
+        z = np.load(path)
+        if str(z["layout"]) != fg.LAYOUT:
+            raise ValueError(f"{path}: fed-goal layout {z['layout']}, this trainer reads {fg.LAYOUT}")
+        ticks = np.flatnonzero(data["session"] == sid)
+        j = fg.pair(z["log_t"], data["t_ns"][ticks] / 1e9)
+        has = j >= 0
+        jj = np.where(has, j, 0)
+        has &= z["ok"][jj]
+        ok[ticks[has]] = True
+        ahead[ticks[has]] = z["ahead"][jj][has]
+        left[ticks[has]] = z["left"][jj][has]
+    data["fed_ok"], data["fed_ahead"], data["fed_left"] = ok, ahead, left
+    return int(ok.sum())
+
+
 def goal_inputs(data, rows, map_shown, rng, no_goal_share=pg.NO_GOAL_SHARE,
-                k_s=None):
-    """Hindsight goals (policy_goal.hindsight_goals) for dataset ticks
-    `rows`, as the model is fed them: k drawn from [NEAR_S, FAR_S] unless
-    given, no goal where the tick's map is not shown to the model this time
-    (map_shown: no map, or blanked by the map dropout) -- the car has no
-    goal without the map -- and on no_goal_share of the rest."""
+                k_s=None, path_m=None):
+    """Goals for dataset ticks `rows`, as the model is fed them.
+
+    Drawn ones first: hindsight goals (policy_goal.hindsight_goals), k drawn
+    from [NEAR_S, FAR_S] unless given, or with path_m path goals
+    (policy_goal.path_goals) path_m along the truck's own path, a share
+    PATH_NEAR_SHARE of them nearer, down to ARRIVE_M, as the car feeds the
+    goal itself once it is inside the planner's lookahead. Then the goal the
+    car was really fed (load_fed_goals) wherever there was one, in place of
+    the drawn one. No goal where the tick's map is not shown to the model
+    this time (map_shown: no map, or blanked by the map dropout) -- the car
+    has no goal without the map -- and on no_goal_share of the rest."""
     rows = np.asarray(rows)
     n = len(rows)
     g = data.get("goal_poses")
     if g is None or n == 0:
         return np.zeros((n, pg.SIZE), np.float32)
-    if k_s is None:
-        k_s = rng.uniform(pg.NEAR_S, pg.FAR_S, n)
-    ahead, left, ok = pg.hindsight_goals(data["map_row"][rows], k_s, g)
+    if path_m is not None:
+        d = np.where(rng.random(n) < PATH_NEAR_SHARE,
+                     rng.uniform(pg.ARRIVE_M, path_m, n), path_m)
+        ahead, left, ok = pg.path_goals(data["map_row"][rows], d, g)
+    else:
+        if k_s is None:
+            k_s = rng.uniform(pg.NEAR_S, pg.FAR_S, n)
+        ahead, left, ok = pg.hindsight_goals(data["map_row"][rows], k_s, g)
+    if "fed_ok" in data:
+        fed = data["fed_ok"][rows]
+        ahead = np.where(fed, data["fed_ahead"][rows], ahead)
+        left = np.where(fed, data["fed_left"][rows], left)
+        ok = ok | fed
     ok &= np.asarray(map_shown, bool)
     if no_goal_share > 0:
         ok &= rng.random(n) >= no_goal_share
@@ -893,6 +943,12 @@ def contrast_angles(rng, n):
     return np.where(rng.random(n) < 0.5, a, -a)
 
 
+def contrast_rows(present, tok, sok, steer_only=False):
+    """The rows the goal contrast costs: a goal in, and a label to explain --
+    the steer's alone when steer_only."""
+    return present & (sok if steer_only else (tok | sok))
+
+
 def goal_contrast(loss_true, loss_fake, margin=GOAL_CONTRAST_MARGIN, xp=np):
     """Per row: what it costs that the turned goal explains my action within
     margin of the real one, relu(margin + true - fake)."""
@@ -945,7 +1001,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           uses_lidar=False, lidar_dropout=LIDAR_DROPOUT, uses_map=False,
           map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE,
           mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam",
-          lowband=None, tip_mask=None, tip_weight=0.0, label_off=None, contrast_weight=0.0):
+          lowband=None, tip_mask=None, tip_weight=0.0, label_off=None, contrast_weight=0.0,
+          goal_path_m=None, contrast_steer_only=False):
     """tip_mask: the rows the tip penalty goes on (tip_rows), trained beside
     train_mask with no label of their own. label_off: ticks that are never a
     label, at any chunk offset either (tip_marks' tipped and run-up)."""
@@ -1053,21 +1110,25 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     # is the one it always was.
     contrast_rng = np.random.default_rng([seed, 2])
 
-    def row_loss(o, bb, tok, sok, sb):
+    def row_loss(o, bb, tok, sok, sb, steer_only=False):
         # Per row, unweighted: the gear's cross entropy where it is a label
-        # plus the steer's L1 where that is, offset 0.
+        # plus the steer's L1 where that is, offset 0. steer_only drops the
+        # gear: the steer is read off the labelled gear's head either way.
         n = len(bb)
         lg = o[0].reshape(n, chunk, len(pl.ACTIONS))[:, 0]
         st = (torch.where(gear_of[bb] == GEAR_REVERSE, o[3][:, 0], o[2][:, 0]) if per_gear
               else o[2][:, 0])
         g = nn.functional.cross_entropy(lg, action[bb], reduction="none")
-        return (torch.where(tok, g, torch.zeros(())) +
-                torch.where(sok, (st - sb).abs(), torch.zeros(())))
+        gear = torch.zeros(()) if steer_only else torch.where(tok, g, torch.zeros(()))
+        return gear + torch.where(sok, (st - sb).abs(), torch.zeros(()))
 
     def contrast_term(out, inputs, gb, bb, tok, sok, sb):
         # The goal contrast: the batch again with each goal turned away
         # (contrast_angles), costed where it explains my driving as well.
-        rows = (gb[:, pg.PRESENT] > 0) & (tok | sok)
+        # Steer only (contrast_steer_only): the wrong goal is costed on the
+        # steer alone, read off the gear my hand chose, so changing gear for
+        # it -- the way out D and E took -- buys nothing.
+        rows = contrast_rows(gb[:, pg.PRESENT] > 0, tok, sok, contrast_steer_only)
         if not bool(rows.any()):
             return torch.zeros(())
         ang = torch.from_numpy(contrast_angles(contrast_rng, len(gb)).astype(np.float32))
@@ -1075,7 +1136,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
         xb_, pb_, mo_, ib_, lb_, mb_ = inputs
         extra = [v for v in (ib_, lb_, mb_, fake) if v is not None]
         o_fake = model(xb_, pb_, mo_, *extra)
-        lt, lf = row_loss(out, bb, tok, sok, sb), row_loss(o_fake, bb, tok, sok, sb)
+        lt = row_loss(out, bb, tok, sok, sb, contrast_steer_only)
+        lf = row_loss(o_fake, bb, tok, sok, sb, contrast_steer_only)
         return contrast_weight * goal_contrast(lt[rows], lf[rows], xp=torch).sum() / len(bb)
 
     opt = (torch.optim.AdamW if optimizer == "adamw" else torch.optim.Adam)(
@@ -1102,7 +1164,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 if uses_goal:
                     shown = map_on[b.numpy()] & ~blank
                     gb = torch.from_numpy(goal_inputs(data, idx[b.numpy()], shown, goal_rng,
-                                                      no_goal_share))
+                                                      no_goal_share, path_m=goal_path_m))
                 mb = torch.from_numpy(mb)
             # The mirror (MIRROR_MODES). Every input of a mirrored row is the
             # same moment seen in a mirror, and its steering labels change
@@ -1444,6 +1506,14 @@ def main(argv=None):
                     help="the goal contrast at W: each goal tick again with its goal turned "
                          "90-180 degrees away, costed where that explains my driving within "
                          f"{GOAL_CONTRAST_MARGIN} of the real goal. Needs --goal; 0 is off")
+    ap.add_argument("--contrast-steer-only", action="store_true",
+                    help="the goal contrast on the steer alone, off the labelled gear's head")
+    ap.add_argument("--goal-path-m", type=float, default=None, metavar="M",
+                    help="draw goals M metres along the truck's own path (the planner's "
+                         f"lookahead is {pg.PATH_M:g}) instead of hindsight goals k s ahead")
+    ap.add_argument("--fed-goals", default=None, metavar="DIR",
+                    help="tools/fed_goals.py output: the goal the car was fed, in place of "
+                         "the drawn one on every tick that had one")
     ap.add_argument("--tip-hygiene", action="store_true",
                     help="only drop the tip's labels, no penalty")
     ap.add_argument("--tip-deg", type=float, default=TIP_DEG,
@@ -1552,6 +1622,16 @@ def main(argv=None):
     if args.goal_contrast > 0 and (not args.goal or args.steer_head == pl.STEER_DIRECTION):
         print("--goal-contrast needs --goal and a regression steer head")
         return 2
+    if (args.goal_path_m is not None or args.fed_goals or args.contrast_steer_only) and not args.goal:
+        print("--goal-path-m, --fed-goals and --contrast-steer-only need --goal")
+        return 2
+    if args.fed_goals:
+        try:
+            fed = load_fed_goals(data, args.fed_goals)
+        except ValueError as e:
+            print(e)
+            return 1
+        print(f"fed goals: the car's own goal on {fed} of {len(data['t_ns'])} ticks")
     if args.goal and not bool(np.any(data["goal_poses"]["present"])):
         print(f"--goal: no crop in {args.map} carries its pose; replay them again "
               "with tools/map_crops.py")
@@ -1602,7 +1682,8 @@ def main(argv=None):
                mirror=args.mirror, stop_gear_s=args.stop_gear_s,
                map_act=args.map_act, optimizer=args.optimizer, lowband=args.lowband,
                tip_weight=args.tip_weight, label_off=label_off,
-               contrast_weight=args.goal_contrast)
+               contrast_weight=args.goal_contrast, goal_path_m=args.goal_path_m,
+               contrast_steer_only=args.contrast_steer_only)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1708,8 +1789,12 @@ def main(argv=None):
             **tip_meta(args.tip_weight, args.tip_deg, args.tip_lead_s,
                        hygiene=tip_on),
             **({"tip_penalty_rows": int(tip_mask.sum())} if tip_mask is not None else {}),
-            "goal_contrast": ({"weight": args.goal_contrast, "margin": GOAL_CONTRAST_MARGIN}
+            "goal_contrast": ({"weight": args.goal_contrast, "margin": GOAL_CONTRAST_MARGIN,
+                               "steer_only": bool(args.contrast_steer_only)}
                               if args.goal_contrast > 0 else None),
+            "goal_draw": ({"path_m": args.goal_path_m, "near_share": PATH_NEAR_SHARE}
+                          if args.goal_path_m is not None else "hindsight"),
+            "goal_fed": bool(args.fed_goals),
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
                if args.lidar else {}),
