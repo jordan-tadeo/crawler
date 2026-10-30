@@ -58,23 +58,48 @@ uncertain: the map stays as it was. Only lost for RESEED_LOST_S (counted from
 when it was last rolled, so the time in a hand does not count) is a fresh map
 started from the scan in hand (Result.reseed "lost"), and even then the old
 one is kept on the shelf: the truck is relocalized against it, round where
-the fresh map has the truck, and when that is found (twice running, the same
+it is reckoned to be on it, and when that is found (twice running, the same
 way) the fresh map is merged into the old one and the old one is the map
 again (Result.reseed "merged"). That search is done a piece at a time,
 SHELF_SHARE_S of it a scan (Slam._shelf_slice), never whole in one step:
 the fresh map is the one being driven on meanwhile.
+
+Where the truck is on the shelf. From the reseed that shelved it, the shelf
+reckons the truck on itself every scan (Shelf.here, Slam._reckon_shelf): the
+heading by the gyro, the position by the fresh map's own step turned onto
+the shelf by the gyro's heading, or by the commanded speed when nothing
+fits. None of that goes through the fresh map's frame, so a fresh map that
+spins on its own, starts again young or relocalizes onto its own twin does
+not move it. The search is drawn round it, as wide as its doubt, over only
+the headings within SHELF_DRIFT_DEG (and more with time) of its heading, and
+a fit outside that is never merged however well it fits: the 180 degree
+twin of a room fits it as well as the truth does. Before this the search
+was drawn where the truck had frozen, every heading, and 174641
+(2026-10-29) merged the twin. Long lost, the position's doubt is many metres
+and the heading alone cannot tell a wrong place: a merge is only made if
+the fresh map's walls land on the shelf's walls, not its open floor
+(SHELF_AGREE).
 
 How a fresh map sits on the one before it. A fresh map goes on from the
 pose the truck was last believed at, which after a loss is where it froze,
 not where it is, so a point on the old map is not the same point on the new
 one. Every reseed says how far off (Result.link): the old map's frame onto
 the new one, from where the truck is reckoned to have got since its last
-good fit. The heading off the gyro (bias taken off, projected on up, so a
+good fit the gyro agrees with. A fit that is good by its inliers but has
+turned the truck where the gyro did not (DR_AGREE_DEG) is the scan lining up
+with the wrong walls on the way to getting lost: in replays of 052302 with
+the scans blinded at 520 s, good fits turned it 10 to 20 degrees the gyro
+never saw, the reckoning restarted from them, and the shelf held the merge
+to a heading 85 degrees off. The reckoning carries on through such a fit,
+unless DR_TRUST_RUN good fits in a row each agree with the gyro scan to
+scan (DR_STEP_DEG), which is the map tracking again from a heading the gyro
+has drifted off. The heading off the gyro (bias taken off, projected on up, so a
 rollover too); the position off the commanded speed step() is handed (the
 throttle through nav/truck.ground_speed) along that heading; and an error
 estimate for both, LINK_ERR_* below. A merge's link is the fit that merged
 (old = T . fresh) with no error. A goal clicked on the map rides these
-(autopilot/goal.py ClickGoal); nothing in here uses them.
+(autopilot/goal.py ClickGoal); the shelf starts its own reckoning from the
+shelving link and goes on by itself.
 
 A map is young until it has had SEED_WRITES writes. A young map that a scan
 does not fit is started again from that scan (Result.reseed "young"), and
@@ -208,6 +233,48 @@ LINK_UNKNOWN_M_S = 0.3
 LINK_ERR_DEG = 1.0
 LINK_ERR_DEG_S = 0.1
 LINK_ROLLED_M = 1.0
+# A good fit restarts the reckoning only if its heading is within
+# DR_AGREE_DEG (plus the gyro's LINK_ERR_DEG_S a second) of the reckoned one,
+# or DR_TRUST_RUN good fits in a row have each turned within DR_STEP_DEG of
+# the gyro. Scan to scan, fit and gyro part by 1.1 degrees at p99, 3.2 at
+# p99.99 and 5.0 at most over 71k tracking scan pairs of the 10-29 replays.
+DR_AGREE_DEG = 5.0
+DR_STEP_DEG = 3.0
+DR_TRUST_RUN = 10
+
+# A shelved map keeps reckoning where the truck is on it (Shelf.here, see
+# "Where the truck is on the shelf"), and a merge is held to that. Its
+# heading may be off the reckoned one by the shelving link's err_yaw plus
+# SHELF_DRIFT_DEG, and SHELF_DRIFT_DEG_S more for every second since the map
+# was shelved: how far SLAM's heading parts from the bias-corrected gyro's
+# while it tracks, over windows on one map in replays of the 10-29 drives
+# (gaps in the gyro left out), p99 6 degrees over 10 s, 11 over 60 s, 12.5
+# over 120 s, 17-18 over 180-300 s, the worst 20 over 300 s bar one drive
+# whose SLAM spun on its own. A 180 degree twin, the merge 174641 took at
+# 250 s, is far outside it. The search only tries headings within it, so a
+# circle is a few headings, not ninety. A gap in the gyro since the map was
+# shelved and the heading is anyone's: the whole circle, as before.
+SHELF_DRIFT_DEG = 12.0
+SHELF_DRIFT_DEG_S = 0.03
+# The position's doubt: the shelving link's err_m, plus SHELF_TRACK_FRAC of
+# every metre the fresh map tracked (its steps are good; what turns them
+# onto the shelf is the gyro's heading, off by up to the tolerance above),
+# plus what the link would own up to for the metres counted off the
+# commanded speed or not counted at all (LINK_*). The search is drawn round
+# Shelf.here as wide as that, never under reloc.SEARCH_R_M, never over
+# SHELF_MAX_R_M.
+SHELF_TRACK_FRAC = 0.15
+SHELF_MAX_R_M = 6.0
+# A merge the walls do not bear out is not made: of the fresh map's walls
+# that land, through the merge, where the shelf knows something, at least
+# SHELF_AGREE must land within a cell of one of its walls rather than on its
+# open floor (agreement()). Under SHELF_AGREE_MIN of them is no evidence
+# either way. In replays of the 10-29 drives the right merges agreed 0.73 to
+# 1.00 (68 with a loss injected, 2 of the losses that happened); the wrong
+# ones 0.38 (191314, the right heading 6 m off where the truck was reckoned
+# after 200 s lost), 0.42 (the 174641 twin) and 0.60 (an 85 degree one).
+SHELF_AGREE = 0.65
+SHELF_AGREE_MIN = 50
 
 # The revolution period when there is nothing better to go on: 0.1009 s
 # measured over the four drives.
@@ -273,6 +340,15 @@ class Shelf:
         self.circle = False         # a circle is done: pick once todo is
         self.pending = None         # T the last circle picked
         self.credit = 0.0           # seconds the search may still spend
+        # Where the truck is reckoned to be on it (Slam._reckon_shelf), the
+        # doubt in that (metres, radians), and the scan time it was shelved.
+        # here is None when nothing reckoned it (it was put there by hand);
+        # err_yaw is pi once the gyro has had a gap.
+        self.here = None
+        self.err_m = 0.0
+        self.err_yaw = math.pi
+        self.since = 0.0
+        self.rolled = False         # the last reckoned step was rolled
 
 
 class Slam:
@@ -304,6 +380,8 @@ class Slam:
         self._map_writes = 0
         self.reseeds = 0
         self.merges = 0
+        # Shelf merges found twice that the walls did not bear out.
+        self.shelf_refused = 0
         self._reseed = ""
         # The relocalization in progress while lost (reloc.Search), and a fit
         # waiting to be confirmed on the next scan.
@@ -338,6 +416,9 @@ class Slam:
         self._dr_s = 0.0
         self._dr_unknown_m = 0.0
         self._dr_rolled = 0
+        self._dr_blind = False
+        # Good fits in a row that each turned as the gyro did.
+        self._dr_run = 0
         self._link = ()
         self._shelved = False
 
@@ -377,6 +458,7 @@ class Slam:
                             t - last_t if last_t is not None else 0.0)
             if last_t is not None:
                 self._reckon(rolled_rate, None, t - last_t, rolled=True)
+                self._reckon_shelf(rolled_rate, None, t - last_t, rolled=True)
             self.lost = True
             self._lost_since = t
             self._search = None
@@ -453,7 +535,12 @@ class Slam:
             if not good and self._map_writes < SEED_WRITES:
                 self._reseed = "young"
 
-        if last_t is not None and not (good and not self._reseed):
+        trusted = (good and not self._reseed
+                   and (recovered or last_t is None
+                        or self._agrees(newpose, pose, imu_rate, dt)))
+        if not good:
+            self._dr_run = 0
+        if last_t is not None and not trusted:
             self._reckon(imu_rate, speed, dt)
         if self._reseed:
             # A fresh map from this scan, at the pose the truck is believed
@@ -462,6 +549,8 @@ class Slam:
             self._shelved = self._start_over(keep=self._reseed == "lost")
             newpose, good, fit = pred.copy(), True, None
             self._link = self._link_from_reckoning(newpose)
+            if self._shelved:
+                self._shelf_from_reckoning(t)
         if self._tree is not None and not good and not self.lost:
             self.fails += 1
             self.vel *= 0.5
@@ -490,8 +579,15 @@ class Slam:
                 # The gyro's slow bias, from how far it disagrees with the
                 # fits: an EMA slow enough that one bad fit is noise.
                 self.bias += 0.002 * (imu_rate - v_new[2])
+        if (self._shelf is not None and last_t is not None
+                and not self._shelved):
+            moved = (newpose[:2] - pose[:2]
+                     if trusted and fit is not None and not recovered
+                     else None)
+            self._reckon_shelf(imu_rate, speed, dt, moved=moved,
+                               fresh_yaw=float(newpose[2]))
         self.pose = newpose
-        if good:
+        if trusted or (good and self._reseed):
             self._dr_reset(newpose)
 
         pitch, roll = self._att
@@ -510,7 +606,7 @@ class Slam:
             written = True
         if (self._shelf is not None and good and not self._reseed
                 and state in (TRACKING, TILTED)
-                and self._shelf_slice(p, nrm, t0)):
+                and self._shelf_slice(p, nrm, t0, t)):
             self._reseed = "merged"
             self._dr_reset(self.pose)
         self._refresh_target()
@@ -585,6 +681,21 @@ class Slam:
         self._dr = np.array(pose, float)
         self._dr_m = self._dr_s = self._dr_unknown_m = 0.0
         self._dr_rolled = 0
+        self._dr_blind = False
+
+    def _agrees(self, newpose, pose, rate, dt):
+        """Whether a good fit to newpose (from pose, dt ago) is one the
+        reckoning starts again from: its heading within DR_AGREE_DEG of the
+        reckoned one, or the last DR_TRUST_RUN good fits each turned as the
+        gyro did. With no gyro to say, any good fit is."""
+        if rate is None or not math.isfinite(rate) or self._dr_blind:
+            return True
+        step = abs(_wrap(float(newpose[2]) - float(pose[2]) - rate * dt))
+        self._dr_run = (self._dr_run + 1
+                        if step <= math.radians(DR_STEP_DEG) else 0)
+        off = abs(_wrap(float(newpose[2]) - (self._dr[2] + rate * dt)))
+        tol = math.radians(DR_AGREE_DEG + LINK_ERR_DEG_S * (self._dr_s + dt))
+        return off <= tol or self._dr_run >= DR_TRUST_RUN
 
     def _reckon(self, rate, speed, dt, rolled=False):
         """Move the dead-reckoned pose on over dt: the heading by the gyro's
@@ -594,6 +705,9 @@ class Slam:
             return
         if rate is not None and math.isfinite(rate):
             self._dr[2] = _wrap(self._dr[2] + rate * dt)
+        else:
+            # A gap in the gyro: how far it turned meanwhile is anyone's.
+            self._dr_blind = True
         self._dr_s += dt
         if rolled:
             self._dr_rolled = 1
@@ -614,9 +728,78 @@ class Slam:
         T = _between(new_pose, self._dr)
         err_m = (LINK_ERR_M + LINK_ERR_FRAC * self._dr_m + self._dr_unknown_m
                  + LINK_ROLLED_M * self._dr_rolled)
-        err_yaw = math.radians(LINK_ERR_DEG + LINK_ERR_DEG_S * self._dr_s)
+        err_yaw = (math.pi if self._dr_blind else
+                   math.radians(LINK_ERR_DEG + LINK_ERR_DEG_S * self._dr_s))
         return (T[0], T[1], T[2], float(err_m), float(err_yaw),
                 float(self._dr[0]), float(self._dr[1]))
+
+    # ---- where the truck is on the shelf ---------------------------------
+
+    def _shelf_from_reckoning(self, t):
+        """A map just shelved: the truck is where the reckoning has it on
+        that map (the link's own pivot and heading), as sure as the link."""
+        sh = self._shelf
+        _, _, _, err_m, err_yaw = self._link[:5]
+        sh.here = np.array(self._dr, float)
+        sh.err_m, sh.err_yaw, sh.since = float(err_m), float(err_yaw), t
+        sh.search = None
+
+    def _reckon_shelf(self, rate, speed, dt, moved=None, fresh_yaw=0.0,
+                      rolled=False):
+        """Move Shelf.here on over dt. The heading by the gyro, as the
+        reckoning for a link is; the position by the fresh map's own step
+        when it fitted (`moved`, its x, y change, turned onto the shelf by
+        how far the gyro's heading there is from the fresh map's), else by
+        `speed` along the heading. Neither depends on the fresh map's frame,
+        so a fresh map that is started again, or relocalizes onto a twin of
+        itself, does not move it."""
+        sh = self._shelf
+        if sh is None or sh.here is None or not dt > 0.0:
+            return
+        h = sh.here
+        if rate is not None and math.isfinite(rate):
+            h[2] = _wrap(h[2] + rate * dt)
+        else:
+            sh.err_yaw = math.pi
+        if rolled:
+            sh.err_m += LINK_ROLLED_M if not sh.rolled else 0.0
+            sh.rolled = True
+            return
+        sh.rolled = False
+        if moved is not None:
+            d = mt.rot(h[2] - fresh_yaw) @ np.asarray(moved, float)
+            h[0] += d[0]
+            h[1] += d[1]
+            sh.err_m += SHELF_TRACK_FRAC * math.hypot(d[0], d[1])
+        elif speed is None or not math.isfinite(speed) or dt > 1.0:
+            sh.err_m += LINK_UNKNOWN_M_S * dt
+        else:
+            step = float(speed) * dt
+            h[0] += step * math.cos(h[2])
+            h[1] += step * math.sin(h[2])
+            sh.err_m += LINK_ERR_FRAC * abs(step)
+
+    def _on_shelf(self, sh):
+        """The truck on the shelved map: where it is reckoned to be, or with
+        nothing reckoned the pose as it is (the fresh map went on from the
+        old frame)."""
+        if sh.here is None:
+            return np.array(self.pose, float)
+        return np.array(sh.here, float)
+
+    def _shelf_tol(self, sh, t):
+        """How far a merge's heading may be off the reckoned one, radians
+        (pi: anything goes)."""
+        if sh.here is None:
+            return math.pi
+        drift = SHELF_DRIFT_DEG + SHELF_DRIFT_DEG_S * max(t - sh.since, 0.0)
+        return min(math.pi, sh.err_yaw + math.radians(drift))
+
+    def _shelf_r(self, sh):
+        """The search's radius round Shelf.here: its position doubt."""
+        if sh.here is None:
+            return rl.SEARCH_R_M
+        return min(max(rl.SEARCH_R_M, sh.err_m), SHELF_MAX_R_M)
 
     def _carry_yaw(self, rate, dt):
         """Turn the lost heading on by the gyro's rate over dt; a scan with
@@ -679,7 +862,7 @@ class Slam:
         # how near it came.
         return best, False
 
-    def _shelf_slice(self, p, nrm, t0):
+    def _shelf_slice(self, p, nrm, t0, t):
         """On a fresh map with one on the shelf: the next pieces of the
         search for the truck on the shelved one (_shelf_piece). Each step
         adds SHELF_SHARE_S to what the search may spend, never banking more
@@ -693,17 +876,19 @@ class Slam:
         while sh.credit > 0 and (first or self._clock() - t0 < SHELF_STEP_S):
             first = False
             t1 = self._clock()
-            done = self._shelf_piece(sh, p, nrm)
+            done = self._shelf_piece(sh, p, nrm, t)
             sh.credit -= self._clock() - t1
             if done is not None:
                 return done
         return False
 
-    def _shelf_piece(self, sh, p, nrm):
+    def _shelf_piece(self, sh, p, nrm, t):
         """One piece of the shelf's search, the first of these that is due:
 
-          draw the search (reloc.Search) and the old map's tree round the
-          truck, the first time and again once it is SHELF_MOVE_M off;
+          draw the search (reloc.Search) and the old map's tree round where
+          the truck is reckoned to be on it (_on_shelf), only the headings
+          within _shelf_tol of the reckoned one and as wide as _shelf_r, the
+          first time and again once it is SHELF_MOVE_M off;
           ICP from the next candidate of the last reloc.YAWS_PER_SCAN
           headings scored, the best reloc.TOP_K of them;
           once a circle's candidates are all fitted, the pick (as a lost
@@ -714,12 +899,14 @@ class Slam:
         one thing about it that does not change while the truck drives on,
         and put back on the truck's pose of the scan that fits it. None to
         go on, False to stop for this scan, True if it merged."""
-        x, y, yaw = (float(v) for v in self.pose)
+        x, y, yaw = (float(v) for v in self._on_shelf(sh))
+        tol = self._shelf_tol(sh, t)
+        span = tol if tol < math.pi else None
         if sh.search is None or math.hypot(sh.search.field.cx - x,
                                            sh.search.field.cy - y) > SHELF_MOVE_M:
-            sh.search = rl.Search(sh.grid, x, y, yaw)
-            tgt = sh.grid.local_points(
-                x, y, LOCAL_R_M + rl.SEARCH_R_M + SHELF_MOVE_M)
+            r = self._shelf_r(sh)
+            sh.search = rl.Search(sh.grid, x, y, yaw, r_m=r, span=span)
+            tgt = sh.grid.local_points(x, y, LOCAL_R_M + r + SHELF_MOVE_M)
             sh.tgt = tgt
             sh.tree = cKDTree(tgt) if len(tgt) >= 50 else None
             sh.batch, sh.headings, sh.todo, sh.circle = [], 0, [], False
@@ -734,7 +921,8 @@ class Slam:
             return None
         if sh.circle:
             sh.circle = False
-            return True if self._shelf_pick(sh, p, nrm) else None
+            return True if self._shelf_pick(sh, p, nrm, t) else None
+        sh.search.span = span
         cands = sh.search.step(p, yaw, per_scan=1, top_k=rl.PER_YAW)
         if not cands and not sh.search.swept:
             return False
@@ -748,23 +936,41 @@ class Slam:
             sh.circle = sh.search.swept
         return None
 
-    def _shelf_pick(self, sh, p, nrm):
+    def _shelf_pick(self, sh, p, nrm, t):
         """A circle of the shelf's search done: its pick, ICP from it on
         this scan, and the merge if it is the transform the last circle
-        picked too. True if it merged."""
+        picked too. Only a fit within _shelf_tol of the reckoned heading is
+        an answer at all, before the pick and after the ICP: a twin or a
+        wrong room is never merged however well it fits. True if it
+        merged."""
         search = sh.search
         search.fits = [(i, _apply(T, self.pose)) for i, T in search.fits]
-        picked = search.pick(RECOVER_MIN_INLIERS)
+        here = self._on_shelf(sh)
+        tol = self._shelf_tol(sh, t)
+        gated = tol < math.pi
+        if gated:
+            search.fits = [f for f in search.fits
+                           if abs(_wrap(f[1][2] - here[2])) <= tol]
+        picked = search.pick(RECOVER_MIN_INLIERS,
+                             prior=float(here[2]) if gated else None)
         if picked is None:
             sh.pending = None
             return False
         c = mt.icp(p, nrm, sh.tree, sh.tgt, picked, iters=25)
-        if not (c.converged and c.inliers >= RECOVER_MIN_INLIERS):
+        if not (c.converged and c.inliers >= RECOVER_MIN_INLIERS
+                and (not gated or abs(_wrap(c.pose[2] - here[2])) <= tol)):
             sh.pending = None
             return False
         T = _between(c.pose, self.pose)
         if sh.pending is None or not _close(T, sh.pending):
             sh.pending = T
+            return False
+        share, counted = agreement(sh.grid, self.grid, T)
+        if counted >= SHELF_AGREE_MIN and share < SHELF_AGREE:
+            # Found twice, and the fresh map's walls stand on the shelf's
+            # open floor: the wrong place, however well the scan fits it.
+            sh.pending = None
+            self.shelf_refused += 1
             return False
         # Found twice the same way: the fresh map into the old, and the old
         # one is the map.
@@ -888,6 +1094,32 @@ def _between(old_pose, new_pose):
     R = mt.rot(dyaw)
     t = np.asarray(old_pose[:2], float) - R @ np.asarray(new_pose[:2], float)
     return (float(t[0]), float(t[1]), dyaw)
+
+
+def agreement(old, new, T):
+    """How far `new`'s walls bear out the transform T (old = T . new): of
+    its wall cells that land on a cell `old` knows (or next to a wall of
+    it), the share that land within a cell of an old wall rather than on old
+    open floor, and how many that is. (share, count); (1.0, 0) with none."""
+    ii, jj = np.nonzero(new.lo > gr.L_OCC)
+    if not len(ii):
+        return 1.0, 0
+    wx = (ii + new.ox + 0.5) * new.res
+    wy = (jj + new.oy + 0.5) * new.res
+    q = np.stack([wx, wy], 1) @ mt.rot(T[2]).T + (T[0], T[1])
+    hx = np.floor(q[:, 0] / old.res).astype(np.int64) - old.ox
+    hy = np.floor(q[:, 1] / old.res).astype(np.int64) - old.oy
+    n = old.size
+    ok = (hx >= 1) & (hx < n - 1) & (hy >= 1) & (hy < n - 1)
+    hx, hy = hx[ok], hy[ok]
+    near = np.zeros(len(hx), bool)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            near |= old.lo[hx + dx, hy + dy] > gr.L_OCC
+    agree = int(near.sum())
+    clash = int(((~near) & (old.lo[hx, hy] < 0)).sum())
+    counted = agree + clash
+    return (agree / counted if counted else 1.0), counted
 
 
 def merge(old, new, T):

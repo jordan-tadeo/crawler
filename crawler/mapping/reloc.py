@@ -119,13 +119,18 @@ def subsample(pts, n=SCORE_POINTS):
     return pts[np.linspace(0, len(pts) - 1, n).astype(np.int64)]
 
 
-def yaw_order(yaw0, step_deg=YAW_STEP_DEG):
-    """Every heading a step apart round the circle, outwards from yaw0."""
+def yaw_order(yaw0, step_deg=YAW_STEP_DEG, span=None):
+    """Every heading a step apart round the circle, outwards from yaw0; with
+    `span` (radians) only those within it of yaw0, and one step past it, so
+    a span between two steps is still covered."""
     n = int(round(360.0 / step_deg))
     out = [0]
     for k in range(1, n // 2 + 1):
         out += [k, -k]
     out = out[:n]
+    if span is not None and span < math.pi:
+        last = int(math.ceil(math.degrees(span) / step_deg))
+        out = [k for k in out if abs(k) <= last]
     return [yaw0 + math.radians(step_deg) * k for k in out]
 
 
@@ -134,9 +139,12 @@ class Search:
     still to try, YAWS_PER_SCAN of them each step(), starting over once the
     circle is done."""
 
-    def __init__(self, grid, cx, cy, yaw0, r_m=SEARCH_R_M):
+    def __init__(self, grid, cx, cy, yaw0, r_m=SEARCH_R_M, span=None):
         self.field = Field(grid, cx, cy, r_m)
         self.yaw0 = float(yaw0)
+        # Only headings within this of the one handed to step() (radians),
+        # or None for the whole circle: a circle is then that arc.
+        self.span = span
         self._next = 0
         self.sweeps = 0
         self.swept = False      # the last step() finished a circle
@@ -196,7 +204,8 @@ class Search:
         points over the next per_scan headings, best first. The headings run
         outwards from yaw_now (the IMU's) when it is given, else from the
         heading the search started at."""
-        order = yaw_order(self.yaw0 if yaw_now is None else yaw_now)
+        order = yaw_order(self.yaw0 if yaw_now is None else yaw_now,
+                          span=self.span)
         sub = subsample(pts)
         if not len(sub) or self.field.points == 0:
             return []
