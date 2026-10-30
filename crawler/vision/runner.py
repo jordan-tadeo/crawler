@@ -32,6 +32,8 @@ IDLE_SAMPLE_S = 1.0
 ERROR_LOG_S = 60.0
 # Boxes older than this are not drawn on /pantilt/image.
 BOX_SHOW_S = 1.0
+# More of the detector's input than this grey padding is journalled.
+PADDING_WARN = 0.15
 
 
 class Sighting(NamedTuple):
@@ -144,8 +146,23 @@ class PanTiltRunner:
             shape = getattr(self.detector, "input_shape", None)
             self._log("info", f"Person detector up ({self.detector.model_path}"
                       + (f", input {shape[1]}x{shape[0]}" if shape else "") + ")")
+            if shape:
+                self._check_padding(shape)
         elif state == "failed":
             self._log("warning", f"Person detector down: {self.detector.error}")
+
+    def _check_padding(self, shape):
+        """Warn when the model's input is the wrong shape for the camera: a
+        4:3 input for the 16:9 windshield camera spends 30% of every run on
+        grey padding."""
+        from crawler.vision.person import padding
+        cam = self.cfg.camera
+        waste = padding(cam.width, cam.height, shape[0], shape[1])
+        if waste > PADDING_WARN:
+            self._log("warning", f"The person model's {shape[1]}x{shape[0]} "
+                      f"input is {100 * waste:.0f}% padding for a "
+                      f"{cam.width}x{cam.height} camera; a model shaped like "
+                      f"the camera is as good and faster (tools/person_model.py)")
 
     def _collect(self, now):
         msg = self.detector.poll()

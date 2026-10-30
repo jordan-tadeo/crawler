@@ -3,16 +3,23 @@
 The model is a YOLO detector exported to ONNX (YOLO11n or YOLOv8n, COCO,
 class 0 is a person) and run by onnxruntime, which the car already has for
 the driving policy, so there is nothing new to install but the model file.
-It is not in the repo: models/ is untracked, like the policy. Exported on
-the Mac with
+It is not in the repo: models/ is untracked, like the policy.
+tools/person_model.py makes it on the Mac: YOLO11n exported with
 
     uvx --python 3.11 --from 'ultralytics==8.3.40' --with onnx --with onnxslim \
         --with 'torch<2.6' --with 'torchvision<0.21' \
-        yolo export model=yolo11n.pt format=onnx imgsz=256,320 opset=12
+        yolo export model=yolo11n.pt format=onnx imgsz=192,320 opset=12
 
-which writes yolo11n.onnx, input 1x3x256x320 (a 320x240 frame letterboxed
-with 8 rows top and bottom), output 1x84x1680. Copy it to models/person.onnx
-on the car. The weights are Ultralytics' and AGPL-3.0.
+then quantised to INT8 (static, QDQ, per channel, calibrated on coco128
+frames in a 16:9 canvas, the detection head left in float). Input
+1x3x192x320, output 1x84x1260. Copy it to models/person.onnx on the car. The
+weights are Ultralytics' and AGPL-3.0.
+
+The input is shaped for the windshield camera: 1280x720 is 16:9, so it
+scales by 0.25 to 320x180 with 6 grey rows top and bottom. The first model
+here was 256x320, shaped for a 4:3 webcam, and a 16:9 frame in it is 30%
+padding the network still pays for. Same 0.25 scale, so a person is the
+same number of pixels in either and recall is the same.
 
 Why this and not the others
 ---------------------------
@@ -34,16 +41,25 @@ Why this and not the others
   the obvious next step if the measured cost here is too high. It is a new
   dependency; onnxruntime is not.
 
-The cost, estimated and not yet measured on the car: Qengineering measured
-YOLOv8n at 640 at 3.1 fps on all four cores of an overclocked Pi 4 (NCNN).
-256x320 is a fifth of those pixels, so about 150-300 ms a frame on one core
-through onnxruntime, which at the default 3 Hz is capped by max_duty 0.5 to
-about 1.5-3 Hz and half of one core at most. The Mac does it in 6 ms. The
-journal's "Detection ... Hz, ... ms each" line every minute is the real
-number, and RateGovernor halves the rate whenever the whole Pi is under
-15% idle. It runs in a process of its own at nice 10 on one thread and
-shares nothing with the driving pipeline -- not the OAK-D, not its USB link,
-not the control loop's GIL.
+The cost, measured on the car (Pi 4B, onnxruntime 1.31, one thread at nice
+10, the service running with SLAM and the voxel map), session.run on a
+1280x720 frame:
+
+    model                p50     p95    coco128 person recall, conf 0.4
+    256x320 float        232 ms  249 ms  89/254
+    192x320 float        182 ms  205 ms  91/254 (Mac)
+    192x320 INT8          95 ms  108 ms  93/254
+    288x512 INT8         230 ms  237 ms  109/254 (Mac, float)
+
+Letterboxing the frame is 4 ms and the pipe 4-7 ms. More threads are no
+faster on a busy Pi: two cut 192x320 INT8 to 77 ms but cost 1.4 cores for
+it, three and four were slower than one. At the default 5 Hz, capped by
+max_duty 0.5, the 192x320 INT8 model measured 0.52 of a core (p95 121 ms),
+against 0.27 for the old model at the 1.2 Hz it managed. RateGovernor halves the rate whenever the whole Pi
+is under 15% idle. The journal's "Detection ... Hz, ... ms each" line every
+minute is the real number. It runs in a process of its own at nice 10 on
+one thread and shares nothing with the driving pipeline -- not the OAK-D,
+not its USB link, not the control loop's GIL.
 
 The worker
 ----------
@@ -62,6 +78,15 @@ from crawler.vision.track import Detection
 
 PERSON_CLASS = 0
 PAD_VALUE = 114
+
+
+def padding(frame_w, frame_h, in_h, in_w):
+    """The fraction of a frame_w x frame_h frame's letterboxed input that is
+    grey padding: work the network does for nothing."""
+    scale = min(in_w / float(frame_w), in_h / float(frame_h))
+    nw = min(int(round(frame_w * scale)), in_w)
+    nh = min(int(round(frame_h * scale)), in_h)
+    return 1.0 - (nw * nh) / float(in_w * in_h)
 
 
 def letterbox(frame, in_h, in_w):
@@ -163,6 +188,13 @@ def _serve(conn, model_path, conf, iou, threads, nice, make=None):
     """The worker: load, say ready, then answer frames until the pipe closes."""
     if nice:
         _lower_priority(nice)
+        # One core: OpenCV's resize would otherwise fan out over all four.
+        # The thread worker passes nice 0, so this is the process's alone.
+        try:
+            import cv2
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
     try:
         detector = (make or OnnxPersonDetector)(model_path, conf=conf, iou=iou,
                                                 threads=threads)

@@ -171,8 +171,9 @@ class DetectorConfig:
     conf: float = 0.4
     iou: float = 0.45
     # Detections a second when the Pi has room, and the floor it backs off
-    # to when it does not.
-    base_hz: float = 3.0
+    # to when it does not. 5 Hz is what the 192x320 INT8 model (97 ms) does
+    # inside max_duty; a slower model is held to less by max_duty anyway.
+    base_hz: float = 5.0
     min_hz: float = 0.5
     # The most of one core the detector may average: the interval is never
     # shorter than the last inference time divided by this.

@@ -492,6 +492,48 @@ def test_decode_undoes_the_letterbox_and_keeps_people_only():
                                           (128 + 60 - 8) / 240))
 
 
+def test_letterbox_fits_the_windshield_camera_into_a_16_by_9_input():
+    frame = np.zeros((720, 1280, 3), np.uint8)
+    t, scale, px, py = person.letterbox(frame, 192, 320)
+    assert t.shape == (1, 3, 192, 320)
+    assert (scale, px, py) == (0.25, 0, 6)
+    out = yolo_output([(160, 96, 40, 120, 0, 0.9)], n=1260)
+    p = person.decode(out, 1280, 720, scale, px, py)[0]
+    assert (p.x0, p.x1) == pytest.approx((0.4375, 0.5625))
+    assert (p.y0, p.y1) == pytest.approx(((36 - 6) / 180, (156 - 6) / 180))
+
+
+def test_padding_is_what_a_4_by_3_input_wastes_on_a_16_by_9_camera():
+    assert person.padding(1280, 720, 256, 320) == pytest.approx(0.296875)
+    assert person.padding(1280, 720, 192, 320) == pytest.approx(0.0625)
+    assert person.padding(320, 240, 256, 320) == pytest.approx(0.0625)
+
+
+def test_the_default_rate_is_what_the_int8_model_can_do():
+    g = gov()
+    assert g.update(infer_s=0.1) == pytest.approx(0.2)   # 5 Hz at 97 ms
+    assert g.update(infer_s=0.36) == pytest.approx(0.72)  # the float model
+    for name in ("pantilt.json", "pantilt-servo.json"):
+        cfg = json.loads((ROOT / "deploy" / name).read_text())
+        assert cfg["detector"]["base_hz"] == 5.0, name
+
+
+def test_a_model_shaped_for_another_camera_is_journalled():
+    cfg = pt.config_from_dict({"camera": {"width": 1280, "height": 720}})
+
+    def warnings_for(shape):
+        d = FakeDetector()
+        d.input_shape = shape
+        log = FakeLogger()
+        r = ptr.PanTiltRunner(cfg, pt.ServoMount(cfg.mount, FakeWriter()),
+                              FakeGrabber(), d, logger=log, clock=Clock(),
+                              idle=FakeIdle(0.5))
+        r._watch_detector()
+        return [m for lvl, _, m in log.lines if lvl == "warning"]
+    assert any("30% padding" in m for m in warnings_for((256, 320)))
+    assert warnings_for((192, 320)) == []
+
+
 def test_decode_of_nothing():
     assert person.decode(yolo_output([]), 320, 240, 1.0, 0, 8) == []
 

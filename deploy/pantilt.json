@@ -39,7 +39,7 @@
     "model": "models/person.onnx",
     "conf": 0.4,
     "iou": 0.45,
-    "base_hz": 3.0,
+    "base_hz": 5.0,
     "min_hz": 0.5,
     "max_duty": 0.5,
     "low_idle": 0.15,
