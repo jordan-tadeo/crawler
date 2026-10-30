@@ -73,6 +73,21 @@ def test_a_window_that_does_not_parse_is_refused(tmp_path):
         rules_of(tmp_path, f"{RUN}@00:41:03 battery\n")
 
 
+def test_a_new_window_builds_the_dataset_again(tmp_path):
+    """The dataset cache is keyed on the sessions; a window added to one of
+    them changes what is in the set, so it has to change the key too."""
+    mcap = tmp_path / "mcap"
+    mcap.mkdir()
+    recording(mcap, f"{RUN}-001")
+    (tmp_path / "cache").mkdir()
+    cands, _ = scan(mcap, tmp_path / "cache", decode=FakeDecode())
+    none = rt.dataset_key("code", cands, [])
+    battery = rt.dataset_key("code", cands, rules_of(tmp_path, f"{RUN}@2026-10-30T00:41:03Z battery\n"))
+    other = rt.dataset_key("code", cands, rules_of(tmp_path, "crawler-x@2026-10-30T00:41:03Z a\n"))
+    assert battery != none
+    assert other == none, "a window on a run not in the set changes nothing"
+
+
 def test_retrain_keeps_a_session_with_only_a_window_on_it(tmp_path):
     rules = rules_of(tmp_path, f"{RUN}@2026-10-30T00:41:03Z battery\n")
     mcap = tmp_path / "mcap"

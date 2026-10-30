@@ -54,9 +54,8 @@ The junk rules. A session trains unless one of these says it is junk:
               never to learn from, the takeovers I made because the car kept
               stopping on 10-29 the first of them. A rule with a window
               (prefix@FROM..TO) keeps the session and policy_dataset drops
-              only its ticks inside the window; that reads the default
-              exclude file, so a different --exclude-file here is the
-              session rules only.
+              only its ticks inside the window. The windows are in the
+              dataset's cache key, so adding one builds the set again.
 
 The folds are policy_train.py's --blocks N, so the numbers are the ones a plain
 `policy_train.py --blocks 5` prints. The deployed model is graded as it is, a
@@ -355,13 +354,21 @@ def apply_filter(cands, excludes=()):
 # The dataset: policy_dataset.main, reading the cache.
 # ---------------------------------------------------------------------------
 
-def dataset_key(code, kept):
-    text = "|".join([code, str(MIN_USABLE), *sorted(f"{c.name}.{c.key}" for c in kept)])
+def dataset_key(code, kept, excludes=()):
+    """The cache key of a dataset: the decode code, the sessions, and every
+    exclude window on one of them (policy_dataset drops those ticks)."""
+    windows = sorted(f"{prefix} {why}" for prefix, why in excludes
+                     if pd.WINDOW_MARK in prefix
+                     and any(c.name.startswith(prefix.partition(pd.WINDOW_MARK)[0])
+                             for c in kept))
+    text = "|".join([code, str(MIN_USABLE), *sorted(f"{c.name}.{c.key}" for c in kept),
+                     *windows])
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def build_dataset(kept, out, log_path, scratch):
-    """policy_dataset.main over `kept`, with each Session out of the cache."""
+def build_dataset(kept, out, log_path, scratch, exclude_file=pd.EXCLUDE_FILE):
+    """policy_dataset.main over `kept`, with each Session out of the cache,
+    reading the same exclude file the filter did (its windows)."""
     by_path = {os.path.realpath(c.path): c for c in kept}
     real = pd.read_session
 
@@ -380,7 +387,8 @@ def build_dataset(kept, out, log_path, scratch):
         drives = [c for c in kept if c.drive]
         for c in drives:
             os.symlink(c.path, os.path.join(links, os.path.basename(c.path)))
-        argv = [out, *records, "--uncompressed"] + (["--drive-logs", links] if drives else [])
+        argv = ([out, *records, "--uncompressed", "--exclude-file", exclude_file]
+                + (["--drive-logs", links] if drives else []))
         pd.read_session = cached
         try:
             with open(log_path, "w") as log, contextlib.redirect_stdout(log):
@@ -699,7 +707,8 @@ def main(argv=None):
           f"{stubs} too small to open")
     clock.lap("scan")
 
-    kept = apply_filter(cands, pd.read_excludes(args.exclude_file))
+    excludes = pd.read_excludes(args.exclude_file)
+    kept = apply_filter(cands, excludes)
     for c in cands:
         if c.why:
             print(f"  junk {c.name}: {'; '.join(c.why)}")
@@ -709,14 +718,15 @@ def main(argv=None):
     clock.lap("filter")
 
     representation, labels = _train_flags(extra)
-    dkey = dataset_key(code, kept)
+    dkey = dataset_key(code, kept, excludes)
     data_path = os.path.join(args.cache_dir, f"dataset-{dkey}.npz")
     x_path = os.path.join(args.cache_dir, f"dataset-{dkey}.x-{representation}.npy")
     if os.path.exists(data_path):
         print(f"dataset: the same sessions as last time, {data_path}")
     else:
         tmp = os.path.join(args.cache_dir, f"dataset-{dkey}.part.npz")
-        build_dataset(kept, tmp, os.path.join(run_dir, "dataset.log"), args.cache_dir)
+        build_dataset(kept, tmp, os.path.join(run_dir, "dataset.log"), args.cache_dir,
+                      args.exclude_file)
         os.replace(tmp, data_path)
         for old in glob.glob(os.path.join(args.cache_dir, "dataset-*")):
             if not os.path.basename(old).startswith(f"dataset-{dkey}."):
