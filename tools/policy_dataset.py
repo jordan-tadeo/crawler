@@ -2,7 +2,7 @@
 
     python tools/policy_dataset.py OUT.npz [REC.mcap ...]
 
-With no files it reads every ~/crawler-data/mcap/crawler-record-*.mcap, where
+With no files it reads every <data>/mcap/crawler-record-*.mcap, where
 tools/pull_mcaps.py leaves the car's recordings.
 
 Each file is one session, and a session is the unit the train/val split is
@@ -130,13 +130,14 @@ from typing import NamedTuple
 
 import numpy as np
 
-# The training venv (~/crawler-train) does not install this project, so the
+# The training venv (<folder>/train, tools/data_paths.py) does not install this project, so the
 # checkout root goes on the path for `import crawler`. Under `uv run` it is
 # installed already and this is a no-op.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from crawler.autopilot import driver as dv  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
+import data_paths as dp  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
@@ -1021,17 +1022,17 @@ def _pct(values, q):
 
 # Where the recordings are pulled to on the laptop, and the files a bare
 # `policy_dataset.py OUT.npz` reads.
-DEFAULT_MCAPS = "~/crawler-data/mcap/crawler-record-*.mcap"
+DEFAULT_MCAPS = os.path.join(dp.DATA_ROOT, "mcap", "crawler-record-*.mcap")
 
 
-def default_mcaps(pattern=DEFAULT_MCAPS):
+def default_mcaps(pattern=None):
     """Every file the default glob matches, oldest name first."""
-    return sorted(glob.glob(os.path.expanduser(pattern)))
+    return sorted(glob.glob(os.path.expanduser(pattern or DEFAULT_MCAPS)))
 
 
 # Where a pull leaves the auto drives (the rolling recordings), and the
 # record sessions' name, which a drive log never has.
-DEFAULT_DRIVE_LOGS = "~/crawler-data/mcap/drives"
+DEFAULT_DRIVE_LOGS = os.path.join(dp.DATA_ROOT, "mcap", "drives")
 RECORD_PREFIX = "crawler-record-"
 
 
@@ -1049,7 +1050,7 @@ def drive_logs(directory):
 # segment of that run goes, -001, -002 and on. Read by this file's main()
 # and by retrain.py's filter, so a plain policy_dataset.py run and a retrain
 # leave out the same sessions.
-EXCLUDE_FILE = os.environ.get("CRAWLER_EXCLUDE", "~/crawler-data/exclude.txt")
+EXCLUDE_FILE = os.environ.get("CRAWLER_EXCLUDE", os.path.join(dp.DATA_ROOT, "exclude.txt"))
 
 # A rule can instead take only a stretch of a run: "<prefix>@FROM..TO <why>",
 # FROM and TO UTC ISO times with a Z (2026-10-30T00:41:03Z), either one left

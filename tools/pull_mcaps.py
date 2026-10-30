@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Move the car's recordings onto the laptop, outside the repo, and prove it.
 
-    python3 tools/pull_mcaps.py                    # everything new, into ~/crawler-data/mcap
+    python3 tools/pull_mcaps.py                    # everything new, into <data>/mcap (tools/data_paths.py)
     python3 tools/pull_mcaps.py --list             # what is on the car, and what is live
     python3 tools/pull_mcaps.py -n 3               # the newest three only
     python3 tools/pull_mcaps.py --records-only     # only the RECORD-mode sessions
@@ -53,6 +53,8 @@ import subprocess
 import sys
 import tempfile
 
+import data_paths as dp
+
 CAR = os.environ.get("CRAWLER_HOST", "jt@jtpi.local")
 # The rolling ring the service writes in every mode, and where record mode
 # (manual-recording branch) puts its one-file-per-session drives.
@@ -60,7 +62,7 @@ REMOTE_DIRS = (
     "/home/jt/Documents/py/crawler/log/mcap",
     "/home/jt/Documents/py/crawler/recordings",
 )
-DEFAULT_DEST = os.path.expanduser("~/crawler-data/mcap")
+DEFAULT_DEST = os.path.expanduser(os.environ.get("CRAWLER_MCAP", os.path.join(dp.DATA_ROOT, "mcap")))
 SERVICE = "crawler"
 
 # What a closed MCAP ends in. Only close() writes it.

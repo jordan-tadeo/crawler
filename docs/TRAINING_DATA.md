@@ -39,7 +39,7 @@ Files: a record session is `log/mcap/crawler-record-<UTC>Z-p<pid>-001.mcap`
 (`/home/jt/Documents/py/crawler/log/mcap/` on the car, or `--record-dir`), one
 per session, never pruned by the ring; the rolling recording is
 `crawler-<UTC>Z-...mcap` in the same directory. `./scripts/pull-recordings.sh` pulls
-both, into `~/crawler-data/mcap/` by default; `--records-only` pulls just the
+both, into `~/crawler/data/mcap/` by default; `--records-only` pulls just the
 record sessions and leaves the drive logs on the car.
 
 A record session ends on a Y tap, on START, on losing the pad, or when the pad
@@ -131,7 +131,7 @@ quantised to whole disparity levels: about 5 mm steps at 400 mm, 25 mm at
 | `imu_age_ms` | float | age of that sample at the tick; **-1 and all zeros if there has been none** |
 | `imu_up_x/y/z` | float | same sample: the unit vector pointing away from the ground, in the IMU's own axes, off `GAME_ROTATION_VECTOR`. **All three 0 when there is no orientation reading**, which is every recording made before this field existed. See "Tilt" |
 | `autopilot` | string | who drove auto's `driver` groups: `""` in record, `rules` or `policy` (`python -m crawler --policy`) |
-| `policy_model` | string | which model drove, by name and version, e.g. `kblock 1.1` (the sidecar's `model_name` and `model_version`; a sidecar without them reads as its file's stem, e.g. `policy-20261028-170131Z`). `""` unless `autopilot` is `policy`. **Rows from before the name existed carry the sha256 here instead**: 64 hex characters, look it up in `~/crawler-data/models/registry.json` |
+| `policy_model` | string | which model drove, by name and version, e.g. `kblock 1.1` (the sidecar's `model_name` and `model_version`; a sidecar without them reads as its file's stem, e.g. `policy-20261028-170131Z`). `""` unless `autopilot` is `policy`. **Rows from before the name existed carry the sha256 here instead**: 64 hex characters, look it up in `~/crawler/data/models/registry.json` |
 | `policy_model_sha256` | string | sha256 of the `.onnx` driving, the exact model; `""` unless `autopilot` is `policy`. Absent in rows from before the name existed |
 | `policy_action` | string | the model's pick: `forward`, `reverse` or `stop` |
 | `policy_throttle` | float | the model's throttle after its floor veto; what it would have driven even while my trigger has the group |
@@ -336,7 +336,7 @@ Learned models are a family name plus MAJOR.MINOR, like `kblock 1.1`. MAJOR
 changes when the car's runtime has to know: a new input (IMU, the previous
 action), a different representation or input contract, different outputs.
 MINOR is a retrain on the same contract: more data, other weights. The
-versions live on the Mac in `~/crawler-data/models/` as `kblock-X.Y.onnx` +
+versions live on the Mac in `~/crawler/data/models/` as `kblock-X.Y.onnx` +
 `.json`, listed in `registry.json` with each one's sha256, training sessions
 (and their MCAPs' sha256), training commit and command, CV scores and parent.
 `./scripts/models.sh list | register | deploy | rollback | status` is the tool;
@@ -345,7 +345,7 @@ versions live on the Mac in `~/crawler-data/models/` as `kblock-X.Y.onnx` +
 ## Getting it out
 
 ```sh
-uv run --with mcap deploy/footprint_dump.py ~/crawler-data/mcap/crawler-record-*.mcap -o rows.csv
+uv run --with mcap deploy/footprint_dump.py ~/crawler/data/mcap/crawler-record-*.mcap -o rows.csv
 uv run --with mcap --with pyarrow deploy/footprint_dump.py run.mcap -o rows.parquet
 uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
     deploy/footprint_dump.py run.mcap --small pictures/ --verify
@@ -366,7 +366,7 @@ The whole loop in one command, on the laptop:
 ./scripts/retrain.sh --no-pull -- --lidar   # after --: flags for policy_train.py
 ```
 
-It decodes each recording once into `~/crawler-data/cache` (again only when
+It decodes each recording once into `~/crawler/data/cache` (again only when
 the file or the decode code changes), drops the junk sessions and says why,
 trains the five held-out folds and the final model at once, grades the
 model the car runs on the same folds, and registers the new one as a
@@ -374,10 +374,10 @@ candidate with that table in its note. It never deploys. A run with nothing
 new takes about 16 s, against about 5 min for the commands below by hand.
 `tools/retrain.py`'s docstring has the details.
 
-By hand, in `~/crawler-train` (see the README):
+By hand, in `~/crawler/train` (see the README):
 
 ```sh
-python tools/policy_dataset.py data.npz           # every ~/crawler-data/mcap/crawler-record-*.mcap
+python tools/policy_dataset.py data.npz           # every ~/crawler/data/mcap/crawler-record-*.mcap
 python tools/policy_train.py data.npz models/policy.onnx --val <one session name>
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5   # one session: time blocks
 python tools/policy_train.py data.npz models/policy.onnx --val <name> --imu --prev   # + IMU, + last decision
@@ -388,9 +388,9 @@ python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --steer-head
 python tools/policy_eval.py data.npz models/policy.onnx --out report.md
 
 # + my takeovers on the auto drives, weighted 3x
-python tools/policy_dataset.py data.npz --drive-logs ~/crawler-data/mcap/drives
+python tools/policy_dataset.py data.npz --drive-logs ~/crawler/data/mcap/drives
 python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --takeover-weight 3
-python tools/session_report.py --no-jpeg-depth ~/crawler-data/mcap/drives   # how much each drive gave
+python tools/session_report.py --no-jpeg-depth ~/crawler/data/mcap/drives   # how much each drive gave
 ```
 
 ### Learning from my takeovers

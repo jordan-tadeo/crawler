@@ -6,7 +6,7 @@
 # is something Foxglove Studio will actually accept, and repairs the ones that
 # are not.
 #
-#   ./scripts/pull-recordings.sh              # everything new into ~/crawler-data/mcap
+#   ./scripts/pull-recordings.sh              # everything new into ~/crawler/data/mcap
 #   ./scripts/pull-recordings.sh -n 20        # only the newest 20
 #   ./scripts/pull-recordings.sh --records-only   # only the Y-button training sessions, not the drive logs
 #   ./scripts/pull-recordings.sh --list       # just say what is on the car, and what is live
@@ -19,7 +19,7 @@
 #
 # Is a drive any good as training data:
 #   uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
-#       python tools/session_report.py ~/crawler-data/mcap/crawler-record-*.mcap
+#       python tools/session_report.py ~/crawler/data/mcap/crawler-record-*.mcap
 #
 # The copy itself is tools/pull_mcaps.py: it refuses a destination inside any
 # git work tree (this repo is public and a recording is video of my house),
@@ -46,7 +46,9 @@ set -euo pipefail
 CAR="${CRAWLER_HOST:-jt@jtpi.local}"
 export CRAWLER_HOST="$CAR"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="${CRAWLER_DATA:-$HOME/crawler-data/mcap}"
+# tools/data_paths.py says where the data folder is; CRAWLER_MCAP overrides
+# just the recordings.
+OUT="${CRAWLER_MCAP:-$(python3 "$REPO_DIR/tools/data_paths.py" data)/mcap}"
 ARGS=()
 LIST_ONLY=0
 

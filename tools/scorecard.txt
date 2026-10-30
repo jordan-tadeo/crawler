@@ -1,6 +1,6 @@
 # The scorecard: drives no model trains on (policy_train.py keeps them out),
 # so tools/policy_scorecard.py can grade any two models on ticks neither has
-# seen. Names only; the recordings stay in ~/crawler-data. Frozen 2026-10-29:
+# seen. Names only; the recordings stay in ~/crawler/data. Frozen 2026-10-29:
 # four drives after the lidar and the map, all auto with my takeovers. Add to
 # it, never take one off, or old numbers stop meaning the same thing.
 crawler-20261029-050853Z-p1258-002

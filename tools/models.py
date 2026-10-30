@@ -2,7 +2,7 @@
 """Named driving models: candidates, the releases that earned a number, and the car's pick.
 
     python3 tools/models.py list                    # releases, candidates, which one drives
-    python3 tools/models.py register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
+    python3 tools/models.py register <data>/models/policy-<stamp>.onnx --tag imu-gyro
     python3 tools/models.py deploy candidate-imu-gyro --dry-run   # say what it would do
     python3 tools/models.py deploy --candidate imu-gyro           # a test drive on the car
     python3 tools/models.py promote imu-gyro --evidence ab.json --approved-on-car \\
@@ -65,7 +65,8 @@ for a release that should not have had its number: it copies kblock-X.Y.*
 to candidate-<tag>.*, keeps kblock-X.Y.* on disk, and drops the release
 entry. It refuses the model the car is running.
 
-The registry is ~/crawler-data/models/registry.json, beside the model files,
+The registry is <data>/models/registry.json (tools/data_paths.py says where
+<data> is), beside the model files,
 never inside a git tree (the repo is public; the guard is
 pull_mcaps.refuse_reason). Registering copies: the policy-<stamp> files the
 trainer wrote stay exactly where and what they were, the copy is hashed against
@@ -111,11 +112,12 @@ import subprocess
 import sys
 import time
 
+import data_paths as dp
 import pull_mcaps as pm
 
 FAMILY = "kblock"
-MODELS_DIR = os.path.expanduser(os.environ.get("CRAWLER_MODELS", "~/crawler-data/models"))
-MCAP_DIR = os.path.expanduser(os.environ.get("CRAWLER_DATA", "~/crawler-data/mcap"))
+MODELS_DIR = os.path.expanduser(os.environ.get("CRAWLER_MODELS", os.path.join(dp.DATA_ROOT, "models")))
+MCAP_DIR = os.path.expanduser(os.environ.get("CRAWLER_MCAP", os.path.join(dp.DATA_ROOT, "mcap")))
 REGISTRY = "registry.json"
 # 1: one "versions" list. 2: "releases" and "candidates"; a schema 1 registry
 # is read as releases that predate the gate (upgrade_registry).

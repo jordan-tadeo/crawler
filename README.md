@@ -39,6 +39,17 @@ tests/              pytest, runs on the laptop with no hardware
 Models (`models/`), logs (`log/`) and recordings never go in the repo. On the
 car they sit at the checkout root, untracked.
 
+### Where things go
+
+- Laptop: one folder, `~/crawler/`, holding `repo/` (this checkout), `data/`
+  (recordings, models, cache, retrain runs), `train/` (the training venv) and
+  `worktrees/<name>`. `tools/data_paths.py` finds `data/` and `train/` beside
+  the checkout; `CRAWLER_DATA` and `CRAWLER_TRAIN` override them. A new
+  worktree goes in `~/crawler/worktrees/<name>` and comes out
+  (`git worktree remove`, `git branch -d`) once it is merged.
+- Car: the live checkout stays at `~/Documents/py/crawler`. Any bench, scratch
+  copy or unit backup goes under `~/crawler-misc/`, never loose in `~`.
+
 ## Setup
 
 Dependencies are in `pyproject.toml`, locked in `uv.lock`. On the car, pigpio
@@ -257,7 +268,7 @@ the car if it fails.
 ## Record, pull, train, deploy
 
 1. **Record.** Hold Y in manual and drive.
-2. **Pull**, on the Mac. Recordings go to `~/crawler-data/mcap`, never into a
+2. **Pull**, on the Mac. Recordings go to `~/crawler/data/mcap`, never into a
    git tree (the repo is public and a recording is video of my house):
 
    ```sh
@@ -271,14 +282,14 @@ the car if it fails.
 
    ```sh
    uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
-       python tools/session_report.py ~/crawler-data/mcap/crawler-record-*.mcap
+       python tools/session_report.py ~/crawler/data/mcap/crawler-record-*.mcap
    ```
 
 3. **Train**, in its own venv. Torch never goes near the car or
    `pyproject.toml`:
 
    ```sh
-   python3.11 -m venv ~/crawler-train && ~/crawler-train/bin/pip install -r tools/requirements-train.txt
+   python3.11 -m venv ~/crawler/train && ~/crawler/train/bin/pip install -r tools/requirements-train.txt
    python tools/policy_dataset.py data.npz
    python tools/policy_train.py data.npz models/policy.onnx --val <session>
    python tools/policy_train.py data.npz models/policy.onnx --blocks 5 --imu-no-yaw --imu-tilt
@@ -295,14 +306,14 @@ a hand on START. The numbers only say it agrees with me on recorded frames.
 
 ## Models registry
 
-Models live on the Mac in `~/crawler-data/models`, listed in `registry.json`.
+Models live on the Mac in `~/crawler/data/models`, listed in `registry.json`.
 A new model is a candidate with no number. `promote` gives it the next
 `kblock X.Y` only when it beats the latest release on held-out folds and I say
 it drove well. `deploy` and `rollback` refuse unless the car is parked.
 
 ```sh
 ./scripts/models.sh list                      # releases, candidates, * = on the car
-./scripts/models.sh register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
+./scripts/models.sh register ~/crawler/data/models/policy-<stamp>.onnx --tag imu-gyro
 ./scripts/models.sh deploy candidate-imu-gyro --dry-run   # then without --dry-run
 ./scripts/models.sh promote imu-gyro --evidence ab.json --approved-on-car --notes "..."
 ./scripts/models.sh rollback                  # back to what drove before

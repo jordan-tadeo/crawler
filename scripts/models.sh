@@ -2,13 +2,13 @@
 # The driving models: the releases that earned a number, the candidates that
 # have not yet, which one the car runs, and putting another one on it.
 #
-# Runs on the Mac. The models live in ~/crawler-data/models (kblock-X.Y.* and
+# Runs on the Mac. The models live in ~/crawler/data/models (kblock-X.Y.* and
 # candidate-<tag>.*, with registry.json), never in this repo; tools/models.py
 # is the tool and its docstring says what earns a number and how a deploy
 # keeps the car safe.
 #
 #   ./scripts/models.sh list                       # releases, candidates, * = on the car
-#   ./scripts/models.sh register ~/crawler-data/models/policy-<stamp>.onnx --tag imu-gyro
+#   ./scripts/models.sh register ~/crawler/data/models/policy-<stamp>.onnx --tag imu-gyro
 #   ./scripts/models.sh deploy candidate-imu-gyro  # a test drive (or --candidate imu-gyro)
 #   ./scripts/models.sh promote imu-gyro --evidence ab.json --approved-on-car --notes "..."
 #   ./scripts/models.sh promote imu-gyro --force-gate "why" --approved-on-car

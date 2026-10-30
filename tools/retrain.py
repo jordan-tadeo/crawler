@@ -10,7 +10,7 @@ What it does, in order, and the time each stage took is printed at the end:
 
   pull      scripts/pull-recordings.sh, unless --no-pull. A car that cannot be
             reached is a warning, and the run goes on with what is here.
-  scan      every crawler-*.mcap in ~/crawler-data/mcap (never a .orig, the
+  scan      every crawler-*.mcap in ~/crawler/data/mcap (never a .orig, the
             copy mcap_check kept before a repair), each one decoded once into
             the cache, the decodes spread over --jobs processes.
   filter    the junk rules below, off numbers the decode wrote down.
@@ -29,7 +29,7 @@ What it does, in order, and the time each stage took is printed at the end:
   register  the final model as a candidate, the fold table in its note. Never
             a deploy: that stays scripts/models.sh deploy, by hand.
 
-The cache. ~/crawler-data/cache/<session>.<key>.pkl is that file's decoded
+The cache. ~/crawler/data/cache/<session>.<key>.pkl is that file's decoded
 policy_adapters.Session, and <session>.<key>.json the numbers the junk rules
 read. The key hashes the file's size and mtime and the source of every module
 of this repo the decode can reach from policy_dataset (policy_adapters, the
@@ -49,7 +49,7 @@ The junk rules. A session trains unless one of these says it is junk:
   no labels   fewer than MIN_USABLE decision ticks my hand labelled outside a
               BAD mark. 1.5 s: the shortest real manoeuvre in the set is a
               2.1 s back-up, and every session under the line has none at all.
-  excluded    its name starts with a prefix in ~/crawler-data/exclude.txt
+  excluded    its name starts with a prefix in ~/crawler/data/exclude.txt
               (policy_dataset.EXCLUDE_FILE, --exclude-file): a drive I said
               never to learn from, the takeovers I made because the car kept
               stopping on 10-29 the first of them. A rule with a window
@@ -91,6 +91,7 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(TOOLS)
 sys.path[:0] = [p for p in (REPO, TOOLS) if p not in sys.path]
 
+import data_paths as dp  # noqa: E402
 import models as md  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 import policy_dataset as pd  # noqa: E402
@@ -99,7 +100,7 @@ import policy_train as pt  # noqa: E402
 import pull_mcaps as pm  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
 
-DATA_ROOT = os.path.expanduser("~/crawler-data")
+DATA_ROOT = dp.DATA_ROOT
 MCAP_DIR = md.MCAP_DIR
 MODELS_DIR = md.MODELS_DIR
 CACHE_DIR = os.path.expanduser(os.environ.get("CRAWLER_CACHE", os.path.join(DATA_ROOT, "cache")))

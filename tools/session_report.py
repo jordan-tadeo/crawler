@@ -1,6 +1,6 @@
 """Say whether a drive is any good as training data, one file at a time.
 
-    uv run --with mcap python tools/session_report.py ~/crawler-data/mcap/crawler-record-*.mcap
+    uv run --with mcap python tools/session_report.py ~/crawler/data/mcap/crawler-record-*.mcap
     uv run --with mcap --with numpy==1.26.4 --with opencv-python-headless \
         python tools/session_report.py run.mcap      # depth off /camera/depth too
 

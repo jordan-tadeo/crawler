@@ -32,6 +32,8 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import data_paths as dp  # noqa: E402
+
 COCO128 = "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco128.zip"
 PAD_VALUE = 114
 
@@ -108,7 +110,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", help="the float YOLO .onnx from yolo export")
     ap.add_argument("dst", help="where the INT8 .onnx goes")
-    ap.add_argument("--data", default=os.path.expanduser("~/crawler-data/coco128"),
+    ap.add_argument("--data", default=os.path.join(dp.DATA_ROOT, "coco128"),
                     help="where coco128 is, or is downloaded to")
     a = ap.parse_args(argv)
     files = calibration_images(a.data)

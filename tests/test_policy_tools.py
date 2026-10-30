@@ -16,6 +16,7 @@ import pytest
 
 from crawler.autopilot import driver as dv  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
+import data_paths as dp  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 import policy_dataset as pd  # noqa: E402
 import policy_eval as pe  # noqa: E402
@@ -261,10 +262,10 @@ def test_the_row_says_who_drove_and_which_scan():
 
 
 def test_no_files_reads_the_pulled_recordings(tmp_path, monkeypatch):
-    assert pd.DEFAULT_MCAPS == "~/crawler-data/mcap/crawler-record-*.mcap"
-    monkeypatch.setenv("HOME", str(tmp_path))
-    mcap = tmp_path / "crawler-data" / "mcap"
+    assert pd.DEFAULT_MCAPS == os.path.join(dp.DATA_ROOT, "mcap", "crawler-record-*.mcap")
+    mcap = tmp_path / "data" / "mcap"
     mcap.mkdir(parents=True)
+    monkeypatch.setattr(pd, "DEFAULT_MCAPS", str(mcap / "crawler-record-*.mcap"))
     for name in ("crawler-record-2.mcap", "crawler-record-1.mcap", "crawler-x.mcap"):
         (mcap / name).write_bytes(b"")
     assert [os.path.basename(p) for p in pd.default_mcaps()] == [
@@ -279,7 +280,7 @@ def test_no_files_reads_the_pulled_recordings(tmp_path, monkeypatch):
 
 
 def test_no_files_and_none_pulled_is_an_error_not_an_empty_set(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(pd, "DEFAULT_MCAPS", str(tmp_path / "mcap" / "crawler-record-*.mcap"))
     with pytest.raises(SystemExit) as e:
         pd.main([str(tmp_path / "out.npz")])
     assert e.value.code == 2

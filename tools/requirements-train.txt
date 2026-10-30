@@ -4,8 +4,8 @@
 # (tests/fixtures/policy-smoke.onnx) was built and checked with, on macOS
 # arm64, Python 3.11.
 #
-#   python3.11 -m venv ~/crawler-train
-#   ~/crawler-train/bin/pip install -r tools/requirements-train.txt
+#   python3.11 -m venv ~/crawler/train
+#   ~/crawler/train/bin/pip install -r tools/requirements-train.txt
 #
 # numpy stays on the car's pin, so a dataset built here reads back the same
 # there. onnxruntime matches uv.lock, so the eval runs the model the way the

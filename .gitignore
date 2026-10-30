@@ -77,7 +77,7 @@ build/
 out.txt
 
 # Where pull-recordings.sh used to drop what it fetched off the car. It puts
-# them in ~/crawler-data/mcap now, outside any repo, and refuses a
+# them in ~/crawler/data/mcap now, outside any repo, and refuses a
 # destination inside one; this stays for the copies already sitting here.
 recordings/
 
