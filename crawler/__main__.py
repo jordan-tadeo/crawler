@@ -805,7 +805,7 @@ class AutoPilot:
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
                  slam=None, nav=False, map_source=None, goals=None,
                  fallback_path=None, clicks=None, patrol_store=None,
-                 lidar_near=False):
+                 lidar_near=False, path=None):
         self.vecon = vecon
         # --lidar-near: the creep's stop under the stereo clamp comes off the
         # lidar's front arc (driver.py, "the near field"). Set on every
@@ -838,6 +838,11 @@ class AutoPilot:
         self.goal = (patrol.Patrol(say=logger.log, store=patrol_store,
                                    map_view=getattr(slam, "map", None))
                      if clicks is not None else goal.Goal())
+        # --goal's path planner (autopilot/pathgoal.PathPlanner), on unless
+        # --no-path: the goal model is fed a point along a path round the
+        # walls to self.goal instead of the goal itself. Planned on its own
+        # thread; it never steers. None without --goal.
+        self.path = path
         # The roof lidar's reader with --lidar, else None: handed to the
         # driver for its rear stop, which only ever asks it latest().
         self.lidar = lidar
@@ -860,6 +865,9 @@ class AutoPilot:
         try:
             crop = self.slam.crop() if self.slam is not None else None
             self.goal.poll(self.clicks, crop)
+            if self.path is not None:
+                # Planned in any mode, so the path is on the map before auto.
+                self.path.update(crop, self.goal)
         except Exception as e:
             print(f"[goal] {e}", file=sys.stderr)
 
@@ -1016,6 +1024,7 @@ class AutoPilot:
                             "model drives as it always has")
         d = policy.PolicyDriver(self.command, view, model, goal=self.goal,
                                 lidar=self.lidar, slam=self.slam, fallback=fallback)
+        d.path = self.path if model.uses_goal else None
         # Only the policy creeps, so only it reads the near field.
         d.lidar_near = self.lidar_near and self.lidar is not None
         if d.lidar_near:
@@ -1601,6 +1610,13 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                         tele.offer("patrol_status", autopilot.goal.patrol_status(), now)
                     if tele.wants("patrol_marker", now):
                         tele.offer("patrol_marker", autopilot.goal.marker(), now)
+                # The path the goal model is pointed along, and the point fed.
+                path = getattr(autopilot, "path", None)
+                if path is not None:
+                    if tele.wants("path_status", now):
+                        tele.offer("path_status", path.status(), now)
+                    if tele.wants("path", now):
+                        tele.offer("path", path.marker(), now)
 
             if tele.wants("diagnostics", now):
                 elapsed = now - window_started
@@ -1923,6 +1939,17 @@ def parse_args(argv=None):
              "to drive to, holding neutral on arrival (needs --slam; off "
              "unless given)",
     )
+    # On with --goal unless this is given. The goal model is fed a point
+    # PathPlanner picks along a path round the walls to the goal (autopilot/
+    # pathgoal.py), planned on the SLAM map on a thread at 2 Hz; with it off
+    # the model is fed the goal itself, the straight-line bearing, as it was.
+    # Either way the model does all the driving.
+    parser.add_argument(
+        "--no-path",
+        action="store_true",
+        help="with --goal, feed the goal model the goal itself instead of a "
+             "point along a planned path to it",
+    )
     # Off unless named. The OAK-D's low obstacles (--voxel-map) as extra
     # solid cells in the navigator's map, never clearing a lidar cell. Off
     # because how often it sees things that are not there is not settled.
@@ -2147,6 +2174,13 @@ def main(argv=None):
             log.log("info", "Goal", "Taking goals from Foxglove's Publish pose "
                     "tool on /move_base_simple/goal, in the map frame, and patrol "
                     "commands on /patrol/cmd")
+    path_planner = None
+    if args.goal and slam is not None and not args.no_path:
+        from crawler.autopilot import pathgoal
+        path_planner = pathgoal.PathPlanner(slam, say=log.log)
+        log.log("info", "Path", "The goal model is fed a point "
+                f"{pathgoal.LOOKAHEAD_M:g} m along a path round the walls to "
+                "the goal, planned on the SLAM map (--no-path for the goal itself)")
     pantilt = start_pantilt(args, vecon, tele if channels_live else None, log)
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           fallback_path=args.fallback_policy,
@@ -2156,7 +2190,7 @@ def main(argv=None):
                           clicks=goals if args.goal else None,
                           patrol_store=(patrol.Store(lg.log_path(PATROL_FILE))
                                         if args.goal else None),
-                          lidar_near=args.lidar_near)
+                          lidar_near=args.lidar_near, path=path_planner)
 
     # Who gets the device opened at startup, and who waits for it:
     #

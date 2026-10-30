@@ -154,6 +154,10 @@ INTERVALS = {
     # its waypoints on the map once a second.
     "patrol_status": 0.5,
     "patrol_marker": 1.0,
+    # With --goal (autopilot/pathgoal.PathPlanner): what the goal model is
+    # fed and why, twice a second, and the path with that point once a second.
+    "path_status": 0.5,
+    "path": 1.0,
     # With --pantilt (vision/runner.py): the mount and the person at 10 Hz,
     # and the hood camera's picture at 2 Hz. The picture is a 320x240 JPEG,
     # about 15 KB, so 30 KiB/s.
@@ -496,6 +500,11 @@ JSON_SCHEMAS = {
         # whether it had handed the wheels to its map-free fallback.
         "policy_map_present": _BOOL,
         "policy_fallback": _BOOL,
+        # Whether a goal model was fed a goal, and what it was the encoding
+        # of: goal (the goal itself), subgoal (a point along the path to it,
+        # autopilot/pathgoal.py) or none.
+        "policy_goal_present": _BOOL,
+        "policy_goal_fed": _STR,
         # The back-out, either autopilot (driver.Driver.backout_fields): its
         # phase (reverse / settle / handback, "" with none), what started it,
         # why its reverse ended, time since it began, how long the reverse
@@ -620,6 +629,23 @@ JSON_SCHEMAS = {
         "approx": _BOOL, "approx_m": _NUM, "restored": _BOOL, "pending": _BOOL,
         "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
     }),
+    # The path the goal model is pointed along, with --goal:
+    # pathgoal.PathPlanner.status(). fed: what the goal input was the
+    # encoding of this decision, "subgoal" (a point along the path),
+    # "goal" (the goal itself) or "none"; why, when it was the goal itself
+    # (in sight, along the path, or why there is no path to use); aim_x,
+    # aim_y the point fed, map frame. path: a plan to the goal is in hand;
+    # plan_why why the newest has none; length_m along it (-1 with none);
+    # age_s of the newest; plan_ms and plan_cpu_ms its wall and thread CPU
+    # time, with the mean and max over the run; plans made and failed;
+    # lookahead_m, how far along the path the point is.
+    "path_status": _schema("crawler.PathStatus", {
+        "fed": _STR, "why": _STR, "aim_x": _NUM, "aim_y": _NUM, "path": _BOOL,
+        "plan_why": _STR, "length_m": _NUM, "age_s": _NUM, "plan_ms": _NUM,
+        "plan_cpu_ms": _NUM, "plan_ms_mean": _NUM, "plan_ms_max": _NUM,
+        "plan_cpu_ms_mean": _NUM, "plans": _INT, "failed": _INT,
+        "lookahead_m": _NUM,
+    }),
     # The hood camera's pan/tilt, with --pantilt: vision/runner.status().
     # state idle / tracking / lost; pan and tilt what the mount was told,
     # degrees, pan left positive, tilt up; the target it is slewing to.
@@ -701,6 +727,7 @@ JSON_TOPICS = {
     "nav_status": "/nav/status",
     "goal_status": "/goal/status",
     "patrol_status": "/patrol/status",
+    "path_status": "/path/status",
     "pantilt": "/pantilt",
 }
 
@@ -766,6 +793,9 @@ NAV_CHANNELS = {
     # The patrol's waypoints (--goal), patrol_view.scene: numbered, joined in
     # order, the current one lit; an empty list clears them.
     "patrol_marker": "/patrol/marker",
+    # The path the goal model is pointed along (--goal), path_view.scene:
+    # the path as a line and the point fed as a disc; empty clears both.
+    "path": "/path",
 }
 
 ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
@@ -1322,6 +1352,9 @@ class Telemetry:
         if key == "patrol_marker":
             from crawler.telemetry import patrol_view
             return patrol_view.scene(payload, log_time)
+        if key == "path":
+            from crawler.telemetry import path_view
+            return path_view.scene(payload, log_time)
         if key in ("nav_path", "goal_marker"):
             from crawler.telemetry import nav_view
             return nav_view.path_scene(payload, log_time)

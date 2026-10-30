@@ -98,6 +98,9 @@
         },
         "/patrol/marker": {
           "visible": true
+        },
+        "/path": {
+          "visible": true
         }
       },
       "layers": {
@@ -122,7 +125,7 @@
           "order": 1
         }
       },
-      "foxglovePanelTitle": "SLAM map, the truck outline is the car; Publish pose (toolbar) on the map sets the goal, the green disc, or in patrol edit the next waypoint, the numbered blue discs (/map, /slam/path, scan in orange; voxels in the topic list)",
+      "foxglovePanelTitle": "SLAM map, the truck outline is the car; Publish pose (toolbar) on the map sets the goal, the green disc, or in patrol edit the next waypoint, the numbered blue discs; the model is pointed along the cyan path at the magenta disc (/map, /slam/path, scan in orange; voxels in the topic list)",
       "publish": {
         "type": "pose",
         "poseTopic": "/move_base_simple/goal",
@@ -318,6 +321,14 @@
         "flipVertical": false
       },
       "foxglovePanelTitle": "Hood pan/tilt (2 Hz)"
+    },
+    "RawMessages!path": {
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "topicPath": "/path/status",
+      "foxglovePanelTitle": "Path"
     }
   },
   "layout": {
@@ -344,8 +355,13 @@
           "first": {
             "direction": "row",
             "first": "RawMessages!goal",
-            "second": "RawMessages!patrol",
-            "splitPercentage": 50
+            "second": {
+              "direction": "row",
+              "first": "RawMessages!patrol",
+              "second": "RawMessages!path",
+              "splitPercentage": 50
+            },
+            "splitPercentage": 33
           },
           "second": {
             "direction": "column",

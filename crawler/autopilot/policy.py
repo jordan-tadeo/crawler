@@ -1515,6 +1515,11 @@ class PolicyDriver(dv.Driver):
         # be committed (goal.py). Asked every tick.
         self.goal = goal if goal is not None else gl.Goal()
         self.goal_reached = False
+        # --goal's path planner (pathgoal.PathPlanner), or None: which point
+        # the goal input is the encoding of, the goal or one along a path
+        # round the walls to it. It never steers; see pathgoal.py.
+        self.path = None
+        self.last_goal_fed = "none"
         self.downsample = downsample or downsample_for(model.contract)
         self._prev = (STOP, 0.0, 0.0)
         # The forward floor and its memory of the last second of scans. This
@@ -1909,6 +1914,10 @@ class PolicyDriver(dv.Driver):
             "policy_map_present": bool(self.uses_map and self.last_map_present),
             # Whether a goal model was fed a goal this decision.
             "policy_goal_present": bool(self.uses_goal and self.last_goal_present),
+            # What that goal input was the encoding of: "goal", the goal
+            # itself; "subgoal", a point along the path to it (pathgoal.py);
+            # "none" with no goal fed.
+            "policy_goal_fed": str(self.last_goal_fed if self.uses_goal else "none"),
             "policy_hand_rules": bool(self.hand_rules),
             # Whether the map-free fallback drove this tick (the map lost).
             "policy_fallback": bool(self.on_fallback),
@@ -2104,11 +2113,19 @@ class PolicyDriver(dv.Driver):
         if self.uses_map and not self.on_fallback:
             extra["map"] = ego
         self.last_goal_present = False
+        self.last_goal_fed = "none"
         if self.uses_goal and not self.on_fallback:
             # The goal off the same crop the map input is, and only with that
             # crop going in: no map is no goal, as the model was trained.
-            g = self.goal.encode(crop) if present else pg.missing()
+            if not present:
+                g = pg.missing()
+            elif self.path is not None:
+                g = self.path.encode(crop, self.goal)
+            else:
+                g = self.goal.encode(crop)
             self.last_goal_present = bool(g[0, pg.PRESENT] > 0)
+            self.last_goal_fed = ((self.path.fed if self.path is not None else "goal")
+                                  if self.last_goal_present else "none")
             extra["goal"] = g
         started = time.perf_counter()
         if extra:

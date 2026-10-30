@@ -107,6 +107,11 @@ AUTOPILOT_FIELDS = {
     "policy_map_present": False,
     # A map model had handed the wheels to its map-free fallback (the map lost).
     "policy_fallback": False,
+    # A goal model was fed a goal this decision, and what it was the encoding
+    # of: "goal" the goal itself, "subgoal" a point along the path to it
+    # (pathgoal.py), "none".
+    "policy_goal_present": False,
+    "policy_goal_fed": "none",
     # The back-out (driver.Driver.begin_recover), for either autopilot.
     "backout_phase": "",         # reverse / settle / handback, "" with none
     "backout_reason": "",        # stuck / standoff / obstacle: what started it
