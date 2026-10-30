@@ -218,6 +218,8 @@ class CameraHub:
         self.logger = logger
         self.tele = tele
         self.rectified = rectified
+        # Every IMU sample the listeners get, into /imu/batch (_offer).
+        self.imu_batch = tm.ImuBatcher()
 
         self.state = OFF
         self.error = ""
@@ -524,6 +526,9 @@ class CameraHub:
             return
 
         if stream == "imu":
+            # All of them, at the time the listeners were handed, so a
+            # recording replays what SLAM actually saw. /imu is the plot's.
+            self.imu_batch.add(tele, now, packet)
             if tele.wants("imu", now):
                 sample = tm.imu_sample(packet)
                 if sample is not None:

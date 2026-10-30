@@ -175,9 +175,10 @@ POST_PROCESSING_SLICES = 3
 # 25/33/50/100/200/400 Hz for the gyro family, so by that table the accel
 # runs at 125 Hz and the gyro at 100. The hub measured 87.6 Hz of delivered
 # IMU messages on the car (driver.py). The rotation vector is fused at up to 400 Hz; 100 is
-# plenty for a car that decides at 10. The ~17 /imu messages a second a
-# recording shows is not the sensor: telemetry.RATES gates /imu at 20 Hz
-# (0.05 s) and the 5 ms hub loop's phase against that gate loses a few.
+# plenty for a car that decides at 10. The ~16 /imu messages a second a
+# recording shows is not the sensor: telemetry.INTERVALS gates /imu at 20 Hz
+# (0.05 s) off the sample it let through, so each period loses part of a
+# sample's worth. /imu/batch records every sample (telemetry.ImuBatcher).
 #
 # The "imu" XLinkOut queue is opened shallow and non-blocking like every
 # other one (OakD.__init__), so a third report in each packet cannot back

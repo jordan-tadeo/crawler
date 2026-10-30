@@ -91,6 +91,23 @@ DRAIN_INTERVAL = 0.01
 # notice is invisible.
 SINK_POLL_INTERVAL = 0.1
 
+# How long ImuBatcher gathers samples before it hands /imu/batch one message.
+# A tenth of a second is about nine samples, 10 messages a second, so the
+# publisher thread draining at DRAIN_INTERVAL has ten passes to take each one
+# before the next would replace it in the one-deep mailbox. Each message
+# carries a seq, so a batch that was replaced anyway shows as a gap.
+#
+# What it costs, measured by writing a real drive's IMU resampled to 88 Hz
+# through the recorder's own MCAP options: 141 KiB a minute in the file,
+# against 82 for /imu, so under 2% on a camera-up recording. On the Pi,
+# loaded with the service running, 0.9% of a core all in (this thread and
+# the publisher's encode), against 0.35% for /imu.
+IMU_BATCH_S = 0.1
+
+# Most samples one batch may hold. A batch is flushed every IMU_BATCH_S, so
+# this is only the bound if something stops the flush for seconds.
+IMU_BATCH_MAX = 256
+
 # Per-channel rate limits, in seconds between messages. These are transport
 # rates and nothing else: the control loop runs at 100 Hz and the OAK-D IMU
 # at 100 Hz, and neither a plot panel nor a wifi link wants all of it.
@@ -107,7 +124,15 @@ INTERVALS = {
     # a gate here could only ever lose me a press. Zero so that if something
     # does start asking wants("marks"), the answer is always yes.
     "marks": 0.0,
-    "imu": 0.05,          # 20 Hz, downsampled from the sensor's 100 Hz
+    # 20 Hz is the gate's nominal rate, and it records about 16: the gate is
+    # set off the sample it let through, and at 88 samples a second the next
+    # one after it lands up to a sample period late, every time. /imu is the
+    # one to plot. /imu/batch below is the one that keeps everything.
+    "imu": 0.05,
+    # Every sample the camera hub hands its IMU listeners (SLAM, the voxel
+    # mapper), batched by ImuBatcher. This is the flush interval, not a rate
+    # limit: a batch holds all the samples since the last one.
+    "imu_batch": IMU_BATCH_S,
     "depth": 0.125,       # 8 Hz
     "disparity": 0.125,   # 8 Hz
     "rectified_left": 0.5,  # 2 Hz -- this is for checking aim, not for driving
@@ -360,6 +385,30 @@ JSON_SCHEMAS = {
         # referenced, so this is the tilt the accel channels cannot show.
         # All three 0 when there is no orientation reading. See policy_imu.
         "up_x": _NUM, "up_y": _NUM, "up_z": _NUM,
+    }),
+    # Every IMU sample the camera hub hands its listeners, about 88 a second,
+    # in one message per IMU_BATCH_S: column by column, row i of each array
+    # being one sample. /imu is the same numbers gated to a plot's rate; the
+    # SLAM replay (tools/slam_replay.py) reads this one when it is there.
+    #
+    # t is that sample's own time, the hub's monotonic clock read when it
+    # drained it -- the time the live SLAM was handed -- made epoch seconds
+    # the way every log_time is (epoch_ns). The message's log_time is the
+    # last sample's. up_* is 0 for a sample that carried no rotation vector,
+    # as on /imu. seq counts batches from 0 at boot, one per message, so a
+    # gap is a batch lost to a stalled publisher.
+    "imu_batch": _schema("crawler.ImuBatch", {
+        "seq": _INT,
+        "t": {"type": "array", "items": _NUM},
+        "gyro_x": {"type": "array", "items": _NUM},
+        "gyro_y": {"type": "array", "items": _NUM},
+        "gyro_z": {"type": "array", "items": _NUM},
+        "accel_x": {"type": "array", "items": _NUM},
+        "accel_y": {"type": "array", "items": _NUM},
+        "accel_z": {"type": "array", "items": _NUM},
+        "up_x": {"type": "array", "items": _NUM},
+        "up_y": {"type": "array", "items": _NUM},
+        "up_z": {"type": "array", "items": _NUM},
     }),
     # One message per press of a mark button. See marks.py for what a mark is
     # and why it is a window rather than an instant; everything in here is a
@@ -773,6 +822,7 @@ JSON_TOPICS = {
     "vehicle": "/vehicle",
     "diagnostics": "/diagnostics",
     "imu": "/imu",
+    "imu_batch": "/imu/batch",
     "marks": "/marks",
     "footprint": "/footprint",
     "lidar": "/lidar",
@@ -866,7 +916,7 @@ ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
 # own channels are not in here -- /diagnostics is what says the pad went.
 # /lidar is, for the same reason: it is a sensor with no driving in it, and
 # so is its 3D view, the transform and the outline with it.
-CAMERA_KEYS = frozenset(("imu", "lidar", "slam_status", "pantilt")
+CAMERA_KEYS = frozenset(("imu", "imu_batch", "lidar", "slam_status", "pantilt")
                         + tuple(IMAGE_CHANNELS)
                         + tuple(RAW_DEPTH_CHANNELS)
                         + tuple(LIDAR_VIEW_CHANNELS)
@@ -1133,6 +1183,15 @@ class Telemetry:
         if key in self._muted:
             return False
         return now >= self._next_at.get(key, 0.0)
+
+    def watched(self, key: str) -> bool:
+        """wants() without the rate gate: is anything taking this channel?
+
+        For a caller that gathers between messages (ImuBatcher), which has
+        to know whether to keep a sample before its gate comes round.
+        """
+        return (self.running and self._watched.get(key, False)
+                and key not in self._muted)
 
     def mute(self, keys) -> None:
         """Stop writing `keys` until unmute(). One assignment, never blocks.
@@ -1644,6 +1703,91 @@ def controller_sample(joystick, throttle, steering_front, steering_rear):
         pass
 
     return sample
+
+
+# Decimal places kept per column of /imu/batch. The BNO086 reports fixed
+# point (driver.py): the gyro in steps of 0.00106526 rad/s and the accel in
+# 1/256 m/s^2, so six places is under a thousandth of a gyro step and a few
+# hundredths of an accel one, and the rotation vector's up is good to a
+# fraction of a millidegree. The time is to the microsecond. Rounding is what
+# lets zstd see the repeats: a float32 printed whole is seventeen digits of
+# mostly noise.
+IMU_BATCH_PLACES = 6
+IMU_BATCH_T_PLACES = 6
+
+_IMU_BATCH_COLUMNS = ("gyro_x", "gyro_y", "gyro_z",
+                      "accel_x", "accel_y", "accel_z",
+                      "up_x", "up_y", "up_z")
+_NO_UP = (0.0, 0.0, 0.0)
+
+
+class ImuBatcher:
+    """Every IMU sample into /imu/batch, one message per IMU_BATCH_S.
+
+    add() is called on the camera reader thread with the same (time, sample)
+    every IMU listener gets, so a recording holds exactly what the live SLAM
+    was fed. It keeps nothing while nobody takes the channel, and hands a
+    batch over when the channel's gate comes round. Never blocks, never
+    raises.
+    """
+
+    def __init__(self):
+        self.seq = 0
+        self._rows = []
+
+    def add(self, tele, now, reading) -> None:
+        try:
+            if not tele.watched("imu_batch"):
+                if self._rows:
+                    self._rows = []
+                return
+            # Per sample, only the floats out of the dict: the checks, the
+            # rounding and the epoch go once a batch, in message(), in numpy.
+            # Done per sample in Python they were most of this channel's CPU.
+            if reading and len(self._rows) < IMU_BATCH_MAX:
+                try:
+                    g = reading["gyro"]
+                    a = reading["accel"]
+                    row = (now, float(g[0]), float(g[1]), float(g[2]),
+                           float(a[0]), float(a[1]), float(a[2]))
+                except Exception:
+                    row = None
+                if row is not None:
+                    up = reading.get("up")
+                    try:
+                        row += (float(up[0]), float(up[1]), float(up[2]))
+                    except Exception:
+                        row += _NO_UP
+                    self._rows.append(row)
+            if self._rows and tele.wants("imu_batch", now):
+                msg = self.message()
+                if msg is not None:
+                    tele.offer("imu_batch", msg, now)
+        except Exception:
+            self._rows = []
+
+    def message(self):
+        """The gathered rows as one /imu/batch message, and start again.
+        None when not one of them had a usable gyro."""
+        import numpy as np
+
+        rows, self._rows = self._rows, []
+        arr = np.array(rows, float).reshape(-1, 10)
+        # A gyro that is not a number is a sample ImuTrack.add throws away,
+        # so a replay must not be handed it either.
+        arr = arr[np.isfinite(arr[:, 1:4]).all(1)]
+        if not len(arr):
+            return None
+        acc = arr[:, 4:7]
+        acc[~np.isfinite(acc)] = 0.0
+        # The up whole or not at all, as ImuTrack takes it.
+        arr[~np.isfinite(arr[:, 7:10]).all(1), 7:10] = 0.0
+        t = np.round(arr[:, 0] + epoch_offset(), IMU_BATCH_T_PLACES)
+        cols = np.round(arr[:, 1:], IMU_BATCH_PLACES).T.tolist()
+        msg = {"seq": self.seq, "t": t.tolist()}
+        msg.update(zip(_IMU_BATCH_COLUMNS, cols))
+        self.seq += 1
+        return msg
 
 
 def imu_sample(reading):

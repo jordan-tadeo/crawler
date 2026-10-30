@@ -1,7 +1,8 @@
 """The OAK-D's IMU as the mapper reads it: heading rate about gravity, and tilt.
 
 Fed one sample at a time, in time order, as the camera hub drains them
-(about 88 a second live, 17-20 a second in a recording's /imu). Asked, once
+(about 88 a second, all of them in a recording's /imu/batch; /imu holds
+about 16 a second). Asked, once
 a scan, how far the truck turned between two times and how tilted it is.
 
 Yaw rate is the gyro projected on the up vector, gyro . up, in the device's

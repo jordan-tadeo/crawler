@@ -3,10 +3,15 @@
     uv run --with mcap==1.6.0 python tools/slam_replay.py RUN.mcap --out DIR
 
 The same crawler.mapping.slam.Slam the car runs with --slam, fed the same
-inputs in the same order: every /imu row up to a scan's log time, then the
-scan. Nothing from later in the file reaches a step, so what it does here is
-what it would have done live (bar the IMU rate: a recording's /imu is gated
-to 20 Hz, live it is about 88).
+inputs in the same order: every IMU sample up to a scan's log time, then
+the scan. Nothing from later in the file reaches a step, so what it does here
+is what it would have done live.
+
+The IMU is /imu/batch when the file has it: every sample the car's SLAM was
+handed, about 88 a second, each at its own time. A file from before that
+channel has only /imu, gated to about 16 a second, and a replay of one is
+coarser than the live run was -- by enough to change a verdict on anything
+that compares the scan heading to the gyro.
 
 The scan's time is the best one the file has: the lidar's own packet stamp
 through clock.SensorClock when /lidar carries it (recordings from this
@@ -66,6 +71,7 @@ from crawler.mapping.slam import Slam            # noqa: E402
 SCAN_TOPIC = "/lidar/scan"
 LIDAR_TOPIC = "/lidar"
 IMU_TOPIC = "/imu"
+IMU_BATCH_TOPIC = "/imu/batch"
 
 
 # ---- reading -----------------------------------------------------------------
@@ -108,7 +114,7 @@ def load_mcap(path):
     from mcap.records import Channel, Message
     from mcap.stream_reader import StreamReader
     channels = {}
-    scans, lidar, imu = [], [], []
+    scans, lidar, imu, batch = [], [], [], []
     with open(path, "rb") as fh:
         try:
             for rec in StreamReader(fh).records:
@@ -131,6 +137,8 @@ def load_mcap(path):
                     imu.append((t, d["gyro_x"], d["gyro_y"], d["gyro_z"],
                                 d.get("up_x", 0.0), d.get("up_y", 0.0),
                                 d.get("up_z", 0.0)))
+                elif topic == IMU_BATCH_TOPIC:
+                    batch.extend(imu_batch_rows(json.loads(rec.data)))
         except Exception as e:  # a file cut off by the battery coming out
             print(f"[replay] stopped reading at: {e}", file=sys.stderr)
     scans.sort(key=lambda s: s[0])
@@ -147,8 +155,26 @@ def load_mcap(path):
                 stamp[k] = int(b)
             if c:
                 rpm[k] = float(c)
-    imu = np.array(sorted(imu), float).reshape(-1, 7)
+    imu = imu_rows(imu, batch)
     return dict(t=t, ranges=ranges, stamp=stamp, rpm=rpm, imu=imu)
+
+
+def imu_batch_rows(d):
+    """An /imu/batch message as the same (t, gx, gy, gz, ux, uy, uz) rows an
+    /imu message makes, one per sample, each at its own time."""
+    cols = [d["t"], d["gyro_x"], d["gyro_y"], d["gyro_z"],
+            d.get("up_x"), d.get("up_y"), d.get("up_z")]
+    n = len(cols[0])
+    cols = [c if c is not None and len(c) == n else [0.0] * n for c in cols]
+    return list(zip(*cols))
+
+
+def imu_rows(gated, batch):
+    """The IMU a replay is fed, as a time-ordered (n, 7) array: every sample
+    off /imu/batch when the file has that channel, the gated /imu otherwise.
+    Never the two mixed: /imu is a subset of the same samples."""
+    rows = batch if batch else gated
+    return np.array(sorted(rows), float).reshape(-1, 7)
 
 
 def load(path):
