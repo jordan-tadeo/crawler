@@ -421,11 +421,14 @@ def goal_adherence(model, data, ticks):
 
 
 def hind_goals(data, ticks, k_s=HIND_S):
-    """The hindsight goal k_s on for each tick, none where there is none."""
+    """The hindsight goal k_s on for each tick, none where there is none.
+    Never the goal the car was fed (--fed): goal_inputs would put that in
+    its place, and every goal_* number would stop meaning what it did."""
     if "goal_poses" not in data:
         return np.zeros((len(ticks), pg.SIZE), np.float32)
     on = np.asarray(data["map_on"], bool)[ticks]
-    return pt.goal_inputs(data, ticks, on, np.random.default_rng(0), no_goal_share=0.0,
+    hind = {k: v for k, v in data.items() if not k.startswith("fed_")}
+    return pt.goal_inputs(hind, ticks, on, np.random.default_rng(0), no_goal_share=0.0,
                           k_s=k_s)
 
 

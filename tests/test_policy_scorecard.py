@@ -235,6 +235,20 @@ def test_a_model_spec_with_a_plus_is_an_ensemble_and_named_so():
     assert sc.model_label("/m/a.onnx+/m/b.onnx") == "ensemble(a+b)"
 
 
+def test_the_hindsight_goal_never_takes_the_fed_one(monkeypatch):
+    seen = {}
+
+    def grab(data, rows, shown, rng, **kw):
+        seen.update(data)
+        return np.zeros((len(rows), 4), np.float32)
+    monkeypatch.setattr(pt, "goal_inputs", grab)
+    d = {"goal_poses": np.zeros(2), "map_on": np.ones(2, bool), "fed_ok": np.ones(2, bool),
+         "fed_ahead": np.ones(2), "fed_left": np.ones(2)}
+    sc.hind_goals(d, np.arange(2))
+    assert "goal_poses" in seen and not any(k.startswith("fed_") for k in seen)
+    assert "fed_ok" in d
+
+
 def test_the_rejected_drives_list_is_names_only():
     names = pt.rejected_sessions()
     assert names and len(set(names)) == len(names)
