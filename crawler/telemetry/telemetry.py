@@ -682,12 +682,15 @@ JSON_SCHEMAS = {
     # distance_m from the truck (-1 with none), approx and approx_m as for
     # the goal. restored: the list came back from before a restart;
     # pending: a saved list is waiting for the map to be checked.
+    # stuck_s: the current one's seconds without getting 0.3 m closer;
+    # skip_stuck: whether that skips it at 20 s (off: kept, only said).
     # truck_x, truck_y, truck_yaw_deg: the truck's map pose off the crop the
     # distance is from, so a recording has the waypoint and the pose in one
     # message on one map frame.
     "patrol_status": _schema("crawler.PatrolStatus", {
         "use": _STR, "state": _STR, "mode": _STR, "running": _BOOL, "tracing": _BOOL,
         "index": _INT, "number": _INT, "count": _INT, "laps": _INT, "skipped": _INT,
+        "stuck_s": _NUM, "skip_stuck": _BOOL,
         "passed_on_path": _INT, "x": _NUM, "y": _NUM, "frame_now": _INT, "on_map": _BOOL, "distance_m": _NUM,
         "approx": _BOOL, "approx_m": _NUM, "restored": _BOOL, "pending": _BOOL,
         "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,

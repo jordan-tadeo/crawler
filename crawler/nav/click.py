@@ -229,6 +229,20 @@ class ClickGoals:
         except Exception:
             pass
 
+    def push(self, kind, command):
+        """A command from somewhere other than Foxglove (the map page's
+        HTTP POST, telemetry/buttons.py) into the same queue, in order with
+        the rest: ("cmd", dict) or ("follow", dict). False if refused."""
+        if kind not in ("cmd", "follow") or not isinstance(command, dict) \
+                or not isinstance(command.get("cmd"), str):
+            with self._lock:
+                self.rejected += 1
+            return False
+        with self._lock:
+            self.received += 1
+            self._events.append((kind, command))
+        return True
+
     def take(self) -> Optional[ClickGoal]:
         """The newest goal since the last take(), or None."""
         with self._lock:

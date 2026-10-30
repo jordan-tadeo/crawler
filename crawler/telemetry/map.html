@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>Crawler map</title>
+<style>
+:root{--bg:#0e1116;--card:#171b22;--line:#262c36;--text:#e8ecf2;--dim:#8a94a6;
+--go:#16a874;--hold:#d98c0b;--blue:#3b7be0;--red:#d44848;--gold:#d9b31a;--btn:#222833;--btn2:#2b3240}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);overflow:hidden;
+font:15px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{display:flex;flex-direction:column;padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right))
+max(8px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));gap:6px}
+.tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--card);
+border:1px solid var(--line);border-radius:12px;padding:4px;flex:none}
+.tab{display:block;text-align:center;padding:9px 0;border-radius:9px;color:var(--dim);
+text-decoration:none;font-weight:600}
+.tab.on{background:var(--btn2);color:var(--text)}
+#wrap{position:relative;flex:1;min-height:0;border-radius:14px;overflow:hidden;
+background:#0a0c10;border:1px solid var(--line)}
+canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;display:block}
+#status{position:absolute;left:8px;right:8px;top:8px;display:flex;gap:6px;flex-wrap:wrap;pointer-events:none}
+.chip{background:rgba(23,27,34,.88);border:1px solid var(--line);border-radius:999px;
+padding:4px 10px;font-size:12px;color:var(--dim)}
+.chip b{color:var(--text);font-weight:600}
+.chip.warn{color:#ffd28a;border-color:#6b4a12}
+.chip.bad{color:#ff9b9b;border-color:#6b2020}
+#side{position:absolute;right:8px;bottom:8px;display:flex;flex-direction:column;gap:6px}
+#side button{min-height:44px;width:44px;padding:0;font-size:20px}
+#toast{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);max-width:80%;
+background:rgba(23,27,34,.95);border:1px solid var(--line);border-radius:10px;padding:7px 12px;
+font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;text-align:center}
+#toast.show{opacity:1}
+#toast.warn{border-color:#6b4a12;color:#ffd28a}
+#toast.bad{border-color:#6b2020;color:#ff9b9b}
+.bar{display:grid;gap:6px;flex:none}
+.bar.four{grid-template-columns:repeat(4,1fr)}
+.bar.three{grid-template-columns:repeat(3,1fr)}
+button{border:0;border-radius:11px;background:var(--btn);color:var(--text);font:inherit;
+font-weight:600;min-height:50px;padding:6px 4px;cursor:pointer;user-select:none;
+-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+button:active{filter:brightness(1.4)}
+button:disabled{opacity:.35}
+button.on{background:#1d2a40;box-shadow:inset 0 0 0 2px var(--blue)}
+button.go{background:var(--go)}button.hold{background:var(--hold)}
+button.danger{color:#ff9b9b}
+button .sub{display:block;font-size:11px;font-weight:500;color:var(--dim)}
+#adjust{display:none}
+body.adjusting #adjust{display:grid}
+body.adjusting #main{display:none}
+#sheet{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-end;justify-content:center;z-index:5}
+#sheet.show{display:flex}
+#sheet .in{background:var(--card);border:1px solid var(--line);border-radius:16px 16px 0 0;width:100%;
+max-width:520px;max-height:80%;overflow:auto;padding:14px 14px max(14px,env(safe-area-inset-bottom))}
+#sheet h2{font-size:13px;margin:4px 2px 10px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim)}
+#sheet .row{display:flex;gap:6px;align-items:center;margin-bottom:6px}
+#sheet .row .nm{flex:1;padding:10px;background:var(--btn);border-radius:10px;text-align:left}
+#sheet .row button{min-height:44px}
+#sheet .grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px}
+#sheet .empty{color:var(--dim);font-size:13px;padding:6px 2px 12px}
+</style>
+</head>
+<body>
+<nav class="tabs"><a class="tab" href="/">Buttons</a><a class="tab on" href="/map">Map</a></nav>
+<div id="wrap">
+<canvas id="cv"></canvas>
+<div id="status"><span class="chip" id="c_conn">Connecting</span><span class="chip" id="c_track"></span><span class="chip" id="c_fit"></span></div>
+<div id="side">
+<button id="b_zin" title="Zoom in">+</button>
+<button id="b_zout" title="Zoom out">&minus;</button>
+<button id="b_ctr" title="Centre on the truck">&#9678;</button>
+</div>
+<div id="toast"></div>
+</div>
+<div class="bar four" id="main">
+<button id="b_draw">Draw<span class="sub">off: pan</span></button>
+<button id="b_unstroke">Undo<span class="sub">last stroke</span></button>
+<button id="b_del" disabled>Delete<span class="sub">waypoint</span></button>
+<button id="b_menu">Track<span class="sub">save, load</span></button>
+<button id="b_run" class="go" style="grid-column:span 2">Start</button>
+<button id="b_skip">Skip<span class="sub">stuck: off</span></button>
+<button id="b_adj">Nudge<span class="sub">turn or shift</span></button>
+</div>
+<div class="bar four" id="adjust">
+<button id="a_ccw">&#8634;<span class="sub">2&deg;</span></button>
+<button id="a_cw">&#8635;<span class="sub">2&deg;</span></button>
+<button id="a_ok" class="go">Place</button>
+<button id="a_no">Cancel</button>
+</div>
+<div id="sheet"><div class="in" id="sheetin"></div></div>
+<script>
+(function(){
+"use strict";
+// Every distance below is in map metres unless it says px.
+var SPACING_M=1.0;          // a waypoint every this much of a drawn stroke
+var LONG_MS=450;            // hold this long without moving to pick up a waypoint
+var SLOP_PX=10;             // a finger moving less than this is still holding
+var HIT_PX=30;              // a waypoint within this of a finger is under it
+var DOT_PX=11;              // waypoint marker radius
+var POLL_MS=500, MAP_MS=1000;
+var ROT_STEP=2*Math.PI/180;
+
+var cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+var $=function(id){return document.getElementById(id);};
+var st=null;                // the last /api/state
+var map=null;               // {img, x0, y0, res, nx, ny, px: ImageData}
+var view={cx:0,cy:0,s:40};  // world centre, px per metre (css px)
+var centred=false;
+var drawMode=false,sel=-1;
+var stroke=null;            // {pts:[[x,y]], drops:[[x,y]], acc}
+var sent=[];                // strokes sent, drawn until the state has them
+var drag=null;              // {i, x, y} a waypoint being moved
+var adj=null;               // {kind:"pending"|"nudge", T:[yaw,x,y], pts, walls}
+var pendingWalls={id:null,walls:[]};
+var dpr=1;
+
+function toast(msg,kind){var t=$("toast");t.textContent=msg;t.className="show "+(kind||"");
+  clearTimeout(toast.h);toast.h=setTimeout(function(){t.className=kind||"";},3500);}
+
+function send(cmd,extra){
+  var body=Object.assign({cmd:cmd},extra||{});
+  return fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)}).then(function(r){return r.json().then(function(j){
+      if(!j.ok)toast("Refused: "+(j.why||cmd),"bad");return j.ok;});})
+    .catch(function(){toast("Not sent: no connection","bad");return false;});
+}
+
+// ---- view ------------------------------------------------------------------
+function resize(){dpr=window.devicePixelRatio||1;var r=cv.getBoundingClientRect();
+  cv.width=Math.round(r.width*dpr);cv.height=Math.round(r.height*dpr);draw();}
+function W(){return cv.width/dpr;}function H(){return cv.height/dpr;}
+function toS(x,y){return [(x-view.cx)*view.s+W()/2,H()/2-(y-view.cy)*view.s];}
+function toW(px,py){return [(px-W()/2)/view.s+view.cx,view.cy-(py-H()/2)/view.s];}
+function zoomAt(f,px,py){var a=toW(px,py);view.s=Math.max(4,Math.min(400,view.s*f));
+  var b=toW(px,py);view.cx+=a[0]-b[0];view.cy+=a[1]-b[1];draw();}
+
+function T(tr,p){var c=Math.cos(tr[0]),s=Math.sin(tr[0]);
+  return [c*p[0]-s*p[1]+tr[1],s*p[0]+c*p[1]+tr[2]];}
+
+// ---- the waypoints the page shows -----------------------------------------
+function points(){return st&&st.patrol&&st.patrol.points?st.patrol.points:[];}
+function shown(){
+  // [[x,y]|null], the placed list plus strokes sent and the one being drawn.
+  var p=points().slice();
+  sent.forEach(function(s){s.drops.forEach(function(q){p.push(q);});});
+  if(stroke)stroke.drops.forEach(function(q){p.push(q);});
+  if(drag&&p[drag.i])p[drag.i]=[drag.x,drag.y];
+  if(adj&&adj.kind==="nudge")p=adj.pts.map(function(q){return q&&T(adj.T,q);});
+  return p;
+}
+function loopMode(){return !st||!st.patrol||st.patrol.mode!=="once";}
+function hit(px,py){var p=points(),best=-1,bd=HIT_PX;
+  for(var i=0;i<p.length;i++){if(!p[i])continue;var s=toS(p[i][0],p[i][1]);
+    var d=Math.hypot(s[0]-px,s[1]-py);if(d<bd){bd=d;best=i;}}return best;}
+function occupied(x,y){
+  if(!map||!map.px)return false;
+  var i=Math.floor((x-map.x0)/map.res),j=Math.floor((y-map.y0)/map.res);
+  if(i<0||j<0||i>=map.nx||j>=map.ny)return false;
+  var k=((map.ny-1-j)*map.nx+i)*4;return map.px.data[k+3]>0&&map.px.data[k]>200;}
+
+// ---- the estimated drive line ---------------------------------------------
+// Straight between waypoints, each corner rounded to the truck's turning
+// radius. Where the legs are too short for that circle (or the corner is a
+// hairpin) the corner is drawn with the circle that fits, in red: the truck
+// cannot follow it as drawn.
+function driveLine(p,closed,R){
+  var q=p.filter(function(a){return a;});var n=q.length;
+  if(n<2||!R)return null;
+  var corners=[];
+  var idx=function(i){return (i+n)%n;};
+  for(var i=0;i<n;i++){
+    if(!closed&&(i===0||i===n-1)){corners.push(null);continue;}
+    var a=q[idx(i-1)],b=q[i],c=q[idx(i+1)];
+    var l1=Math.hypot(b[0]-a[0],b[1]-a[1]),l2=Math.hypot(c[0]-b[0],c[1]-b[1]);
+    if(l1<1e-6||l2<1e-6){corners.push(null);continue;}
+    var u=[(b[0]-a[0])/l1,(b[1]-a[1])/l1],v=[(c[0]-b[0])/l2,(c[1]-b[1])/l2];
+    var th=Math.acos(Math.max(-1,Math.min(1,u[0]*v[0]+u[1]*v[1])));
+    if(th<1e-3){corners.push(null);continue;}
+    var room=Math.min(closed||i>1?l1/2:l1,closed||i<n-2?l2/2:l2);
+    var t=R*Math.tan(th/2),r=R,bad=false;
+    if(th>150*Math.PI/180||t>room){bad=true;t=Math.min(t,room);r=t/Math.tan(th/2);}
+    corners.push({b:b,u:u,v:v,t:t,r:r,bad:bad});
+  }
+  return {q:q,corners:corners,closed:closed};
+}
+function strokeLine(L){
+  var q=L.q,n=q.length,cs=L.corners;
+  var start=L.closed?[(q[0][0]+q[1][0])/2,(q[0][1]+q[1][1])/2]:q[0];
+  var s=toS(start[0],start[1]);ctx.beginPath();ctx.moveTo(s[0],s[1]);
+  var order=[];for(var i=1;i<n;i++)order.push(i);if(L.closed)order.push(0);
+  order.forEach(function(i){var c=cs[i];var b=q[i];
+    if(c){var nx=q[(i+1)%n],B=toS(b[0],b[1]),N=toS(nx[0],nx[1]);ctx.arcTo(B[0],B[1],N[0],N[1],c.r*view.s);}
+    else{var B2=toS(b[0],b[1]);ctx.lineTo(B2[0],B2[1]);}});
+  if(L.closed)ctx.lineTo(s[0],s[1]);
+  ctx.stroke();
+  // The corners it cannot drive, again in red.
+  ctx.save();ctx.setLineDash([]);ctx.strokeStyle="#ff5a5a";ctx.lineWidth=4;
+  cs.forEach(function(c,i){if(!c||!c.bad)return;
+    var a=[c.b[0]-c.u[0]*c.t,c.b[1]-c.u[1]*c.t],e=[c.b[0]+c.v[0]*c.t,c.b[1]+c.v[1]*c.t];
+    var A=toS(a[0],a[1]),B=toS(c.b[0],c.b[1]),E=toS(e[0],e[1]);
+    ctx.beginPath();ctx.moveTo(A[0],A[1]);ctx.arcTo(B[0],B[1],E[0],E[1],Math.max(c.r*view.s,0.5));ctx.lineTo(E[0],E[1]);ctx.stroke();});
+  ctx.restore();
+  return cs.filter(function(c){return c&&c.bad;}).length;
+}
+
+// ---- drawing -----------------------------------------------------------------
+function draw(){
+  var w=W(),h=H();ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+  if(map&&map.img){var tl=toS(map.x0,map.y0+map.ny*map.res);
+    ctx.imageSmoothingEnabled=false;ctx.drawImage(map.img,tl[0],tl[1],map.nx*map.res*view.s,map.ny*map.res*view.s);}
+  // A saved track not placed yet: its walls and waypoints where the nudge has them.
+  if(adj&&adj.kind==="pending"){ctx.fillStyle="rgba(255,170,60,.85)";
+    var sz=Math.max(2,0.08*view.s);
+    adj.walls.forEach(function(q){var s=T(adj.T,q),S=toS(s[0],s[1]);ctx.fillRect(S[0]-sz/2,S[1]-sz/2,sz,sz);});}
+  var p=adj&&adj.kind==="pending"?adj.pts.map(function(q){return T(adj.T,q);}):shown();
+  // The drive line, under the waypoints.
+  var R=st&&st.turn_radius_m,bad=0;
+  var L=driveLine(p,loopMode(),R);
+  if(L){ctx.save();ctx.setLineDash([2,6]);ctx.lineCap="round";ctx.lineWidth=3;
+    ctx.strokeStyle="rgba(120,200,255,.9)";bad=strokeLine(L);ctx.restore();}
+  $("c_track").textContent="";
+  // The planner's path and the point it feeds.
+  if(st&&st.path&&st.path.length>1){ctx.save();ctx.strokeStyle="rgba(22,168,116,.8)";ctx.lineWidth=2;
+    ctx.beginPath();st.path.forEach(function(q,i){var s=toS(q[0],q[1]);i?ctx.lineTo(s[0],s[1]):ctx.moveTo(s[0],s[1]);});
+    ctx.stroke();ctx.restore();}
+  if(st&&st.aim){var A=toS(st.aim[0],st.aim[1]);ctx.fillStyle="#16a874";ctx.beginPath();ctx.arc(A[0],A[1],5,0,7);ctx.fill();}
+  // The stroke being drawn.
+  if(stroke&&stroke.pts.length>1){ctx.save();ctx.strokeStyle="rgba(59,123,224,.9)";ctx.lineWidth=3;
+    ctx.beginPath();stroke.pts.forEach(function(q,i){var s=toS(q[0],q[1]);i?ctx.lineTo(s[0],s[1]):ctx.moveTo(s[0],s[1]);});
+    ctx.stroke();ctx.restore();}
+  // The legs between waypoints, thin, and the markers, numbered.
+  var vis=p.filter(function(a){return a;});
+  if(vis.length>1){ctx.save();ctx.strokeStyle="rgba(232,236,242,.35)";ctx.lineWidth=1.5;ctx.beginPath();
+    vis.forEach(function(q,i){var s=toS(q[0],q[1]);i?ctx.lineTo(s[0],s[1]):ctx.moveTo(s[0],s[1]);});
+    if(loopMode()&&vis.length>2)ctx.closePath();ctx.stroke();ctx.restore();}
+  var cur=st&&st.patrol?st.patrol.index:-1,run=st&&st.patrol&&st.patrol.running;
+  ctx.font="600 11px -apple-system,Helvetica,Arial,sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";
+  p.forEach(function(q,i){if(!q)return;var s=toS(q[0],q[1]);
+    var col=adj&&adj.kind==="pending"?"#d98c0b":(i===sel?"#3b7be0":(run&&i===cur?"#16a874":"#2b3240"));
+    if(drag&&i===drag.i)col="#3b7be0";
+    ctx.beginPath();ctx.arc(s[0],s[1],DOT_PX+(drag&&i===drag.i?4:0),0,7);ctx.fillStyle=col;ctx.fill();
+    ctx.lineWidth=2;ctx.strokeStyle=occupied(q[0],q[1])?"#ff5a5a":"#e8ecf2";ctx.stroke();
+    ctx.fillStyle="#fff";ctx.fillText(String(i+1),s[0],s[1]+0.5);});
+  // The truck.
+  var pose=st&&st.patrol&&st.patrol.pose;
+  if(pose){var P=toS(pose[0],pose[1]),y=pose[2],k=Math.max(10,0.3*view.s);
+    ctx.save();ctx.translate(P[0],P[1]);ctx.rotate(-y);ctx.beginPath();
+    ctx.moveTo(k,0);ctx.lineTo(-k*.6,k*.55);ctx.lineTo(-k*.35,0);ctx.lineTo(-k*.6,-k*.55);ctx.closePath();
+    ctx.fillStyle="#d9b31a";ctx.fill();ctx.strokeStyle="#000";ctx.lineWidth=1;ctx.stroke();ctx.restore();}
+  chips(bad);
+}
+
+function chips(bad){
+  var c=$("c_conn"),t=$("c_track"),f=$("c_fit");
+  if(!st){c.textContent="Connecting";c.className="chip warn";t.style.display=f.style.display="none";return;}
+  var age=st.age_s;
+  if(!st.ready){c.textContent="Car not ready";c.className="chip warn";}
+  else if(age>3){c.textContent="Stale "+age.toFixed(0)+" s";c.className="chip warn";}
+  else if(st.patrol.running&&st.patrol.stuck_s>=20){
+    c.innerHTML="<b>stuck</b> on "+(st.patrol.index+1)+", "+st.patrol.stuck_s.toFixed(0)+" s";c.className="chip warn";}
+  else{c.innerHTML="<b>"+(st.patrol.state||"")+"</b>";c.className="chip";}
+  var pt=st.patrol||{},n=(pt.points||[]).length;
+  var name=pt.name?pt.name:"unsaved";
+  t.style.display="";t.className="chip"+(bad?" bad":"");
+  t.innerHTML="<b>"+esc(name)+(pt.dirty?" *":"")+"</b> "+n+" wp"+(bad?", "+bad+" too tight":"")
+    +(st.turn_radius_m?", r "+st.turn_radius_m.toFixed(2)+" m":"");
+  var fit=pt.fit||{};
+  if(pt.pending){f.style.display="";f.className="chip warn";
+    f.textContent="'"+(pt.pending.name||"saved track")+"' not placed: "+(fit.busy?"fitting":(fit.why||fit.state||"waiting"));}
+  else{f.style.display="none";}
+}
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
+
+// ---- touch ---------------------------------------------------------------------
+var ptrs={},gest=null,hold=null;
+function pos(e){var r=cv.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top];}
+function beginStroke(px,py){var w=toW(px,py);stroke={pts:[w],drops:[w],acc:0};warnAt(w);}
+function extendStroke(px,py){
+  var w=toW(px,py),last=stroke.pts[stroke.pts.length-1];
+  var d=Math.hypot(w[0]-last[0],w[1]-last[1]);if(d<0.02)return;
+  // Waypoints every SPACING_M of arc length, on the line itself.
+  var left=d,from=last;
+  while(stroke.acc+left>=SPACING_M){
+    var need=SPACING_M-stroke.acc,f=need/left;
+    var q=[from[0]+(w[0]-from[0])*f,from[1]+(w[1]-from[1])*f];
+    stroke.drops.push(q);warnAt(q);left-=need;from=q;stroke.acc=0;
+  }
+  stroke.acc+=left;stroke.pts.push(w);
+}
+function warnAt(q){if(occupied(q[0],q[1]))toast("Waypoint "+(points().length+(stroke?stroke.drops.length:1))+" is on a wall","warn");}
+function endStroke(){
+  var s=stroke;stroke=null;if(!s||!s.drops.length){draw();return;}
+  // The end of the stroke gets a waypoint of its own if it is over half a
+  // spacing past the last one, and none if it came back round onto the
+  // first (the loop closes there anyway).
+  var end=s.pts[s.pts.length-1],d0=s.drops[0];
+  if(s.acc>=SPACING_M/2)s.drops.push(end);
+  var last=s.drops[s.drops.length-1];
+  if(s.drops.length>=3&&Math.hypot(last[0]-d0[0],last[1]-d0[1])<SPACING_M/2)s.drops.pop();
+  var dropped=s.drops.map(function(q){return [Math.round(q[0]*1000)/1000,Math.round(q[1]*1000)/1000];});
+  var job={drops:dropped,before:(st&&st.patrol?st.patrol.strokes:0)};sent.push(job);
+  send("stroke",{points:dropped}).then(function(ok){if(!ok){sent.splice(sent.indexOf(job),1);draw();}
+    else setTimeout(function(){var k=sent.indexOf(job);if(k>=0){sent.splice(k,1);draw();}},4000);});
+  draw();
+}
+
+cv.addEventListener("pointerdown",function(e){cv.setPointerCapture(e.pointerId);
+  var p=pos(e);ptrs[e.pointerId]=p;var ids=Object.keys(ptrs);
+  if(ids.length===2){cancelHold();if(stroke){stroke=null;}
+    var a=ptrs[ids[0]],b=ptrs[ids[1]];
+    gest={d:Math.hypot(a[0]-b[0],a[1]-b[1]),m:[(a[0]+b[0])/2,(a[1]+b[1])/2],ang:Math.atan2(b[1]-a[1],b[0]-a[0])};draw();return;}
+  if(ids.length>2)return;
+  gest={start:p,last:p,moved:false};
+  var i=adj?-1:hit(p[0],p[1]);
+  hold=setTimeout(function(){hold=null;if(gest&&!gest.moved&&i>=0&&points()[i]){
+    var q=points()[i];drag={i:i,x:q[0],y:q[1]};sel=i;$("b_del").disabled=false;
+    if(navigator.vibrate)navigator.vibrate(15);draw();}},LONG_MS);
+});
+function cancelHold(){if(hold){clearTimeout(hold);hold=null;}}
+cv.addEventListener("pointermove",function(e){if(!ptrs[e.pointerId])return;var p=pos(e);
+  var prev=ptrs[e.pointerId];ptrs[e.pointerId]=p;var ids=Object.keys(ptrs);
+  if(ids.length===2&&gest&&gest.d){var a=ptrs[ids[0]],b=ptrs[ids[1]];
+    var d=Math.hypot(a[0]-b[0],a[1]-b[1]),m=[(a[0]+b[0])/2,(a[1]+b[1])/2],ang=Math.atan2(b[1]-a[1],b[0]-a[0]);
+    if(adj){var w0=toW(gest.m[0],gest.m[1]),w1=toW(m[0],m[1]);
+      var da=-(ang-gest.ang);rotateAbout(da,w1);adj.T[1]+=w1[0]-w0[0];adj.T[2]+=w1[1]-w0[1];}
+    else{view.cx-=(m[0]-gest.m[0])/view.s;view.cy+=(m[1]-gest.m[1])/view.s;}
+    if(gest.d>0)zoomAt(d/gest.d,m[0],m[1]);gest.d=d;gest.m=m;gest.ang=ang;draw();return;}
+  if(!gest||gest.d)return;
+  if(!gest.moved&&Math.hypot(p[0]-gest.start[0],p[1]-gest.start[1])>SLOP_PX){gest.moved=true;
+    if(!drag){cancelHold();if(drawMode&&!adj)beginStroke(gest.start[0],gest.start[1]);}}
+  if(drag){var w=toW(p[0],p[1]);drag.x=w[0];drag.y=w[1];draw();return;}
+  if(!gest.moved)return;
+  if(stroke){extendStroke(p[0],p[1]);draw();return;}
+  if(adj){var A=toW(prev[0],prev[1]),B=toW(p[0],p[1]);adj.T[1]+=B[0]-A[0];adj.T[2]+=B[1]-A[1];draw();return;}
+  view.cx-=(p[0]-prev[0])/view.s;view.cy+=(p[1]-prev[1])/view.s;draw();
+});
+function up(e){if(!ptrs[e.pointerId])return;var p=pos(e);delete ptrs[e.pointerId];cancelHold();
+  if(Object.keys(ptrs).length){gest=null;return;}
+  var g=gest;gest=null;
+  if(drag){var d=drag;drag=null;if(g&&g.moved){
+      if(occupied(d.x,d.y))toast("Waypoint "+(d.i+1)+" is on a wall","warn");
+      send("move",{i:d.i,x:Math.round(d.x*1000)/1000,y:Math.round(d.y*1000)/1000});
+      // Hold it where it was dropped until the state comes back with it.
+      if(st&&st.patrol&&st.patrol.points[d.i])st.patrol.points[d.i]=[d.x,d.y];}
+    draw();return;}
+  if(stroke){extendStroke(p[0],p[1]);endStroke();return;}
+  if(g&&!g.moved&&!g.d&&!adj){
+    if(drawMode){beginStroke(p[0],p[1]);endStroke();return;}
+    sel=hit(p[0],p[1]);$("b_del").disabled=sel<0;draw();}
+}
+cv.addEventListener("pointerup",up);cv.addEventListener("pointercancel",function(e){stroke=null;drag=null;up(e);});
+cv.addEventListener("wheel",function(e){e.preventDefault();var p=pos(e);zoomAt(e.deltaY<0?1.15:1/1.15,p[0],p[1]);},{passive:false});
+
+function rotateAbout(da,c){ // turn adj.T by da about world point c
+  var t=[da,0,0],moved=T(t,[adj.T[1]-c[0],adj.T[2]-c[1]]);
+  adj.T=[adj.T[0]+da,moved[0]+c[0],moved[1]+c[1]];}
+function adjCentre(){var p=adj.pts.filter(function(a){return a;}).map(function(q){return T(adj.T,q);});
+  if(!p.length)return toW(W()/2,H()/2);var x=0,y=0;p.forEach(function(q){x+=q[0];y+=q[1];});return [x/p.length,y/p.length];}
+
+// ---- the buttons ---------------------------------------------------------------
+$("b_zin").onclick=function(){zoomAt(1.4,W()/2,H()/2);};
+$("b_zout").onclick=function(){zoomAt(1/1.4,W()/2,H()/2);};
+$("b_ctr").onclick=function(){var p=st&&st.patrol&&st.patrol.pose;if(p){view.cx=p[0];view.cy=p[1];draw();}};
+$("b_draw").onclick=function(){drawMode=!drawMode;this.classList.toggle("on",drawMode);
+  this.querySelector(".sub").textContent=drawMode?"on: drag to draw":"off: pan";};
+$("b_unstroke").onclick=function(){send("unstroke");};
+$("b_del").onclick=function(){if(sel<0)return;var i=sel;sel=-1;this.disabled=true;send("delete",{i:i});};
+$("b_run").onclick=function(){send(st&&st.patrol&&st.patrol.running?"pause":"start");};
+$("b_adj").onclick=function(){startAdjust();};
+// The stuck-waypoint skip: off, a waypoint with no 0.3 m gained in 20 s
+// stays the goal; on, it is skipped.
+$("b_skip").onclick=function(){var on=!(st&&st.patrol&&st.patrol.skip_stuck);
+  if(on&&!confirm("Skip a waypoint after 20 s without getting closer?"))return;
+  send("skip",{on:on});};
+$("a_ccw").onclick=function(){rotateAbout(ROT_STEP,adjCentre());draw();};
+$("a_cw").onclick=function(){rotateAbout(-ROT_STEP,adjCentre());draw();};
+$("a_no").onclick=function(){stopAdjust();};
+$("a_ok").onclick=function(){var t=adj.T;stopAdjust();
+  send("place",{yaw:Math.round(t[0]*1e5)/1e5,x:Math.round(t[1]*1000)/1000,y:Math.round(t[2]*1000)/1000});};
+
+function startAdjust(){
+  var pt=st&&st.patrol;if(!pt)return;
+  if(pt.pending){
+    var g=pt.fit&&pt.fit.guess,T0=g?g.slice():null,pts=pt.pending.points;
+    if(!T0){ // no guess yet: put its middle in the middle of the screen
+      var c=[0,0];pts.forEach(function(q){c[0]+=q[0]/pts.length;c[1]+=q[1]/pts.length;});
+      var m=toW(W()/2,H()/2);T0=[0,m[0]-c[0],m[1]-c[1]];}
+    adj={kind:"pending",T:T0,pts:pts,walls:pendingWalls.id===pt.pending.id?pendingWalls.walls:[]};
+    if(pendingWalls.id!==pt.pending.id)fetch("/api/pending").then(function(r){return r.json();}).then(function(j){
+      pendingWalls=j;if(adj&&adj.kind==="pending")adj.walls=j.walls;draw();}).catch(function(){});
+  }else{
+    var p=pt.points||[];if(!p.length||p.some(function(q){return !q;})){toast("Nothing placed to nudge","warn");return;}
+    adj={kind:"nudge",T:[0,0,0],pts:p.map(function(q){return q.slice();})};
+  }
+  sel=-1;$("b_del").disabled=true;document.body.classList.add("adjusting");
+  toast("Drag to shift, two fingers or the arrows to turn, then Place");draw();
+}
+function stopAdjust(){adj=null;document.body.classList.remove("adjusting");draw();}
+
+// ---- the track menu ------------------------------------------------------------
+function sheet(html){$("sheetin").innerHTML=html;$("sheet").classList.add("show");}
+function closeSheet(){$("sheet").classList.remove("show");}
+$("sheet").addEventListener("click",function(e){if(e.target.id==="sheet")closeSheet();});
+$("b_menu").onclick=function(){
+  var pt=(st&&st.patrol)||{},tracks=(st&&st.tracks)||[];
+  var h="<h2>This track: "+esc(pt.name||"unsaved")+(pt.dirty?" *":"")+"</h2><div class=\"grid\">"
+    +"<button data-a=\"save\">Save</button><button data-a=\"new\" class=\"danger\">New / clear</button></div>"
+    +"<h2>Saved tracks</h2>";
+  if(!tracks.length)h+="<div class=\"empty\">None saved yet</div>";
+  tracks.forEach(function(t,k){h+="<div class=\"row\"><button class=\"nm\" data-a=\"load\" data-k=\""+k+"\">"
+    +esc(t.name)+" <span class=\"sub\">"+t.points+" waypoints</span></button>"
+    +"<button class=\"danger\" data-a=\"forget\" data-k=\""+k+"\">Delete</button></div>";});
+  h+="<div class=\"grid\" style=\"margin-top:10px\"><button data-a=\"close\">Close</button></div>";
+  sheet(h);
+  $("sheetin").querySelectorAll("button").forEach(function(b){b.onclick=function(){
+    var a=b.getAttribute("data-a"),t=tracks[+b.getAttribute("data-k")];
+    var unsaved=pt.dirty&&(pt.points||[]).length;
+    if(a==="close")return closeSheet();
+    if(a==="save"){var nm=prompt("Name this track",pt.name||"");if(!nm||!nm.trim())return;nm=nm.trim();
+      var exists=tracks.some(function(r){return r.name===nm;});
+      if(exists&&nm!==pt.name&&!confirm("'"+nm+"' is already saved. Replace it?"))return;
+      send("save",{name:nm,overwrite:exists});closeSheet();return;}
+    if(a==="new"){if(!confirm(unsaved?"Clear this track? It has unsaved changes; they are kept as 'track kept ...'.":"Clear this track?"))return;
+      send("clear");closeSheet();return;}
+    if(a==="load"){if(unsaved&&!confirm("Load '"+t.name+"'? This track's unsaved changes are kept as 'kept ...'."))return;
+      send("load",{name:t.name});closeSheet();return;}
+    if(a==="forget"){if(!confirm("Delete '"+t.name+"' for good?"))return;send("forget",{name:t.name});closeSheet();}
+  };});
+};
+
+// ---- polling, only while the page is on screen -------------------------------
+var lastSaid=null;
+function pollState(){
+  if(document.hidden)return;
+  fetch("/api/state",{cache:"no-store"}).then(function(r){return r.json();}).then(function(j){
+    var had=st;st=j;
+    var pt=j.patrol||{};
+    // Strokes the state has taken in are no longer drawn from here.
+    if(had&&had.patrol&&pt.strokes!==had.patrol.strokes)sent=[];
+    if(pt.said&&pt.said.length){var s=pt.said[pt.said.length-1];var key=s.join("|");
+      if(lastSaid!==null&&key!==lastSaid)toast(s[1],s[0]==="warning"?"warn":"");lastSaid=key;}
+    if(!centred&&pt.pose){view.cx=pt.pose[0];view.cy=pt.pose[1];centred=true;}
+    var b=$("b_run");b.textContent=pt.running?"Pause":"Start";b.className=pt.running?"hold":"go";
+    $("b_adj").innerHTML=pt.pending?"Place<span class=\"sub\">by hand</span>":"Nudge<span class=\"sub\">turn or shift</span>";
+    var k=$("b_skip");k.classList.toggle("on",!!pt.skip_stuck);
+    k.innerHTML="Skip<span class=\"sub\">stuck: "+(pt.skip_stuck?"on":"off")+"</span>";
+    if(!drag&&!stroke)draw();
+  }).catch(function(){st=st&&Object.assign({},st,{age_s:99});draw();});
+}
+function pollMap(){
+  if(document.hidden)return;
+  fetch("/api/map.png",{cache:"no-store"}).then(function(r){
+    if(r.status!==200)return null;var hdr=(r.headers.get("X-Map")||"").split(" ").map(Number);
+    return r.blob().then(function(b){return createImageBitmap(b).then(function(img){
+      var off=document.createElement("canvas");off.width=hdr[3];off.height=hdr[4];
+      var o=off.getContext("2d");o.drawImage(img,0,0);
+      map={img:img,x0:hdr[0],y0:hdr[1],res:hdr[2],nx:hdr[3],ny:hdr[4],px:o.getImageData(0,0,hdr[3],hdr[4])};
+      if(!drag&&!stroke)draw();});});
+  }).catch(function(){});
+}
+document.addEventListener("visibilitychange",function(){if(!document.hidden){pollState();pollMap();}});
+window.addEventListener("resize",resize);
+setInterval(pollState,POLL_MS);setInterval(pollMap,MAP_MS);
+resize();pollState();pollMap();
+})();
+</script>
+</body>
+</html>

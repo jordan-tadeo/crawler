@@ -81,6 +81,15 @@ MAX_CURVATURE = float(min(curvature_for_front(-MAX_TURN),
                           -curvature_for_front(MAX_TURN)))
 TURN_RADIUS_M = 1.0 / MAX_CURVATURE
 
+# The tightest circle the truck actually drove, off the recordings of
+# 10-29 and 10-30: the lidar's path (the SLAM pose) at full lock (0.7, all
+# four wheels), forward, speed over gyro yaw rate in 0.5 s windows. Median
+# 0.70 m, p25-p75 0.61-0.82, 977 auto windows in 21 runs; reverse is
+# tighter (0.58 m) and left tighter than right. Turns in auto at any
+# steering: 0.87 m forward, 0.66 m reverse. The map page's drive line
+# rounds corners to this; slip, rocks and how the model steers are not in it.
+DRIVEN_TURN_RADIUS_M = 0.70
+
 # The inverse, as a table: k(u) falls monotonically in u.
 _U = np.linspace(-1.0, 1.0, 2001)
 _K = curvature_for_front(_U)

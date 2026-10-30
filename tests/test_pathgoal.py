@@ -499,7 +499,9 @@ def simulate(seconds, path=True):
     model = GoalSteerStub()
     d = driver(model, slam)
     clock = Clock(T0)
-    p = pt.Patrol(clock=clock)
+    # The skip on, as it was when this was written: without the path the
+    # count of skips is what shows it stuck.
+    p = pt.Patrol(clock=clock, skip_stuck=True)
     d.goal = p
     if path:
         d.path = pgo.PathPlanner(slam, background=False, clock=clock)

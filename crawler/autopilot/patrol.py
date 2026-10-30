@@ -44,8 +44,14 @@ One waypoint in a loop or a patrol is a "once": there is nowhere to go on to.
 A waypoint it cannot get to. While auto drives towards a waypoint on the map
 (a decision with the waypoint placed, observe(); not manual, not a lost map),
 its clock runs: no PROGRESS_M closer for NO_PROGRESS_S, or TIMEOUT_S in all,
-and it is skipped with a journal line. Every waypoint skipped in a row, a
-lap with no arrival at all, pauses the patrol.
+and it is stuck. With the skip on it is skipped with a journal line, and
+every waypoint skipped in a row, a lap with no arrival at all, pauses the
+patrol. The skip is off unless asked for (--patrol-skip-stuck, or the
+toggle on the map page, {"cmd": "skip", "on": true}, kept in a settings
+file across a restart): the owner found a timed skip threw a lap off more
+than it helped. Off, the waypoint stays the goal until it is passed, the
+stall gets one journal line, and /patrol/status still says how long it has
+gone without getting closer (stuck_s).
 
 Across a reseed. Every waypoint is carried as a single clicked goal is
 (goal.ClickGoal: its per-frame places, the links followed once each, the snap
@@ -53,19 +59,31 @@ back on a merge), each in a ClickGoal of its own whose journal lines are
 gathered into one line a link.
 
 Across a restart. With a store, the list is written on every change (on a
-thread, never in the control loop), with the walls of the map it is on. A
-restart is a new map 0 with its origin wherever the truck boots; only with
---slam-map-restore does the saved SLAM map (mapping/mapfile.py) come back
-as map 0 in the frame it was saved in, the old list on it again. Either way
-nothing is restored until the first map comes up and its walls are checked
-against the saved ones (MATCH_SHARE of them within one cell); a match
-restores it paused, anything else clears it with a journal line, as does a
-list that
-was on a map other than 0 (a fresh map after a reseed comes back after a
-restart only as map 0, if it was the one saved, so its old number means
-nothing).
+thread, never in the control loop) as a track (autopilot/tracks.py): the
+points and a sample of the walls round them, in one frame. A restart is a
+fresh map with its origin wherever the truck boots, so the saved track is
+"not placed yet" until mapping/trackfit.py has fitted its walls onto the
+live map (turned and moved, never scaled), on a thread, tried again every
+FIT_EVERY_S while the map grows. Only a confident fit places it, and then
+the points are put through the same fit and the patrol is paused until
+start. Until then nothing is lost: the file is not written over, and the
+owner can place it by hand (the "place" command: the map page's nudge).
+The walls are only ever used to fit; the map is not restored.
+
+Named tracks. "save" keeps the list under a name (tracks.Library), "load"
+brings one back as a track to place, "forget" deletes one. Nothing
+automatic deletes or writes over a named track; an unplaced or unsaved
+track that is about to be replaced is kept in the library first under a
+name of its own (AUTOSAVE).
+
+Editing from the map page (telemetry/map.html), on the map the truck is on:
+"stroke" appends a run of points drawn with a finger as one step that
+"unstroke" takes back, and makes the patrol a loop; "move" and "delete"
+take a waypoint's index.
 """
 
+import collections
+import datetime
 import json
 import math
 import os
@@ -76,9 +94,15 @@ import numpy as np
 
 from crawler.autopilot import goal as gl
 from crawler.autopilot import policy_goal as pg
+from crawler.autopilot import tracks as tk
 
 MODES = ("once", "loop", "patrol")
-COMMANDS = ("edit", "goal", "start", "pause", "undo", "clear", "mode", "trace")
+# The drive layout's buttons send these; the map page (telemetry/map.html)
+# sends them and MAP_COMMANDS, which take points, indices or names.
+BUTTON_COMMANDS = ("edit", "goal", "start", "pause", "undo", "clear", "mode", "trace")
+MAP_COMMANDS = ("stroke", "unstroke", "move", "delete", "save", "load", "forget", "place",
+                "skip")
+COMMANDS = BUTTON_COMMANDS + MAP_COMMANDS
 # Within this of a waypoint it is passed and the next is the goal. Wider
 # than ARRIVE_M: a waypoint on the way is somewhere to go past, not to stop
 # on, and a model asked to hit 0.25 m on the way round circles for it.
@@ -97,13 +121,19 @@ MAX_WAYPOINTS = 100
 # The waypoints after the current one the path planner is told of
 # (pathgoal.MAX_AHEAD plans through no more).
 AHEAD_MAX = 3
-# The restart check: the boot map's walls against the saved ones.
-MATCH_SHARE = 0.6
+# The walls kept with the track, for fitting it on the next boot's map.
 MIN_WALLS = 50
 WALLS_KEPT = 3000
 WALLS_EVERY_S = 30.0
-# Present crops on map 0 with too few walls to check before giving up.
-RESTORE_WAIT_S = 30.0
+# A saved track's fit is tried at most this often, and again sooner than
+# FIT_STALE_S only once the live map has FIT_GROWTH times the walls it had.
+FIT_EVERY_S = 10.0
+FIT_STALE_S = 60.0
+FIT_GROWTH = 1.15
+# The name a track about to be replaced is kept under, with the time.
+AUTOSAVE = "kept {:%m-%d %H:%M:%S}"
+# Journal lines kept for the map page.
+SAID_KEPT = 6
 
 
 class _Waypoint(gl.ClickGoal):
@@ -189,27 +219,53 @@ def _occupied_points(view):
                             view.y0 + (j + 0.5) * view.res])
 
 
-def walls_match(saved, view):
-    """The share of the view's walls within one pixel of a saved wall."""
+def _thin(pts, n=WALLS_KEPT):
+    pts = np.asarray(pts, float).reshape(-1, 2)
+    if len(pts) > n:
+        pts = pts[np.linspace(0, len(pts) - 1, n).astype(np.int64)]
+    return pts
+
+
+def merged_walls(view, old):
+    """The view's walls, and those of `old` (same frame) that land where the
+    view has seen nothing: a room driven last time and not this time is
+    kept for the next fit. Thinned to WALLS_KEPT."""
     now = _occupied_points(view)
-    saved = np.asarray(saved, float).reshape(-1, 2)
-    if len(now) == 0 or len(saved) == 0:
-        return 0.0
-    res = float(view.res)
-    have = set()
-    for i, j in np.floor(saved / res).astype(np.int64):
-        for di in (-1, 0, 1):
-            for dj in (-1, 0, 1):
-                have.add((int(i) + di, int(j) + dj))
-    cells = np.floor(now / res).astype(np.int64)
-    return float(np.mean([(int(i), int(j)) in have for i, j in cells]))
+    old = np.asarray(old if old is not None else [], float).reshape(-1, 2)
+    if len(old):
+        from crawler.mapping import grid as gr
+        codes = np.asarray(view.codes)
+        i = np.floor((old[:, 0] - view.x0) / view.res).astype(np.int64)
+        j = np.floor((old[:, 1] - view.y0) / view.res).astype(np.int64)
+        inside = (i >= 0) & (i < codes.shape[0]) & (j >= 0) & (j < codes.shape[1])
+        seen = np.zeros(len(old), bool)
+        seen[inside] = codes[i[inside], j[inside]] != gr.UNKNOWN
+        now = np.concatenate([now, old[~seen]])
+    return np.round(_thin(now), 3).tolist()
+
+
+def _xy_list(v):
+    """[[x, y], ...] of finite numbers off a command's list, or []."""
+    out = []
+    if not isinstance(v, (list, tuple)):
+        return out
+    for p in v:
+        try:
+            x, y = float(p[0]), float(p[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return []
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return []
+        out.append((x, y))
+    return out
 
 
 class Patrol(gl.Goal):
     """The single clicked goal, or the patrol. Control loop only."""
 
     def __init__(self, arrive_m=pg.ARRIVE_M, pass_m=PASS_M, dwell_s=DWELL_S,
-                 say=None, store=None, map_view=None, clock=time.monotonic):
+                 say=None, store=None, map_view=None, clock=time.monotonic,
+                 library=None, fitter=None, skip_stuck=False, settings=None):
         super().__init__()
         self.arrive_m, self.pass_m, self.dwell_s = float(arrive_m), float(pass_m), float(dwell_s)
         self._say = say
@@ -241,17 +297,38 @@ class Patrol(gl.Goal):
         self._best = math.inf
         self._since_best = 0.0
         self._last_obs = None
-        self._walls = None            # map 0's walls, for the restart check
+        self._walls = None            # the walls round the list, for a later fit
+        self._walls_frame = None      # the map frame they are on
         self._walls_at = None
-        self._pending = None          # a saved list waiting for the map
-        self._pending_wait = 0.0
+        self.name = None              # the track's name, if it was saved or loaded as one
+        self.dirty = False            # changed since it was saved under its name
+        self._strokes = []            # points appended per step, for unstroke
+        self.library = library        # tracks.Library, or None
+        self.fitter = fitter          # trackfit.Fitter, or None: fitted in line
+        self._pending = None          # a track (tracks.py) not placed on this map yet
+        self.fit_state = {"state": "none", "why": "", "tries": 0, "share": 0.0,
+                          "agree": 0, "guess": None}
+        self._fit_at = None
+        self._fit_occ = 0
+        self._fit_why = None
+        self.said = collections.deque(maxlen=SAID_KEPT)
+        # Whether a stuck waypoint is skipped: the settings file's, else
+        # the default given (--patrol-skip-stuck).
+        self.settings = settings      # a Store of {"skip_stuck": bool}, or None
+        saved = settings.load() if settings is not None else None
+        kept = saved.get("skip_stuck") if isinstance(saved, dict) else None
+        self.skip_stuck = kept if isinstance(kept, bool) else bool(skip_stuck)
+        self._log("info", f"Stuck waypoints are {'skipped' if self.skip_stuck else 'kept'}"
+                  f" (skip {'on' if self.skip_stuck else 'off'}, "
+                  f"{'as last set' if isinstance(kept, bool) else 'the default'})")
         if store is not None:
-            data = store.load()
+            data = tk.migrate(store.load())
             if data and data.get("points"):
-                self._pending = data
+                self._set_pending(data)
 
     def _log(self, level, text):
         print(text)
+        self.said.append((level, text))
         if self._say is not None:
             try:
                 self._say(level, "Patrol", text)
@@ -359,6 +436,7 @@ class Patrol(gl.Goal):
         if (self.use != "patrol" or self.holding() or self.last is None
                 or not self.present):
             return
+        was_wp, was_best = self._wp_time, self._since_best
         self._wp_time += dt
         d = self.last[0]
         if d < self._best - PROGRESS_M:
@@ -370,6 +448,13 @@ class Patrol(gl.Goal):
             why = f"no {PROGRESS_M:.1f} m closer in {NO_PROGRESS_S:.0f} s"
         elif self._wp_time >= TIMEOUT_S - 1e-6:
             why = f"not there in {TIMEOUT_S:.0f} s"
+        if why is not None and not self.skip_stuck:
+            # Kept as the goal: said once as it goes stuck, not skipped.
+            if (was_best < NO_PROGRESS_S - 1e-6 <= self._since_best
+                    or was_wp < TIMEOUT_S - 1e-6 <= self._wp_time):
+                self._log("warning", f"Waypoint {self.index + 1} of {len(self.points)} "
+                          f"stuck: {why}, {d:.2f} m off; kept (skip is off)")
+            return
         if why is not None:
             self.skipped += 1
             self._in_row += 1
@@ -418,18 +503,41 @@ class Patrol(gl.Goal):
         elif name == "undo":
             if not self.points:
                 return False
-            self.points.pop()
-            if self.index >= len(self.points):
-                self.index = max(len(self.points) - 1, 0)
-                self._reset_clock()
-            if not self.points:
-                self.running = False
+            self._remove(len(self.points) - 1)
             self._log("info", f"Waypoint {len(self.points) + 1} undone, "
                       f"{len(self.points)} left")
         elif name == "clear":
+            if self._pending is not None:
+                self._keep_pending("the track was cleared")
+            elif self.points and (self.dirty or self.name is None):
+                self._keep_current("the track was cleared")
             self.points, self.running, self.tracing, self.finished = [], False, False, False
             self.index, self.direction = 0, 1
+            self._strokes, self.name, self.dirty = [], None, False
+            self._walls, self._walls_frame = None, None
             self._log("info", "Patrol cleared")
+        elif name in ("stroke", "unstroke", "move", "delete"):
+            if self._edit(name, msg, crop) is False:
+                return False
+        elif name in ("save", "load", "forget"):
+            if self._library_command(name, msg) is False:
+                return False
+        elif name == "place":
+            if self._place_command(msg) is False:
+                return False
+        elif name == "skip":
+            on = msg.get("on")
+            if on is None:
+                on = not self.skip_stuck
+            if not isinstance(on, bool):
+                self._log("warning", f"Skip refused: on is {on!r}, not true or false")
+                return False
+            self.skip_stuck = on
+            if self.settings is not None:
+                self.settings.save({"skip_stuck": on})
+            self._log("info", "Stuck waypoints are skipped from now on" if on else
+                      "Stuck waypoints are kept from now on: no timed skip")
+            return True
         elif name == "mode":
             mode = msg.get("mode")
             if mode is None:
@@ -464,7 +572,9 @@ class Patrol(gl.Goal):
             return False
         return self.append(placed[0], placed[1], int(getattr(crop, "frame", 0)))
 
-    def append(self, x, y, frame):
+    def append(self, x, y, frame, stroke=False):
+        """One waypoint on the end. stroke=True: part of the newest stroke
+        (unstroke takes it back with the rest), else a step of its own."""
         x, y = float(x), float(y)
         if not (math.isfinite(x) and math.isfinite(y)):
             self.refused += 1
@@ -474,14 +584,316 @@ class Patrol(gl.Goal):
             self._log("warning", f"Waypoint refused: {MAX_WAYPOINTS} is the most")
             return False
         if self._pending is not None:
-            self._drop_pending("a new waypoint was set before the map was checked")
-        w = _Waypoint()
-        w._seq = self._seq
-        w.set_goal(x, y, frame)
-        w.said.clear()
-        self.points.append(w)
+            self._keep_pending("a new waypoint was set before it was placed")
+        self.points.append(self._waypoint(x, y, frame))
+        if stroke and self._strokes:
+            self._strokes[-1] += 1
+        else:
+            self._strokes.append(1)
+        self.dirty = True
         self._save()
         return True
+
+    def _waypoint(self, x, y, frame):
+        w = _Waypoint()
+        w._seq = self._seq
+        w.set_goal(float(x), float(y), int(frame))
+        w.said.clear()
+        return w
+
+    def _remove(self, i):
+        """Take waypoint i out, the place in the list kept on the same one."""
+        self.points.pop(i)
+        k, at = 0, 0
+        while k < len(self._strokes):
+            if i < at + self._strokes[k]:
+                self._strokes[k] -= 1
+                if self._strokes[k] == 0:
+                    self._strokes.pop(k)
+                break
+            at += self._strokes[k]
+            k += 1
+        if i < self.index:
+            self.index -= 1
+        elif i == self.index:
+            self._reset_clock()
+        if self.index >= len(self.points):
+            self.index = max(len(self.points) - 1, 0)
+            self._reset_clock()
+        if not self.points:
+            self.running = False
+            self._strokes = []
+        self.dirty = True
+
+    # ---- editing from the map page ---------------------------------------------------
+
+    def _edit(self, name, msg, crop):
+        """stroke, unstroke, move, delete. False if refused."""
+        if name == "unstroke":
+            if not self._strokes:
+                return False
+            n = self._strokes[-1]
+            for _ in range(n):
+                self._remove(len(self.points) - 1)
+            self._log("info", f"Stroke of {n} waypoints undone, {len(self.points)} left")
+            return True
+        frame = self.frame_now
+        if frame is None and crop is not None:
+            frame = int(getattr(crop, "frame", 0))
+        if frame is None:
+            self._log("warning", f"{name.capitalize()} refused: no SLAM map yet")
+            return False
+        if name == "stroke":
+            pts = _xy_list(msg.get("points"))
+            if not pts:
+                return False
+            if self._pending is not None:
+                self._keep_pending("a new track was drawn before it was placed")
+            had = len(self.points)
+            self._strokes.append(0)
+            for x, y in pts:
+                if not self.append(x, y, frame, stroke=True):
+                    break
+            if self._strokes and self._strokes[-1] == 0:
+                self._strokes.pop()
+            if len(self.points) == had:
+                return False
+            self.mode, self.finished = "loop", False
+            if self.use != "patrol":
+                self.use, self.running = "patrol", False
+            self._log("info", f"Drew waypoints {had + 1}-{len(self.points)}; the loop "
+                      f"closes back to 1")
+            return True
+        i = msg.get("i")
+        if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < len(self.points):
+            self._log("warning", f"{name.capitalize()} refused: no waypoint {i!r}")
+            return False
+        if name == "delete":
+            self._remove(i)
+            self._log("info", f"Waypoint {i + 1} deleted, {len(self.points)} left")
+            return True
+        xy = _xy_list([[msg.get("x"), msg.get("y")]])
+        if not xy:
+            return False
+        self.points[i] = self._waypoint(xy[0][0], xy[0][1], frame)
+        if i == self.index:
+            self._reset_clock()
+        self.dirty = True
+        self._log("info", f"Waypoint {i + 1} moved to ({xy[0][0]:.2f}, {xy[0][1]:.2f})")
+        return True
+
+    # ---- named tracks ----------------------------------------------------------------
+
+    def track(self):
+        """The track as it would be saved now (tracks.py), or None."""
+        if self._pending is not None:
+            return dict(self._pending)
+        if not self.points:
+            return None
+        return dict(self._saved(), name=self.name)
+
+    def _later(self, fn, *args):
+        """Library writes, off the control loop."""
+        if getattr(self.library, "synchronous", False):
+            fn(*args)
+            return
+        threading.Thread(target=fn, args=args, name="tracks", daemon=True).start()
+
+    def _keep(self, data, why):
+        if self.library is None or not data or not data.get("points"):
+            return
+        name = tk.clean_name(f"{data.get('name') or 'track'} "
+                             f"{AUTOSAVE.format(datetime.datetime.now())}")
+        self._later(self.library.save, name, data)
+        self._log("info", f"Kept the track as '{name}' in the saved tracks: {why}")
+
+    def _keep_pending(self, why):
+        data, self._pending = self._pending, None
+        self._fit_reset()
+        self._keep(data, why)
+
+    def _keep_current(self, why):
+        self._keep(self.track(), why)
+
+    def _library_command(self, name, msg):
+        if self.library is None:
+            self._log("warning", "No saved tracks on this run")
+            return False
+        track_name = tk.clean_name(msg.get("name"))
+        if track_name is None:
+            self._log("warning", f"{name.capitalize()} refused: no name")
+            return False
+        if name == "save":
+            data = self.track()
+            if data is None:
+                self._log("warning", "Save refused: no waypoints")
+                return False
+            if self.library.has(track_name) and not msg.get("overwrite"):
+                self._log("warning", f"Save refused: '{track_name}' is saved already")
+                return False
+            self._later(self.library.save, track_name, data)
+            if self._pending is not None:
+                self._pending["name"] = track_name
+            self.name, self.dirty = track_name, False
+            self._log("info", f"Saved '{track_name}': {len(data['points'])} waypoints")
+            return True
+        if name == "forget":
+            if not self.library.has(track_name):
+                self._log("warning", f"No saved track '{track_name}'")
+                return False
+            self._later(self.library.delete, track_name)
+            self._log("info", f"Deleted the saved track '{track_name}'")
+            return True
+        data = self.library.load(track_name)
+        if data is None or not data.get("points"):
+            self._log("warning", f"No saved track '{track_name}'")
+            return False
+        if self._pending is not None and self._pending.get("name") != track_name:
+            self._keep_pending("another track was loaded")
+        elif self.points and (self.dirty or self.name is None):
+            self._keep_current("another track was loaded")
+        self.points, self.running, self.tracing, self.finished = [], False, False, False
+        self.index, self.direction, self._strokes = 0, 1, []
+        self._walls, self._walls_frame = None, None
+        self._set_pending(data)
+        self.use = "patrol"
+        self._log("info", f"Loaded '{track_name}': {len(data['points'])} waypoints, "
+                  "placing it on this map")
+        return True
+
+    # ---- placing a saved track -------------------------------------------------------
+
+    def _set_pending(self, data):
+        self._pending = data
+        self.name = data.get("name")
+        self.mode = data["mode"] if data.get("mode") in MODES else self.mode
+        self.dirty = False
+        self._fit_reset()
+        if not data.get("walls"):
+            self.fit_state["state"] = "no walls"
+
+    def _fit_reset(self):
+        self.fit_state = {"state": "none", "why": "", "tries": 0, "share": 0.0,
+                          "agree": 0, "guess": None}
+        self._fit_at, self._fit_occ, self._fit_why = None, 0, None
+
+    def _place_command(self, msg):
+        """{"cmd": "place", "yaw": rad, "x": m, "y": m}: the unplaced track
+        put on this map through that transform (its own frame -> this map);
+        with none unplaced, the list on this map moved by it (a nudge)."""
+        try:
+            fit = (float(msg.get("yaw", 0.0)), float(msg.get("x", 0.0)),
+                   float(msg.get("y", 0.0)))
+        except (TypeError, ValueError):
+            return False
+        if not all(math.isfinite(v) for v in fit) or self.frame_now is None:
+            self._log("warning", "Place refused: no SLAM map yet" if self.frame_now is None
+                      else "Place refused: not a transform")
+            return False
+        if self._pending is not None:
+            self._place_pending(fit, "placed by hand")
+            return True
+        places = [w.places.get(self.frame_now) for w in self.points]
+        if not places or any(p is None for p in places):
+            self._log("warning", "Nudge refused: no waypoints on this map")
+            return False
+        from crawler.mapping import trackfit as tf
+        moved = tf.transform(fit, [p[:2] for p in places])
+        self.points = [self._waypoint(x, y, self.frame_now) for x, y in moved]
+        if self._walls and self._walls_frame == self.frame_now:
+            self._walls = np.round(tf.transform(fit, self._walls), 3).tolist()
+        self._reset_clock()
+        self.dirty = True
+        self._log("info", f"Track nudged {math.degrees(fit[0]):+.0f} deg, "
+                  f"({fit[1]:+.2f}, {fit[2]:+.2f}) m")
+        return True
+
+    def _place_pending(self, fit, how):
+        from crawler.mapping import trackfit as tf
+        data, self._pending = self._pending, None
+        frame = self.frame_now
+        pts = tf.transform(fit, data["points"])
+        self.points = [self._waypoint(x, y, frame) for x, y in pts[:MAX_WAYPOINTS]]
+        self._strokes = [len(self.points)] if self.points else []
+        self.index, self.direction, self.finished, self.laps = 0, 1, False, 0
+        walls = data.get("walls") or []
+        self._walls = np.round(tf.transform(fit, walls), 3).tolist() if walls else None
+        self._walls_frame = frame if walls else None
+        self._walls_at = None
+        self.name, self.dirty = data.get("name"), False
+        self.use, self.running, self.restored = "patrol", False, True
+        self.fit_state = dict(self.fit_state, state="placed", why=how)
+        self._save()
+        name = f"'{self.name}'" if self.name else "The saved track"
+        self._log("info", f"{name} placed on map {frame} ({how}): {len(self.points)} "
+                  f"waypoints, turned {math.degrees(fit[0]):.0f} deg and moved "
+                  f"({fit[1]:.2f}, {fit[2]:.2f}) m, {self.mode}, paused until start")
+
+    def _fit_pending(self, crop):
+        """Try the unplaced track's walls on the live map: a result in, and
+        another try out when it is due."""
+        if self._pending is None or self.frame_now is None or not self.present:
+            return
+        fitter = self.fitter
+        if fitter is not None:
+            done = fitter.result()
+            if done is not None:
+                self._fit_result(*done)
+                if self._pending is None:
+                    return
+        walls = self._pending.get("walls") or []
+        if len(walls) < MIN_WALLS or self.map_view is None:
+            return
+        if fitter is not None and fitter.busy:
+            return
+        now = float(self.clock())
+        if self._fit_at is not None and now - self._fit_at < FIT_EVERY_S:
+            return
+        try:
+            view = self.map_view()
+        except Exception:
+            view = None
+        if view is None:
+            return
+        occ = int(np.count_nonzero(np.asarray(view.codes) == 2))
+        if occ < MIN_WALLS:
+            return
+        if (self._fit_at is not None and occ < self._fit_occ * FIT_GROWTH
+                and now - self._fit_at < FIT_STALE_S):
+            return
+        self._fit_at, self._fit_occ = now, occ
+        self.fit_state["state"] = "searching" if self.fit_state["state"] == "none" \
+            else self.fit_state["state"]
+        tag = (self.frame_now, self._seq, id(self._pending))
+        if fitter is None:
+            from crawler.mapping import trackfit as tf
+            self._fit_result(tag, tf.fit(walls, view))
+        else:
+            fitter.submit(tag, walls, view)
+
+    def _fit_result(self, tag, fit):
+        if self._pending is None or tag != (self.frame_now, self._seq, id(self._pending)):
+            self._fit_at = None          # the map moved on under it; try again
+            return
+        st = self.fit_state
+        st["tries"] += 1
+        if fit is None:
+            st.update(state="unsure", why="nothing on the map to fit to yet")
+            return
+        st.update(share=fit.share, agree=fit.agree, guess=[fit.yaw, fit.x, fit.y])
+        if fit.ok:
+            self._place_pending((fit.yaw, fit.x, fit.y),
+                                f"fitted, {fit.share:.0%} of {fit.agree + fit.disagree} "
+                                "seen walls agree")
+            return
+        st.update(state="unsure", why=fit.why)
+        kind = fit.why.split(" ")[0]
+        if kind != self._fit_why:
+            self._fit_why = kind
+            name = f"'{self._pending.get('name')}'" if self._pending.get("name") else \
+                "The saved track"
+            self._log("info", f"{name} is not placed yet: {fit.why}; trying again as "
+                      "the map grows (or place it by hand on the map page)")
 
     # ---- each pass -------------------------------------------------------------------
 
@@ -494,6 +906,7 @@ class Patrol(gl.Goal):
             if L.seq <= self._seq:
                 continue
             self._seq = L.seq
+            self._carry_walls(L)
             moved = snapped = 0
             offs, errs = [], []
             for w in self.points:
@@ -547,7 +960,7 @@ class Patrol(gl.Goal):
         if self.use == "goal":
             self.single.observe(crop)
         if self._pending is not None:
-            self._check_pending(crop)
+            self._fit_pending(crop)
         if not self.present:
             self.last = None
             return
@@ -639,82 +1052,56 @@ class Patrol(gl.Goal):
     # ---- across a restart ------------------------------------------------------------
 
     def _keep_walls(self):
-        """Map 0's walls, every WALLS_EVERY_S while there is a list to save."""
-        if (self.store is None or self.map_view is None or self.frame_now != 0
-                or not self.points):
+        """The walls round the list, every WALLS_EVERY_S while there is one
+        on this map: the live map's, and the kept ones it has not seen."""
+        if (self.store is None or self.map_view is None or self.frame_now is None
+                or not self.points or self._pending is not None):
+            return
+        if any(w.places.get(self.frame_now) is None for w in self.points):
             return
         now = float(self.clock())
         if self._walls_at is not None and now - self._walls_at < WALLS_EVERY_S:
             return
         self._walls_at = now
         try:
-            pts = _occupied_points(self.map_view())
+            view = self.map_view()
         except Exception:
             return
-        if len(pts) >= MIN_WALLS:
-            step = max(1, int(math.ceil(len(pts) / WALLS_KEPT)))
-            self._walls = np.round(pts[::step], 3).tolist()
-            self._save()
+        if view is None or len(_occupied_points(view)) < MIN_WALLS:
+            return
+        old = self._walls if self._walls_frame == self.frame_now else None
+        self._walls = merged_walls(view, old)
+        self._walls_frame = self.frame_now
+        self._save()
+
+    def _carry_walls(self, L):
+        """The kept walls along a link, as the waypoints go."""
+        if self._walls and self._walls_frame == L.frm:
+            from crawler.mapping import trackfit as tf
+            self._walls = np.round(tf.transform((L.yaw, L.x, L.y), self._walls), 3).tolist()
+            self._walls_frame = L.to
 
     def _saved(self):
-        # Their places on map 0 if they all have one; else on the map the
-        # newest was set on, which a restart never has.
-        frame = 0
-        if not all(w.places.get(0) is not None for w in self.points):
-            frame = self.points[-1].goal[2]
+        """The track as written: the points on the frame the walls are on
+        if they all have a place there, else on the one the truck is on (or
+        the newest was set on), without walls when those are elsewhere."""
+        frame = self._walls_frame
+        if frame is None or any(w.places.get(frame) is None for w in self.points):
+            frame = self.frame_now
+            if frame is None or any(w.places.get(frame) is None for w in self.points):
+                frame = self.points[-1].goal[2] if self.points else 0
         places = [w.places.get(frame) for w in self.points]
         pts = [[float(p[0]), float(p[1])] for p in places if p is not None]
-        return {"version": 1, "frame": int(frame), "mode": self.mode, "points": pts,
-                "walls": self._walls or []}
+        walls = self._walls if (self._walls and self._walls_frame == frame) else []
+        return {"version": tk.VERSION, "name": self.name, "mode": self.mode,
+                "points": pts, "walls": walls, "saved_at": time.time()}
 
     def _save(self):
+        """The working track to the store. Never while a saved track is
+        waiting to be placed: that one stays on disk as it is."""
         if self.store is None or self._pending is not None:
             return
         self.store.save(self._saved())
-
-    def _drop_pending(self, why):
-        n = len(self._pending.get("points") or [])
-        self._pending = None
-        self._log("warning", f"The saved patrol ({n} waypoints) is cleared: {why}")
-        self._save()
-
-    def _check_pending(self, crop):
-        data = self._pending
-        if crop is None or not getattr(crop, "present", False):
-            return
-        if int(data.get("frame", -1)) != 0:
-            self._drop_pending(f"it was on map {data.get('frame')}, a fresh map that "
-                               "is not there after a restart")
-            return
-        if self.frame_now != 0:
-            self._drop_pending("the map reseeded before its walls could be checked")
-            return
-        try:
-            view = self.map_view() if self.map_view is not None else None
-        except Exception:
-            view = None
-        if len(_occupied_points(view)) < MIN_WALLS:
-            now = float(self.clock())
-            if self._pending_wait == 0.0:
-                self._pending_wait = now
-            elif now - self._pending_wait >= RESTORE_WAIT_S:
-                self._drop_pending("the map never had walls enough to check it against")
-            return
-        share = walls_match(data.get("walls") or [], view)
-        if share < MATCH_SHARE:
-            self._drop_pending(f"this map is not the one it was set on ({share:.0%} of "
-                               "the walls agree)")
-            return
-        self._pending = None
-        mode = data.get("mode")
-        self.mode = mode if mode in MODES else self.mode
-        for x, y in data["points"]:
-            self.append(x, y, 0)
-        self._walls = data.get("walls") or None
-        self.use, self.running, self.restored = "patrol", False, True
-        self._save()
-        self._log("info", f"Patrol restored: {len(self.points)} waypoints on the same "
-                  f"map ({share:.0%} of the walls agree), {self.mode}, paused until start")
 
     # ---- out -------------------------------------------------------------------------
 
@@ -771,6 +1158,10 @@ class Patrol(gl.Goal):
                 "index": int(self.index), "number": int(self.index + 1) if self.points else 0,
                 "count": len(self.points), "laps": int(self.laps),
                 "skipped": int(self.skipped),
+                # The current waypoint's time without getting PROGRESS_M
+                # closer, and whether that skips it at NO_PROGRESS_S.
+                "stuck_s": round(float(self._since_best), 2),
+                "skip_stuck": bool(self.skip_stuck),
                 "passed_on_path": int(self.passed_on_path), "x": float(x), "y": float(y),
                 "frame_now": -1 if self.frame_now is None else int(self.frame_now),
                 "on_map": bool(have and self.present), "distance_m": float(d),
@@ -794,3 +1185,32 @@ class Patrol(gl.Goal):
                 if self.use == "patrol" else None,
                 "closed": self.mode == "loop",
                 "approx_m": float(places[min(self.index, len(places) - 1)][2])}
+
+    def page_state(self):
+        """The map page's view of the patrol (telemetry/buttons.py), built in
+        the control loop when the page asks: the waypoints on the map the
+        truck is on (None for one with no place there), and a track not
+        placed yet in its own frame, with the best fit so far as a guess."""
+        frame = self.frame_now
+        pts = []
+        for w in self.points:
+            p = w.places.get(frame) if frame is not None else None
+            pts.append(None if p is None else [round(p[0], 3), round(p[1], 3)])
+        pending = None
+        if self._pending is not None:
+            pending = {"name": self._pending.get("name"), "mode": self._pending.get("mode"),
+                       "points": self._pending.get("points") or [],
+                       "walls": self._pending.get("walls") or [],
+                       "id": id(self._pending)}
+        fit = dict(self.fit_state)
+        fit["busy"] = bool(getattr(self.fitter, "busy", False))
+        return {"frame": frame, "present": bool(self.present),
+                "pose": list(self.pose) if (self.pose is not None and self.present) else None,
+                "use": self.use, "state": self.state(), "mode": self.mode,
+                "running": bool(self.running), "tracing": bool(self.tracing),
+                "index": int(self.index), "points": pts, "laps": int(self.laps),
+                "skipped": int(self.skipped), "name": self.name, "dirty": bool(self.dirty),
+                "stuck_s": round(float(self._since_best), 1),
+                "skip_stuck": bool(self.skip_stuck),
+                "strokes": len(self._strokes), "pending": pending, "fit": fit,
+                "said": [list(x) for x in self.said]}

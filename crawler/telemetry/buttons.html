@@ -53,11 +53,17 @@ button.arming .fill{width:100%;transition:width var(--hold-ms) linear}
 #follow.on{background:var(--gold);color:#1a1500;box-shadow:none}
 #follow.on .sub{color:rgba(26,21,0,.7)}
 .note{font-size:12px;color:var(--dim);text-align:center;min-height:16px;margin:0}
+.tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--card);
+border:1px solid var(--line);border-radius:12px;padding:4px}
+.tab{display:block;text-align:center;padding:10px 0;border-radius:9px;color:var(--dim);
+text-decoration:none;font-weight:600}
+.tab.on{background:var(--btn2);color:var(--text)}
 @media (min-width:700px){main{padding-top:24px}}
 </style>
 </head>
 <body>
 <main>
+<nav class="tabs"><a class="tab on" href="/">Buttons</a><a class="tab" href="/map">Map</a></nav>
 <header>
 <h1>Crawler</h1>
 <div class="pill" id="conn"><span class="dot"></span><span id="conntext">Offline</span></div>

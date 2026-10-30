@@ -228,7 +228,7 @@ def drive_ticks(p, clock, seconds, xy=(0.0, 0.0), dt=0.1):
 
 
 def test_no_progress_for_the_window_skips_the_waypoint_with_a_journal_line():
-    p, said, clock = patrol_of(mode="loop")
+    p, said, clock = patrol_of(mode="loop", skip_stuck=True)
     drive_ticks(p, clock, pt.NO_PROGRESS_S - 1.0, xy=(-1.0, -1.0))
     assert p.index == 0
     drive_ticks(p, clock, 1.5, xy=(-1.0, -1.0))
@@ -236,8 +236,47 @@ def test_no_progress_for_the_window_skips_the_waypoint_with_a_journal_line():
     assert any("skipped" in a[2].lower() and "waypoint 1" in a[2].lower() for a in said)
 
 
+def test_by_default_a_stuck_waypoint_is_kept_said_once_and_reported():
+    p, said, clock = patrol_of(mode="loop")
+    assert not p.skip_stuck
+    drive_ticks(p, clock, pt.TIMEOUT_S + 30.0, xy=(-1.0, -1.0))
+    assert p.index == 0 and p.skipped == 0 and p.running
+    stuck = [a[2] for a in said if "stuck" in a[2]]
+    assert len(stuck) == 2 and "kept" in stuck[0], "once at 20 s, once at 120 s"
+    st = p.patrol_status()
+    assert st["stuck_s"] == pytest.approx(pt.TIMEOUT_S + 30.0, abs=0.3)
+    assert st["skip_stuck"] is False and p.page_state()["skip_stuck"] is False
+    # Passing it still moves on (PASS_M, unchanged).
+    visit(p, SQUARE[0])
+    assert p.index == 1 and p.patrol_status()["stuck_s"] == 0.0
+
+
+def test_the_skip_is_toggled_and_kept_across_a_restart(tmp_path):
+    settings = pt.Store(str(tmp_path / "patrol_settings.json"), background=False)
+    p, said, clock = patrol_of(mode="loop", settings=settings)
+    assert any("kept (skip off, the default)" in a[2] for a in said)
+    p.poll(Events(cmd("skip", on=True)), crop_at(-1.0, -1.0))
+    assert p.skip_stuck and settings.load() == {"skip_stuck": True}
+    drive_ticks(p, clock, pt.NO_PROGRESS_S + 0.5, xy=(-1.0, -1.0))
+    assert p.index == 1, "on: skipped as before"
+    # Next boot: the toggle wins over the default either way.
+    q, said, _ = patrol_of(mode="loop", settings=settings)
+    assert q.skip_stuck and any("as last set" in a[2] for a in said)
+    q.poll(Events(cmd("skip")), crop_at(-1.0, -1.0))
+    assert not q.skip_stuck
+    r, _, _ = patrol_of(mode="loop", settings=settings, skip_stuck=True)
+    assert not r.skip_stuck
+    assert p.command({"cmd": "skip", "on": "yes"}) is False
+    # With no settings file, the default given: off unless the flag says.
+    assert patrol_of(mode="loop", skip_stuck=True)[0].skip_stuck
+    from crawler import __main__ as cm
+    assert cm.parse_args([]).patrol_skip_stuck is False
+    assert cm.parse_args(["--patrol-skip-stuck"]).patrol_skip_stuck is True
+
+
 def test_progress_resets_the_window_but_the_timeout_still_skips():
-    p, said, clock = patrol_of(points=[(50.0, 0.0), (0.0, 0.0)], mode="loop")
+    p, said, clock = patrol_of(points=[(50.0, 0.0), (0.0, 0.0)], mode="loop",
+                               skip_stuck=True)
     x, t_end = -1.0, clock.t + pt.TIMEOUT_S + 1.0
     while clock.t < t_end and p.index == 0:
         clock.t += 0.1
@@ -248,7 +287,7 @@ def test_progress_resets_the_window_but_the_timeout_still_skips():
 
 
 def test_the_clock_runs_only_on_decisions_in_auto_not_on_manual_passes():
-    p, said, clock = patrol_of(mode="loop")
+    p, said, clock = patrol_of(mode="loop", skip_stuck=True)
     for _ in range(int(pt.NO_PROGRESS_S * 10) + 50):
         clock.t += 0.1
         p.poll(Events(), crop_at(-1.0, -1.0))
@@ -261,7 +300,7 @@ def test_the_clock_runs_only_on_decisions_in_auto_not_on_manual_passes():
 
 
 def test_every_waypoint_skipped_in_a_row_pauses_the_patrol():
-    p, said, clock = patrol_of(mode="loop")
+    p, said, clock = patrol_of(mode="loop", skip_stuck=True)
     drive_ticks(p, clock, 4 * (pt.NO_PROGRESS_S + 0.5) + 1.0, xy=(-5.0, -5.0))
     assert not p.running and p.skipped == 4 and p.reached()
     assert any("every waypoint" in a[2].lower() for a in said)
@@ -302,7 +341,7 @@ def test_a_waypoint_added_on_the_fresh_map_rides_the_merge_onto_the_old_one():
 
 
 def test_a_reseed_does_not_burn_the_clock_while_the_waypoint_is_off_the_map():
-    p, said, clock = patrol_of(mode="loop")
+    p, said, clock = patrol_of(mode="loop", skip_stuck=True)
     drive_ticks(p, clock, pt.NO_PROGRESS_S - 2.0, xy=(-1.0, -1.0))
     # Lost: the crop is not present, the model gets no goal, nothing counts.
     for _ in range(100):
@@ -313,14 +352,27 @@ def test_a_reseed_does_not_burn_the_clock_while_the_waypoint_is_off_the_map():
 
 # --- across a restart ------------------------------------------------------------------
 
-def room_view(shift=(0.0, 0.0)):
-    """A MapView of a 6 x 4 m room drawn round the boot pose, moved by shift."""
+def room_view(shift=(0.0, 0.0), yaw=0.0):
+    """A MapView of a 6 x 4 m room with furniture off to the sides, drawn
+    round the boot pose, turned by yaw and moved by shift."""
+    from crawler.mapping import trackfit as tf
     res = 0.1
-    codes = np.full((80, 60), gr.FREE, np.uint8)
-    codes[0, :] = codes[-1, :] = codes[:, 0] = codes[:, -1] = gr.OCCUPIED
-    codes[30:50, 25] = gr.OCCUPIED        # a cupboard, so it is not a bare box
-    return rn.MapView(t=0.0, version=1, x0=-2.0 + shift[0], y0=-2.0 + shift[1],
-                      res=res, codes=codes)
+    walls, free = [], []
+    for i in range(60):
+        for j in range(40):
+            p = (-2.0 + (i + 0.5) * res, -2.0 + (j + 0.5) * res)
+            edge = i in (0, 59) or j in (0, 39) or (i == 12 and 8 <= j < 28) \
+                or (j == 30 and 40 <= i < 52) or (i == 50 and 2 <= j < 18) \
+                or (j == 8 and 20 <= i < 35)
+            (walls if edge else free).append(p)
+    w = tf.transform((yaw,) + tuple(shift), walls)
+    f = tf.transform((yaw,) + tuple(shift), free)
+    x0, y0 = np.concatenate([w, f]).min(0) - 0.5
+    codes = np.zeros((90, 90), np.uint8)
+    for pts, code in ((f, gr.FREE), (w, gr.OCCUPIED)):
+        i, j = np.floor((pts - (x0, y0)) / res).astype(int).T
+        codes[i, j] = code
+    return rn.MapView(t=0.0, version=1, x0=float(x0), y0=float(y0), res=res, codes=codes)
 
 
 def saved_patrol(tmp_path, view=None):
@@ -334,39 +386,82 @@ def saved_patrol(tmp_path, view=None):
 def test_the_list_is_saved_and_comes_back_on_the_same_map(tmp_path):
     store, _ = saved_patrol(tmp_path)
     data = json.loads((tmp_path / "patrol.json").read_text())
-    assert data["frame"] == 0 and len(data["points"]) == 4 and data["walls"]
+    assert data["version"] == 2 and len(data["points"]) == 4 and data["walls"]
     said = []
     q = pt.Patrol(say=lambda *a: said.append(a), store=store, map_view=room_view,
                   clock=Clock())
-    assert q.waypoints() == [], "nothing until the map is checked"
+    assert q.waypoints() == [], "nothing until it is fitted"
     visit(q, (0.3, 0.1))
-    assert [w[:2] for w in q.waypoints()] == SQUARE and q.mode == "patrol"
-    assert q.use == "patrol" and not q.running, "restored paused: Start drives it"
-    assert any("restored" in a[2].lower() for a in said)
+    got = [w[:2] for w in q.waypoints()]
+    assert np.allclose(got, SQUARE, atol=0.1) and q.mode == "patrol"
+    assert q.use == "patrol" and not q.running, "placed paused: Start drives it"
+    assert q.fit_state["state"] == "placed"
+    assert any("placed" in a[2] for a in said)
 
 
-def test_a_restart_on_a_different_map_clears_the_list_with_a_journal_line(tmp_path):
+def test_a_restart_with_the_map_turned_and_moved_puts_the_list_where_it_was_in_the_room(
+        tmp_path):
+    from crawler.mapping import trackfit as tf
     store, _ = saved_patrol(tmp_path)
+    boot = (math.radians(-75), 1.5, -2.0)     # where the old origin is on the new map
+    q = pt.Patrol(store=store, map_view=lambda: room_view(shift=boot[1:], yaw=boot[0]),
+                  clock=Clock())
+    visit(q, (0.0, 0.0))
+    got = np.array([w[:2] for w in q.waypoints()])
+    assert np.allclose(got, tf.transform(boot, SQUARE), atol=0.12)
+
+
+def test_a_restart_somewhere_else_keeps_the_track_unplaced_and_the_file_as_it_was(tmp_path):
+    store, _ = saved_patrol(tmp_path)
+    before = (tmp_path / "patrol.json").read_text()
     said = []
-    q = pt.Patrol(say=lambda *a: said.append(a), store=store,
-                  map_view=lambda: room_view(shift=(0.7, -0.4)), clock=Clock())
+    clock = Clock()
+    elsewhere = rn.MapView(t=0.0, version=1, x0=-3.0, y0=-3.0, res=0.1,
+                           codes=np.pad(np.full((58, 58), gr.FREE, np.uint8), 1,
+                                        constant_values=gr.OCCUPIED))
+    q = pt.Patrol(say=lambda *a: said.append(a), store=store, map_view=lambda: elsewhere,
+                  clock=clock)
+    for _ in range(5):
+        visit(q, (0.0, 0.0))
+        clock.t += pt.FIT_STALE_S
+    assert q.waypoints() == [] and q.fit_state["state"] == "unsure"
+    assert q.fit_state["tries"] >= 2, "tried again"
+    assert q.page_state()["pending"]["points"] == [list(xy) for xy in SQUARE]
+    assert (tmp_path / "patrol.json").read_text() == before, "never written over"
+    assert sum("not placed yet" in a[2] for a in said) == 1, "said once, not every try"
+
+
+def test_an_unplaced_track_is_placed_by_hand_through_the_transform_given(tmp_path):
+    store, _ = saved_patrol(tmp_path)
+    q = pt.Patrol(store=store, map_view=lambda: None, clock=Clock())
     visit(q, (0.0, 0.0))
     assert q.waypoints() == []
-    assert any("cleared" in a[2].lower() and "map" in a[2] for a in said)
-    assert json.loads((tmp_path / "patrol.json").read_text())["points"] == []
+    q.poll(Events(cmd("place", yaw=math.pi / 2, x=1.0, y=0.0)), crop_at(0.0, 0.0))
+    got = [w[:2] for w in q.waypoints()]
+    assert np.allclose(got, [(1.0, 2.0), (-1.0, 2.0), (-1.0, 0.0), (1.0, 0.0)])
+    assert q.fit_state["state"] == "placed" and not q.running
+    assert json.loads((tmp_path / "patrol.json").read_text())["points"] == [
+        list(map(float, xy)) for xy in got]
 
 
-def test_a_list_only_on_a_fresh_map_frame_is_cleared_on_restart(tmp_path):
-    store = pt.Store(str(tmp_path / "patrol.json"), background=False)
-    p = pt.Patrol(store=store, map_view=room_view, clock=Clock())
-    lost = link(1, 0, 1, (0.0, 0.0, 0.0), err_m=0.2)
-    p.poll(Events(cmd("edit"), pose(1.0, 1.0)), crop_at(frame=1, links=[lost]))
-    assert json.loads((tmp_path / "patrol.json").read_text())["frame"] == 1
-    said = []
-    q = pt.Patrol(say=lambda *a: said.append(a), store=store, map_view=room_view,
+def test_a_version_1_file_is_read_and_one_on_another_frame_keeps_its_points(tmp_path):
+    view = room_view()
+    from crawler.autopilot.patrol import _occupied_points
+    walls = _occupied_points(view).tolist()
+    path = tmp_path / "patrol.json"
+    path.write_text(json.dumps({"version": 1, "frame": 0, "mode": "loop",
+                                "points": [list(xy) for xy in SQUARE], "walls": walls}))
+    q = pt.Patrol(store=pt.Store(str(path), background=False), map_view=lambda: view,
                   clock=Clock())
     visit(q, (0.0, 0.0))
-    assert q.waypoints() == [] and any("map 1" in a[2] for a in said)
+    assert np.allclose([w[:2] for w in q.waypoints()], SQUARE, atol=0.1)
+    path.write_text(json.dumps({"version": 1, "frame": 3, "mode": "loop",
+                                "points": [list(xy) for xy in SQUARE], "walls": walls}))
+    q = pt.Patrol(store=pt.Store(str(path), background=False), map_view=lambda: view,
+                  clock=Clock())
+    visit(q, (0.0, 0.0))
+    assert q.waypoints() == [] and q.fit_state["state"] == "no walls"
+    assert len(q.page_state()["pending"]["points"]) == 4, "kept, to place by hand"
 
 
 def test_a_store_that_cannot_be_read_is_an_empty_patrol(tmp_path):
@@ -375,6 +470,19 @@ def test_a_store_that_cannot_be_read_is_an_empty_patrol(tmp_path):
     q = pt.Patrol(store=store, map_view=room_view, clock=Clock())
     visit(q, (0.0, 0.0))
     assert q.waypoints() == []
+
+
+def test_the_walls_ride_a_reseed_with_the_waypoints(tmp_path):
+    store, p = saved_patrol(tmp_path)
+    lost = link(1, 0, 1, (2.0, 1.0, math.pi / 2), err_m=0.1)
+    visit(p, (0.0, 0.0), frame=1, links=[lost])
+    data = json.loads((tmp_path / "patrol.json").read_text())
+    old = room_view()
+    from crawler.autopilot.patrol import _occupied_points
+    from crawler.mapping import trackfit as tf
+    want = tf.transform((math.pi / 2, 2.0, 1.0), _occupied_points(old))
+    assert np.allclose(np.array(data["walls"])[:5], want[:5], atol=1e-3)
+    assert np.allclose(data["points"], tf.transform((math.pi / 2, 2.0, 1.0), SQUARE))
 
 
 # --- telemetry -------------------------------------------------------------------------
@@ -495,7 +603,7 @@ def test_the_drive_layout_has_a_button_for_every_patrol_command_and_draws_the_li
         assert ck.parse_command(json.dumps(msg).encode()) is not None, key
         assert pt.Patrol(clock=Clock()).command(msg) is not None, key
         sent.add(msg["cmd"])
-    assert sent == set(pt.COMMANDS)
+    assert sent == set(pt.BUTTON_COMMANDS)
     assert cfg["3D!slam"]["topics"]["/patrol/marker"]["visible"]
 
 

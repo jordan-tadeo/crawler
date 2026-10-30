@@ -105,6 +105,8 @@ RECORD_HOLD_SECONDS = 1.0
 # --goal's patrol waypoints, kept across a restart (autopilot/patrol.py says
 # when they come back). Under log/, which is untracked.
 PATROL_FILE = "log/patrol.json"
+# The patrol's settings the map page sets (the stuck-waypoint skip).
+PATROL_SETTINGS_FILE = "log/patrol_settings.json"
 
 # --slam's map, saved as it goes for a record of the run and loaded at boot
 # only with --slam-map-restore (mapping/mapfile.py says why). Under log/
@@ -810,7 +812,8 @@ class AutoPilot:
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
                  slam=None, nav=False, map_source=None, goals=None,
                  fallback_path=None, clicks=None, patrol_store=None,
-                 lidar_near=False, path=None, person=None, tilt_veto=True):
+                 lidar_near=False, path=None, person=None, tilt_veto=True,
+                 library=None, fitter=None, skip_stuck=False, patrol_settings=None):
         self.vecon = vecon
         # --no-tilt-veto turns the policy's tilt veto off (driver.TiltVeto).
         # Set on every policy driver this builds.
@@ -841,11 +844,17 @@ class AutoPilot:
         # nothing sets. --goal's click listener (nav/click.ClickGoals),
         # drained into it every pass in every mode by goal_step(): a click
         # or a patrol command before auto is what auto drives to.
-        # patrol_store (a patrol.Store) keeps the waypoints across a restart.
+        # patrol_store (a patrol.Store) keeps the waypoints across a restart;
+        # library (tracks.Library) the named tracks; fitter
+        # (trackfit.Fitter) fits a saved track onto the fresh map.
         self.clicks = clicks
         self.goal = (patrol.Patrol(say=logger.log, store=patrol_store,
-                                   map_view=getattr(slam, "map", None))
+                                   map_view=getattr(slam, "map", None),
+                                   library=library, fitter=fitter,
+                                   skip_stuck=skip_stuck, settings=patrol_settings)
                      if clicks is not None else goal.Goal())
+        # The patrol itself, under the FollowSwitch if there is one.
+        self.patrol = self.goal if clicks is not None else None
         # --goal's path planner (autopilot/pathgoal.PathPlanner), on unless
         # --no-path: the goal model is fed a point along a path round the
         # walls to self.goal instead of the goal itself. Planned on its own
@@ -1311,7 +1320,8 @@ def drive_pad(joystick, vecon, log, split=False, limits=None, latch=None):
 
 def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                  markpad=None, steer=None, session=None, tap=None,
-                 record_button=None, clock=time.monotonic, takeover=None):
+                 record_button=None, clock=time.monotonic, takeover=None,
+                 page=None):
     """Poll the controller and drive whichever mode is current.
 
     Only one mode ever has the wheels: auto runs as a step() on this thread
@@ -1647,6 +1657,10 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                         tele.offer("path_status", path.status(), now)
                     if tele.wants("path", now):
                         tele.offer("path", path.marker(), now)
+                # The map page (telemetry/buttons.py), only while it is open.
+                if (page is not None and getattr(autopilot, "patrol", None) is not None
+                        and page.wants_state(now)):
+                    page.offer_state(map_page_state(autopilot), now)
                 # Following a person: who, where, and the goal input fed.
                 if hasattr(autopilot.goal, "follow_status"):
                     if tele.wants("follow_status", now):
@@ -2025,6 +2039,14 @@ def parse_args(argv=None):
         help="with --goal, feed the goal model the goal itself instead of a "
              "point along a planned path to it",
     )
+    parser.add_argument(
+        "--patrol-skip-stuck",
+        action="store_true",
+        help="with --goal, skip a patrol waypoint that has not been got 0.3 m "
+             "closer to in 20 s (or reached in 120 s). Only the default: the "
+             "map page's toggle is kept across a restart and wins (off unless "
+             "given: a stuck waypoint stays the goal until it is passed)",
+    )
     # Off unless named. The OAK-D's low obstacles (--voxel-map) as extra
     # solid cells in the navigator's map, never clearing a lidar cell. Off
     # because how often it sees things that are not there is not settled.
@@ -2072,16 +2094,57 @@ def nav_goals(args, log):
         return None, None
 
 
-def start_buttons(args, tele, goals, log):
-    """The button page (telemetry/buttons.ButtonPage), or None. Only when the
-    Foxglove server is up and takes client commands, since the page's
-    buttons go through it; --buttons-port 0 is off."""
+def start_buttons(args, tele, goals, log, slam=None, library=None):
+    """The phone pages (telemetry/buttons.ButtonPage), or None. Only when the
+    Foxglove server is up and takes client commands, since the buttons go
+    through it; --buttons-port 0 is off. The map page as well when there is
+    a SLAM map to draw."""
     port = getattr(args, "buttons_port", 0)
     if not port or goals is None or not getattr(tele, "serving", False):
         return None
+    from crawler.nav import truck
     from crawler.telemetry import buttons as bt
-    page = bt.ButtonPage(logger=log, host=tele.host, port=port, ws_port=tele.port)
+    page = bt.ButtonPage(logger=log, host=tele.host, port=port, ws_port=tele.port,
+                         goals=goals if slam is not None else None,
+                         map_source=getattr(slam, "map", None), library=library,
+                         turn_radius_m=truck.DRIVEN_TURN_RADIUS_M)
     return page if page.start() else None
+
+
+TRACKS_DIR = "log/tracks"
+
+
+def track_library(args, slam, log):
+    """--goal's named tracks (autopilot/tracks.Library) and the fitter that
+    puts a saved one on the fresh map (mapping/trackfit.Fitter, on a niced
+    thread of its own), or (None, None). The fitter needs --slam and
+    scipy; without it a saved track waits to be placed by hand."""
+    if not getattr(args, "goal", False):
+        return None, None
+    from crawler.autopilot import tracks
+    library = tracks.Library(lg.log_path(TRACKS_DIR))
+    fitter = None
+    if slam is not None:
+        try:
+            import scipy.fft, scipy.ndimage, scipy.spatial  # noqa: F401  (trackfit's)
+            from crawler.mapping import trackfit
+            fitter = trackfit.Fitter()
+        except Exception as e:
+            log.log("warning", "Patrol", f"No track fitting ({e}): a saved track "
+                    "is placed by hand on the map page")
+    return library, fitter
+
+
+def map_page_state(autopilot):
+    """The map page's snapshot, built on the control loop's thread: the
+    patrol's page_state() and the planner's path."""
+    out = {"patrol": autopilot.patrol.page_state()}
+    path = getattr(autopilot, "path", None)
+    if path is not None:
+        m = path.marker()
+        out["path"] = [[round(x, 2), round(y, 2)] for x, y in m.get("path", [])]
+        out["aim"] = list(m["aim"]) if m.get("aim") is not None else None
+    return out
 
 
 def nav_map_source(args, slam, lidar, voxels, log):
@@ -2216,7 +2279,9 @@ def main(argv=None):
     channels_live = args.telemetry or args.record
     if channels_live:
         tele.start(serve=args.telemetry)
-    buttons = start_buttons(args, tele, goals, log)
+    # The phone pages start once the autopilot is built (below): the map
+    # page draws its patrol and the SLAM map.
+    buttons = None
 
     # One camera for the whole process, and constructing it opens nothing --
     # no USB, no depthai import, no risk. The rectified mono stream is only
@@ -2296,6 +2361,7 @@ def main(argv=None):
                 f"{pathgoal.LOOKAHEAD_M:g} m along a path round the walls to "
                 "the goal, planned on the SLAM map (--no-path for the goal itself)")
     pantilt = start_pantilt(args, vecon, tele if channels_live else None, log)
+    library, fitter = track_library(args, slam, log)
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           fallback_path=args.fallback_policy,
                           lidar=lidar, slam=slam, nav=args.nav,
@@ -2306,7 +2372,12 @@ def main(argv=None):
                                         if args.goal else None),
                           lidar_near=args.lidar_near, path=path_planner,
                           tilt_veto=args.tilt_veto,
-                          person=follow_person(args, pantilt, lidar, slam, hub, log))
+                          person=follow_person(args, pantilt, lidar, slam, hub, log),
+                          library=library, fitter=fitter,
+                          skip_stuck=args.patrol_skip_stuck,
+                          patrol_settings=(patrol.Store(lg.log_path(PATROL_SETTINGS_FILE))
+                                           if args.goal else None))
+    buttons = start_buttons(args, tele, goals, log, slam=slam, library=library)
 
     # Who gets the device opened at startup, and who waits for it:
     #
@@ -2370,7 +2441,7 @@ def main(argv=None):
     if not args.dashboard:
         try:
             control_loop(joystick, vecon, autopilot, modes, log, stop_event,
-                         tele, markpad, session=session, tap=tap)
+                         tele, markpad, session=session, tap=tap, page=buttons)
         finally:
             # After control_loop's own finally, which is what disarms the ESC.
             # The camera and the telemetry server go last because they are the
@@ -2406,7 +2477,7 @@ def main(argv=None):
         target=control_loop,
         args=(joystick, vecon, autopilot, modes, log, stop_event, tele,
               markpad),
-        kwargs={"session": session, "tap": tap},
+        kwargs={"session": session, "tap": tap, "page": buttons},
         daemon=True,
     )
     worker.start()

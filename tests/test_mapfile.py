@@ -182,15 +182,24 @@ def test_a_map_with_no_walls_near_its_pose_is_not_restored():
     assert not slam.started and slam.grid.bounds() is None
 
 
-def test_the_patrols_restart_check_passes_on_the_restored_map():
+def test_a_saved_track_fits_the_restored_map_where_it_was():
+    pytest.importorskip("scipy")
+    from crawler.mapping import trackfit as tf
     slam = mapped()
     walls = pt._occupied_points(rn.map_view(slam, 6.0))
     new, imu = booted(slam.snapshot())
-    # Before it has found itself, and after.
-    assert pt.walls_match(walls, rn.map_view(new, 100.0)) >= 0.99
-    put_down(new, imu, path_pose(6.0), 20, 100.0)
-    assert new.recoveries == 1
-    assert pt.walls_match(walls, rn.map_view(new, 102.0)) >= pt.MATCH_SHARE
+    # Before it has found itself, and after: the best fit is no turn and no
+    # shift, every wall agreeing. (It is not placed on its own: this test
+    # room is near enough the same turned round that a second place scores
+    # well too, and that is trackfit's to refuse.)
+    for view in (rn.map_view(new, 100.0), None):
+        if view is None:
+            put_down(new, imu, path_pose(6.0), 20, 100.0)
+            assert new.recoveries == 1
+            view = rn.map_view(new, 102.0)
+        fit = tf.fit(walls, view)
+        assert fit is not None and fit.share > 0.95
+        assert abs(fit.yaw) < math.radians(1.5) and math.hypot(fit.x, fit.y) < 0.1
 
 
 class Said:
