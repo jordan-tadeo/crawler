@@ -125,11 +125,12 @@ def test_good_fits_the_gyro_never_saw_do_not_turn_the_reckoning():
     # says it never turned. The reckoning the shelf is held to goes on from
     # before them, so the truck is merged where it is: reckoned from the
     # last of them, the true heading is out of the gate and the twin is too.
-    # The fits are held to the gyro now (slam.py GYRO_LOST_DEG): the truck is
-    # lost before the third, and not found again on their heading either.
+    # The fits are held to the gyro now (slam.py GYRO_LOST_DEG): from the
+    # second nothing is written, and the truck goes blind before it is lost
+    # for them.
     slam, out, truth = lost_in_the_box(slip_deg=24.0)
     k = next(i for i, r in enumerate(out) if r.reseed == "lost")
-    assert slam.gyro_lost == 1
+    assert max(yaw_off(r.yaw, 0.0) for r in out[:k]) > 20.0, "it slipped"
     assert max(yaw_off(r.yaw, 0.0) for r in out[:k] if r.written) \
         <= sl.GYRO_LOST_DEG, "written on the slipped heading"
     assert out[-1].reseed == "merged", "it found the shelved map again"

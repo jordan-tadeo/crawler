@@ -769,6 +769,39 @@ def test_fits_that_turn_the_truck_where_the_gyro_did_not_are_lost():
         [round(d) for d in off]
 
 
+def test_fits_off_the_gyro_for_a_moment_are_not_written_and_not_lost():
+    # A parting that comes back (the gyro a scan behind on a bump, fits on
+    # the wrong walls for a few scans) holds the writes, not the truck: here
+    # the truck stands still, the gyro reads nothing, and the fits turn it 4
+    # degrees a scan out to 20 and back. Nothing is written past
+    # GYRO_LOST_DEG, nor on the way back until it is under half that; it is
+    # never lost, and written again once it is back.
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    still = path_pose(6.0)
+    steps = [4.0 * k for k in range(1, 6)] + [20.0] * 3 \
+        + [20.0 - 4.0 * k for k in range(1, 6)] + [0.0] * 10
+    out = []
+    for k, deg in enumerate(steps):
+        t = 6.0 + (k + 1) * PERIOD
+        for j in range(10):
+            imu.add(t - PERIOD + (j + 1) * 0.01, (0.0, 0.0, 0.0), LEVEL)
+        turned = still + np.array([0.0, 0.0, math.radians(deg)])
+        out.append(slam.step(t, scan_at(t, lambda _t: turned)))
+    assert not any(r.state == sl.LOST for r in out)
+    assert slam.gyro_lost == 0
+    off = [round(math.degrees(abs(wrap(r.yaw - still[2])))) for r in out]
+    assert max(off) >= 16, off
+    held = next(k for k, r in enumerate(out) if r.why == "off gyro")
+    seen = list(zip(off, [r.written for r in out]))
+    assert max(d for d, w in seen if w) <= sl.GYRO_LOST_DEG, seen
+    # The sum leaks while it is held, so it is under half a little early.
+    assert max(d for d, w in seen[held:] if w) <= sl.GYRO_LOST_DEG / 2 + 2, \
+        seen
+    assert all(r.written for r in out[-5:])
+
+
 def test_a_map_that_does_not_fit_its_next_scan_is_started_again():
     # 182749Z: the first scans were the truck at rest, then it was carried
     # 1.7 m before the mapper's first result. The map was those scans and
