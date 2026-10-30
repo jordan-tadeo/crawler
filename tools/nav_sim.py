@@ -19,9 +19,9 @@ Scenarios:
   rove        no map and no goal, for --rove-minutes: frontier exploration
 
 The safety layer here is a stand-in for the real one (crawler/nav/driver.py
-uses the real one): the forward floor is any solid cell in a box
-FORWARD_FLOOR_M ahead of the bumper and the truck's width, the rear stop is
-the simulated lidar's rear sector, STUCK is a forward commanded for a second
+uses the real one): the forward floor is any solid cell in a box from the
+bumper out to FORWARD_FLOOR_M off the lens, the probes' width, the rear stop
+is the simulated lidar's rear sector, STUCK is a forward commanded for a second
 that went nowhere, and the back-out reverses at lock at ESCAPE_SPEED until
 the front opens, the rear stop, or its cap. The same order and the same
 numbers as the car; the camera itself is not simulated.
@@ -96,8 +96,11 @@ HOLD_SETTLE_S = 0.5
 CLOSEST_OK_M = nv.ARRIVE_M + nv.AIM_CLEAR_M - (cmod.INSCRIBED_M + 0.02) + 0.1
 
 
-def _probe_box(length):
-    xs = np.arange(tk.FRONT_M + 0.02, tk.FRONT_M + length, 0.025)
+def _probe_box(lens_m):
+    """The box a camera distance `lens_m` reaches, from the bumper out. The
+    probes measure off the lens (tk.LENS_M ahead of the pose), not the
+    bumper."""
+    xs = np.arange(tk.FRONT_M + 0.02, tk.LENS_M + lens_m, 0.025)
     ys = np.arange(-PROBE_HALF_M, PROBE_HALF_M + 1e-9, 0.025)
     gx, gy = np.meshgrid(xs, ys, indexing="ij")
     return gx.ravel(), gy.ravel()
@@ -305,7 +308,7 @@ def run_episode(world, scenario, start, goal=None, level="measured", seed=0,
                                 safety.begin(now, "standoff")
                             else:
                                 safety.causes["standoff"] += 1
-                                nav.blocked_ahead(now, est, tk.FRONT_M + nd.FLOOR_AHEAD_M)
+                                nav.blocked_ahead(now, est, nd.FLOOR_AHEAD_M)
                     else:
                         safety.standoff_since = None
                     if throttle < 0 and rear is not None and rear < dv.REAR_STOP_CLEAR_MM:

@@ -131,15 +131,23 @@ _px, _py = np.meshgrid(np.linspace(REAR_M, FRONT_M, _nx),
 RECT_POINTS = np.stack([_px.ravel(), _py.ravel()], 1)
 RECT_SLACK_M = 0.5 * math.hypot(LENGTH_M / (_nx - 1), 2 * HALF_WIDTH_M / (_ny - 1))
 
+# The camera's lens, ahead of the pose (driver.LENS_X_MM). The probes
+# measure from here, not from the bumper, which is LENS_TO_FRONT_BUMPER_MM
+# further on: a probe distance is put in the pose's frame as LENS_M plus it.
+LENS_M = dv.LENS_X_MM / 1000.0
+
 # The forward floor's reach, as the planner sees it: the box the camera's
 # floor veto (driver.ForwardFloorVeto) holds a forward for, from the bumper
-# out to driver.FORWARD_FLOOR_MM (363 mm at the 0.4 forward cap) and as wide
-# as its outermost probes (0.153 m a side at 400 mm). A forward path that
-# puts something in this box is one the veto will stop, so the planner keeps
-# it clear except on the last stretch to the goal (planner.PROBE_FREE_M).
+# out to driver.FORWARD_FLOOR_MM (363 mm at the 0.4 forward cap) off the
+# LENS, so 335 mm past the bumper, and as wide as its outermost probes
+# (0.153 m a side at 400 mm). A forward path that puts something in this box
+# is one the veto will stop, so the planner keeps it clear except on the last
+# stretch to the goal (planner.PROBE_FREE_M). FLOOR_REACH_M is where it ends,
+# ahead of the pose.
 FLOOR_PROBE_M = dv.FORWARD_FLOOR_MM / 1000.0
+FLOOR_REACH_M = LENS_M + FLOOR_PROBE_M
 FLOOR_PROBE_HALF_M = 0.153
-_fx = np.arange(FRONT_M + 0.02, FRONT_M + FLOOR_PROBE_M + 1e-9, 0.03)
+_fx = np.arange(FRONT_M + 0.02, FLOOR_REACH_M + 1e-9, 0.03)
 _fy = np.linspace(-FLOOR_PROBE_HALF_M, FLOOR_PROBE_HALF_M, 7)
 _fx, _fy = np.meshgrid(_fx, _fy, indexing="ij")
 PROBE_POINTS = np.stack([_fx.ravel(), _fy.ravel()], 1)

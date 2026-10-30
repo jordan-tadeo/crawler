@@ -528,7 +528,8 @@ def test_a_plan_never_drives_forward_with_the_floor_veto_box_on_a_wall():
     assert m.any()
     assert cm.probe_clearance(p[m, 0], p[m, 1], p[m, 2]).min() >= pl.PROBE_CLEAR_M
     # And the box itself: on the wall it reads 0, a metre short of it more.
-    assert cm.probe_clearance(1.6, 1.5, 0.0) == 0.0
+    # The wall's face is x 2.2; the box reaches tk.FLOOR_REACH_M, 0.598 m.
+    assert cm.probe_clearance(1.65, 1.5, 0.0) == 0.0
     assert cm.probe_clearance(0.8, 1.5, 0.0) > 0.3
 
 

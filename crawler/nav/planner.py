@@ -40,7 +40,7 @@ path, and the search ends there instead of creeping up on the goal a
 PRIM_STEP_M at a time.
 
 The floor veto. The camera holds any forward with something in a box
-FORWARD_FLOOR_MM past the bumper (truck.PROBE_POINTS), so a path that
+FORWARD_FLOOR_MM off the lens (truck.PROBE_POINTS), so a path that
 noses up to a wall before turning away from it is a path the car stops on
 and then backs out of. With Params.floor_probe (off by default), forward
 moves keep that box PROBE_CLEAR_M clear, except within PROBE_FREE_M of the

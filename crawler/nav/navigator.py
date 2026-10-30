@@ -86,7 +86,6 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 
-from crawler.autopilot import driver as dv
 from crawler.nav import costmap as cmod
 from crawler.nav import follower as fl
 from crawler.nav import frontier as fr
@@ -141,11 +140,13 @@ CLOSEST_REFRESH_S = 2.0
 CLOSEST_SWITCH_M = 0.1
 CLOSEST_GAIN_M = 0.3
 # How clear of anything a goto's point has to be (_aim). The forward floor
-# holds a forward FORWARD_FLOOR_MM (363 mm) off the bumper, which is FRONT_M
-# ahead of the pose, so head on to a wall the pose stops about 0.63 m off it,
-# and a point nearer the wall than ARRIVE_M inside that could never be
-# arrived at that way; 7 cm more for the brake and the pose's noise. 0.45 m.
-AIM_CLEAR_M = tk.FRONT_M + dv.FORWARD_FLOOR_MM / 1000.0 - ARRIVE_M + 0.07
+# holds a forward FORWARD_FLOOR_MM (363 mm) off the LENS, which is LENS_M
+# (235 mm) ahead of the pose, so head on to a wall the pose stops about
+# 0.60 m off it (truck.FLOOR_REACH_M), and a point nearer the wall than
+# ARRIVE_M inside that could never be arrived at that way; 7 cm more for the
+# brake and the pose's noise. 0.42 m. It was 0.45, which took the 363 as off
+# the bumper (FRONT_M, 28 mm further on).
+AIM_CLEAR_M = tk.FLOOR_REACH_M - ARRIVE_M + 0.07
 # A forward the camera's floor held off for driver.STANDOFF_S is something
 # the lidar map does not have (a shoe under the lidar's plane): a disc of
 # BLOCK_R_M is put there in the cost map for BLOCK_S and the path planned
@@ -402,8 +403,8 @@ class Navigator:
         self.reason = "takeover"
 
     def blocked_ahead(self, now, pose, ahead_m):
-        """The floor has held a forward: something `ahead_m` past the pose's
-        front bumper that the map may not have. Planned round for BLOCK_S."""
+        """The floor has held a forward: something `ahead_m` ahead of the
+        pose that the map may not have. Planned round for BLOCK_S."""
         x, y, yaw = (float(v) for v in pose[:3])
         d = float(ahead_m) + BLOCK_R_M
         self.blocks = [b for b in self.blocks if b[2] > now]
@@ -896,7 +897,7 @@ class Navigator:
         A goal the footprint fits on is the goal however near a wall. A
         point instead of the goal is one AIM_CLEAR_M clear of anything where
         there is one (the footprint's clearance where there is not): facing
-        a wall the forward floor stops the truck with its pose about 0.63 m
+        a wall the forward floor stops the truck with its pose about 0.60 m
         off it, and a point nearer the wall than that could not be arrived
         at head on. `keep`, the point a closest goto is
         already going to, stays the point while it can still be stood on and

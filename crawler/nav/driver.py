@@ -53,9 +53,10 @@ from crawler.nav import truck as tk
 # 0.25 is 0.22 m/s and always moves.
 MIN_FORWARD = 0.25
 STANDOFF_S = 1.0
-# Where the floor's hold is marked: the forward floor's own distance past
-# the bumper.
-FLOOR_AHEAD_M = dv.FORWARD_FLOOR_MM / 1000.0
+# Where the floor's hold is marked, ahead of the pose: the forward floor's
+# own distance off the lens (truck.FLOOR_REACH_M). It was that distance past
+# the bumper, 28 mm further out than the veto reaches.
+FLOOR_AHEAD_M = tk.FLOOR_REACH_M
 
 
 def request_for(out, forward_speed, max_turn=tk.MAX_TURN):
@@ -248,7 +249,7 @@ class NavDriver(dv.Driver):
                 print("Standoff with the floor - planning round it.")
                 if self.last_pose is not None:
                     self.nav.blocked_ahead(now, self.last_pose,
-                                           tk.FRONT_M + FLOOR_AHEAD_M)
+                                           FLOOR_AHEAD_M)
         else:
             self._standoff_since = None
 
