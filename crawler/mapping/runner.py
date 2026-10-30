@@ -34,6 +34,8 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 
+from crawler import workers
+
 MODE_THREAD = "thread"
 MODE_PROCESS = "process"
 MODES = (MODE_THREAD, MODE_PROCESS)
@@ -342,7 +344,10 @@ class SlamRunner:
                     self.nav_half_m)
             self._worker = threading.Thread(target=_work, args=args,
                                             name="slam", daemon=True)
-        self._worker.start()
+        if self.mode == MODE_PROCESS:
+            workers.start(self._worker)
+        else:
+            self._worker.start()
         self._pump = threading.Thread(target=self._pump_loop,
                                       name="slam-pump", daemon=True)
         self._pump.start()

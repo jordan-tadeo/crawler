@@ -74,6 +74,7 @@ import os
 import threading
 import time
 
+from crawler import workers
 from crawler.vision.track import Detection
 
 PERSON_CLASS = 0
@@ -177,17 +178,10 @@ class OnnxPersonDetector:
         return decode(out, w, h, scale, px, py, self.conf, self.iou), dt
 
 
-def _lower_priority(nice):
-    try:
-        os.nice(int(nice))
-    except Exception:
-        pass
-
-
 def _serve(conn, model_path, conf, iou, threads, nice, make=None):
     """The worker: load, say ready, then answer frames until the pipe closes."""
     if nice:
-        _lower_priority(nice)
+        workers.lower_priority(nice)
         # One core: OpenCV's resize would otherwise fan out over all four.
         # The thread worker passes nice 0, so this is the process's alone.
         try:
@@ -252,7 +246,7 @@ class DetectorClient:
             parent, child = ctx.Pipe()
             self._proc = ctx.Process(target=_serve, args=(child, *self.args),
                                      name="person-detect", daemon=True)
-            self._proc.start()
+            workers.start(self._proc)
             child.close()
         else:
             import multiprocessing as mp

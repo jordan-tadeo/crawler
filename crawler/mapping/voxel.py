@@ -41,6 +41,7 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 
+from crawler import workers
 from crawler.autopilot import driver as dv
 
 # ---- the camera ---------------------------------------------------------------
@@ -598,11 +599,7 @@ def _work(inbox, outbox, publish_every_s, nice=0):
     the inbox ends it. `nice` only for a process: a thread's would be the
     whole service's."""
     if nice:
-        try:
-            import os
-            os.nice(nice)
-        except Exception:
-            pass
+        workers.lower_priority(nice)
     m = _Maps(publish_every_s)
     while True:
         item = inbox.get()
@@ -685,7 +682,10 @@ class VoxelMapper:
             args = (self._inbox, self._outbox, PUBLISH_EVERY_S)
             self._worker = threading.Thread(target=_work, args=args,
                                             name="voxel", daemon=True)
-        self._worker.start()
+        if self.mode == MODE_PROCESS:
+            workers.start(self._worker)
+        else:
+            self._worker.start()
         self._feeder = threading.Thread(target=self._feed_loop,
                                         name="voxel-feed", daemon=True)
         self._feeder.start()
