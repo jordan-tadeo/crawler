@@ -205,6 +205,29 @@ def test_a_gap_too_tight_for_the_wide_clearance_is_still_planned_through_at_the_
     assert p.status()["clear_m"] == pytest.approx(tk.HALF_WIDTH_M + pgo.NARROW_MARGIN_M)
 
 
+def test_a_gap_only_the_truck_fits_is_taken_when_the_way_round_is_much_longer():
+    # A wall across the room with a 0.45 m gap in it, the kind the truck
+    # drives through (0.41-0.44 m, 2026-10-30) but the wide clearance keeps
+    # off, and a wide opening further along. Far along (2.7 m longer round),
+    # the gap: with the narrow only a fallback it went round. Nearer (1.6 m
+    # longer round), the opening: the toll is worth more than that.
+    def walls(gap, open_at):
+        h = gap / 2.0
+        return [(1.95, -3.0, 2.05, -h), (1.95, h, 2.05, open_at),
+                (1.95, open_at + 0.8, 2.05, 3.0)]
+    narrow = tk.HALF_WIDTH_M + pgo.NARROW_MARGIN_M
+    wide = tk.HALF_WIDTH_M + pgo.WIDE_MARGIN_M
+    pts, why, cm = pgo.find_path(world(walls(0.45, 2.1)), (0.0, 0.0), (4.0, 0.0))
+    assert why == "" and np.abs(pts[:, 1]).max() < 0.3, "through the gap"
+    assert cm.inscribed == pytest.approx(narrow)
+    pts, why, cm = pgo.find_path(world(walls(0.45, 1.5)), (0.0, 0.0), (4.0, 0.0))
+    assert why == "" and np.abs(pts[:, 1]).max() > 1.5, "round by the opening"
+    assert cm.inscribed == pytest.approx(wide)
+    # Starting by a wall is not a narrow plan.
+    pts, why, cm = pgo.find_path(world([(-2.0, -3.0, 6.0, -0.25)]), (0.0, -0.05), (4.0, 1.0))
+    assert why == "" and cm.inscribed == pytest.approx(wide)
+
+
 def test_a_goal_sealed_off_has_no_path_and_says_why():
     box = [(3.0, -1.0, 5.0, -0.9), (3.0, 0.9, 5.0, 1.0), (3.0, -1.0, 3.1, 1.0), (4.9, -1.0, 5.0, 1.0)]
     pts, why, _ = pgo.find_path(world(box), (0.0, 0.0), (4.0, 0.0))

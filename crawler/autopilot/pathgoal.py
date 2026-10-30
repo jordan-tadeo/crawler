@@ -32,16 +32,19 @@ a second anyway, so planning costs no map of its own), cut to the box round
 the truck and the goal padded by PAD_M, unknown past the edge of what has
 been seen:
 
-  inflated  nav.costmap.build: a cell is out of bounds within the truck's
-            half-width plus WIDE_MARGIN_M of an occupied one (0.266 m), and
-            costs more the closer it is, out to SOFT_M, paid at SOFT_WEIGHT,
-            so a path runs down the middle of a gap and goes wide round a
-            corner instead of shaving it (the truck rubbed walls and caught
-            a wheel on corners on the old 0.196 m and 0.6 m band). With no
-            way through at that, the plan is made again at the truck's own
-            fit, NARROW_MARGIN_M (0.196 m), soft band and all, so a tight
-            doorway still routes: on the 10 cm map an opening of 0.55 m
-            and up is planned wide, down to about 0.35-0.4 m narrow.
+  inflated  nav.costmap.build: a cell within the truck's half-width plus
+            WIDE_MARGIN_M of an occupied one (0.266 m) is kept off, and one
+            further out costs more the closer it is, out to SOFT_M, paid at
+            SOFT_WEIGHT, so a path runs down the middle of a gap and goes
+            wide round a corner instead of shaving it (the truck rubbed
+            walls and caught a wheel on corners on the old 0.196 m and
+            0.6 m band). Kept off, not banned: down to the truck's own fit,
+            NARROW_MARGIN_M (0.196 m), a cell costs NARROW_TOLL on top of
+            the band's most, so a tight doorway is gone through when the
+            way round is a good deal longer, as well as when there is none:
+            on the 10 cm map an opening of 0.55 m and up is planned wide,
+            down to about 0.35-0.4 m narrow. A path through any of those
+            cells, bar the ones it starts or ends in, is a narrow plan;
             /path/status says which (clear_m).
   unknown   costed, never banned (costmap.UNKNOWN_COST), so a goal past the edge of the map gets a path
             into the unknown towards it, and the truck maps it on the way.
@@ -132,6 +135,7 @@ import numpy as np
 
 from crawler.autopilot import policy_goal as pg
 from crawler.nav import costmap as cmap
+from crawler.nav import truck as tk
 
 LOOKAHEAD_M = pg.PATH_M
 # Staged and rate-limited (the docstring's "Staged"): policy_goal.stage's
@@ -155,16 +159,25 @@ PLAN_EVERY_S = 0.5
 REPLAN_MOVE_M = 0.2
 PAD_M = 3.0
 SNAP_M = 0.6
-# Off the walls. The plan is first looked for with the truck's middle kept
-# WIDE_MARGIN_M past its half-width off every wall (hard), and paying more
-# the nearer than SOFT_M it goes (the soft band, costmap.build's, at
-# SOFT_WEIGHT), so it runs down the middle of a gap and swings wide of a
-# corner; with nothing through that way, again at costmap.MARGIN_M (the
-# narrow, the truck's own fit), so a tight doorway still routes.
+# Off the walls. The plan keeps the truck's middle WIDE_MARGIN_M past its
+# half-width off every wall where it can, paying more the nearer than SOFT_M
+# it goes (the soft band, costmap.build's, at SOFT_WEIGHT), so it runs down
+# the middle of a gap and swings wide of a corner. Nearer than that, down
+# to costmap.MARGIN_M (the narrow, the truck's own fit), a cell costs
+# 1 + NARROW_TOLL against the band's 1 at its edge, so a gap only the truck
+# fits is gone through when the way round is longer by more than the toll.
+# With the narrow only as a fallback (no way round at all), the plan went
+# round a 0.42 m gap the truck had driven through 10 times, 2.5 m further
+# on the median of 30 decisions (2026-10-30 p4242, replayed). Replayed on
+# that and p2607, any toll from 0.95 to 1.2 takes a gap on the same
+# decisions, each saving 1.35 m or more (median 2.55); under 0.9 it cuts
+# into the band at corners for nothing. Round a bare doorway in an open
+# room the way round has to be about 2.5 m longer.
 WIDE_MARGIN_M = 0.13
 SOFT_M = 1.0
 SOFT_WEIGHT = 4.0
 NARROW_MARGIN_M = cmap.MARGIN_M
+NARROW_TOLL = 1.0
 # The line to the point keeps as clear of walls as the path itself must:
 # the truck drives the chord, not the path. The plan's own clearance (its
 # cost map's inscribed), this when there is none to hand.
@@ -281,27 +294,30 @@ def _window(view, start, goal, pad=PAD_M):
 
 
 def find_path(view, start, goal, cost_weight=SOFT_WEIGHT, snap_m=SNAP_M,
-              margins=(WIDE_MARGIN_M, NARROW_MARGIN_M), soft_m=SOFT_M):
+              margins=(WIDE_MARGIN_M, NARROW_MARGIN_M), soft_m=SOFT_M,
+              toll=NARROW_TOLL):
     """(points (n, 2) or None, why, CostMap) from map point `start` to map
     point `goal` on a runner.MapView. The points run from start itself to
-    goal itself through the centres of the cells between. Tried at each of
-    `margins` in turn (the hard clearance off the walls past the truck's
-    half-width), the first with a path kept; the CostMap's `inscribed` says
-    which. With none, the last one's why."""
+    goal itself through the centres of the cells between. `margins` is the
+    wide and the narrow clearance off the walls past the truck's half-width
+    (the first and the last; one alone is a hard clearance, no band): the
+    cells between them cost `toll` on top of the band's most. The CostMap
+    is the narrow's when the path goes through those cells, bar the ones it
+    starts or ends in, the wide's otherwise; its `inscribed` says which."""
     win = _window(view, start, goal)
-    out = None
-    for margin in margins:
-        out = _find_at(win, start, goal, margin, soft_m, cost_weight, snap_m)
-        if out[0] is not None:
-            return out
-    return out
+    return _find_at(win, start, goal, margins[0], margins[-1], soft_m,
+                    cost_weight, snap_m, toll)
 
 
-def _find_at(win, start, goal, margin, soft_m, cost_weight, snap_m):
+def _find_at(win, start, goal, wide, narrow, soft_m, cost_weight, snap_m, toll):
     from crawler.nav import planner as pl
-    cm = cmap.build(win, margin=margin, inflation=soft_m)
-    g = pl.grid_distances(cm, [goal[:2]], coarsen=1, cost_weight=cost_weight,
-                          snap_m=snap_m)
+    cm = cmap.build(win, margin=wide, inflation=soft_m)
+    fit = tk.HALF_WIDTH_M + narrow
+    # Kept off at the wide, passable at the narrow: the toll band.
+    band = cm.lethal & (cm.dist >= fit)
+    search = cm._replace(cost=np.where(band, np.float32(1.0 + toll), cm.cost))
+    g = pl.grid_distances(search, [goal[:2]], coarsen=1, cost_weight=cost_weight,
+                          snap_m=snap_m, clearance=min(fit, cm.inscribed))
     if not np.isfinite(g.dist).any():
         return None, "goal boxed in", cm
     s = pl._snap(g.passable, g, start[0], start[1], snap_m)
@@ -332,6 +348,12 @@ def _find_at(win, start, goal, margin, soft_m, cost_weight, snap_m):
     pts = np.column_stack([g.origin[0] + (c[:, 0] + 0.5) * g.res,
                            g.origin[1] + (c[:, 1] + 0.5) * g.res])
     pts = np.vstack([[start[0], start[1]], pts, [goal[0], goal[1]]])
+    # Through the band on the way, not just starting or ending in it (the
+    # truck or the goal by a wall): a narrow plan.
+    inb = band[c[:, 0].astype(int), c[:, 1].astype(int)]
+    out = np.flatnonzero(~inb)
+    if not len(out) or inb[out[0]:out[-1] + 1].any():
+        cm = cmap.build(win, margin=narrow, inflation=soft_m)
     return pts, "", cm
 
 
