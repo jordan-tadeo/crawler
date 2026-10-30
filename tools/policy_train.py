@@ -300,9 +300,18 @@ GOAL_FEATURES = 16
 
 
 def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION,
-                uses_lidar=False, uses_map=False, chunk=1, uses_goal=False, map_act="relu"):
+                uses_lidar=False, uses_map=False, chunk=1, uses_goal=False, map_act="relu",
+                lowband=None):
     import torch
     from torch import nn
+
+    if lowband is not None and (lowband not in cp.LOWBAND_LAYOUTS
+                                or representation != pl.PROFILE):
+        raise ValueError(f"lowband {lowband!r}: one of {cp.LOWBAND_LAYOUTS}, "
+                         f"on a profile model")
+    # The lower band is three more rows of x under the footprint band's,
+    # through the same convs: one picture of the columns, six numbers deep.
+    x_rows = profile_rows_of(lowband)
 
     if map_act not in MAP_ACTS:
         raise ValueError(f"map activation {map_act!r}: one of {MAP_ACTS}")
@@ -461,12 +470,13 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             return self.heads(self.features(x), prev, mode, *extra)
 
     class ProfileNet(nn.Module):
-        """(1, 3, 32) -> two 1-D convs along the columns -> the heads."""
+        """(1, 3, 32), or (1, 6, 32) with the lower band -> two 1-D convs
+        along the columns -> the heads."""
 
         def __init__(self):
             super().__init__()
             self.features = nn.Sequential(
-                nn.Conv1d(cp.PROFILE_FEATURES, 16, 5, padding=2), nn.ReLU(),
+                nn.Conv1d(x_rows, 16, 5, padding=2), nn.ReLU(),
                 nn.Conv1d(16, 16, 5, stride=2, padding=2), nn.ReLU(),
                 nn.Flatten())
             self.heads = Heads(16 * (cp.PROFILE_COLUMNS // 2))
@@ -482,11 +492,38 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     model.imu_yaw = bool(imu_yaw)
     model.steer_head = steer_head
     model.chunk = int(chunk)
+    model.lowband = lowband
     return model
 
 
-def encode_frames(frames, representation):
-    return np.concatenate([pl.encode_input(representation, f) for f in frames])
+def profile_rows_of(lowband):
+    """x's rows for a profile model: the footprint band's three, and three
+    more with a lower band."""
+    return cp.PROFILE_FEATURES * (2 if lowband is not None else 1)
+
+
+def encode_frames(frames, representation, lowband=None, pitch=None):
+    """Every frame's x, as policy.encode_input draws it on the car. pitch is
+    (len(frames),) radians, a LOWBAND_FLOOR model's (frame_pitch)."""
+    if lowband is None:
+        return np.concatenate([pl.encode_input(representation, f) for f in frames])
+    if pitch is None:
+        pitch = np.zeros(len(frames))
+    return np.concatenate([pl.encode_input(representation, f, lowband, p)
+                           for f, p in zip(frames, pitch)])
+
+
+def frame_pitch(data, lowband):
+    """(len(frames),) the pitch each frame's lower band is drawn at: the
+    pitch of the tick that points at it (policy.lowband_pitch off the tick's
+    up vector, policy_eval.tick_up), 0 for a frame no tick points at and
+    for every layout but LOWBAND_FLOOR."""
+    out = np.zeros(len(data["frames"]))
+    if lowband != cp.LOWBAND_FLOOR:
+        return out
+    for i in range(len(data["frame"])):
+        out[data["frame"][i]] = pl.lowband_pitch(lowband, pe.tick_up(data, i))
+    return out
 
 
 def encode_modes(mode_in):
@@ -787,7 +824,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           straight_band=STRAIGHT_BAND, takeover_weight=TAKEOVER_WEIGHT,
           uses_lidar=False, lidar_dropout=LIDAR_DROPOUT, uses_map=False,
           map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE,
-          mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam"):
+          mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam",
+          lowband=None):
     import torch
     from torch import nn
 
@@ -797,7 +835,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
     model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar, uses_map,
-                        chunk, uses_goal, map_act)
+                        chunk, uses_goal, map_act, lowband)
     # The goals' draws on a generator of their own, so a model without the
     # goal is trained on exactly the draws it always was.
     goal_rng = np.random.default_rng([seed, 1])
@@ -980,7 +1018,7 @@ def export(model, representation, out_path, meta):
     import torch
 
     shape = ((1, 2, pl.INPUT_HEIGHT, pl.INPUT_WIDTH) if representation == pl.IMAGE
-             else (1, cp.PROFILE_FEATURES, cp.PROFILE_COLUMNS))
+             else (1, profile_rows_of(getattr(model, "lowband", None)), cp.PROFILE_COLUMNS))
     args = (torch.zeros(shape), torch.zeros((1, pl.PREV_SIZE)),
             torch.zeros((1, pl.MODE_SIZE)))
     names = ["x", "prev", pl.MODE_INPUT]
@@ -1212,6 +1250,11 @@ def main(argv=None):
     ap.add_argument("--train-on-scorecard", action="store_true",
                     help="train on the scorecard's sessions too (tools/scorecard.txt), "
                          "which every model is otherwise kept off so they stay a fair test")
+    ap.add_argument("--lowband", choices=cp.LOWBAND_LAYOUTS, default=None,
+                    help="add the bottom third of the frame as a second column profile "
+                         "under the footprint band's (column_profile.py): lower_third, "
+                         "nearest/median/valid; lower_third_floor, against a flat floor "
+                         "at the IMU's pitch")
     ap.add_argument("--chunk", type=int, default=1, metavar="K",
                     help="action chunks: the gear and steer heads answer for this decision "
                          "and the next K-1, which the car blends (policy.ChunkEnsembler). "
@@ -1255,6 +1298,9 @@ def main(argv=None):
         return 2
     if args.chunk > 1 and args.steer_head == pl.STEER_DIRECTION:
         print("--chunk needs a regression steer head (regression or per_gear)")
+        return 2
+    if args.lowband is not None and args.representation != pl.PROFILE:
+        print("--lowband is a second column profile: it needs --representation profile")
         return 2
     if args.chunk > 1 and not -10.0 <= args.ensemble_m <= 10.0:
         print(f"--ensemble-m is -10..10, not {args.ensemble_m}")
@@ -1326,7 +1372,8 @@ def main(argv=None):
         labelled = labelled & ~scorecard_mask(data, held_card)
         print(f"scorecard: {len(held_card)} sessions kept out of training "
               f"({SCORECARD_FILE})")
-    data["x"] = encode_frames(data["frames"], args.representation)
+    data["x"] = encode_frames(data["frames"], args.representation, args.lowband,
+                              frame_pitch(data, args.lowband))
     fit = dict(representation=args.representation, label_mode=args.labels,
                uses_prev=args.prev, epochs=args.epochs, seed=args.seed,
                good_weight=args.good_weight, switch_weight=args.switch_weight,
@@ -1337,7 +1384,7 @@ def main(argv=None):
                uses_map=bool(args.map), map_dropout=args.map_dropout, chunk=args.chunk,
                uses_goal=args.goal, no_goal_share=args.no_goal_share,
                mirror=args.mirror, stop_gear_s=args.stop_gear_s,
-               map_act=args.map_act, optimizer=args.optimizer)
+               map_act=args.map_act, optimizer=args.optimizer, lowband=args.lowband)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1486,6 +1533,7 @@ def _base_meta(meta_in, args, val_ids, val_names):
                      getattr(args, "straight_band", STRAIGHT_BAND),
                      getattr(args, "stop_gear_s", STOP_GEAR_S)),
         **chunk_meta(getattr(args, "chunk", 1), getattr(args, "ensemble_m", 0.0)),
+        **pl.lowband_meta(getattr(args, "lowband", None)),
         "steer_scale": pl.STEER_SCALE,
         "labels": args.labels,
         "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids

@@ -44,6 +44,9 @@ drives). What is measured:
                       with the crop's planes blanked and present left on.
                       0 is a map branch that does nothing: every map model
                       up to goal2 had one (policy_train.MapBranch)
+  lowband_use         the same for the lower band (column_profile, "the
+                      lower band"), every column of it blind; and
+                      lowband_use_dir, the share of ticks whose gear changes
 
 What this cannot say: whether the car drives well. These are my own labels on
 moments I took over; the car's feel is mine to judge on a drive.
@@ -59,6 +62,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from crawler.autopilot import column_profile as cp  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
 from crawler.autopilot import policy_goal as pg  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
@@ -88,10 +92,13 @@ def scorecard_ticks(data, names):
     return ticks[np.lexsort((data["t_ns"][ticks], data["session"][ticks]))]
 
 
-def inputs(model, data, i, goal=None, mirrored=False, blank_map=False):
+def inputs(model, data, i, goal=None, mirrored=False, blank_map=False, blank_lowband=False):
     """Tick i's inputs as the car feeds them, the mirror image if asked, or
-    with the crop's planes all zero and its present flag as it was."""
-    x = pl.encode_input(model.representation, data["frames"][data["frame"][i]])
+    with the crop's planes all zero and its present flag as it was, or with
+    the lower band every column blind (column_profile.lowband_blank)."""
+    x = pe.x_input(model, data, i)
+    if blank_lowband and getattr(model, "lowband", None) is not None:
+        x[0, cp.PROFILE_FEATURES:] = cp.lowband_blank(model.lowband)
     prev = np.zeros((1, pl.PREV_SIZE), np.float32)
     mode = None
     if model.has_mode:
@@ -121,7 +128,8 @@ def inputs(model, data, i, goal=None, mirrored=False, blank_map=False):
     return x, prev, mode, extra
 
 
-def decode(model, data, ticks, goals=None, mirrored=False, blend=True, blank_map=False):
+def decode(model, data, ticks, goals=None, mirrored=False, blend=True, blank_map=False,
+           blank_lowband=False):
     """(action, steer) per tick: the car's read_output, after the chunk blend
     (blend) or off the raw answer's offset 0. A chain starts over on a new
     session and wherever the ensembler's own link rule says."""
@@ -134,7 +142,7 @@ def decode(model, data, ticks, goals=None, mirrored=False, blend=True, blank_map
             ens = pl.ChunkEnsembler(model.chunk, model.ensemble_m, model.ensemble_link_s)
         x, prev, mode, extra = inputs(model, data, i,
                                       None if goals is None else goals[j], mirrored,
-                                      blank_map)
+                                      blank_map, blank_lowband)
         out = model.run(x, prev, mode, **extra)
         if blend:
             out = ens.apply(out, data["t_ns"][i] / 1e9,
@@ -246,6 +254,10 @@ def score(model, data, ticks):
         mapped = np.asarray(data["map_on"], bool)[ticks[g]]
         _, bs = decode(model, data, ticks[g], blend=False, blank_map=True)
         out["map_use"] = float(np.abs(rs - bs)[mapped].mean()) if mapped.any() else float("nan")
+    if getattr(model, "lowband", None) is not None:
+        la, ls = decode(model, data, ticks[g], blend=False, blank_lowband=True)
+        out["lowband_use"] = float(np.abs(rs - ls).mean())
+        out["lowband_use_dir"] = float(np.mean(ra != la))
     # Goals.
     if model.uses_goal:
         goals = hind_goals(data, ticks)
@@ -278,7 +290,7 @@ def score(model, data, ticks):
 KEYS = ("dir_acc", "dir_bal", "stop_rec", "stop_prec", "rev_rec", "rev_prec", "steer_mae",
         "side", "stop_side", "lock", "mirror_fail", "mirror_fail_goal", "goal_dir",
         "goal_side", "goal_gain_side", "behind_dir", "behind_rev_rec", "onset_dir",
-        "onset_side", "map_use")
+        "onset_side", "map_use", "lowband_use", "lowband_use_dir")
 
 
 def table(rows):

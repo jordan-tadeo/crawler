@@ -399,35 +399,49 @@ def build_dataset(kept, out, log_path, scratch, exclude_file=pd.EXCLUDE_FILE):
         raise SystemExit(f"policy_dataset.py failed ({rc}); see {log_path}")
 
 
-def _encode_chunk(frames, representation):
-    return pt.encode_frames(frames, representation)
+def _encode_chunk(frames, representation, lowband=None, pitch=None):
+    return pt.encode_frames(frames, representation, lowband, pitch)
 
 
-def encode_frames_parallel(frames, representation, jobs=JOBS):
+def input_key(representation, lowband=None):
+    """What an x cache was drawn as, in its file name and the worker's argv:
+    the representation, and the lower band's layout after a dot."""
+    return representation if lowband is None else f"{representation}.{lowband}"
+
+
+def parse_input_key(key):
+    representation, _, lowband = key.partition(".")
+    return representation, lowband or None
+
+
+def encode_frames_parallel(frames, representation, jobs=JOBS, lowband=None, pitch=None):
     """pt.encode_frames over every frame, in --jobs pieces."""
     if jobs <= 1 or len(frames) < 4096:
-        return pt.encode_frames(frames, representation)
+        return pt.encode_frames(frames, representation, lowband, pitch)
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
-    pieces = np.array_split(np.arange(len(frames)), jobs)
+    pieces = [p for p in np.array_split(np.arange(len(frames)), jobs) if len(p)]
+    pitch = np.zeros(len(frames)) if pitch is None else np.asarray(pitch)
     with ProcessPoolExecutor(jobs, mp_context=mp.get_context("spawn")) as ex:
-        parts = list(ex.map(_encode_chunk, [frames[p[0]:p[-1] + 1] for p in pieces if len(p)],
-                            [representation] * jobs))
+        parts = list(ex.map(_encode_chunk, [frames[p[0]:p[-1] + 1] for p in pieces],
+                            [representation] * len(pieces), [lowband] * len(pieces),
+                            [pitch[p[0]:p[-1] + 1] for p in pieces]))
     return np.concatenate(parts)
 
 
 def train_worker(argv):
     """In a child: policy_train.main, with the frames already encoded."""
-    xpath, representation, rest = argv[0], argv[1], argv[2:]
+    xpath, key, rest = argv[0], argv[1], argv[2:]
     if rest and rest[0] == "--":
         rest = rest[1:]
     x = np.load(xpath)
     real = pt.encode_frames
+    want = parse_input_key(key)
 
-    def encode(frames, rep):
-        if rep == representation and len(frames) == len(x):
+    def encode(frames, rep, lowband=None, pitch=None):
+        if (rep, lowband) == want and len(frames) == len(x):
             return x
-        return real(frames, rep)
+        return real(frames, rep, lowband, pitch)
 
     pt.encode_frames = encode
     import torch
@@ -629,8 +643,9 @@ def _train_flags(extra):
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--representation", default=pl.PROFILE)
     p.add_argument("--labels", default="pad")
+    p.add_argument("--lowband", default=None)
     known, _ = p.parse_known_args(extra)
-    return known.representation, known.labels
+    return known.representation, known.labels, known.lowband
 
 
 def thread_env():
@@ -717,10 +732,11 @@ def main(argv=None):
           f"{len(cands) - len(kept)} junk")
     clock.lap("filter")
 
-    representation, labels = _train_flags(extra)
+    representation, labels, lowband = _train_flags(extra)
+    key = input_key(representation, lowband)
     dkey = dataset_key(code, kept, excludes)
     data_path = os.path.join(args.cache_dir, f"dataset-{dkey}.npz")
-    x_path = os.path.join(args.cache_dir, f"dataset-{dkey}.x-{representation}.npy")
+    x_path = os.path.join(args.cache_dir, f"dataset-{dkey}.x-{key}.npy")
     if os.path.exists(data_path):
         print(f"dataset: the same sessions as last time, {data_path}")
     else:
@@ -734,7 +750,8 @@ def main(argv=None):
         print(f"dataset: built {data_path} (report in {run_dir}/dataset.log)")
     data = pe.load(data_path)
     if not os.path.exists(x_path):
-        x = encode_frames_parallel(data["frames"], representation, args.jobs)
+        x = encode_frames_parallel(data["frames"], representation, args.jobs, lowband,
+                                   pt.frame_pitch(data, lowband))
         np.save(x_path + ".part.npy", x)
         os.replace(x_path + ".part.npy", x_path)
     n_ticks = len(data["t_ns"])
@@ -759,7 +776,7 @@ def main(argv=None):
     pieces = [str(k + 1) for k in range(args.blocks)] + ["final"]
     outs = [os.path.join(run_dir, f"fold-{p}.onnx") for p in pieces[:-1]]
     outs.append(os.path.join(run_dir, f"policy-{stamp}.onnx"))
-    child = [sys.executable, os.path.abspath(__file__), WORKER, x_path, representation, "--"]
+    child = [sys.executable, os.path.abspath(__file__), WORKER, x_path, key, "--"]
     commands = [[*child, *base, out, "--blocks", str(args.blocks), *recipe, "--fold", p]
                 for p, out in zip(pieces, outs)]
     if held_names:

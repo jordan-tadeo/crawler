@@ -79,6 +79,28 @@ def imu_input(model, data, i):
     return pl.encode_imu(feats)
 
 
+_UP_Z = pimu.FEATURES.index("up_z")
+_TILT_VALID = pimu.FEATURES.index("tilt_valid")
+
+
+def tick_up(data, i):
+    """Tick i's up vector as policy_imu.up_of read it off the row, or None:
+    the dataset's imu array keeps it (built with tilt on) in up_x..up_z and
+    says whether there was one in tilt_valid."""
+    imu = data.get("imu")
+    if imu is None or not imu[i, _TILT_VALID] > 0:
+        return None
+    return tuple(float(v) for v in imu[i, _UP_Z - 2:_UP_Z + 1])
+
+
+def x_input(model, data, i):
+    """Tick i's x as the car draws it: the footprint band, and the lower
+    band under it for a model that has one, at the tick's own pitch."""
+    lowband = getattr(model, "lowband", None)
+    return pl.encode_input(model.representation, data["frames"][data["frame"][i]], lowband,
+                           pl.lowband_pitch(lowband, tick_up(data, i)))
+
+
 def map_input(data, i):
     """Tick i's map input for a model that takes one: the crop
     policy_train.load_maps paired it with, through egomap.encode_many, or
@@ -103,7 +125,7 @@ def lidar_input(data, i):
 def _run(model, data, i, split=None):
     """One tick through the model. A mode head is fed `split`, or the
     recorded mode going into the tick when that is None."""
-    x = pl.encode_input(model.representation, data["frames"][data["frame"][i]])
+    x = x_input(model, data, i)
     prev = (data["prev"][i:i + 1] if model.uses_prev
             else np.zeros((1, pl.PREV_SIZE), dtype=np.float32))
     mode = None

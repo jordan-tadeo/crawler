@@ -219,6 +219,19 @@ check_lidar() refuses a sidecar with another lidar_layout, and every graph
 with an input this runtime does not know (KNOWN_INPUTS). /footprint's
 policy_lidar_present says whether a scan went in.
 
+The lower band
+--------------
+A model whose sidecar says lowband (column_profile.LOWBAND_LAYOUTS) has an
+x of six rows, not three: the footprint band's column profile, then the
+bottom third of the same downsampled frame (column_profile.lowband_profile),
+so whatever the downsample does to the frame -- the near clamp included --
+it does to both. check_lowband() refuses a layout this car cannot draw, a
+camera height or fy other than the one it was drawn with, and an x whose
+rows do not match the sidecar. lower_third_floor reads the band against a
+flat floor at the camera IMU's pitch (policy_imu.up_of off the tick's row,
+the same up the dataset keeps); only that model ever reads the pitch, and
+a model with no lowband -- every one before it -- never has the band drawn.
+
 numpy only at import. onnxruntime is imported when a model is loaded, so this
 file imports on a laptop and in every test without it.
 """
@@ -640,13 +653,26 @@ def encode_depth(small_mm):
     return np.stack([depth, valid]).astype(np.float32)[None]
 
 
-def encode_input(representation, small_mm):
-    """The model's first input for one downsampled frame."""
+def encode_input(representation, small_mm, lowband=None, pitch=0.0):
+    """The model's first input for one downsampled frame. lowband is the
+    sidecar's (None for every model before the lower band); pitch, radians
+    nose down, only matters to a column_profile.LOWBAND_FLOOR one."""
     if representation == IMAGE:
+        if lowband is not None:
+            raise ValueError("a lower band is a profile model's, not an image model's")
         return encode_depth(small_mm)
     if representation == PROFILE:
-        return cp.column_profile(small_mm)[None]
+        return cp.profile_input(small_mm, lowband, pitch)[None]
     raise ValueError(f"unknown representation {representation!r}")
+
+
+def lowband_pitch(lowband, up):
+    """The pitch a model's lower band is drawn at: the up vector's
+    (policy_imu.up_of, None with no reading) for a LOWBAND_FLOOR model, 0
+    for any other, which never reads it."""
+    if lowband != cp.LOWBAND_FLOOR or up is None:
+        return 0.0
+    return cp.floor_pitch(up[2])
 
 
 def encode_mode(split):
@@ -740,6 +766,55 @@ def check_lidar(meta, inputs, where="sidecar"):
     if not isinstance(clip, (int, float)) or abs(float(clip) - pli.CLIP_MM) > 1e-6:
         raise ValueError(f"{where}: lidar_clip_mm {clip!r} != {pli.CLIP_MM}")
     return True
+
+
+def lowband_meta(lowband):
+    """The lower band's half of the sidecar, what check_lowband reads: the
+    layout and the geometry it was drawn with. {} without one."""
+    if lowband is None:
+        return {}
+    if lowband not in cp.LOWBAND_LAYOUTS:
+        raise ValueError(f"unknown lowband {lowband!r}")
+    return {"lowband": lowband, "lowband_fraction": cp.LOWBAND_FRACTION,
+            "lowband_camera_height_mm": dv.CAMERA_HEIGHT_MM,
+            "lowband_fy_at_400": dv.FY_AT_400}
+
+
+def check_lowband(meta, x_shape, representation, where="sidecar"):
+    """The lower band's half of the contract -> the layout, or None.
+
+    A sidecar with no lowband (every model before it) is fed the footprint
+    band alone, x (1, 3, 32), as it always was. One with a lowband names
+    one of column_profile.LOWBAND_LAYOUTS, is a profile model, was drawn
+    with this car's camera height and fy, and has an x of 6 rows. x_shape
+    is the graph's; a dimension that is not a number is not checked.
+    """
+    lowband = meta.get("lowband")
+    want = cp.PROFILE_FEATURES * (2 if lowband is not None else 1)
+    try:
+        rows = list(x_shape)[1]
+    except (TypeError, IndexError):
+        rows = None
+    if (representation == PROFILE and isinstance(rows, int) and not isinstance(rows, bool)
+            and rows != want):
+        raise ValueError(f"{where}: the graph's x has {rows} rows, the sidecar's "
+                         f"lowband {lowband!r} needs {want}")
+    if lowband is None:
+        return None
+    if lowband not in cp.LOWBAND_LAYOUTS:
+        raise ValueError(f"{where}: lowband {lowband!r} is not one of "
+                         f"{list(cp.LOWBAND_LAYOUTS)}: this car cannot draw it")
+    if representation != PROFILE:
+        raise ValueError(f"{where}: lowband on a {representation!r} model")
+    for key, have in (("lowband_fraction", cp.LOWBAND_FRACTION),
+                      ("lowband_camera_height_mm", dv.CAMERA_HEIGHT_MM),
+                      ("lowband_fy_at_400", dv.FY_AT_400)):
+        v = meta.get(key)
+        if (isinstance(v, bool) or not isinstance(v, (int, float))
+                or abs(float(v) - have) > 1e-6):
+            raise ValueError(f"{where}: {key} {v!r} != {have}: the lower band "
+                             f"it was trained on is not the one this car draws")
+    return lowband
 
 
 def check_map(meta, inputs, where="sidecar"):
@@ -1394,6 +1469,10 @@ class PolicyModel:
         self.uses_map = check_map(self.meta, input_names, meta_path)
         # False for every model before the goal input: never fed one.
         self.uses_goal = check_goal(self.meta, input_names, meta_path)
+        # None for every model before the lower band: x is the footprint
+        # band alone and the lower one is never drawn.
+        x_shape = next((i.shape for i in self.session.get_inputs() if i.name == "x"), None)
+        self.lowband = check_lowband(self.meta, x_shape, self.representation, meta_path)
         self.path = path
 
     def run(self, x, prev, mode=None, imu=None, lidar=None, map=None, goal=None):
@@ -1468,6 +1547,7 @@ class PolicyDriver(dv.Driver):
         self._imu_sample = None
         self._imu_at = 0.0
         self.last_imu = None        # the features fed on the last model run
+        self.last_lowband_pitch = 0.0  # radians, a LOWBAND_FLOOR model's last
         # The lidar input: the roof lidar's newest fresh scan each decision
         # (policy_lidar.live_bins off self.lidar), or no scan.
         self.uses_lidar = bool(getattr(model, "uses_lidar", False))
@@ -2000,7 +2080,14 @@ class PolicyDriver(dv.Driver):
                     self._switch(MAP_SLOT, now, "")
         imu_x = imu_out[id(self.imu_features)]
 
-        x = encode_input(self.model.representation, self.downsample(depth))
+        # The lower band only for a model that has one, and the IMU's pitch
+        # only for the one that reads it: every other model is fed what it
+        # always was, at the cost it always was.
+        lowband = getattr(self.model, "lowband", None)
+        pitch = (lowband_pitch(lowband, pimu.up_of(imu_row))
+                 if lowband == cp.LOWBAND_FLOOR else 0.0)
+        self.last_lowband_pitch = pitch
+        x = encode_input(self.model.representation, self.downsample(depth), lowband, pitch)
         prev = (encode_prev(*self._prev) if self.model.uses_prev
                 else np.zeros((1, PREV_SIZE), dtype=np.float32))
         mode = encode_mode(self.mode.split) if self.has_mode else None

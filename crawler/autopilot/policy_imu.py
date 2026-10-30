@@ -213,6 +213,24 @@ def _clip(value):
     return max(-CLIP, min(CLIP, value))
 
 
+def up_of(row):
+    """A /footprint row's up vector, unit length, or None: the up and
+    tilt_valid columns ImuFeatures puts in, by the same rule (a fresh,
+    finite sample, and an up within 10% of unit length). Stateless, so the
+    lower band's pitch (column_profile.floor_pitch) can be read off a row on
+    the car exactly as the dataset reads it off its imu array."""
+    get = row.get if hasattr(row, "get") else (lambda k, d=None: d)
+    age = _num(get(ROW_AGE), -1.0)
+    readings = [_num(get(k), float("nan")) for k in ROW_ACCEL + ROW_GYRO]
+    if not (0.0 <= age <= MAX_AGE_MS and all(math.isfinite(v) for v in readings)):
+        return None
+    up = [_num(get(k), 0.0) for k in ROW_UP]
+    norm = math.sqrt(sum(v * v for v in up))
+    if not 0.9 <= norm <= 1.1:
+        return None
+    return tuple(v / norm for v in up)
+
+
 class ImuFeatures:
     """IMU rows in, one decision at a time; the policy's IMU input out.
 
@@ -259,12 +277,10 @@ class ImuFeatures:
             out[7] = _clip(max(self._gyro) / GYRO_SCALE)
             out[8] = 1.0
 
-        if valid:
-            up = [_num(get(k), 0.0) for k in ROW_UP]
-            norm = math.sqrt(sum(v * v for v in up))
-            if 0.9 <= norm <= 1.1:
-                out[9:12] = [v / norm for v in up]
-                out[12] = 1.0
+        up = up_of(row) if valid else None
+        if up is not None:
+            out[9:12] = up
+            out[12] = 1.0
         if not self.tilt:
             out = without_tilt(out)
         return out if self.yaw else out[_NO_YAW_COLUMNS]
