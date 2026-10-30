@@ -2483,36 +2483,68 @@ def test_the_forward_floor_moves_with_the_speed(monkeypatch):
 def test_the_creep_floor_is_measured_from_the_front_bumper():
     """The creep's line is CREEP_STOP_CLEAR_MM off the front bumper, read on
     the probes, which measure from the lens: so the bumper's lead on the lens
-    is added. The lens is LENS_X_MM ahead of the lidar, measured off the
-    drives; the bumper is lidar.FRONT_BUMPER_X_MM, ESTIMATED."""
+    is added: 28 mm, taped. The lens is LENS_X_MM ahead of the lidar,
+    measured off the drives, and lidar.FRONT_BUMPER_X_MM is the two added,
+    so the map, the planner and the stops have the bumper in one place."""
     from crawler.hardware import lidar as ld
     assert dv.LENS_X_MM == 235.0
-    assert dv.LENS_TO_FRONT_BUMPER_MM == pytest.approx(
-        ld.FRONT_BUMPER_X_MM - dv.LENS_X_MM)
+    assert dv.LENS_TO_FRONT_BUMPER_MM == 28.0
+    assert ld.FRONT_BUMPER_X_MM == pytest.approx(
+        dv.LENS_X_MM + dv.LENS_TO_FRONT_BUMPER_MM)
     assert dv.CREEP_FLOOR_MM == pytest.approx(
         dv.CREEP_STOP_CLEAR_MM + dv.LENS_TO_FRONT_BUMPER_MM)
-    assert dv.CREEP_FLOOR_MM == pytest.approx(185.0)
+    assert dv.CREEP_FLOOR_MM == pytest.approx(178.0)
 
 
 def test_the_creep_floor_leaves_the_margin_after_the_measured_overrun():
     """A creep held at the floor still ends CREEP_MARGIN_MM off the bumper
     after the measured overrun, and the floor sits above the stereo pair's
-    near clamp by a tick of creep, so the probe always reads a number under
-    it before it can read nothing."""
+    near clamp. Less than a tick of creep above it, so a tick can carry a
+    probe past the line into the clamp or the blind zone; the next test is
+    what holds it there."""
     end = dv.CREEP_FLOOR_MM - dv.CREEP_OVERRUN_MM - dv.LENS_TO_FRONT_BUMPER_MM
     assert end >= dv.CREEP_MARGIN_MM
-    tick = dv.ground_speed_mm_s(dv.CREEP_SPEED) * 0.1
-    assert dv.CREEP_FLOOR_MM >= dv.STEREO_NEAR_MM + tick
+    assert dv.CREEP_FLOOR_MM > dv.STEREO_NEAR_MM
     # Nearer than the cap's floor, which is unchanged.
     assert dv.STEREO_NEAR_MM < dv.CREEP_FLOOR_MM < dv.FORWARD_FLOOR_MM
     assert dv.FORWARD_FLOOR_MM == pytest.approx(362.96, abs=0.01)
+
+
+def _creep_frame(mm):
+    """A depth frame with probe 4 at `mm` (0 is the camera's unmeasurable)
+    and open floor at 3 m across the rest of the fan."""
+    frame = np.full((400, 640), 3000, dtype=np.uint16)
+    edges = dv.footprint_geometry(frame.shape, dv.CLEARANCE_MM).col_edges
+    frame[:, edges[4]:edges[5]] = mm
+    return frame
+
+
+def test_a_creep_tick_past_the_floor_into_the_near_clamp_or_blind_holds():
+    """The creep's floor is 19 mm over the stereo clamp, under a tick of
+    creep, so one tick can take the centre probe from just over the line to
+    the clamp, 159, or to nothing measurable at all. Through the real probe:
+    the clamp is NEAR and under the line, and blind out of an approach is
+    latched, so the creep holds either way, and stays held."""
+    over = dv.CREEP_FLOOR_MM + 2.0
+    for after in ([dv.STEREO_NEAR_MM, 0, 0], [0, 0], [dv.STEREO_NEAR_MM, dv.STEREO_NEAR_MM]):
+        veto = dv.ForwardFloorVeto(forward_speed=dv.FORWARD_SPEED)
+        said = []
+        for k, mm in enumerate([300.0, over] + after):
+            scan = dv.free_by_column(_creep_frame(int(mm)))
+            veto.observe(scan, k * TICK)
+            said.append(veto.vetoes(floor_mm=dv.CREEP_FLOOR_MM))
+        assert said[:2] == [False, False], after   # creeping, just over the line
+        assert said[2:] == [True] * len(after), after
+        if 0 in after:
+            assert dv.free_by_column(_creep_frame(0)).reason[4] == dv.NO_RETURN
+            assert veto.latch.latched[4]
 
 
 def test_the_veto_asked_at_the_creep_floor():
     """vetoes(floor_mm=...) holds on that line instead of the cap's; the
     latch holds either way."""
     said = []
-    for p in ("N300", "N200", "N180"):
+    for p in ("N300", "N200", "N170"):
         veto = dv.ForwardFloorVeto()
         veto.observe(centre(p), 0.0)
         said.append((veto.vetoes(), veto.vetoes(floor_mm=dv.CREEP_FLOOR_MM)))

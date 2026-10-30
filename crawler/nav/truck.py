@@ -4,12 +4,12 @@ Size, read off the modules that measured or estimated it first:
 
   half-width     lidar.HALF_WIDTH_MM, 135.89 mm over the wheels, MEASURED
   rear bumper    lidar.REAR_BUMPER_X_MM, 247.65 mm behind the lidar, MEASURED
-  front bumper   lidar.FRONT_BUMPER_X_MM, 270 mm ahead of it, ESTIMATED
+  front bumper   lidar.FRONT_BUMPER_X_MM, 263 mm ahead of it, TAPED off the lens
 
 The pose is the lidar's. On a counter-phase four-wheel steer with the rear
 the mirror of the front, the point midway between the axles moves along the
 turning circle with no sideslip, and the lidar sits close to that point (the
-bumpers are 248 mm behind it and 270 mm ahead), so the lidar is the point the
+bumpers are 248 mm behind it and 263 mm ahead), so the lidar is the point the
 curvature is about. A path curvature k is the inverse of the radius of the
 circle that point drives, positive to the left, and it is the same circle
 forward and in reverse: the steering picks the circle, the throttle picks

@@ -417,7 +417,7 @@ MOVING_FLOOR_REVERSE = -dv.ESCAPE_SPEED
 # while the picture ages, and that overrun is worked out at the cap
 # (forward_speed, 0.4: 363 mm). A forward at CREEP_THROTTLE overruns less,
 # so when the cap's floor holds a map model's forward and the creep's
-# (driver.CREEP_FLOOR_MM, 185 mm off the lens, 150 off the front bumper) does
+# (driver.CREEP_FLOOR_MM, 178 mm off the lens, 150 off the front bumper) does
 # not, the forward goes out at no more than CREEP_THROTTLE instead of 0, on
 # the model's own steering. The creep's floor is its own measured line,
 # not the cap's arithmetic at 0.2 (that was 282, and it boxed the car in with

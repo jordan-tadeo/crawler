@@ -1532,9 +1532,11 @@ FORWARD_FLOOR_MM = forward_floor_mm(FORWARD_SPEED)
 # which is the half-tick between a scan and a frame, not the mount. 235.
 # The voxel fit had 220 (mapping/voxel.py), off a different comparison.
 LENS_X_MM = 235.0
-# The front bumper is ESTIMATED (lidar.FRONT_BUMPER_X_MM, never taped), so
-# this is too: 35 mm. A tape from the lens to the bumper face replaces it.
-LENS_TO_FRONT_BUMPER_MM = _lidar.FRONT_BUMPER_X_MM - LENS_X_MM
+# The lens to the front face of the front bumper, TAPED on the car
+# 2026-10-29: the OAK-D looks through the grille 1-1.2 in behind it, 25-30
+# mm, so 28. It was 35, off an estimated bumper. lidar.FRONT_BUMPER_X_MM is
+# LENS_X_MM plus this.
+LENS_TO_FRONT_BUMPER_MM = 28.0
 
 # The speed the overrun below was measured at, and the creep's throttle.
 CREEP_SPEED = 0.2
@@ -1554,8 +1556,12 @@ STEREO_NEAR_MM = 159.0
 CREEP_MARGIN_MM = 40.0
 # The line itself, off the bumper: 150 (about 6 in), which leaves
 # 150 - 78 = 72 mm after the worst overrun, past the 40 margin; nearer than
-# that the near clamp, not the overrun, is what binds: 185 off the lens is
-# 26 mm, a tick and a bit of creep, above 159. Mine to judge on the floor.
+# that the near clamp, not the overrun, is what binds: 178 off the lens is
+# 19 mm, under a tick of creep (21), above 159. That is safe because a
+# reading at the clamp is still NEAR and under the line, and a probe that
+# goes blind out of an approach latches (advance_floor_latch), so a tick that
+# carries a probe past the line into the blind zone still holds. Mine to
+# judge on the floor.
 CREEP_STOP_CLEAR_MM = 150.0
 CREEP_FLOOR_MM = CREEP_STOP_CLEAR_MM + LENS_TO_FRONT_BUMPER_MM
 

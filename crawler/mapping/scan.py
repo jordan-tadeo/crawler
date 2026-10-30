@@ -27,7 +27,7 @@ FRAC_BEFORE_END = (np.arange(SLOTS) * lv.SCAN_STEP_DEG) / 360.0
 
 # The truck's own body, as a box round the lidar in the car frame, metres:
 # the measured half width over the wheels (lidar.HALF_WIDTH_MM, 135.89),
-# the measured rear bumper (-247.65) and the estimated front one (+270),
+# the measured rear bumper (-247.65) and the taped front one (+263),
 # each with BODY_MARGIN_M on it. A return inside it is the truck or
 # something touching it, and is neither matched nor written. A circle of
 # 0.32 m used to stand in for this, and it was blind to anything within

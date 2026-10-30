@@ -375,13 +375,15 @@ class Mount(NamedTuple):
 # 2D scan.
 MOUNT = Mount(yaw_deg=-90.0, x_mm=0.0, y_mm=0.0, upside_down=False)
 
-# The front bumper's x, mm, ESTIMATED off the same box: 575 seen less 305
-# from the bumper. Not measured yet.
+# The front bumper's x, mm: the lens (driver.LENS_X_MM, 235) plus the
+# lens to the bumper face, TAPED on the car 2026-10-29 at 1-1.2 in through
+# the grille, 28 mm (driver.LENS_TO_FRONT_BUMPER_MM). It was 270, estimated
+# off the box test above (575 seen less 305 from the bumper).
 # The rear bumper's x, mm, MEASURED on the car: centre of the lidar to the
-# rear bumper, 9.75 in = 247.65 mm. So the lidar is about 22 mm nearer the
-# back than the front, going by the front estimate.
+# rear bumper, 9.75 in = 247.65 mm. So the lidar is about 15 mm nearer the
+# back than the front.
 # A clearance stop is a range from the lidar less one of these.
-FRONT_BUMPER_X_MM = 270.0
+FRONT_BUMPER_X_MM = 263.0
 REAR_BUMPER_X_MM = -247.65
 # Half the truck's width, mm, MEASURED on the car at the widest point, the
 # outside of the wheels: 10.7 in = 271.78 mm, half of that. Only the

@@ -245,7 +245,9 @@ def test_raw_270_is_straight_ahead_and_raw_0_is_the_right_as_measured():
     assert ld.nearest_in_sector(bins, "front") == 575
     assert ld.nearest_in_sector(bins, "left") == 0
     assert ld.nearest_in_sector(bins, "right") == 0
-    assert 575 - ld.FRONT_BUMPER_X_MM == pytest.approx(305.0)
+    # The box was 305 mm off the bumper, so it put the bumper at 270; the tape
+    # (lens 235 + 28) puts it at 263, inside the box's own 575-597 spread.
+    assert 575 - 305 - ld.FRONT_BUMPER_X_MM == pytest.approx(0.0, abs=10.0)
 
 
 def test_upside_down_turns_the_other_way():

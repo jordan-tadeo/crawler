@@ -56,8 +56,8 @@ CAMERA_HEIGHT_M = dv.CAMERA_HEIGHT_MM / 1000.0
 # offline by placing camera points 6-28 cm above the floor (walls, cabinet
 # faces) on the lidar's own points through the SLAM poses, 278 frames over two
 # drives, grid search then refine: x 0.22 m, yaw -0.25 deg. 0.22 is plausible
-# against the tape (front bumper 0.27 m ahead of the lidar, the camera a few
-# cm behind it). The offset sideways was not separable from zero.
+# against the bumper (front bumper 0.263 m ahead of the lidar, the camera 28
+# mm behind it, taped). The offset sideways was not separable from zero.
 # The x is driver.LENS_X_MM now, 235 mm: the centre probe against the lidar
 # straight ahead with the car standing still, four scenes, 228-246. One
 # number for the lens, so the map and the stops agree on where it is.

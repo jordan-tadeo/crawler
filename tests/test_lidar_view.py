@@ -168,12 +168,12 @@ def test_the_truck_is_a_closed_outline_on_base_link_with_the_arrow_at_the_front(
     (line,) = e.lines
     assert line.type == 1                                      # LINE_LOOP
     corners = sorted((round(p.x, 3), round(p.y, 3)) for p in line.points)
-    # The measured rear bumper and width, the estimated front bumper.
+    # The measured rear bumper and width, the taped front bumper.
     assert corners == [(-0.248, -0.136), (-0.248, 0.136),
-                       (0.27, -0.136), (0.27, 0.136)]
+                       (0.263, -0.136), (0.263, 0.136)]
     (tri,) = e.triangles
     tip, left, right = [(p.x, p.y) for p in tri.points]
-    assert tip == pytest.approx((0.27, 0.0))
+    assert tip == pytest.approx((0.263, 0.0))
     assert left[0] == right[0] < tip[0], "it points forward, +x"
     assert left[1] == -right[1] > 0
     assert -0.248 < left[0]
