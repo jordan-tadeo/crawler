@@ -300,12 +300,13 @@ def _stop_on_signals(stop):
 
 
 def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
-          nav_every_s=NAV_EVERY_S, map_path=None):
+          nav_every_s=NAV_EVERY_S, map_path=None, restore=False):
     """The worker, thread or process: scans in, Results and MapViews out.
     None in the inbox ends it. With nav_half_m, a full-resolution MapView
     for the navigator too, every nav_every_s. With map_path, the map is
-    restored from it before the first scan and saved to it as it goes and
-    at the end (mapfile.py)."""
+    saved to it as it goes and at the end (mapfile.py), the last run's file
+    put aside first; with restore as well, the map starts from that file."""
+    from crawler.mapping import mapfile
     from crawler.mapping.clock import SensorClock
     from crawler.mapping.egomap import EgoMap
     from crawler.mapping.imu import ImuTrack
@@ -317,12 +318,18 @@ def _work(inbox, outbox, l_max, map_every_s, nav_half_m=None,
     keeper = None
     stop = threading.Event()
     if map_path is not None:
-        try:
-            _restore(slam, map_path, outbox)
-        except Exception as e:      # never in the way of mapping at all
-            slam = Slam(imu=imu, **kw)
-            _say_out(outbox, "warning", f"The saved map is ignored ({e!r}); "
-                     "starting a new one")
+        if restore:
+            try:
+                _restore(slam, map_path, outbox)
+            except Exception as e:      # never in the way of mapping at all
+                slam = Slam(imu=imu, **kw)
+                _say_out(outbox, "warning", f"The saved map is ignored "
+                         f"({e!r}); starting a new one")
+        prev = mapfile.set_aside(map_path)
+        if not restore:
+            _say_out(outbox, "info", "Starting a new map" + (
+                f"; the last run's is kept at {prev}, not loaded"
+                if prev else ""))
         keeper = _MapKeeper(slam, map_path, outbox)
         _stop_on_signals(stop)
     # The policy's crop of the map, drawn here after every step, on the
@@ -415,7 +422,7 @@ class SlamRunner:
     def __init__(self, mode=MODE_THREAD, tele=None, logger=None, mount=None,
                  l_max=None, inbox=INBOX, map_every_s=MAP_EVERY_S,
                  clock=time.monotonic, nav_half_m=None, speed=None,
-                 map_path=None):
+                 map_path=None, restore_map=False):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
         if mount is None:
@@ -437,9 +444,11 @@ class SlamRunner:
         # truck has got to while it is lost with it (slam.py, "How a fresh
         # map sits on the one before it"). main() asks the throttle.
         self.speed = speed
-        # Where the map is kept across a restart (mapfile.py), or None to
-        # start from nothing every time and keep nothing.
+        # Where the map is saved as it goes (mapfile.py), or None to keep
+        # nothing. Saved, not loaded: every boot starts a fresh map unless
+        # restore_map, when it starts lost on the saved one.
         self.map_path = None if map_path is None else str(map_path)
+        self.restore_map = bool(restore_map)
 
         self._imu = deque(maxlen=IMU_KEEP)
         self._imu_lock = threading.Lock()
@@ -483,14 +492,16 @@ class SlamRunner:
             self._inbox = ctx.Queue(maxsize=self.inbox_size)
             self._outbox = ctx.Queue(maxsize=OUTBOX)
             args = (self._inbox, self._outbox, self.l_max, self.map_every_s,
-                    self.nav_half_m, NAV_EVERY_S, self.map_path)
+                    self.nav_half_m, NAV_EVERY_S, self.map_path,
+                    self.restore_map)
             self._worker = ctx.Process(target=_work, args=args, name="slam",
                                        daemon=True)
         else:
             self._inbox = queue.Queue(maxsize=self.inbox_size)
             self._outbox = queue.Queue(maxsize=OUTBOX)
             args = (self._inbox, self._outbox, self.l_max, self.map_every_s,
-                    self.nav_half_m, NAV_EVERY_S, self.map_path)
+                    self.nav_half_m, NAV_EVERY_S, self.map_path,
+                    self.restore_map)
             self._worker = threading.Thread(target=_work, args=args,
                                             name="slam", daemon=True)
         if self.mode == MODE_PROCESS:

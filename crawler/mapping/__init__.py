@@ -16,7 +16,8 @@ The parts
   runner.py   SlamRunner: Slam on a worker beside the control loop, and
               the Foxglove messages (telemetry/map_view.py draws them)
   mapfile.py  the map on disk (log/slam_map.npz): saved as it goes and on
-              a clean stop, restored on boot for the truck to find itself on
+              a clean stop, a record of the run; loaded at boot only with
+              --slam-map-restore
 
 tools/slam_replay.py runs the same Slam over a recording; tools/slam_bench.py
 times it on the Pi.

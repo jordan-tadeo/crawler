@@ -1,4 +1,5 @@
-"""The SLAM map on disk, so a restart does not lose it.
+"""The SLAM map on disk: a record of the run, and where the next boot
+starts only if asked.
 
 Nothing kept the map before this: it lived in the mapping worker's memory
 and nowhere else. 10-29 at 21:39 the truck went over, was carried 3.3 m and
@@ -16,13 +17,20 @@ and once more on a clean stop, and hands it to a Saver, which writes it on
 a thread of its own: the snapshot is only the observed cells copied out
 (Grid.bounds), a few ms; the compressing and writing are on the thread.
 
-On boot the runner loads it (load()), and the Slam starts lost on it
-(Slam.restore): the scan in hand is searched for round where the truck was
-(reloc.py), and if it is not found inside slam.RESEED_LOST_S the restored
-map goes on the shelf as any lost map does and is searched for from the
-fresh map, merged back when it is found. So a truck that boots where it
-stopped is back on its old map in a few scans, and one set down somewhere
-else is no worse off than with no file.
+Nothing loads it at boot unless asked (--slam-map-restore): every boot
+starts a fresh map. On 10-30 the restored map came back at every restart:
+the truck booted elsewhere, and the map showed rooms it had not driven
+that run, and at 11:33 a heading 24 degrees off was written into it, and
+that came back at 11:35 and 11:47 too. So the
+file is a record of the last run, kept for looking at: at boot the runner
+moves it to slam_map.prev.npz (set_aside()) before the first save of the
+new run goes over it, and a restart leaves the run before it to look at.
+
+Asked to (restore=True on the runner), the runner loads it (load()), and
+the Slam starts lost on it (Slam.restore): the scan in hand is searched for
+round where the truck was (reloc.py), and if it is not found inside
+slam.RESEED_LOST_S the restored map goes on the shelf as any lost map does
+and is searched for from the fresh map, merged back when it is found.
 
 Never in the way of SLAM starting. A file that is missing, too big, of
 another version, cut short or not what it says it is, is ignored with a
@@ -184,6 +192,27 @@ def load(path, max_bytes=MAX_BYTES):
         return _checked(meta, arrays), ""
     except Exception as e:
         return None, f"unreadable: {type(e).__name__}: {e}"
+
+
+def previous_path(path):
+    """Where the last run's map is put aside at boot: slam_map.npz ->
+    slam_map.prev.npz."""
+    root, ext = os.path.splitext(os.fspath(path))
+    return f"{root}.prev{ext or '.npz'}"
+
+
+def set_aside(path):
+    """Move the last run's map file to previous_path() before this run's
+    first save goes over it. The path it went to, or None if there was no
+    file. Never raises."""
+    if not os.path.exists(path):
+        return None
+    prev = previous_path(path)
+    try:
+        os.replace(os.fspath(path), prev)
+    except OSError:
+        return None
+    return prev
 
 
 def _checked(meta, arrays):

@@ -53,14 +53,14 @@ back on a merge), each in a ClickGoal of its own whose journal lines are
 gathered into one line a link.
 
 Across a restart. With a store, the list is written on every change (on a
-thread, never in the control loop), with the walls of the map it is on. The
-SLAM map is saved too (mapping/mapfile.py) and comes back as map 0 in the
-frame it was saved in, so the old list is on it again; without that file
-(the first boot, --no-slam-map-file, a file that would not load) a restart
-is a new map 0 with its origin wherever the truck boots. Either way nothing
-is restored until the first map comes up and its walls are checked against
-the saved ones (MATCH_SHARE of them within one cell); a match restores it
-paused, anything else clears it with a journal line, as does a list that
+thread, never in the control loop), with the walls of the map it is on. A
+restart is a new map 0 with its origin wherever the truck boots; only with
+--slam-map-restore does the saved SLAM map (mapping/mapfile.py) come back
+as map 0 in the frame it was saved in, the old list on it again. Either way
+nothing is restored until the first map comes up and its walls are checked
+against the saved ones (MATCH_SHARE of them within one cell); a match
+restores it paused, anything else clears it with a journal line, as does a
+list that
 was on a map other than 0 (a fresh map after a reseed comes back after a
 restart only as map 0, if it was the one saved, so its old number means
 nothing).

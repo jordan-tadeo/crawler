@@ -243,9 +243,16 @@ once each, then switch between them from the Layouts menu.
   for 20 s, or does not reach in 120 s, is skipped with a journal line.
   **Single goal** goes back to one click being the goal, the list kept. The
   list is saved to `log/patrol.json`, and after a restart it only comes back
-  if the new map's walls line up with the old one's: the map is not saved,
-  so that means the truck booted where it did last time. Otherwise it is
-  cleared and the journal says so. `autopilot/patrol.py` has the rules.
+  if the new map's walls line up with the old one's: every boot starts a
+  fresh map, so that means the truck booted where it did last time.
+  Otherwise it is cleared and the journal says so. `autopilot/patrol.py` has
+  the rules.
+
+  The SLAM map is saved to `log/slam_map.npz` every 10 s as a record of the
+  run, and at boot the last run's file is moved to `log/slam_map.prev.npz`.
+  Nothing loads it unless `--slam-map-restore` is given: the truck may boot
+  somewhere else, and a map with a wrong heading written into it came back
+  at every boot. `--no-slam-map-file` keeps nothing.
 
   The same buttons, and Follow, are on a phone page the car serves on port
   8080 with `--goal`: `http://jtpi.local:8080` (or `10.42.0.1:8080` on the

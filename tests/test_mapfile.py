@@ -233,7 +233,7 @@ def test_the_runner_saves_on_close_and_the_next_boot_starts_from_it(
     assert snap is not None, why
     assert snap.writes >= 30
     said = Said()
-    r = rn.SlamRunner(mode=mode, map_path=path, logger=said)
+    r = rn.SlamRunner(mode=mode, map_path=path, logger=said, restore_map=True)
     r.start()
     try:
         here = path_pose(4.0)
@@ -253,12 +253,48 @@ def test_the_runner_saves_on_close_and_the_next_boot_starts_from_it(
         r.close()
 
 
+def test_a_boot_starts_a_new_map_and_keeps_the_last_one_aside(
+        monkeypatch, tmp_path):
+    # 10-30: the restored map came back at every restart, and at 11:35 and
+    # 11:47 it was one written turned at 11:33. Every boot starts afresh.
+    monkeypatch.setattr(rn, "ranges_of", lambda scan, mount: scan.ranges)
+    path = tmp_path / "slam_map.npz"
+    r = rn.SlamRunner(map_path=path)
+    r.start()
+    try:
+        feed(r, 40)
+    finally:
+        r.close()
+    old = mf.load(path)[0]
+    assert old is not None and old.writes >= 30
+    said = Said()
+    r = rn.SlamRunner(map_path=path, logger=said)
+    r.start()
+    try:
+        here = path_pose(4.0)
+        feed(r, 20, t0=50.0, pose_fn=lambda t: here)
+        assert wait_for(lambda: any("Starting a new map" in m
+                                    for _, m in said.lines)), said.lines
+        assert not any("Restored the map" in m for _, m in said.lines)
+        res = r.latest()
+        assert res.state == sl.TRACKING
+        assert math.hypot(res.x, res.y) < 0.05, \
+            "at the origin of a map of its own, not on the last run's"
+    finally:
+        r.close()
+    prev = mf.load(mf.previous_path(path))[0]
+    assert prev is not None and prev.writes == old.writes, \
+        "the last run's map is kept to look at"
+    new = mf.load(path)[0]
+    assert new is not None and new.writes <= 20
+
+
 def test_the_runner_maps_from_nothing_past_a_bad_file(monkeypatch, tmp_path):
     monkeypatch.setattr(rn, "ranges_of", lambda scan, mount: scan.ranges)
     path = tmp_path / "slam_map.npz"
     path.write_bytes(b"\x00" * 1000)
     said = Said()
-    r = rn.SlamRunner(map_path=path, logger=said)
+    r = rn.SlamRunner(map_path=path, logger=said, restore_map=True)
     r.start()
     try:
         feed(r, 40)

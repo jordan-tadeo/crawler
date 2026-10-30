@@ -106,8 +106,9 @@ RECORD_HOLD_SECONDS = 1.0
 # when they come back). Under log/, which is untracked.
 PATROL_FILE = "log/patrol.json"
 
-# --slam's map, kept across a restart (mapping/mapfile.py says how). Under
-# log/ too: a map is a floor plan of the house, never for the repo.
+# --slam's map, saved as it goes for a record of the run and loaded at boot
+# only with --slam-map-restore (mapping/mapfile.py says why). Under log/
+# too: a map is a floor plan of the house, never for the repo.
 SLAM_MAP_FILE = "log/slam_map.npz"
 
 # The camera view the autopilot's driver reads. The footprint tap reads the
@@ -1941,9 +1942,17 @@ def parse_args(argv=None):
     parser.add_argument(
         "--no-slam-map-file",
         action="store_true",
-        help=f"start the map from nothing and keep nothing: by default --slam "
-             f"saves the map to {SLAM_MAP_FILE} as it goes and starts from it "
-             f"on the next boot",
+        help=f"keep nothing: by default --slam saves the map to "
+             f"{SLAM_MAP_FILE} as it goes, a record of the run (the run "
+             f"before it moved aside to slam_map.prev.npz)",
+    )
+    parser.add_argument(
+        "--slam-map-restore",
+        action="store_true",
+        help=f"start from the map saved in {SLAM_MAP_FILE} instead of a "
+             f"fresh one. Off by default: the truck may boot somewhere else, "
+             f"and a map with a wrong heading written into it came back at "
+             f"every boot",
     )
     # Off unless named, and mapping only. The OAK-D's depth as a 3D voxel map
     # placed by the SLAM pose, and the low obstacles the roof lidar passes
@@ -2222,7 +2231,8 @@ def main(argv=None):
                 nav_half_m=slam_runner.NAV_HALF_M if args.nav else None,
                 speed=commanded_speed,
                 map_path=(None if args.no_slam_map_file
-                          else lg.log_path(SLAM_MAP_FILE)))
+                          else lg.log_path(SLAM_MAP_FILE)),
+                restore_map=args.slam_map_restore)
             slam.start()
             hub.imu_listeners.append(slam.on_imu)
             log.log("info", "SLAM", f"Mapping on a {args.slam_worker}")
