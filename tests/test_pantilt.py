@@ -171,6 +171,18 @@ def test_steering_channels_match_the_vehicle_controller():
                                     vc.REAR_STEERING_CHANNEL}
 
 
+def test_the_servos_are_on_10_and_11_everywhere():
+    """Swept with the main battery in (it feeds the servo rail): channel 10
+    turned the camera side to side and 11 up and down. 12 and 13 have nothing
+    on them. The code default, the shipped config and the controller agree."""
+    assert (pt.PAN_CHANNEL, pt.TILT_CHANNEL) == (10, 11)
+    assert (vc.PAN_CHANNEL, vc.TILT_CHANNEL) == (10, 11)
+    cfg = cfg_default()
+    assert (cfg.mount.pan.channel, cfg.mount.tilt.channel) == (10, 11)
+    shipped = pt.load_config(str(ROOT / "deploy" / "pantilt.json"))
+    assert (shipped.mount.pan.channel, shipped.mount.tilt.channel) == (10, 11)
+
+
 @pytest.mark.parametrize("ch", sorted(pt.STEERING_CHANNELS))
 def test_a_mount_refuses_a_steering_channel(ch):
     with pytest.raises(pt.ConfigError):
@@ -238,10 +250,10 @@ def test_servo_mount_clamps_guards_nan_and_skips_repeats():
     m.set(500.0, float("nan"))
     assert m.pan_deg == pytest.approx(hi)
     assert m.tilt_deg == 0.0
-    assert w.writes == [(12, cfg.mount.pan.max_us), (13, 1500.0)]
+    assert w.writes == [(10, cfg.mount.pan.max_us), (11, 1500.0)]
     m.set(500.0, 0.0)
     assert len(w.writes) == 2
-    assert {ch for ch, _ in w.writes} <= {12, 13}
+    assert {ch for ch, _ in w.writes} <= {10, 11}
 
 
 def test_uvc_mount_drives_v4l2_left_positive():
@@ -263,7 +275,7 @@ def test_config_rejects_unknown_keys_and_wrong_types():
     with pytest.raises(pt.ConfigError):
         pt.config_from_dict({"mount": {"pan": {"min_us": 300}}})
     with pytest.raises(pt.ConfigError):
-        pt.config_from_dict({"mount": {"pan": {"channel": 13}}})
+        pt.config_from_dict({"mount": {"pan": {"channel": 11}}})  # = tilt
 
 
 def test_the_committed_config_loads(tmp_path):
@@ -518,7 +530,7 @@ def test_runner_centres_on_start_and_follows_a_person():
     r, w, g, d, tele, log, clock = make_runner()
     r.start()
     r._stop.set()
-    assert w.writes[:2] == [(12, 1500.0), (13, 1500.0)]
+    assert w.writes[:2] == [(10, 1500.0), (11, 1500.0)]
     g.frame = (np.zeros((240, 320, 3), np.uint8), 1.0)
     r.tick()
     assert d.submitted == [1]
@@ -531,7 +543,7 @@ def test_runner_centres_on_start_and_follows_a_person():
         clock.t += 0.05
         r.tick()
     assert r.mount.pan_deg == pytest.approx(pixel_left(0.9), abs=0.1)
-    assert all(ch in (12, 13) for ch, _ in w.writes)
+    assert all(ch in (10, 11) for ch, _ in w.writes)
     assert any("Person at" in m for _, _, m in log.lines)
     r.close()
     assert g.closed and d.state == "closed"
@@ -632,7 +644,7 @@ def test_calibration_commands():
     w = FakeWriter()
     cal = pantilt_cal.Cal(cfg_default(), w)
     cal.centre_both()
-    assert w.writes == [(12, 1500.0), (13, 1500.0)]
+    assert w.writes == [(10, 1500.0), (11, 1500.0)]
     assert cal.apply("p+") == "pan 1520 us"
     assert cal.apply("pinv") == "pan.invert = True"
     assert cal.apply("p+") == "pan 1500 us"
@@ -642,9 +654,9 @@ def test_calibration_commands():
     cal.apply("pmax")
     assert cal.apply("pspan 60") == "pan.deg_per_us = 0.1000"
     assert "outside" in cal.apply("t 2600")
-    assert cal.apply("t 2600") and w.writes[-1][0] == 12
+    assert cal.apply("t 2600") and w.writes[-1][0] == 10
     assert cal.apply("q") is None
-    assert w.writes[-2:] == [(12, 1500.0), (13, 1500.0)]
+    assert w.writes[-2:] == [(10, 1500.0), (11, 1500.0)]
 
 
 def test_calibration_saves_beside_the_model_not_over_the_tracked_config():

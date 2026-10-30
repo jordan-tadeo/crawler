@@ -53,6 +53,10 @@ from dataclasses import dataclass, field, asdict, is_dataclass
 # The channels VehicleController steers on, by value so this file never
 # imports the ESC's module. tests/test_pantilt.py checks they match.
 STEERING_CHANNELS = frozenset((14, 15))
+# Where the hood camera's servos are plugged in, found by sweeping each
+# channel with the main battery in (it feeds the servo rail).
+PAN_CHANNEL = 10
+TILT_CHANNEL = 11
 
 DEFAULT_CONFIG = os.path.join("deploy", "pantilt.json")
 
@@ -71,7 +75,7 @@ PULSE_CEIL_US = 2500
 
 @dataclass
 class AxisConfig:
-    channel: int = 12
+    channel: int = PAN_CHANNEL
     min_us: float = 1100.0
     max_us: float = 1900.0
     centre_us: float = 1500.0
@@ -118,8 +122,10 @@ class MountConfig:
     pitch_deg: float = 0.0         # where tilt 0 points, above level
     x_m: float = 0.0               # from the lidar origin, forward
     y_m: float = 0.0               # left
-    pan: AxisConfig = field(default_factory=lambda: AxisConfig(channel=12))
-    tilt: AxisConfig = field(default_factory=lambda: AxisConfig(channel=13))
+    pan: AxisConfig = field(
+        default_factory=lambda: AxisConfig(channel=PAN_CHANNEL))
+    tilt: AxisConfig = field(
+        default_factory=lambda: AxisConfig(channel=TILT_CHANNEL))
     # For kind "uvc": the v4l2 controls and how many control units a degree
     # is. UVC's pan/tilt_absolute are arc-seconds, 3600 to the degree.
     pan_control: str = "pan_absolute"

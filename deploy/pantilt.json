@@ -15,7 +15,7 @@
     "x_m": 0.0,
     "y_m": 0.0,
     "pan": {
-      "channel": 12,
+      "channel": 10,
       "min_us": 1100.0,
       "max_us": 1900.0,
       "centre_us": 1500.0,
@@ -23,7 +23,7 @@
       "deg_per_us": 0.09
     },
     "tilt": {
-      "channel": 13,
+      "channel": 11,
       "min_us": 1100.0,
       "max_us": 1900.0,
       "centre_us": 1500.0,

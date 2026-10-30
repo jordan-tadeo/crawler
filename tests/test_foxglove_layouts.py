@@ -89,9 +89,13 @@ def test_a_layout_reads_only_topics_the_car_publishes(path):
 
 def test_the_drive_layout_is_pictures_and_the_telemetry_one_is_not():
     drive, tele = (json.load(open(p))["configById"] for p in LAYOUTS)
-    cams = set(tm.IMAGE_CHANNELS.values())
-    assert {cfg["imageMode"]["imageTopic"] for k, cfg in drive.items()
-            if k.startswith("Image!")} == cams
+    # Every picture but disparity: the hood camera took its pane. Disparity
+    # is still published and recorded, and any Image panel can pick it.
+    cams = set(tm.IMAGE_CHANNELS.values()) - {"/camera/disparity"}
+    assert "/pantilt/image" in cams
+    shown = [cfg["imageMode"]["imageTopic"] for k, cfg in drive.items()
+             if k.startswith("Image!")]
+    assert sorted(shown) == sorted(cams)
     assert {"/map", "/lidar/scan", "/voxel/points", "/voxel/low",
             "/goal/marker"} <= set(drive["3D!slam"]["topics"])
     # The planner is not on the drive layout: the model drives to a click.

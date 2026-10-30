@@ -3,7 +3,7 @@
 On the car, from the checkout, with the service up or down:
 
     ./.venv/bin/python tools/pantilt_cal.py
-    ./.venv/bin/python tools/pantilt_cal.py --pan-channel 12 --tilt-channel 13
+    ./.venv/bin/python tools/pantilt_cal.py --pan-channel 10 --tilt-channel 11
 
 It writes only the LEDn registers of the two channels in the config (or the
 ones given), at the frequency the PCA9685 is already running: it never

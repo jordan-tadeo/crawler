@@ -11,17 +11,6 @@
       },
       "foxglovePanelTitle": "Depth (8 Hz)"
     },
-    "Image!cam_disparity": {
-      "synchronize": false,
-      "imageMode": {
-        "imageTopic": "/camera/disparity",
-        "imageSchemaName": "foxglove.CompressedImage",
-        "rotation": 0,
-        "flipHorizontal": false,
-        "flipVertical": false
-      },
-      "foxglovePanelTitle": "Disparity (8 Hz)"
-    },
     "Image!cam_left": {
       "synchronize": false,
       "imageMode": {
@@ -338,16 +327,11 @@
       "first": "Image!cam_depth",
       "second": {
         "direction": "column",
-        "first": "Image!cam_disparity",
-        "second": {
-          "direction": "column",
-          "first": "Image!cam_left",
-          "second": "Image!pantilt",
-          "splitPercentage": 50
-        },
-        "splitPercentage": 33.34
+        "first": "Image!pantilt",
+        "second": "Image!cam_left",
+        "splitPercentage": 50
       },
-      "splitPercentage": 25
+      "splitPercentage": 33.34
     },
     "second": {
       "direction": "row",

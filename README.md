@@ -159,7 +159,7 @@ On the car, find the servos' centre, limits and direction. It writes only
 the two pan/tilt channels and is safe with the service running:
 
 ```sh
-./.venv/bin/python tools/pantilt_cal.py --pan-channel 12 --tilt-channel 13
+./.venv/bin/python tools/pantilt_cal.py --pan-channel 10 --tilt-channel 11
 ```
 
 `save` writes `models/pantilt.json`, which is untracked like the model, so

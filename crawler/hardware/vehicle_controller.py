@@ -27,8 +27,8 @@ ESC_FULL_FORWARD_PW = 2000
 ESC_FULL_REVERSE_PW = 1000
 
 # Constants for PCA9685 PWM Channels (Servos)
-PAN_CHANNEL = 12
-TILT_CHANNEL = 13
+PAN_CHANNEL = 10
+TILT_CHANNEL = 11
 FRONT_STEERING_CHANNEL = 15
 REAR_STEERING_CHANNEL = 14
 SERVO_FREQ = 50
@@ -240,12 +240,11 @@ class VehicleController:
         '''
         Set the pan and tilt angles for the servos.
 
-        Nothing calls this. The pan/tilt gimbal is not on the vehicle any
-        more, and its only callers were in PersonFollower, which is retired.
-        I am keeping this method and PAN_CHANNEL/TILT_CHANNEL on disk on
-        purpose: if the gimbal goes back on, this is the seam -- wire a caller
-        to it, and put pan and tilt back into get_state and return_neutral.
-        Until then the live path does not touch channels 12 and 13 at all.
+        Nothing calls this. The hood camera's pan/tilt is driven by
+        --pantilt (crawler/hardware/pantilt.py), which writes only its own
+        two channels and never goes through this class. This method stays
+        as the old seam; the live path here does not touch channels 10 and
+        11 at all.
         '''
 
         # Restrict values to the range [-1, 1]. Same nan hole as the throttle
