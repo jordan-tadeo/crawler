@@ -60,6 +60,22 @@ def test_the_turn_is_graded_only_where_the_model_drives_forward_both_times():
     s = sc.goal_adherence(GoalStub(lambda g: -0.5 * g[pg.SIN],
                                    gear_of=lambda g: 1 if g[pg.SIN] < 0 else 0), a, t)
     assert s["goal_turn_ticks"] == 0 and np.isnan(s["goal_turn"])
+    # ...and goal_turn_any grades it: the nose goes left either way, so no.
+    assert s["goal_turn_any"] == 0.0
+
+
+def test_backing_round_toward_the_goal_counts_and_driving_away_or_stopping_does_not():
+    a = drive()
+    t = ticks_of(a)
+    rev = lambda g: 1  # noqa: E731
+    # Reversing, positive steer turns the nose left: toward a goal on the left.
+    toward = sc.goal_adherence(GoalStub(lambda g: 0.5 * g[pg.SIN], gear_of=rev), a, t)
+    away = sc.goal_adherence(GoalStub(lambda g: -0.5 * g[pg.SIN], gear_of=rev), a, t)
+    stop = sc.goal_adherence(GoalStub(lambda g: -0.5 * g[pg.SIN], gear_of=lambda g: 2), a, t)
+    assert toward["goal_turn_any"] == 1.0 and np.isnan(toward["goal_turn"])
+    assert away["goal_turn_any"] == 0.0 and stop["goal_turn_any"] == 0.0
+    fwd = sc.goal_adherence(GoalStub(lambda g: -0.5 * g[pg.SIN]), a, t)
+    assert fwd["goal_turn_any"] == 1.0 == fwd["goal_turn"]
 
 
 def test_a_goal_behind_that_makes_it_reverse_counts_and_the_blank_goal_is_measured():

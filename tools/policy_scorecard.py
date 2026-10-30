@@ -35,7 +35,7 @@ drives). What is measured:
                       truck's own pose then), where there is one: gear,
                       side, and the no-goal decode on the same ticks beside
                       it (goal_gain_dir, goal_gain_side)
-  goal_turn / goal_gap / goal_back_rev / goal_use   adherence: the same
+  goal_turn_any / goal_turn / goal_gap / goal_back_rev / goal_use   adherence: the same
                       ticks with a made-up goal GOAL_PROBE_M off left, then
                       right, then behind (goal_adherence). A hindsight goal
                       is where I went anyway, so goal_dir can be passed
@@ -215,10 +215,23 @@ def probe_goals(n, bearing_deg, dist_m=None):
                           np.ones(n, bool))
 
 
+def nose_left(action, steer):
+    """How hard the command turns the truck's nose left: -steer going
+    forward, +steer reversing, 0 stopped (negative steer is left)."""
+    gear = np.where(action == FWD, 1.0, np.where(action == REV, -1.0, 0.0))
+    return -gear * np.asarray(steer, float)
+
+
 def goal_adherence(model, data, ticks):
     """Whether the model goes where it is told, off the same ticks with a
     made-up goal GOAL_PROBE_M away, raw offset 0 (no chunk blend):
 
+      goal_turn_any  on every tick, the share where the nose turns more
+                     than SIDE_BAND further left for the left goal than for
+                     the right one. The nose turns with the gear: forward,
+                     negative steer turns it left; reverse, positive steer
+                     does; a stop does not turn it. So backing round toward
+                     a goal counts, and driving away from it does not
       goal_turn      on the ticks it drives forward with the goal
                      GOAL_PROBE_DEG left and with it as far right, the share
                      whose steer is more than SIDE_BAND further right for the
@@ -247,6 +260,7 @@ def goal_adherence(model, data, ticks):
     gap = rs - ls
     out["goal_turn_ticks"] = int(both.sum())
     out["goal_turn"] = _rate(gap > SIDE_BAND, both)
+    out["goal_turn_any"] = float(np.mean(nose_left(la, ls) - nose_left(ra, rs) > SIDE_BAND))
     out["goal_gap"] = float(gap[both].mean()) if both.any() else float("nan")
     out["goal_back_rev"] = float(np.mean(ba == REV) - np.mean(fa == REV))
     out["goal_use"] = float((np.abs(ls - ns).mean() + np.abs(rs - ns).mean()) / 2)
@@ -392,7 +406,7 @@ def score(model, data, ticks):
 
 KEYS = ("dir_acc", "dir_bal", "stop_rec", "stop_prec", "rev_rec", "rev_prec", "steer_mae",
         "side", "stop_side", "lock", "mirror_fail", "mirror_fail_goal", "goal_dir",
-        "goal_side", "goal_gain_side", "goal_turn", "goal_gap", "goal_back_rev", "goal_use",
+        "goal_side", "goal_gain_side", "goal_turn_any", "goal_turn", "goal_gap", "goal_back_rev", "goal_use",
         "behind_dir", "behind_rev_rec", "onset_dir",
         "onset_side", "map_use", "lowband_use", "lowband_use_dir")
 
