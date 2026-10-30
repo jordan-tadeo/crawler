@@ -29,10 +29,22 @@ PUBLISHED = (set(tm.JSON_TOPICS.values()) | set(tm.IMAGE_CHANNELS.values())
 GOAL_TOPIC = "/move_base_simple/goal"
 
 
-def panels(node):
+def panels(node, configs=None):
+    """Every panel id a mosaic node lays out. With configs, a Tab panel's tabs
+    are walked too: Studio keeps a tab's own mosaic in the Tab panel's config
+    ({"activeTabIdx": 0, "tabs": [{"title": ..., "layout": <mosaic node>}]},
+    TabPanelConfig in types/layouts.ts of the open Lichtblick fork), and the
+    panels inside it keep their configs in the one flat configById
+    (getAllPanelIds in util/layout.ts there)."""
+    if node is None:
+        return []
     if isinstance(node, str):
-        return [node]
-    return panels(node["first"]) + panels(node["second"])
+        out = [node]
+        if configs is not None and node.startswith("Tab!"):
+            for tab in configs[node]["tabs"]:
+                out += panels(tab.get("layout"), configs)
+        return out
+    return panels(node["first"], configs) + panels(node["second"], configs)
 
 
 def path_topic(path):
@@ -70,7 +82,7 @@ def test_there_are_two_layouts_one_to_drive_by_and_one_of_numbers():
 @pytest.mark.parametrize("path", LAYOUTS, ids=os.path.basename)
 def test_a_layout_reads_only_topics_the_car_publishes(path):
     layout = json.load(open(path))
-    assert set(panels(layout["layout"])) == set(layout["configById"])
+    assert set(panels(layout["layout"], layout["configById"])) == set(layout["configById"])
     seen = 0
     for key, cfg in layout["configById"].items():
         for topic, where in topics_read(cfg):
@@ -118,3 +130,49 @@ def test_a_click_on_the_drive_map_publishes_a_goal_pose_in_the_map_frame():
     assert drive["publish"]["poseTopic"] == GOAL_TOPIC
     assert drive["followTf"] == "map"
     assert drive["topics"]["/goal/marker"]["visible"]
+
+
+@pytest.mark.parametrize("path", LAYOUTS, ids=os.path.basename)
+def test_every_panel_is_laid_out_once_tabs_included_and_every_config_is_used(path):
+    layout = json.load(open(path))
+    cfg = layout["configById"]
+    shown = panels(layout["layout"], cfg)
+    # A panel in two places would be one config drawn twice; Studio's own
+    # layout code assumes each id is a single leaf.
+    assert sorted(shown) == sorted(cfg)
+    for key in shown:
+        if key.startswith("Tab!"):
+            tab = cfg[key]
+            assert isinstance(tab["activeTabIdx"], int), key
+            assert 0 <= tab["activeTabIdx"] < len(tab["tabs"]), key
+            for t in tab["tabs"]:
+                assert set(t) == {"title", "layout"} and t["title"], key
+
+
+def test_the_drive_layout_keeps_the_statuses_in_tabs_over_a_grid_of_buttons():
+    layout = json.load(open(LAYOUTS[0]))
+    cfg = layout["configById"]
+    right = layout["layout"]["second"]["second"]
+    assert right["first"] == "3D!lidar"
+    status, grid = right["second"]["first"], right["second"]["second"]
+    tab = cfg[status]
+    assert tab["activeTabIdx"] == 0
+    assert [(t["title"], t["layout"]) for t in tab["tabs"]] == [
+        ("Goal", "RawMessages!goal"), ("Patrol", "RawMessages!patrol"),
+        ("Path", "RawMessages!path"), ("Follow", "RawMessages!follow")]
+    rows = []
+    while isinstance(grid, dict) and grid["direction"] == "column":
+        rows.append(grid["first"])
+        grid = grid["second"]
+    rows.append(grid)
+    pairs = [(r["first"], r["second"]) for r in rows]
+    assert [tuple(k.split("!")[1] for k in p) for p in pairs] == [
+        ("patrol_edit", "patrol_goal"), ("patrol_start", "patrol_pause"),
+        ("patrol_mode", "patrol_trace"), ("patrol_undo", "patrol_clear"),
+        ("follow_on", "follow_off")]
+    for k, v in cfg.items():
+        if k.startswith("RawMessages!"):
+            # "all" opens every field; FONT_SIZE_OPTIONS in Lichtblick's
+            # RawMessagesCommon/constants.ts is the list the panel offers.
+            assert v["expansion"] == "all", k
+            assert v["fontSize"] in (8, 9, 10, 11, 12, 14, 16, 18, 24), k

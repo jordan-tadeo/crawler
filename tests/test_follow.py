@@ -328,9 +328,8 @@ def test_the_drive_layout_has_follow_on_and_off_and_draws_the_person():
     assert cfg["3D!slam"]["topics"]["/follow/marker"]["visible"]
     assert cfg["RawMessages!follow"]["topicPath"] == "/follow/status"
 
-    def names(node):
-        return [node] if isinstance(node, str) else names(node["first"]) + names(node["second"])
-    shown = names(layout["layout"])
+    from test_foxglove_layouts import panels
+    shown = panels(layout["layout"], cfg)
     assert {"Publish!follow_on", "Publish!follow_off", "RawMessages!follow"} <= set(shown)
     assert sorted(shown) == sorted(cfg), "every panel configured is laid out"
 

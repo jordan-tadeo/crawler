@@ -224,7 +224,9 @@
       "diffTopicPath": "",
       "showFullMessageForDiff": false,
       "topicPath": "/goal/status",
-      "foxglovePanelTitle": "Goal"
+      "foxglovePanelTitle": "Goal",
+      "expansion": "all",
+      "fontSize": 14
     },
     "RawMessages!patrol": {
       "diffEnabled": false,
@@ -232,7 +234,9 @@
       "diffTopicPath": "",
       "showFullMessageForDiff": false,
       "topicPath": "/patrol/status",
-      "foxglovePanelTitle": "Patrol"
+      "foxglovePanelTitle": "Patrol",
+      "expansion": "all",
+      "fontSize": 14
     },
     "Publish!patrol_edit": {
       "topicName": "/patrol/cmd",
@@ -331,7 +335,9 @@
       "diffTopicPath": "",
       "showFullMessageForDiff": false,
       "topicPath": "/path/status",
-      "foxglovePanelTitle": "Path"
+      "foxglovePanelTitle": "Path",
+      "expansion": "all",
+      "fontSize": 14
     },
     "RawMessages!follow": {
       "diffEnabled": false,
@@ -339,7 +345,9 @@
       "diffTopicPath": "",
       "showFullMessageForDiff": false,
       "topicPath": "/follow/status",
-      "foxglovePanelTitle": "Follow"
+      "foxglovePanelTitle": "Follow",
+      "expansion": "all",
+      "fontSize": 14
     },
     "Publish!follow_on": {
       "topicName": "/follow/cmd",
@@ -360,6 +368,27 @@
       "advancedView": false,
       "value": "{\"cmd\": \"off\"}",
       "foxglovePanelTitle": "Follow off"
+    },
+    "Tab!status": {
+      "activeTabIdx": 0,
+      "tabs": [
+        {
+          "title": "Goal",
+          "layout": "RawMessages!goal"
+        },
+        {
+          "title": "Patrol",
+          "layout": "RawMessages!patrol"
+        },
+        {
+          "title": "Path",
+          "layout": "RawMessages!path"
+        },
+        {
+          "title": "Follow",
+          "layout": "RawMessages!follow"
+        }
+      ]
     }
   },
   "layout": {
@@ -383,71 +412,56 @@
         "first": "3D!lidar",
         "second": {
           "direction": "column",
-          "first": {
-            "direction": "row",
-            "first": "RawMessages!goal",
-            "second": {
-              "direction": "row",
-              "first": "RawMessages!patrol",
-              "second": {
-                "direction": "row",
-                "first": "RawMessages!path",
-                "second": "RawMessages!follow",
-                "splitPercentage": 50
-              },
-              "splitPercentage": 33.34
-            },
-            "splitPercentage": 25
-          },
+          "first": "Tab!status",
           "second": {
             "direction": "column",
             "first": {
-              "direction": "column",
-              "first": {
-                "direction": "row",
-                "first": {
-                  "direction": "row",
-                  "first": "Publish!patrol_edit",
-                  "second": "Publish!patrol_goal",
-                  "splitPercentage": 50.0
-                },
-                "second": {
-                  "direction": "row",
-                  "first": "Publish!patrol_start",
-                  "second": "Publish!patrol_pause",
-                  "splitPercentage": 50.0
-                },
-                "splitPercentage": 50.0
-              },
-              "second": {
-                "direction": "row",
-                "first": {
-                  "direction": "row",
-                  "first": "Publish!patrol_undo",
-                  "second": "Publish!patrol_clear",
-                  "splitPercentage": 50.0
-                },
-                "second": {
-                  "direction": "row",
-                  "first": "Publish!patrol_mode",
-                  "second": "Publish!patrol_trace",
-                  "splitPercentage": 50.0
-                },
-                "splitPercentage": 50.0
-              },
+              "direction": "row",
+              "first": "Publish!patrol_edit",
+              "second": "Publish!patrol_goal",
               "splitPercentage": 50
             },
             "second": {
-              "direction": "row",
-              "first": "Publish!follow_on",
-              "second": "Publish!follow_off",
-              "splitPercentage": 50.0
+              "direction": "column",
+              "first": {
+                "direction": "row",
+                "first": "Publish!patrol_start",
+                "second": "Publish!patrol_pause",
+                "splitPercentage": 50
+              },
+              "second": {
+                "direction": "column",
+                "first": {
+                  "direction": "row",
+                  "first": "Publish!patrol_mode",
+                  "second": "Publish!patrol_trace",
+                  "splitPercentage": 50
+                },
+                "second": {
+                  "direction": "column",
+                  "first": {
+                    "direction": "row",
+                    "first": "Publish!patrol_undo",
+                    "second": "Publish!patrol_clear",
+                    "splitPercentage": 50
+                  },
+                  "second": {
+                    "direction": "row",
+                    "first": "Publish!follow_on",
+                    "second": "Publish!follow_off",
+                    "splitPercentage": 50
+                  },
+                  "splitPercentage": 50.0
+                },
+                "splitPercentage": 33.33
+              },
+              "splitPercentage": 25.0
             },
-            "splitPercentage": 67
+            "splitPercentage": 20.0
           },
-          "splitPercentage": 60
+          "splitPercentage": 53.85
         },
-        "splitPercentage": 55
+        "splitPercentage": 35
       },
       "splitPercentage": 62
     },

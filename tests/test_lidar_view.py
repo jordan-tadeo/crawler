@@ -17,6 +17,7 @@ import pytest
 from crawler.hardware import lidar as ld
 from crawler.telemetry import lidar_view as lv
 from crawler.telemetry import telemetry as tm
+from test_foxglove_layouts import panels
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAYOUT = os.path.join(ROOT, "deploy", "foxglove-drive.json")
@@ -321,11 +322,6 @@ def test_the_keys_are_wired_through():
 
 # ---- the layout --------------------------------------------------------------------
 
-def panels(node):
-    if isinstance(node, str):
-        return [node]
-    return panels(node["first"]) + panels(node["second"])
-
 
 def ortho_screen_axes(camera):
     """Where the 3D panel's 2D camera puts screen up and screen right, in the
@@ -347,7 +343,7 @@ def ortho_screen_axes(camera):
 
 def test_the_drive_layout_has_the_lidar_from_above_beside_the_map():
     layout = json.load(open(LAYOUT))
-    names = panels(layout["layout"])
+    names = panels(layout["layout"], layout["configById"])
     assert set(names) == set(layout["configById"])
     right = layout["layout"]["second"]
     beside = right["second"]
