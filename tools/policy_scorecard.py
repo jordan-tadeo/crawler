@@ -35,6 +35,11 @@ drives). What is measured:
                       truck's own pose then), where there is one: gear,
                       side, and the no-goal decode on the same ticks beside
                       it (goal_gain_dir, goal_gain_side)
+  goal_turn / goal_gap / goal_back_rev / goal_use   adherence: the same
+                      ticks with a made-up goal GOAL_PROBE_M off left, then
+                      right, then behind (goal_adherence). A hindsight goal
+                      is where I went anyway, so goal_dir can be passed
+                      without ever reading the goal; these cannot
   behind_*            the goal ticks whose goal is behind the truck
                       (cos < 0): gear and reverse recall
   onset_dir / onset_side   the first ONSET ticks of each takeover, where the
@@ -47,6 +52,11 @@ drives). What is measured:
   lowband_use         the same for the lower band (column_profile, "the
                       lower band"), every column of it blind; and
                       lowband_use_dir, the share of ticks whose gear changes
+
+With --tips TIPS.npz, a dataset of drives that went over (built like any
+other, never trained on), each model is also run through those whole drives
+and graded on the second before each tip (tip_scores: tip_go, tip_thr,
+calm_go). Those are the car's own ticks, not my labels.
 
 What this cannot say: whether the car drives well. These are my own labels on
 moments I took over; the car's feel is mine to judge on a drive.
@@ -78,6 +88,10 @@ AFTER = 5
 ONSET = 10
 HIND_S = 8.0
 TAKEOVER = "takeover"
+# goal_adherence's made-up goal: as far along as the planner puts the point
+# it feeds the model (pathgoal.LOOKAHEAD_M), and this far off either side.
+GOAL_PROBE_M = 1.5
+GOAL_PROBE_DEG = 60.0
 
 
 def side(s, band=SIDE_BAND):
@@ -129,12 +143,15 @@ def inputs(model, data, i, goal=None, mirrored=False, blank_map=False, blank_low
 
 
 def decode(model, data, ticks, goals=None, mirrored=False, blend=True, blank_map=False,
-           blank_lowband=False):
+           blank_lowband=False, with_throttle=False):
     """(action, steer) per tick: the car's read_output, after the chunk blend
     (blend) or off the raw answer's offset 0. A chain starts over on a new
-    session and wherever the ensembler's own link rule says."""
+    session and wherever the ensembler's own link rule says. with_throttle:
+    (action, steer, throttle), the throttle the fraction of the cap it asks
+    for, 0 on a stop or no answer."""
     act = np.full(len(ticks), STOP, np.int64)
     steer = np.zeros(len(ticks))
+    thr = np.zeros(len(ticks))
     sess, ens = None, None
     for j, i in enumerate(ticks):
         if data["session"][i] != sess:
@@ -152,7 +169,88 @@ def decode(model, data, ticks, goals=None, mirrored=False, blend=True, blank_map
             continue
         act[j] = pl.ACTIONS.index(decided[0])
         steer[j] = decided[2]
-    return act, steer
+        thr[j] = 0.0 if act[j] == STOP else decided[1]
+    return (act, steer, thr) if with_throttle else (act, steer)
+
+
+def tip_scores(model, data, tip_deg=pt.TIP_DEG, lead_s=pt.TIP_LEAD_S):
+    """The model run through drives that tipped (--tips), every decision
+    tick but the tipped ones, in time order as the car runs it:
+
+      tip_crossings  how many times a session went past tip_deg
+      tip_ticks      the decision ticks in their run-ups (policy_train.tip_marks)
+      tip_go         the share of those it keeps a moving gear on
+      tip_thr        the mean throttle it asks for there, 0 on a stop
+      calm_go        the share it drives on the rest, where the car was
+                     moving: a model that only ever stops is not safe, it
+                     is parked, and this says so
+
+    These are the car's drives, not my labels: nothing says what the right
+    gear in a run-up was, only that the one taken went over."""
+    tipped, runup = pt.tip_marks(data, tip_deg, lead_s)
+    dec = np.asarray(data["decision"], bool) & ~tipped
+    ticks = np.flatnonzero(dec)
+    ticks = ticks[np.lexsort((data["t_ns"][ticks], data["session"][ticks]))]
+    act, _, thr = decode(model, data, ticks, with_throttle=True)
+    run = runup[ticks]
+    calm = ~run & (np.asarray(data["action"])[ticks] != STOP)
+    go = act != STOP
+    sess, t = np.asarray(data["session"]), np.asarray(data["t_ns"])
+    tips = np.flatnonzero(tipped)
+    starts = sum(1 for a, b in zip(tips[:-1], tips[1:]) if sess[a] != sess[b] or b != a + 1)
+    return {"tip_crossings": int(len(tips) > 0) + starts,
+            "tip_ticks": int(run.sum()),
+            "tip_go": _rate(go, run),
+            "tip_thr": float(thr[run].mean()) if run.any() else float("nan"),
+            "calm_go": _rate(go, calm),
+            "calm_ticks": int(calm.sum()),
+            "tip_first_s": float(t[tips[0]] / 1e9) if len(tips) else float("nan")}
+
+
+def probe_goals(n, bearing_deg, dist_m=None):
+    """n copies of a goal dist_m off at bearing_deg (CCW, + is left)."""
+    dist_m = GOAL_PROBE_M if dist_m is None else dist_m
+    b = np.radians(bearing_deg)
+    return pg.encode_many(np.full(n, dist_m * np.cos(b)), np.full(n, dist_m * np.sin(b)),
+                          np.ones(n, bool))
+
+
+def goal_adherence(model, data, ticks):
+    """Whether the model goes where it is told, off the same ticks with a
+    made-up goal GOAL_PROBE_M away, raw offset 0 (no chunk blend):
+
+      goal_turn      on the ticks it drives forward with the goal
+                     GOAL_PROBE_DEG left and with it as far right, the share
+                     whose steer is more than SIDE_BAND further right for the
+                     right one (negative steer is left)
+      goal_gap       the mean of that difference, right minus left; 0 is a
+                     model that never looks at the goal
+      goal_back_rev  how much more often it reverses with the goal straight
+                     behind than straight ahead
+      goal_use       the mean |steer change| the left and right goals make
+                     against no goal at all, as map_use is for the map
+
+    No label in it: a hindsight goal is where I went anyway, and the rest of
+    the inputs already say that, so this is the only grade of the goal
+    that cannot be passed without it."""
+    n = len(ticks)
+    out = {"goal_probe_ticks": int(n)}
+    if n == 0:
+        return out
+    run = lambda g: decode(model, data, ticks, g, blend=False)  # noqa: E731
+    la, ls = run(probe_goals(n, GOAL_PROBE_DEG))
+    ra, rs = run(probe_goals(n, -GOAL_PROBE_DEG))
+    fa, _ = run(probe_goals(n, 0.0))
+    ba, _ = run(probe_goals(n, 180.0))
+    na, ns = run(np.zeros((n, pg.SIZE), np.float32))
+    both = (la == FWD) & (ra == FWD)
+    gap = rs - ls
+    out["goal_turn_ticks"] = int(both.sum())
+    out["goal_turn"] = _rate(gap > SIDE_BAND, both)
+    out["goal_gap"] = float(gap[both].mean()) if both.any() else float("nan")
+    out["goal_back_rev"] = float(np.mean(ba == REV) - np.mean(fa == REV))
+    out["goal_use"] = float((np.abs(ls - ns).mean() + np.abs(rs - ns).mean()) / 2)
+    return out
 
 
 def hind_goals(data, ticks, k_s=HIND_S):
@@ -277,6 +375,11 @@ def score(model, data, ticks):
         ra, rs = decode(model, data, ticks[gg], goals[gg], blend=False)
         ma, ms = decode(model, data, ticks[gg], goals[gg], mirrored=True, blend=False)
         out["mirror_fail_goal"] = float(np.mean((ra != ma) | (side(rs) != -side(ms))))
+        # Adherence, on the graded ticks the car would feed a goal on at
+        # all: a map model's only where its crop is there.
+        shown = (np.asarray(data["map_on"], bool)[ticks[g]] if model.uses_map
+                 else np.ones(len(g), bool))
+        out.update(goal_adherence(model, data, ticks[g][shown]))
     # Takeover onsets.
     on = takeover_onsets(data, ticks, graded)
     out["takeovers"] = len(on)
@@ -289,7 +392,8 @@ def score(model, data, ticks):
 
 KEYS = ("dir_acc", "dir_bal", "stop_rec", "stop_prec", "rev_rec", "rev_prec", "steer_mae",
         "side", "stop_side", "lock", "mirror_fail", "mirror_fail_goal", "goal_dir",
-        "goal_side", "goal_gain_side", "behind_dir", "behind_rev_rec", "onset_dir",
+        "goal_side", "goal_gain_side", "goal_turn", "goal_gap", "goal_back_rev", "goal_use",
+        "behind_dir", "behind_rev_rec", "onset_dir",
         "onset_side", "map_use", "lowband_use", "lowband_use_dir")
 
 
@@ -317,6 +421,11 @@ def main(argv=None):
     ap.add_argument("--map", required=True, metavar="CROPS_DIR",
                     help="the crops tools/map_crops.py replayed, with their poses")
     ap.add_argument("--json", default=None, help="write every number here too")
+    ap.add_argument("--tips", default=None, metavar="TIPS.npz",
+                    help="also run each model through these drives that tipped "
+                         "(tip_scores); never trained on, as the scorecard's")
+    ap.add_argument("--tips-map", default=None, metavar="CROPS_DIR",
+                    help="the crops for --tips, if not in --map")
     args = ap.parse_args(argv)
     names = pt.scorecard_sessions()
     if not names:
@@ -328,15 +437,21 @@ def main(argv=None):
         print(f"{args.data} has no {missing}: build the dataset with them in")
         return 1
     ticks = scorecard_ticks(data, names)
+    tips = load(args.tips, args.tips_map or args.map) if args.tips else None
     rows = []
     for path in args.models:
         model = pl.PolicyModel(path)
         seen = sorted(set(names) & set(model.meta.get("train_sessions", [])))
         s = score(model, data, ticks)
+        if tips is not None:
+            s.update(tip_scores(model, tips))
+            s["tips_seen"] = sorted(set(tips["meta"]["sessions"])
+                                    & set(model.meta.get("train_sessions", [])))
         s["seen"] = seen
         label = os.path.splitext(os.path.basename(path))[0] + (" (seen)" if seen else "")
         rows.append((label, s))
-        print(f"{label}: {json.dumps({k: s[k] for k in s if k != 'seen'})}", flush=True)
+        print(f"{label}: {json.dumps({k: s[k] for k in s if not k.endswith('seen')})}",
+              flush=True)
     print(table(rows))
     if args.json:
         with open(args.json, "w") as f:

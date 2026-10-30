@@ -789,6 +789,126 @@ def training_mask(data, in_val, labelled):
     return ~in_val & data["decision"] & labelled & ~pe.bad_marked(data)
 
 
+# Training against a tip (--tip-weight). A tip is a tick whose up vector is
+# TIP_DEG or more off the session's own upright, the median up of its valid
+# readings: a session driven all along on a lean is not on its side. 45 is
+# past every near-tip the car came back from but one (59), and the car went
+# from under 10 to 45 in 0.5-0.7 s on every tip it had. The run-up is the
+# TIP_LEAD_S before the first tipped tick of each crossing: on the tips it
+# had, that is the stall or the impact and the start of the roll.
+TIP_DEG = 45.0
+TIP_LEAD_S = 1.0
+# The unlikelihood's floor, so a gear the model is certain of costs a large
+# number and not infinity.
+TIP_EPS = 1e-3
+
+
+def tip_marks(data, tip_deg=TIP_DEG, lead_s=TIP_LEAD_S):
+    """(tipped, runup) per tick off the dataset's up vector (data["imu"]):
+    tipped, tip_deg or more off the session's median up on a valid reading;
+    runup, the lead_s before each tipped tick of the same session, not
+    tipped itself, whatever its own reading."""
+    imu = np.asarray(data["imu"])
+    c = pimu.FEATURES.index("up_x")
+    up = imu[:, c:c + 3].astype(np.float64)
+    ok = imu[:, pimu.FEATURES.index("tilt_valid")] > 0.5
+    sess = np.asarray(data["session"])
+    t = np.asarray(data["t_ns"], np.int64)
+    tipped = np.zeros(len(t), bool)
+    runup = np.zeros(len(t), bool)
+    lead = int(lead_s * 1e9)
+    for sid in np.unique(sess):
+        rows = np.flatnonzero(sess == sid)
+        good = rows[ok[rows]]
+        if not len(good):
+            continue
+        ref = np.median(up[good], axis=0)
+        norm = np.linalg.norm(ref)
+        if norm < 1e-6:
+            continue
+        cos = up[good] @ (ref / norm)
+        over = good[np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))) >= tip_deg]
+        if not len(over):
+            continue
+        tipped[over] = True
+        # Each tick's next tipped time in its own session: inside lead of
+        # it is the run-up. A tipped tick's next is itself, so it is never
+        # its own run-up.
+        times = np.sort(t[over])
+        k = np.searchsorted(times, t[rows], side="left")
+        nxt = np.where(k < len(times), times[np.minimum(k, len(times) - 1)],
+                       np.iinfo(np.int64).max)
+        runup[rows] = (nxt > t[rows]) & (nxt - t[rows] <= lead)
+    return tipped, runup
+
+
+def tip_labelled(labelled, tipped, runup):
+    """The labels left once a tip's are dropped: a car on its side is not
+    driving, and my hand in the second before it went over is not driving
+    to copy."""
+    return np.asarray(labelled, bool) & ~np.asarray(tipped, bool) & ~np.asarray(runup, bool)
+
+
+def tip_rows(data, in_val, runup):
+    """The ticks the tip penalty goes on: run-up decisions in a moving gear,
+    outside val and BAD marks, whoever drove them. The car's own drives have
+    no label, and these are what it did before it went over."""
+    return (~np.asarray(in_val, bool) & np.asarray(data["decision"], bool)
+            & np.asarray(runup, bool) & ~pe.bad_marked(data)
+            & (np.asarray(data["action"]) != pl.ACTIONS.index(pl.STOP)))
+
+
+def tip_penalty(p_taken, throttle, xp=np):
+    """Per row: the unlikelihood of the gear the car took into a tip,
+    -log(1 - p), plus the throttle it would ask for. xp is numpy or torch."""
+    return -xp.log(1.0 - p_taken + TIP_EPS) + throttle
+
+
+# The goal contrast (--goal-contrast). A hindsight goal is where my hand went
+# anyway, and the frame and the map mostly say that already, so a model
+# can fit every goal tick and never read the goal (goal6: the hindsight goal
+# moves its gear and side on the scorecard by under half a percent). The
+# contrast runs each goal tick again with its goal turned a quarter to a
+# half turn away, and costs whatever the turned goal explains my driving
+# there as well as the real one did: only the goal can tell the two apart.
+# No action is made up: the label is mine both times.
+GOAL_CONTRAST_MARGIN = 0.2
+
+
+def rotate_goals(goals, angles, xp=np):
+    """Goal inputs (N, SIZE) with each bearing turned angles (N,) radians
+    CCW; distance and presence kept, a row with no goal left all zeros."""
+    g = goals
+    c, s = xp.cos(angles), xp.sin(angles)
+    sin = g[:, pg.SIN] * c + g[:, pg.COS] * s
+    cos = g[:, pg.COS] * c - g[:, pg.SIN] * s
+    p = g[:, pg.PRESENT]
+    # PRESENT, DIST, SIN, COS are columns 0..3 (policy_goal).
+    return xp.stack([p, g[:, pg.DIST], sin * p, cos * p], 1)
+
+
+def contrast_angles(rng, n):
+    """n turns for the contrast's goals: 90 to 180 degrees, either way."""
+    a = rng.uniform(np.pi / 2, np.pi, n)
+    return np.where(rng.random(n) < 0.5, a, -a)
+
+
+def goal_contrast(loss_true, loss_fake, margin=GOAL_CONTRAST_MARGIN, xp=np):
+    """Per row: what it costs that the turned goal explains my action within
+    margin of the real one, relu(margin + true - fake)."""
+    return xp.clip(margin + loss_true - loss_fake, 0.0, None)
+
+
+def tip_meta(weight, deg=TIP_DEG, lead_s=TIP_LEAD_S, hygiene=None):
+    """The sidecar's word on it: None when nothing was done about tips.
+    Hygiene, the tip's labels dropped, comes with any weight."""
+    hygiene = weight > 0 if hygiene is None else hygiene
+    if not hygiene and weight <= 0:
+        return {"tip": None}
+    return {"tip": {"weight": float(weight), "deg": float(deg), "lead_s": float(lead_s),
+                    "hygiene": bool(hygiene)}}
+
+
 def time_blocks(data, n, guard_s=BLOCK_GUARD_S):
     """[(held_out, guard)] boolean masks: n contiguous stretches of decision
     ticks, in session-then-time order, equal by count. `guard` is every tick
@@ -825,7 +945,10 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           uses_lidar=False, lidar_dropout=LIDAR_DROPOUT, uses_map=False,
           map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE,
           mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam",
-          lowband=None):
+          lowband=None, tip_mask=None, tip_weight=0.0, label_off=None, contrast_weight=0.0):
+    """tip_mask: the rows the tip penalty goes on (tip_rows), trained beside
+    train_mask with no label of their own. label_off: ticks that are never a
+    label, at any chunk offset either (tip_marks' tipped and run-up)."""
     import torch
     from torch import nn
 
@@ -844,7 +967,10 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     if mirror not in MIRROR_MODES:
         raise ValueError(f"mirror {mirror!r}: one of {MIRROR_MODES}")
 
-    idx = np.flatnonzero(train_mask)
+    use_tip = tip_mask is not None and tip_weight > 0 and bool(np.any(tip_mask))
+    idx = np.flatnonzero(train_mask | tip_mask) if use_tip else np.flatnonzero(train_mask)
+    tip_on = (torch.from_numpy(np.asarray(tip_mask, bool)[idx] & ~np.asarray(train_mask)[idx])
+              if use_tip else None)
     x_all = torch.from_numpy(data["x"])
     x = x_all[data["frame"][idx]]
     prev = torch.from_numpy(data["prev"][idx] if uses_prev
@@ -869,6 +995,14 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     w_all = torch.from_numpy(tick_weights(data, idx, good_weight, takeover_weight))
     w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
     steer_all, throttle_all = pe.label_masks(data, label_mode)
+    if label_off is not None:
+        keep = ~np.asarray(label_off, bool)
+        steer_all, throttle_all = steer_all & keep, throttle_all & keep
+    if use_tip:
+        # A penalty row is no label at offset 0, whatever my hand did there.
+        steer_all, throttle_all = steer_all.copy(), throttle_all.copy()
+        pen = idx[tip_on.numpy()]
+        steer_all[pen] = throttle_all[pen] = False
     steer_ok = torch.from_numpy(steer_all[idx])
     throttle_ok = torch.from_numpy(throttle_all[idx])
 
@@ -905,6 +1039,45 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     # OPTIMIZERS: "adam" folds the weight decay into the gradient, which on
     # a branch with a small gradient (the map's) is most of what it gets;
     # "adamw" decays the weights apart from it.
+    def tip_term(logits0, throttle, bb):
+        # The tip penalty (tip_penalty) on the batch's penalty rows, summed
+        # over the batch's length: tip_weight is what one such row counts
+        # against a labelled row's one.
+        on = tip_on[bb]
+        if not bool(on.any()):
+            return torch.zeros(())
+        p = torch.softmax(logits0[on], dim=1).gather(1, action[bb][on][:, None])[:, 0]
+        return tip_weight * tip_penalty(p, throttle[on], torch).sum() / len(bb)
+
+    # The contrast's turns on a generator of their own, so every other draw
+    # is the one it always was.
+    contrast_rng = np.random.default_rng([seed, 2])
+
+    def row_loss(o, bb, tok, sok, sb):
+        # Per row, unweighted: the gear's cross entropy where it is a label
+        # plus the steer's L1 where that is, offset 0.
+        n = len(bb)
+        lg = o[0].reshape(n, chunk, len(pl.ACTIONS))[:, 0]
+        st = (torch.where(gear_of[bb] == GEAR_REVERSE, o[3][:, 0], o[2][:, 0]) if per_gear
+              else o[2][:, 0])
+        g = nn.functional.cross_entropy(lg, action[bb], reduction="none")
+        return (torch.where(tok, g, torch.zeros(())) +
+                torch.where(sok, (st - sb).abs(), torch.zeros(())))
+
+    def contrast_term(out, inputs, gb, bb, tok, sok, sb):
+        # The goal contrast: the batch again with each goal turned away
+        # (contrast_angles), costed where it explains my driving as well.
+        rows = (gb[:, pg.PRESENT] > 0) & (tok | sok)
+        if not bool(rows.any()):
+            return torch.zeros(())
+        ang = torch.from_numpy(contrast_angles(contrast_rng, len(gb)).astype(np.float32))
+        fake = torch.where(rows[:, None], rotate_goals(gb, ang, torch), gb)
+        xb_, pb_, mo_, ib_, lb_, mb_ = inputs
+        extra = [v for v in (ib_, lb_, mb_, fake) if v is not None]
+        o_fake = model(xb_, pb_, mo_, *extra)
+        lt, lf = row_loss(out, bb, tok, sok, sb), row_loss(o_fake, bb, tok, sok, sb)
+        return contrast_weight * goal_contrast(lt[rows], lf[rows], xp=torch).sum() / len(bb)
+
     opt = (torch.optim.AdamW if optimizer == "adamw" else torch.optim.Adam)(
         model.parameters(), lr=3e-3, weight_decay=1e-4)
     batch = 64
@@ -957,6 +1130,9 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
             wb = w_all[bb]
             moving = tok & (action[bb] != pl.ACTIONS.index(pl.STOP))
             loss = torch.zeros(())
+            if contrast_weight > 0 and gb is not None:
+                loss = loss + contrast_term(out, (xb, pb, mode_in[bb], ib, lb, mb), gb, bb,
+                                            tok, sok, sb)
             if chunk > 1:
                 # The gear and steer losses averaged over the offsets, as ACT
                 # averages its L1; throttle and mode stay one step. A per-gear
@@ -981,6 +1157,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                     loss = loss + _weighted((t_out[moving, 0] - mag[bb][moving]).abs(), wb[moving])
                 if sok.any():
                     loss = loss + _weighted(ce_mode(m_out[sok], mode[bb][sok]), w_mode[bb][sok])
+                if use_tip:
+                    loss = loss + tip_term(lc[:, 0], t_out[:, 0], bb)
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -1004,6 +1182,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 loss = loss + _weighted((out[2][sok, 0] - sb[sok]).abs(), wb[sok])
             if sok.any():
                 loss = loss + _weighted(ce_mode(m_out[sok], mode[bb][sok]), w_mode[bb][sok])
+            if use_tip:
+                loss = loss + tip_term(logits, t_out[:, 0], bb)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -1255,6 +1435,21 @@ def main(argv=None):
                          "under the footprint band's (column_profile.py): lower_third, "
                          "nearest/median/valid; lower_third_floor, against a flat floor "
                          "at the IMU's pitch")
+    ap.add_argument("--tip-weight", type=float, default=0.0, metavar="W",
+                    help="train against tips: drop every label on a tip and its run-up "
+                         "(tip_marks) and put the tip penalty, the unlikelihood of the "
+                         "gear the car took plus its throttle, on the run-up's moving "
+                         "decisions at W a row. 0 is off")
+    ap.add_argument("--goal-contrast", type=float, default=0.0, metavar="W",
+                    help="the goal contrast at W: each goal tick again with its goal turned "
+                         "90-180 degrees away, costed where that explains my driving within "
+                         f"{GOAL_CONTRAST_MARGIN} of the real goal. Needs --goal; 0 is off")
+    ap.add_argument("--tip-hygiene", action="store_true",
+                    help="only drop the tip's labels, no penalty")
+    ap.add_argument("--tip-deg", type=float, default=TIP_DEG,
+                    help="degrees off the session's upright that is a tip")
+    ap.add_argument("--tip-lead-s", type=float, default=TIP_LEAD_S,
+                    help="seconds before a tip that are its run-up")
     ap.add_argument("--chunk", type=int, default=1, metavar="K",
                     help="action chunks: the gear and steer heads answer for this decision "
                          "and the next K-1, which the car blends (policy.ChunkEnsembler). "
@@ -1354,6 +1549,9 @@ def main(argv=None):
     if args.goal and not args.map:
         print("--goal needs --map: the goal is a point on the map")
         return 2
+    if args.goal_contrast > 0 and (not args.goal or args.steer_head == pl.STEER_DIRECTION):
+        print("--goal-contrast needs --goal and a regression steer head")
+        return 2
     if args.goal and not bool(np.any(data["goal_poses"]["present"])):
         print(f"--goal: no crop in {args.map} carries its pose; replay them again "
               "with tools/map_crops.py")
@@ -1372,6 +1570,24 @@ def main(argv=None):
         labelled = labelled & ~scorecard_mask(data, held_card)
         print(f"scorecard: {len(held_card)} sessions kept out of training "
               f"({SCORECARD_FILE})")
+    tip_on = args.tip_weight > 0 or args.tip_hygiene
+    runup = label_off = None
+    if tip_on:
+        tipped, runup = tip_marks(data, args.tip_deg, args.tip_lead_s)
+        label_off = tipped | runup
+        before = int((labelled & data["decision"]).sum())
+        labelled = tip_labelled(labelled, tipped, runup)
+        print(f"tips: {int(tipped.sum())} ticks past {args.tip_deg:g} deg, {int(runup.sum())} "
+              f"in the {args.tip_lead_s:g} s before; "
+              f"{before - int((labelled & data['decision']).sum())} labelled decisions dropped")
+    card_mask = (scorecard_mask(data, held_card) if held_card
+                 else np.zeros(len(data["t_ns"]), dtype=bool))
+
+    def tip_mask_of(out_of):
+        if args.tip_weight <= 0:
+            return None
+        return tip_rows(data, out_of | card_mask, runup)
+
     data["x"] = encode_frames(data["frames"], args.representation, args.lowband,
                               frame_pitch(data, args.lowband))
     fit = dict(representation=args.representation, label_mode=args.labels,
@@ -1384,7 +1600,9 @@ def main(argv=None):
                uses_map=bool(args.map), map_dropout=args.map_dropout, chunk=args.chunk,
                uses_goal=args.goal, no_goal_share=args.no_goal_share,
                mirror=args.mirror, stop_gear_s=args.stop_gear_s,
-               map_act=args.map_act, optimizer=args.optimizer, lowband=args.lowband)
+               map_act=args.map_act, optimizer=args.optimizer, lowband=args.lowband,
+               tip_weight=args.tip_weight, label_off=label_off,
+               contrast_weight=args.goal_contrast)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1394,7 +1612,7 @@ def main(argv=None):
             if args.fold is not None and k + 1 != int(args.fold):
                 continue
             mask = training_mask(data, guard, labelled)
-            model, _ = train(data, train_mask=mask, **fit)
+            model, _ = train(data, train_mask=mask, tip_mask=tip_mask_of(guard), **fit)
             with torch.no_grad():
                 export(model, args.representation, tmp,
                        {**_base_meta(meta_in, args, [], []), **mode_meta(args.switch_weight)})
@@ -1469,7 +1687,11 @@ def main(argv=None):
         print(f"goal: a hindsight goal possible on {int(ok.sum())} of {int(train_mask.sum())} "
               f"training ticks, none on {args.no_goal_share:.0%} of them and on every "
               f"map-blanked one, k drawn from {pg.NEAR_S:g}-{pg.FAR_S:g} s each batch")
-    model, weights = train(data, train_mask=train_mask, **fit)
+    tip_mask = tip_mask_of(in_val)
+    if tip_mask is not None:
+        print(f"tips: the penalty on {int(tip_mask.sum())} run-up decisions in a moving gear, "
+              f"at {args.tip_weight:g} a row")
+    model, weights = train(data, train_mask=train_mask, tip_mask=tip_mask, **fit)
     params = int(sum(p.numel() for p in model.parameters()))
     shares = loss_shares(data, train_mask, args.labels, args.good_weight,
                          args.takeover_weight, weights)
@@ -1483,6 +1705,11 @@ def main(argv=None):
             "intervention_train_ticks": int((train_mask & intervention_ticks(data)).sum()),
             "intervention_loss_share": {head: share for head, (_, _, share) in shares.items()},
             "parameters": params,
+            **tip_meta(args.tip_weight, args.tip_deg, args.tip_lead_s,
+                       hygiene=tip_on),
+            **({"tip_penalty_rows": int(tip_mask.sum())} if tip_mask is not None else {}),
+            "goal_contrast": ({"weight": args.goal_contrast, "margin": GOAL_CONTRAST_MARGIN}
+                              if args.goal_contrast > 0 else None),
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
                if args.lidar else {}),
