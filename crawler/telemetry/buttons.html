@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<meta name="ws-port" content="8765">
+<title>Crawler buttons</title>
+<style>
+:root{--bg:#0e1116;--card:#171b22;--line:#262c36;--text:#e8ecf2;--dim:#8a94a6;
+--go:#16a874;--hold:#d98c0b;--blue:#3b7be0;--red:#d44848;--gold:#d9b31a;--btn:#222833;--btn2:#2b3240}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);
+font:16px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{padding:max(12px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right))
+max(16px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+main{max-width:520px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+header{display:flex;align-items:center;justify-content:space-between;padding:4px 2px}
+h1{font-size:20px;margin:0;font-weight:650;letter-spacing:.2px}
+.pill{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--dim);
+background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 12px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--red);flex:none}
+.pill.ok .dot{background:var(--go);box-shadow:0 0 8px var(--go)}
+.pill.wait .dot{background:var(--hold);animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.3}}
+section{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px}
+.head{display:flex;justify-content:space-between;align-items:baseline;margin:0 2px 12px}
+h2{font-size:13px;margin:0;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);font-weight:600}
+.state{font-size:14px;color:var(--text);text-align:right}
+.state small{color:var(--dim);font-size:13px}
+.grid{display:grid;gap:10px}
+.two{grid-template-columns:1fr 1fr}.three{grid-template-columns:repeat(3,1fr)}
+.grid+.grid{margin-top:10px}
+button{position:relative;overflow:hidden;border:0;border-radius:12px;background:var(--btn);
+color:var(--text);font:inherit;font-weight:600;min-height:60px;padding:8px 6px;cursor:pointer;
+user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation;
+transition:transform .08s,filter .15s,background .15s,box-shadow .15s}
+button .sub{display:block;font-size:12px;font-weight:500;color:var(--dim);margin-top:2px}
+button:active{transform:scale(.96)}
+button:disabled{opacity:.35;cursor:default;transform:none}
+button.big{min-height:96px;font-size:21px}
+button.go{background:var(--go)}button.hold{background:var(--hold)}
+button.go .sub,button.hold .sub{color:rgba(255,255,255,.75)}
+button.on{box-shadow:inset 0 0 0 2px var(--blue);background:#1d2a40}
+button.go.on{background:var(--go)}button.hold.on{background:var(--hold)}
+button.go.on,button.hold.on{box-shadow:inset 0 0 0 3px #fff}
+button.flash{filter:brightness(1.6)}
+button.sent::after{content:"\2713";position:absolute;top:6px;right:9px;font-size:13px;color:#fff;opacity:.9}
+button.danger{color:#ff9b9b}
+button .fill{position:absolute;left:0;bottom:0;height:4px;width:0;background:var(--red)}
+button.arming .fill{width:100%;transition:width var(--hold-ms) linear}
+#follow{width:100%;min-height:88px;font-size:20px}
+#follow.on{background:var(--gold);color:#1a1500;box-shadow:none}
+#follow.on .sub{color:rgba(26,21,0,.7)}
+.note{font-size:12px;color:var(--dim);text-align:center;min-height:16px;margin:0}
+@media (min-width:700px){main{padding-top:24px}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1>Crawler</h1>
+<div class="pill" id="conn"><span class="dot"></span><span id="conntext">Offline</span></div>
+</header>
+
+<section>
+<div class="head"><h2>Patrol</h2><div class="state" id="pstate"><small>no status</small></div></div>
+<div class="grid two">
+<button class="big go" data-cmd="patrol_start">Start<span class="sub" id="pwhere">&nbsp;</span></button>
+<button class="big hold" data-cmd="patrol_pause">Pause<span class="sub">hold neutral</span></button>
+</div>
+<div class="grid three">
+<button data-cmd="patrol_edit">Edit<span class="sub">add points</span></button>
+<button data-cmd="patrol_goal">Single goal<span class="sub">one click</span></button>
+<button data-cmd="patrol_mode">Mode<span class="sub" id="pmode">&nbsp;</span></button>
+<button data-cmd="patrol_trace">Trace<span class="sub" id="ptrace">&nbsp;</span></button>
+<button data-cmd="patrol_undo">Undo<span class="sub">last point</span></button>
+<button class="danger" data-cmd="patrol_clear" data-hold="700">Clear<span class="sub">hold</span><span class="fill"></span></button>
+</div>
+</section>
+
+<section>
+<div class="head"><h2>Follow</h2><div class="state" id="fstate"><small>no status</small></div></div>
+<button id="follow">Follow on<span class="sub">nearest person is the goal</span></button>
+</section>
+
+<p class="note" id="note"></p>
+</main>
+
+<script type="application/json" id="cmds">
+{
+"patrol_edit": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"edit\"}"},
+"patrol_goal": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"goal\"}"},
+"patrol_start": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"start\"}"},
+"patrol_pause": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"pause\"}"},
+"patrol_undo": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"undo\"}"},
+"patrol_clear": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"clear\"}"},
+"patrol_mode": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"mode\"}"},
+"patrol_trace": {"topic": "/patrol/cmd", "schema": "crawler.PatrolCommand", "value": "{\"cmd\": \"trace\"}"},
+"follow_on": {"topic": "/follow/cmd", "schema": "crawler.FollowCommand", "value": "{\"cmd\": \"on\"}"},
+"follow_off": {"topic": "/follow/cmd", "schema": "crawler.FollowCommand", "value": "{\"cmd\": \"off\"}"}
+}
+</script>
+<script>
+(function(){
+"use strict";
+var CMDS=JSON.parse(document.getElementById("cmds").textContent);
+var STATUS={"/patrol/status":onPatrol,"/follow/status":onFollow};
+var STALE_MS=3000;
+// foxglove-sdk 0.30 only takes the first; older servers named it the second.
+var PROTOCOLS=["foxglove.sdk.v1","foxglove.websocket.v1"];
+var $=function(id){return document.getElementById(id)};
+var enc=new TextEncoder(),dec=new TextDecoder();
+var port=document.querySelector('meta[name="ws-port"]').content;
+var host=location.hostname||"localhost";
+if(host.indexOf(":")>=0)host="["+host+"]";
+var url="ws://"+host+":"+port;
+
+var ws=null,ready=false,backoff=1000,chanOf={},subs={},lastAt={},follow=null;
+
+// One client channel per topic, the encoding and schema name the Publish
+// panels use.
+var nextId=1;
+Object.keys(CMDS).forEach(function(k){
+  var c=CMDS[k];
+  if(!chanOf[c.topic])chanOf[c.topic]={id:nextId++,topic:c.topic,encoding:"json",schemaName:c.schema};
+});
+
+function setConn(cls,text){$("conn").className="pill "+cls;$("conntext").textContent=text;}
+function setEnabled(on){
+  var b=document.querySelectorAll("button");
+  for(var i=0;i<b.length;i++)b[i].disabled=!on;
+}
+function note(t){$("note").textContent=t||"";}
+
+function connect(){
+  setConn("wait","Connecting");
+  ready=false;subs={};
+  try{ws=new WebSocket(url,PROTOCOLS);}catch(e){return retry();}
+  ws.binaryType="arraybuffer";
+  ws.onmessage=onMessage;
+  ws.onclose=function(){ws=null;ready=false;setEnabled(false);setConn("","Offline");noPatrol();noFollow();retry();};
+  ws.onerror=function(){};
+}
+function retry(){
+  setTimeout(connect,backoff);
+  backoff=Math.min(backoff*2,5000);
+}
+
+function onMessage(ev){
+  if(typeof ev.data!=="string")return onBinary(ev.data);
+  var m;try{m=JSON.parse(ev.data);}catch(e){return;}
+  if(m.op==="serverInfo"){
+    backoff=1000;
+    if((m.capabilities||[]).indexOf("clientPublish")<0){
+      setConn("wait","Read only");
+      note("The car takes no commands on this run (no --goal).");
+      return;
+    }
+    ws.send(JSON.stringify({op:"advertise",channels:Object.keys(chanOf).map(function(t){return chanOf[t];})}));
+    ready=true;setEnabled(true);setConn("ok","Connected");note("");
+  }else if(m.op==="advertise"){
+    var want=[];
+    (m.channels||[]).forEach(function(c){
+      if(STATUS[c.topic]&&c.encoding==="json"){
+        var sid=Object.keys(subs).length+1;
+        subs[sid]=STATUS[c.topic];want.push({id:sid,channelId:c.id});
+      }
+    });
+    if(want.length)ws.send(JSON.stringify({op:"subscribe",subscriptions:want}));
+  }
+}
+
+function onBinary(buf){
+  var v=new DataView(buf);
+  if(buf.byteLength<13||v.getUint8(0)!==1)return;
+  var fn=subs[v.getUint32(1,true)];
+  if(!fn)return;
+  try{fn(JSON.parse(dec.decode(new Uint8Array(buf,13))));}catch(e){}
+}
+
+function send(key){
+  var c=CMDS[key];
+  if(!ready||!ws||!c)return false;
+  var body=enc.encode(c.value),out=new Uint8Array(5+body.length);
+  out[0]=1;new DataView(out.buffer).setUint32(1,chanOf[c.topic].id,true);
+  out.set(body,5);
+  ws.send(out);
+  if(navigator.vibrate)navigator.vibrate(12);
+  return true;
+}
+
+function feedback(b){
+  b.classList.add("flash","sent");
+  setTimeout(function(){b.classList.remove("flash");},160);
+  clearTimeout(b._t);b._t=setTimeout(function(){b.classList.remove("sent");},900);
+}
+
+function esc(s){return String(s).replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c];});}
+
+function onPatrol(s){
+  lastAt.p=Date.now();
+  var where=s.count?("point "+s.number+" of "+s.count):"no points";
+  $("pstate").innerHTML=esc(s.state)+" <small>· "+esc(s.use==="goal"?"single goal":s.mode)+"</small>";
+  $("pwhere").textContent=where+(s.laps?" · lap "+s.laps:"");
+  $("pmode").textContent=s.mode;
+  $("ptrace").textContent=s.tracing?"on":"off";
+  mark("patrol_start",s.running);
+  mark("patrol_pause",s.use==="patrol"&&!s.running&&s.count>0);
+  mark("patrol_trace",s.tracing);
+  mark("patrol_edit",s.use==="patrol"&&!s.running);
+  mark("patrol_goal",s.use==="goal");
+}
+function onFollow(s){
+  lastAt.f=Date.now();
+  follow=!!s.active;
+  var d=s.distance_m>=0?" <small>· "+s.distance_m.toFixed(1)+" m</small>":"";
+  $("fstate").innerHTML=esc(s.state)+d;
+  drawFollow();
+}
+function drawFollow(){
+  var b=$("follow");
+  b.classList.toggle("on",follow===true);
+  b.firstChild.nodeValue=follow?"Following":"Follow on";
+  b.lastChild.textContent=follow?"tap to stop":"nearest person is the goal";
+}
+function mark(key,on){
+  var b=document.querySelector('[data-cmd="'+key+'"]');
+  if(b)b.classList.toggle("on",!!on);
+}
+
+// No status for a while: say so instead of showing an old state.
+setInterval(function(){
+  var now=Date.now();
+  if(lastAt.p&&now-lastAt.p>STALE_MS)noPatrol();
+  if(lastAt.f&&now-lastAt.f>STALE_MS)noFollow();
+},1000);
+function noPatrol(){
+  lastAt.p=0;$("pstate").innerHTML="<small>no status</small>";
+  ["pwhere","pmode","ptrace"].forEach(function(id){$(id).innerHTML="&nbsp;";});
+  ["patrol_start","patrol_pause","patrol_trace","patrol_edit","patrol_goal"].forEach(function(k){mark(k,false);});
+}
+function noFollow(){lastAt.f=0;follow=null;$("fstate").innerHTML="<small>no status</small>";drawFollow();}
+
+// Plain buttons fire on click. A data-hold button fires only after being
+// held that long, with a bar filling across it, and a short tap only says so.
+Array.prototype.forEach.call(document.querySelectorAll("[data-cmd]"),function(b){
+  var key=b.getAttribute("data-cmd"),hold=+b.getAttribute("data-hold")||0;
+  if(!hold){b.addEventListener("click",function(){if(send(key))feedback(b);});return;}
+  b.style.setProperty("--hold-ms",hold+"ms");
+  var timer=null;
+  function cancel(){if(timer){clearTimeout(timer);timer=null;}b.classList.remove("arming");}
+  b.addEventListener("pointerdown",function(e){
+    if(b.disabled)return;
+    e.preventDefault();cancel();b.classList.add("arming");
+    timer=setTimeout(function(){timer=null;b.classList.remove("arming");if(send(key))feedback(b);},hold);
+  });
+  b.addEventListener("pointerup",function(){if(timer)note("Hold Clear to drop every point.");cancel();});
+  b.addEventListener("pointerleave",cancel);
+  b.addEventListener("pointercancel",cancel);
+});
+document.addEventListener("contextmenu",function(e){if(e.target.closest("button"))e.preventDefault();});
+
+$("follow").addEventListener("click",function(){
+  var b=this;
+  if(send(follow?"follow_off":"follow_on")){
+    feedback(b);
+    follow=!follow;drawFollow();
+  }
+});
+
+setEnabled(false);
+drawFollow();
+connect();
+})();
+</script>
+</body>
+</html>

@@ -1808,6 +1808,17 @@ def parse_args(argv=None):
         default=8765,
         help="port for the Foxglove WebSocket server (default: 8765)",
     )
+    # The button page (telemetry/buttons.py): patrol and follow from a phone
+    # browser. On whenever the Foxglove server takes commands (--goal or
+    # --nav with telemetry on), because a flag I have to remember is a page I
+    # do not have when I want it. 0 is off.
+    parser.add_argument(
+        "--buttons-port",
+        type=int,
+        default=8080,
+        help="port for the patrol/follow button page, served with --goal or "
+             "--nav and telemetry on; 0 for none (default: 8080)",
+    )
     # Off by default, and this one I thought about for a while.
     #
     # Turning it on means opening the OAK-D on every boot, including the
@@ -2023,6 +2034,18 @@ def nav_goals(args, log):
         return None, None
 
 
+def start_buttons(args, tele, goals, log):
+    """The button page (telemetry/buttons.ButtonPage), or None. Only when the
+    Foxglove server is up and takes client commands, since the page's
+    buttons go through it; --buttons-port 0 is off."""
+    port = getattr(args, "buttons_port", 0)
+    if not port or goals is None or not getattr(tele, "serving", False):
+        return None
+    from crawler.telemetry import buttons as bt
+    page = bt.ButtonPage(logger=log, host=tele.host, port=port, ws_port=tele.port)
+    return page if page.start() else None
+
+
 def nav_map_source(args, slam, lidar, voxels, log):
     """--nav's map: the live SLAM (nav/live.SlamMap), or None, which is auto
     unavailable. The low-obstacle layer only with --nav-low-obstacles and a
@@ -2155,6 +2178,7 @@ def main(argv=None):
     channels_live = args.telemetry or args.record
     if channels_live:
         tele.start(serve=args.telemetry)
+    buttons = start_buttons(args, tele, goals, log)
 
     # One camera for the whole process, and constructing it opens nothing --
     # no USB, no depthai import, no risk. The rectified mono stream is only
@@ -2322,6 +2346,8 @@ def main(argv=None):
             if slam is not None:
                 slam.close()
             hub.close()
+            if buttons is not None:
+                buttons.stop()
             tele.stop()
         return 0
 
@@ -2362,6 +2388,8 @@ def main(argv=None):
         if slam is not None:
             slam.close()
         hub.close()
+        if buttons is not None:
+            buttons.stop()
         tele.stop()
 
 

@@ -235,6 +235,13 @@ once each, then switch between them from the Layouts menu.
   if the new map's walls line up with the old one's: the map is not saved,
   so that means the truck booted where it did last time. Otherwise it is
   cleared and the journal says so. `autopilot/patrol.py` has the rules.
+
+  The same buttons, and Follow, are on a phone page the car serves on port
+  8080 with `--goal`: `http://jtpi.local:8080` (or `10.42.0.1:8080` on the
+  car's hotspot). Nothing to install, and nothing on it loads from the
+  internet. It sends the same messages over the same WebSocket, shows the
+  patrol and follow state, and **Clear** wants a hold. Waypoints are still
+  placed in Foxglove's map. `--buttons-port 0` turns it off.
 - `foxglove-telemetry.json`: commands, ESC, pad axes, IMU, loop health, SLAM
   fit and cost, the mode and SLAM state strips, and `/footprint` and
   `/diagnostics` raw.
