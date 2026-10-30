@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from crawler.autopilot import policy as pl
+from crawler.autopilot import policy_lidar as pli
 import policy_dataset as pd
 import policy_eval as pe
 import policy_scorecard as sc
@@ -126,3 +127,116 @@ def test_steering_standing_still_is_a_stop_decision_labelled_with_its_own_lock()
     steer_ok, throttle_ok = pe.label_masks(a, "pad")
     mask = pt.training_mask(a, np.zeros(len(a["t_ns"]), bool), steer_ok | throttle_ok)
     assert mask[stops].all() and steer_ok[stops].all()
+
+
+# --- the car's own drives: open floor, the rejected drives, the ensemble ------------
+
+A, T = pd.SOURCES.index(pd.SOURCE_AUTO), pd.SOURCES.index(pd.SOURCE_TAKEOVER)
+
+
+def scans(n, front_mm, side_mm=300):
+    """n scans with every front bin (within OPEN_FRONT_DEG) at front_mm and
+    the rest at side_mm: a wall close by on the sides is still open floor."""
+    ang = np.arange(pli.BINS) * pli.BIN_DEG
+    front = (ang <= sc.OPEN_FRONT_DEG) | (ang >= 360 - sc.OPEN_FRONT_DEG)
+    b = np.where(front, front_mm, side_mm).astype(np.uint16)
+    return np.tile(b, (n, 1))
+
+
+def test_open_floor_is_nothing_near_in_front_whatever_is_beside():
+    n = 4
+    d = {"lidar_bins": scans(n, 1500), "lidar_present": np.array([True, True, True, False])}
+    d["lidar_bins"][1, 0] = 900        # one bin dead ahead too near
+    d["lidar_bins"][2, 0] = 0          # a bin with no return is not near
+    assert sc.open_front(d, np.arange(n)).tolist() == [True, False, True, False]
+    assert not sc.open_front({}, np.arange(n)).any()
+
+
+def car_drive():
+    """drive()'s ticks as the car's: auto, forward, on open floor, but for a
+    takeover at the end, which makes the 3 s before it not accepted."""
+    a = drive()
+    n = len(a["t_ns"])
+    a["meta"]["sources"] = list(pd.SOURCES)
+    a["source"] = np.full(n, A, np.int8)
+    a["source"][-3:] = T
+    a["throttle_label"] = a["source"] == T
+    a["steer_label"] = a["source"] == T
+    a["action"] = np.full(n, F, np.int64)
+    a["lidar_bins"] = scans(n, 2000)
+    a["lidar_present"] = np.ones(n, bool)
+    return a
+
+
+def test_the_accepted_ticks_are_auto_forward_open_and_not_before_a_takeover():
+    a = car_drive()
+    ticks = np.arange(len(a["t_ns"]))
+    accepted, took = sc.open_sets(a, ticks)
+    t = a["t_ns"] / 1e9
+    first_take = t[a["source"] == T].min()
+    assert accepted[t < first_take - sc.ACCEPT_S - 0.05].all()
+    assert not accepted[(t >= first_take - sc.ACCEPT_S) & (a["source"] == A)].any()
+    assert took.tolist() == (a["source"] == T).tolist()
+    a["lidar_bins"][:] = 500
+    accepted, took = sc.open_sets(a, ticks)
+    assert not accepted.any() and not took.any()
+
+
+class Gear(Stub):
+    """A model that always answers this gear."""
+
+    def __init__(self, gear, chunk=1):
+        super().__init__(lambda x: 0.0)
+        self.gear = gear
+        self.chunk = chunk
+
+    def run(self, x, prev, mode=None, **_):
+        lg = np.zeros((1, 3 * self.chunk), np.float32)
+        lg[0, self.gear::3] = 5.0
+        return {"logits": lg, "throttle": np.array([[0.5]], np.float32),
+                "steer": np.zeros((1, self.chunk), np.float32)}
+
+
+def test_open_fwd_rev_is_the_share_of_accepted_open_ticks_it_reverses_on():
+    a = car_drive()
+    ticks = np.arange(len(a["t_ns"]))
+    s = sc.open_scores(Gear(V), a, ticks)
+    assert s["open_fwd_rev"] == 1.0 and s["open_fwd_stop"] == 0.0
+    assert s["L_rev"] == 1.0 and s["L_ticks"] == 3
+    s = sc.open_scores(Gear(F), a, ticks)
+    assert s["open_fwd_rev"] == 0.0 and s["L_stop"] == 0.0
+    assert s["open_fwd_ticks"] > 0
+    d = sc.drive_scores(Gear(S), a, ticks)
+    assert d["drive_open_stop"] == 1.0 and d["drive_open_ticks"] == len(ticks)
+
+
+def test_the_ensemble_averages_the_gear_probabilities_per_offset():
+    class Two(Gear):
+        def run(self, x, prev, mode=None, **_):
+            out = super().run(x, prev, mode)
+            out["logits"] = np.log(np.array([[0.6, 0.3, 0.1, 0.2, 0.7, 0.1]], np.float32))
+            return out
+
+    one, two = Gear(F, chunk=2), Two(F, chunk=2)
+    one.meta = two.meta = {"train_sessions": []}
+    e = sc.Ensemble([one, two])
+    lg = e.run(None, None)["logits"].reshape(2, 3)
+    p1 = np.exp(np.array([[5, 0, 0], [5, 0, 0]], float))
+    p1 /= p1.sum(1, keepdims=True)
+    want = (p1 + np.array([[0.6, 0.3, 0.1], [0.2, 0.7, 0.1]])) / 2
+    assert np.exp(lg) == pytest.approx(want, abs=1e-5)
+    assert e.chunk == 2 and e.sha256 is None
+    with pytest.raises(ValueError, match="differ"):
+        sc.Ensemble([Gear(F, chunk=1), Gear(F, chunk=2)])
+
+
+def test_a_model_spec_with_a_plus_is_an_ensemble_and_named_so():
+    assert sc.model_label("/m/a.onnx") == "a"
+    assert sc.model_label("/m/a.onnx+/m/b.onnx") == "ensemble(a+b)"
+
+
+def test_the_rejected_drives_list_is_names_only():
+    names = pt.rejected_sessions()
+    assert names and len(set(names)) == len(names)
+    assert all(re.fullmatch(r"crawler-\d{8}-\d{6}Z-p\d+-\d{3}", n) for n in names), names
+    assert not set(names) & set(pt.scorecard_sessions())

@@ -484,6 +484,23 @@ def evidence(folder, candidate="kblock candidate next", baseline="kblock 1.0",
     return path
 
 
+def card(folder, tag, cand_rev=0.03, base_rev=0.04, name="card.json"):
+    """A policy_scorecard.py --json with candidate `tag` and the latest
+    release in it, open_fwd_rev as given."""
+    reg = md.load_registry(folder)
+    cand = md.find_candidate(reg, tag)
+    base = reg["releases"][-1]
+    doc = {"sessions": ["s1"], "models": {
+        "candidate-" + tag: {"onnx_sha256": cand["onnx_sha256"], "open_fwd_rev": cand_rev,
+                             "open_fwd_stop": 0.02},
+        base["onnx"][:-5]: {"onnx_sha256": base["onnx_sha256"], "open_fwd_rev": base_rev,
+                            "open_fwd_stop": 0.02}}}
+    path = os.path.join(folder, name)
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    return path
+
+
 @pytest.fixture
 def with_candidate(registered):
     """kblock 1.0 released, and candidate "next" on the same contract."""
@@ -576,7 +593,7 @@ def test_promote_on_the_same_contract_is_the_next_minor(with_candidate):
     folder = with_candidate
     path = evidence(folder, cand=metrics(recall=0.7, precision=0.47, steer=0.51))
     entry = md.promote("next", folder, evidence=path, approved_on_car=True,
-                       notes="clean three-point turn",
+                       notes="clean three-point turn", scorecard=card(folder, "next"),
                        now=md.datetime.datetime(2026, 10, 29, 18, 0, tzinfo=md.datetime.timezone.utc))
     assert entry["label"] == "kblock 1.1" and entry["parent"] == "1.0"
     assert entry["gate"] == "passed" and entry["candidate"] == "next"
@@ -612,19 +629,69 @@ def test_promote_off_the_contract_is_the_next_major(registered):
         json.dump(sidecar(uses_imu=True, imu_features=["gx"], imu_window=5), f)
     md.register(src + ".onnx", folder, folder, tag="imu")
     path = evidence(folder, candidate="kblock candidate imu")
-    entry = md.promote("imu", folder, evidence=path, approved_on_car=True)
+    entry = md.promote("imu", folder, evidence=path, approved_on_car=True,
+                       scorecard=card(folder, "imu"))
     assert entry["label"] == "kblock 2.0" and "uses_imu" in entry["why_version"]
 
 
 def test_force_gate_is_recorded(with_candidate):
     path = evidence(with_candidate, cand=metrics(recall=0.1))
     entry = md.promote("next", with_candidate, evidence=path, approved_on_car=True,
-                       force_gate="the folds miss the new terrain")
+                       force_gate="the folds miss the new terrain",
+                       scorecard=card(with_candidate, "next"))
     assert entry["gate"] == "forced"
     assert entry["gate_reason"] == "the folds miss the new terrain"
     assert entry["evidence"]["summary"]["passes"] is False
     saved = md.find(md.load_registry(with_candidate), "kblock", "1.1")
     assert saved["gate_reason"] == "the folds miss the new terrain"
+
+
+def test_promote_refuses_without_a_scorecard_and_force_gate_does_not_skip_it(with_candidate):
+    path = evidence(with_candidate, cand=metrics(recall=0.9))
+    with pytest.raises(SystemExit, match="needs --scorecard"):
+        md.promote("next", with_candidate, evidence=path, approved_on_car=True)
+    with pytest.raises(SystemExit, match="needs --scorecard"):
+        md.promote("next", with_candidate, approved_on_car=True, force_gate="trust me")
+    assert len(md.load_registry(with_candidate)["releases"]) == 1
+
+
+def test_promote_refuses_a_model_that_reverses_on_open_floor(with_candidate):
+    path = evidence(with_candidate, cand=metrics(recall=0.9))
+    # Over the line on its own: fedcontrast3-1030's number.
+    with pytest.raises(SystemExit, match="open_fwd_rev 0.079 .*at most 0.06.*FAILS"):
+        md.promote("next", with_candidate, evidence=path, approved_on_car=True,
+                   scorecard=card(with_candidate, "next", cand_rev=0.079))
+    # Under the line, but past 1.5x the model the car runs.
+    with pytest.raises(SystemExit, match="1.5x the deployed model's\): FAILS"):
+        md.promote("next", with_candidate, evidence=path, approved_on_car=True,
+                   scorecard=card(with_candidate, "next", cand_rev=0.05, base_rev=0.03))
+    assert len(md.load_registry(with_candidate)["releases"]) == 1
+    entry = md.promote("next", with_candidate, evidence=path, approved_on_car=True,
+                       scorecard=card(with_candidate, "next", cand_rev=0.045, base_rev=0.03))
+    assert entry["scorecard"]["passes"] is True
+    assert entry["scorecard"]["checks"][0]["candidate"] == 0.045
+
+
+def test_the_open_floor_gate_reads_the_deployed_model_by_its_sha():
+    doc = {"models": {"a": {"onnx_sha256": "aa", "open_fwd_rev": 0.05},
+                      "b": {"onnx_sha256": "bb", "open_fwd_rev": 0.04},
+                      "c": {"onnx_sha256": "cc", "open_fwd_rev": 0.02}}}
+    assert md.scorecard_gate(doc, "aa", "bb")["passes"]
+    assert not md.scorecard_gate(doc, "aa", "cc")["passes"]
+    assert md.scorecard_gate(doc, "aa", "bb")["baseline"] == "b"
+    with pytest.raises(SystemExit, match="no row for the baseline"):
+        md.scorecard_gate(doc, "aa", "dd")
+    with pytest.raises(SystemExit, match="no open_fwd_rev"):
+        md.scorecard_gate({"models": {**doc["models"], "a": {"onnx_sha256": "aa"}}},
+                          "aa", "bb")
+    assert md.OPEN_REV_MAX == 0.06 and md.OPEN_REV_RATIO == 1.5
+
+
+def test_force_scorecard_is_recorded(with_candidate):
+    path = evidence(with_candidate, cand=metrics(recall=0.9))
+    entry = md.promote("next", with_candidate, evidence=path, approved_on_car=True,
+                       force_scorecard="no lidar on this model")
+    assert entry["scorecard"] == {"forced": "no lidar on this model"}
 
 
 def test_force_gate_still_needs_the_car(with_candidate):
@@ -658,7 +725,8 @@ def with_imu_release(registered):
     with open(src + ".json", "w") as f:
         json.dump(sidecar(uses_imu=True, imu_features=["gx"], imu_window=5), f)
     md.register(src + ".onnx", folder, folder, tag="imu-a")
-    md.promote("imu-a", folder, approved_on_car=True, force_gate="before the gate")
+    md.promote("imu-a", folder, approved_on_car=True, force_gate="before the gate",
+               force_scorecard="before the gate")
     return folder
 
 
@@ -700,7 +768,8 @@ def test_demote_gives_the_number_back(with_imu_release):
         json.dump(sidecar(uses_imu=True, imu_features=["gx"], imu_window=5), f)
     md.register(src + ".onnx", folder, folder, tag="imu-b")
     path = evidence(folder, candidate="kblock candidate imu-b")
-    entry = md.promote("imu-b", folder, evidence=path, approved_on_car=True)
+    entry = md.promote("imu-b", folder, evidence=path, approved_on_car=True,
+                       scorecard=card(folder, "imu-b"))
     assert entry["label"] == "kblock 2.0"
     with open(os.path.join(folder, "kblock-2.0.onnx"), "rb") as f:
         assert f.read() == b"a better imu model"
@@ -767,7 +836,8 @@ def test_list_shows_releases_and_candidates_apart_and_marks_the_car(with_imu_rel
 def test_the_car_running_a_promoted_candidate_is_named_by_its_file(with_candidate):
     folder = with_candidate
     path = evidence(folder, cand=metrics(recall=0.9))
-    release = md.promote("next", folder, evidence=path, approved_on_car=True)
+    release = md.promote("next", folder, evidence=path, approved_on_car=True,
+                         scorecard=card(folder, "next"))
     reg = md.load_registry(folder)
     sha = release["onnx_sha256"]
     assert md.active_entry(reg, CarOn("kblock-1.1.onnx", sha))[0]["label"] == "kblock 1.1"

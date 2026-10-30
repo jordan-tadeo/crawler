@@ -37,7 +37,16 @@ refuses unless both gates pass:
      GATE_STEER_MAE_SLACK. --force-gate "<reason>" skips the rule and the
      reason is kept in the registry. The evidence file is copied in beside
      the release as kblock-X.Y.evidence.json.
-  2. My approval on the car: --approved-on-car, with an optional --notes on
+  2. The open floor. --scorecard is tools/policy_scorecard.py's --json, run
+     with --fed, with the candidate and the model the car runs (the
+     registry's "deployed", else the latest release) in it, found by sha256.
+     The candidate's open_fwd_rev, the share of the car's own accepted
+     forward ticks on open floor it would reverse on, must be at most
+     OPEN_REV_MAX and at most OPEN_REV_RATIO times the deployed model's.
+     fedcontrast3-1030 reversed on open floor on the car at 0.079 against
+     2.1's 0.040. --force-scorecard "<reason>" skips it, kept in the
+     registry; --force-gate does not.
+  3. My approval on the car: --approved-on-car, with an optional --notes on
      how it drove. promote records the date.
 
 The number: MINOR up when the candidate's contract (CONTRACT_KEYS) is the same
@@ -129,6 +138,10 @@ SCHEMA = 2
 GATE_REVERSE_PRECISION_SLACK = 0.05
 GATE_STEER_MAE_SLACK = 0.02
 EVIDENCE_SCHEMA = 1
+# The open-floor gate (scorecard_gate). fedcontrast3-1030, the model sent
+# back for reversing on open floor, reads 0.079; kblock 2.1 0.040, 2.0 0.039.
+OPEN_REV_MAX = 0.06
+OPEN_REV_RATIO = 1.5
 EVIDENCE_METRICS = ("reverse_recall", "reverse_precision", "steer_mae",
                     "direction_balanced_accuracy")
 
@@ -498,6 +511,52 @@ def gate_check(doc):
             "folds": len(doc["folds"]), "sessions": list(doc["sessions"])}
 
 
+def scorecard_row(doc, sha):
+    """The scorecard JSON's row for the model with this onnx sha256:
+    (label, scores), or None."""
+    for name, row in (doc.get("models") or {}).items():
+        if isinstance(row, dict) and row.get("onnx_sha256") == sha:
+            return name, row
+    return None
+
+
+def scorecard_gate(doc, cand_sha, base_sha):
+    """The open-floor rule on a policy_scorecard.py --json document, the
+    candidate's row against the deployed model's. Raises SystemExit when
+    either row or its number is missing. -> {"passes", "checks": [...]}"""
+    rows = {}
+    for side, sha in (("candidate", cand_sha), ("baseline", base_sha)):
+        found = scorecard_row(doc, sha)
+        if found is None:
+            raise SystemExit(f"the scorecard has no row for the {side} (onnx sha256 {sha[:12]})")
+        value = found[1].get("open_fwd_rev")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            raise SystemExit(f"the scorecard's {found[0]} has no open_fwd_rev: "
+                             f"run policy_scorecard.py with --fed")
+        rows[side] = (found[0], float(value), found[1].get("open_fwd_stop"))
+    cand, base = rows["candidate"][1], rows["baseline"][1]
+    checks = [{"metric": "open_fwd_rev", "candidate": cand, "baseline": base,
+               "rule": f"at most {OPEN_REV_MAX}", "ok": cand <= OPEN_REV_MAX},
+              {"metric": "open_fwd_rev", "candidate": cand, "baseline": base,
+               "rule": f"at most {OPEN_REV_RATIO}x the deployed model's",
+               "ok": cand <= OPEN_REV_RATIO * base}]
+    return {"passes": all(c["ok"] for c in checks), "checks": checks,
+            "candidate": rows["candidate"][0], "baseline": rows["baseline"][0],
+            "open_fwd_stop": {"candidate": rows["candidate"][2],
+                              "baseline": rows["baseline"][2]}}
+
+
+def load_scorecard(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise SystemExit(f"no scorecard file {path}")
+    with open(path) as f:
+        try:
+            return path, json.load(f)
+        except ValueError as e:
+            raise SystemExit(f"{path} is not JSON: {e}")
+
+
 def describe_checks(check):
     return [f"{c['metric']} {c['candidate']:.3f} vs {c['baseline']:.3f} "
             f"({c['rule']}): {'ok' if c['ok'] else 'FAILS'}" for c in check["checks"]]
@@ -705,8 +764,8 @@ def register(onnx_path, models_dir=MODELS_DIR, mcap_dir=MCAP_DIR, name=None,
 
 
 def promote(tag, models_dir=MODELS_DIR, evidence=None, approved_on_car=False,
-            notes="", force_gate=None, now=None):
-    """Turn candidate `tag` into the next release, behind both gates. -> entry."""
+            notes="", force_gate=None, now=None, scorecard=None, force_scorecard=None):
+    """Turn candidate `tag` into the next release, behind every gate. -> entry."""
     registry = load_registry(models_dir)
     cand = find_candidate(registry, tag)
     if cand is None:
@@ -749,6 +808,20 @@ def promote(tag, models_dir=MODELS_DIR, evidence=None, approved_on_car=False,
                          f"on the held-out folds:\n  " + "\n  ".join(describe_checks(check)))
     else:
         gate = "passed"
+    card = None
+    if latest is not None and not force_scorecard:
+        if scorecard is None:
+            raise SystemExit(f"Refusing: promoting {cand['label']} needs --scorecard, "
+                             f"policy_scorecard.py --fed --json with it and the deployed model "
+                             f"(or --force-scorecard \"<reason>\")")
+        card_path, card_doc = load_scorecard(scorecard)
+        base_sha = (registry.get("deployed") or {}).get("onnx_sha256") or latest["onnx_sha256"]
+        card = scorecard_gate(card_doc, cand["onnx_sha256"], base_sha)
+        if not card["passes"]:
+            raise SystemExit(f"Refusing: {cand['label']} reverses on open floor:\n  "
+                             + "\n  ".join(describe_checks(card)))
+        card["file"] = os.path.basename(card_path)
+        card["sha256"] = pm.sha256_local(card_path)
 
     version, why = next_version(registry, name, cand["contract"])
     stem = file_stem(name, version)
@@ -768,6 +841,8 @@ def promote(tag, models_dir=MODELS_DIR, evidence=None, approved_on_car=False,
              "parent": latest["version"] if latest else None,
              "why_version": why, "candidate": tag, "promoted": stamp(now),
              "gate": gate, "evidence": record,
+             "scorecard": (card if card is not None
+                           else {"forced": force_scorecard} if force_scorecard else None),
              "approval": {"status": "approved", "date": utc_now(now).strftime("%Y-%m-%d"),
                           "notes": notes or ""}}
     if gate == "forced":
@@ -1313,12 +1388,16 @@ def cmd_register(args):
 
 def cmd_promote(args):
     entry = promote(args.tag, args.models_dir, args.evidence, args.approved_on_car,
-                    args.notes, args.force_gate)
+                    args.notes, args.force_gate, scorecard=args.scorecard,
+                    force_scorecard=args.force_scorecard)
     print(f"promoted candidate {args.tag} to {entry['label']} ({entry['why_version']}) as "
           f"{os.path.join(args.models_dir, entry['onnx'])}")
     print(f"  {gate_text(entry)}")
     if entry.get("evidence"):
         for line in describe_checks(entry["evidence"]["summary"]):
+            print(f"    {line}")
+    if (entry.get("scorecard") or {}).get("checks"):
+        for line in describe_checks(entry["scorecard"]):
             print(f"    {line}")
     return 0
 
@@ -1460,6 +1539,11 @@ def parse_args(argv):
     s.add_argument("--notes", default="", help="how it drove")
     s.add_argument("--force-gate", default=None, metavar="REASON",
                    help="promote without the held-out rule; the reason is kept")
+    s.add_argument("--scorecard", default=None, metavar="SC.json",
+                   help="policy_scorecard.py --fed --json with the candidate and the "
+                        "deployed model: the open-floor gate")
+    s.add_argument("--force-scorecard", default=None, metavar="REASON",
+                   help="promote without the open-floor rule; the reason is kept")
 
     s = sub.add_parser("demote", help="give a release's number back; it becomes a candidate")
     s.add_argument("version")

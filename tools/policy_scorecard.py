@@ -53,6 +53,30 @@ drives). What is measured:
                       lower band"), every column of it blind; and
                       lowband_use_dir, the share of ticks whose gear changes
 
+With --fed FED_DIR (tools/fed_goals.py's goals for the scorecard's drives),
+the car's own drives are graded too, every tick of each session in time
+order, each model fed the goal the car was fed, as it is run on the car:
+
+  open_fwd_rev / open_fwd_stop   the auto ticks the car drove forward on
+                      open floor (open_front: nothing inside OPEN_MM in the
+                      lidar's front OPEN_FRONT_DEG either side) with no
+                      takeover in the ACCEPT_S after: the share the model
+                      reverses on, and stops on. The car went on, and I let
+                      it, so a reverse there is a reverse into nothing. A
+                      release gate (tools/models.py promote: at most
+                      OPEN_REV_MAX and 1.5x the deployed model's)
+  L_rev / L_stop      the same on my takeover ticks labelled forward on open
+                      floor
+
+With --drives DATA.npz (and --drives-map, --drives-fed), the drives I sent
+back off the car (tools/rejected_drives.txt, never trained on) are replayed
+whole, every tick, the fed goal on: drive_open_rev / drive_open_stop, the
+share of the open-floor ticks the model reverses and stops on, pooled.
+
+A model given as A.onnx+B.onnx+C.onnx is the ensemble of them: each run on
+the same inputs, the gear's probabilities averaged per chunk offset and
+every other output averaged (Ensemble).
+
 With --tips TIPS.npz, a dataset of drives that went over (built like any
 other, never trained on), each model is also run through those whole drives
 and graded on the second before each tip (tip_scores: tip_go, tip_thr,
@@ -63,6 +87,7 @@ moments I took over; the car's feel is mine to judge on a drive.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -92,6 +117,12 @@ TAKEOVER = "takeover"
 # it feeds the model (pathgoal.LOOKAHEAD_M), and this far off either side.
 GOAL_PROBE_M = 1.5
 GOAL_PROBE_DEG = 60.0
+# Open floor (open_scores): no lidar return inside OPEN_MM of the car's
+# centre in the bins within OPEN_FRONT_DEG of straight ahead. An auto tick
+# with no takeover in the ACCEPT_S after it is one I let stand.
+OPEN_MM = 1000.0
+OPEN_FRONT_DEG = 20.0
+ACCEPT_S = 3.0
 
 
 def side(s, band=SIDE_BAND):
@@ -171,6 +202,128 @@ def decode(model, data, ticks, goals=None, mirrored=False, blend=True, blank_map
         steer[j] = decided[2]
         thr[j] = 0.0 if act[j] == STOP else decided[1]
     return (act, steer, thr) if with_throttle else (act, steer)
+
+
+class Ensemble:
+    """Several models run as one: each on the same inputs, the gear's
+    softmax averaged per chunk offset (and handed on as its log, so
+    read_output and the ChunkEnsembler take it as logits), every other
+    output averaged. Everything else is the first member's: they must share
+    a contract, which is checked."""
+
+    SAME = ("contract", "representation", "has_mode", "uses_prev", "uses_imu", "imu_yaw",
+            "imu_tilt", "uses_lidar", "uses_map", "uses_goal", "chunk", "ensemble_m",
+            "ensemble_link_s", "steer_head", "lowband")
+
+    def __init__(self, members):
+        self.members = list(members)
+        first = self.members[0]
+        for m in self.members[1:]:
+            diff = [k for k in self.SAME if getattr(m, k, None) != getattr(first, k, None)]
+            if diff:
+                raise ValueError(f"an ensemble's members differ in {diff}")
+        self.meta = {**first.meta, "train_sessions": sorted(
+            set().union(*(m.meta.get("train_sessions", []) for m in self.members)))}
+        self.sha256 = None
+        self.member_sha256 = [getattr(m, "sha256", None) for m in self.members]
+
+    def __getattr__(self, name):
+        return getattr(self.members[0], name)
+
+    def run(self, *a, **k):
+        outs = [m.run(*a, **k) for m in self.members]
+        res = {}
+        for key in outs[0]:
+            v = np.stack([np.asarray(o[key], np.float32) for o in outs])
+            if key == "logits":
+                lg = v.reshape(len(outs), -1, len(pl.ACTIONS)).astype(np.float64)
+                p = np.exp(lg - lg.max(-1, keepdims=True))
+                p = (p / p.sum(-1, keepdims=True)).mean(0)
+                res[key] = np.log(p + 1e-9).reshape(v.shape[1:]).astype(np.float32)
+            else:
+                res[key] = v.mean(0)
+        return res
+
+
+def load_model(spec):
+    """A model file, or A.onnx+B.onnx+.. for their Ensemble."""
+    parts = spec.split("+")
+    if len(parts) == 1:
+        return pl.PolicyModel(spec)
+    return Ensemble(pl.PolicyModel(p) for p in parts)
+
+
+def model_label(spec):
+    stems = [os.path.splitext(os.path.basename(p))[0] for p in spec.split("+")]
+    return stems[0] if len(stems) == 1 else "ensemble(" + "+".join(stems) + ")"
+
+
+def session_ticks(data, names):
+    """Every tick of these sessions (the car runs the model on each one),
+    session then time."""
+    on = pt.scorecard_mask(data, names)
+    ticks = np.flatnonzero(on)
+    return ticks[np.lexsort((data["t_ns"][ticks], data["session"][ticks]))]
+
+
+def open_front(data, ticks, open_mm=OPEN_MM, front_deg=OPEN_FRONT_DEG):
+    """Per tick: a scan, and no return inside open_mm in the bins within
+    front_deg of straight ahead."""
+    if "lidar_bins" not in data:
+        return np.zeros(len(ticks), bool)
+    bins = np.asarray(data["lidar_bins"])[ticks].astype(float)
+    present = np.asarray(data["lidar_present"], bool)[ticks]
+    ang = np.arange(pli.BINS) * pli.BIN_DEG
+    front = (ang <= front_deg) | (ang >= 360 - front_deg)
+    near = np.where(bins[:, front] > 0, bins[:, front], np.inf).min(1)
+    return present & (near >= open_mm)
+
+
+def fed_goals(data, ticks):
+    """The goal the car was fed on each tick (policy_train.load_fed_goals),
+    none where it was fed none or had no map; None for a dataset without."""
+    if "fed_ok" not in data:
+        return None
+    return pg.encode_many(data["fed_ahead"][ticks], data["fed_left"][ticks],
+                          np.asarray(data["fed_ok"], bool)[ticks]
+                          & np.asarray(data["map_on"], bool)[ticks])
+
+
+def open_sets(data, ticks, accept_s=ACCEPT_S):
+    """(accepted, takeover) masks over ticks, both forward on open floor:
+    the auto ticks with no takeover in the accept_s after, and my takeover
+    ticks with a gear label outside a BAD mark."""
+    src = pt.sources_of(data)[ticks]
+    fwd = np.asarray(data["action"])[ticks] == FWD
+    opened = open_front(data, ticks)
+    near = pt.takeover_near(data, accept_s)[ticks]
+    _, t_ok = pe.label_masks(data, "pad")
+    labelled = t_ok[ticks] & ~pe.bad_marked(data)[ticks]
+    accepted = (src == pt.SOURCE_AUTO) & fwd & opened & ~near
+    took = (src == TAKEOVER) & fwd & opened & labelled
+    return accepted, took
+
+
+def open_scores(model, data, ticks):
+    """open_fwd_rev / open_fwd_stop and L_rev / L_stop (the docstring's),
+    off every tick of the sessions given, fed the car's goal."""
+    accepted, took = open_sets(data, ticks)
+    act, _ = decode(model, data, ticks, fed_goals(data, ticks))
+    out = {"open_fwd_ticks": int(accepted.sum()), "L_ticks": int(took.sum())}
+    for name, sub in (("open_fwd", accepted), ("L", took)):
+        out[f"{name}_rev"] = _rate(act == REV, sub)
+        out[f"{name}_stop"] = _rate(act == STOP, sub)
+    return out
+
+
+def drive_scores(model, data, ticks):
+    """drive_open_rev / drive_open_stop: a rejected drive replayed whole,
+    fed the car's goal, on its open-floor ticks."""
+    opened = open_front(data, ticks)
+    act, _ = decode(model, data, ticks, fed_goals(data, ticks))
+    return {"drive_open_ticks": int(opened.sum()),
+            "drive_open_rev": _rate(act == REV, opened),
+            "drive_open_stop": _rate(act == STOP, opened)}
 
 
 def tip_scores(model, data, tip_deg=pt.TIP_DEG, lead_s=pt.TIP_LEAD_S):
@@ -408,7 +561,8 @@ KEYS = ("dir_acc", "dir_bal", "stop_rec", "stop_prec", "rev_rec", "rev_prec", "s
         "side", "stop_side", "lock", "mirror_fail", "mirror_fail_goal", "goal_dir",
         "goal_side", "goal_gain_side", "goal_turn_any", "goal_turn", "goal_gap", "goal_back_rev", "goal_use",
         "behind_dir", "behind_rev_rec", "onset_dir",
-        "onset_side", "map_use", "lowband_use", "lowband_use_dir")
+        "onset_side", "map_use", "lowband_use", "lowband_use_dir",
+        "open_fwd_rev", "open_fwd_stop", "L_rev", "L_stop", "drive_open_rev", "drive_open_stop")
 
 
 def table(rows):
@@ -422,10 +576,17 @@ def table(rows):
     return "\n".join(lines)
 
 
-def load(path, crops, x_cache=None):
+def load(path, crops, fed=None):
     data = pe.load(path)
     pt.load_maps(data, crops)
+    if fed:
+        pt.load_fed_goals(data, fed)
     return data
+
+
+def file_sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 def main(argv=None):
@@ -440,31 +601,61 @@ def main(argv=None):
                          "(tip_scores); never trained on, as the scorecard's")
     ap.add_argument("--tips-map", default=None, metavar="CROPS_DIR",
                     help="the crops for --tips, if not in --map")
+    ap.add_argument("--fed", default=None, metavar="FED_DIR",
+                    help="tools/fed_goals.py's goals for the scorecard's drives: grade "
+                         "the car's own ticks too (open_fwd_rev, L_rev)")
+    ap.add_argument("--drives", default=None, metavar="DATA.npz",
+                    help="a dataset with the rejected drives in it "
+                         "(tools/rejected_drives.txt): drive_open_rev, drive_open_stop")
+    ap.add_argument("--drives-map", default=None, metavar="CROPS_DIR",
+                    help="the crops for --drives, if not in --map")
+    ap.add_argument("--drives-fed", default=None, metavar="FED_DIR",
+                    help="the fed goals for --drives, if not in --fed")
     args = ap.parse_args(argv)
     names = pt.scorecard_sessions()
     if not names:
         print(f"no scorecard at {pt.SCORECARD_FILE}")
         return 1
-    data = load(args.data, args.map)
+    data = load(args.data, args.map, args.fed)
     missing = [n for n in names if n not in data["meta"]["sessions"]]
     if missing:
         print(f"{args.data} has no {missing}: build the dataset with them in")
         return 1
     ticks = scorecard_ticks(data, names)
     tips = load(args.tips, args.tips_map or args.map) if args.tips else None
+    every = session_ticks(data, names) if args.fed else None
+    drives, drive_ticks = None, None
+    if args.drives:
+        drives = load(args.drives, args.drives_map or args.map, args.drives_fed or args.fed)
+        rejected = [n for n in pt.rejected_sessions() if n in drives["meta"]["sessions"]]
+        if not rejected:
+            print(f"{args.drives} has none of {pt.REJECTED_FILE}'s drives")
+            return 1
+        if "fed_ok" not in drives:
+            print("--drives needs --drives-fed or --fed: the car was fed a goal")
+            return 1
+        drive_ticks = session_ticks(drives, rejected)
     rows = []
     for path in args.models:
-        model = pl.PolicyModel(path)
+        model = load_model(path)
         seen = sorted(set(names) & set(model.meta.get("train_sessions", [])))
         s = score(model, data, ticks)
+        if every is not None:
+            s.update(open_scores(model, data, every))
+        if drives is not None:
+            s.update(drive_scores(model, drives, drive_ticks))
+            s["drives_seen"] = sorted(set(rejected) & set(model.meta.get("train_sessions", [])))
+            s["drives"] = rejected
+        s["onnx_sha256"] = (file_sha256(path) if "+" not in path
+                            else [file_sha256(p) for p in path.split("+")])
         if tips is not None:
             s.update(tip_scores(model, tips))
             s["tips_seen"] = sorted(set(tips["meta"]["sessions"])
                                     & set(model.meta.get("train_sessions", [])))
         s["seen"] = seen
-        label = os.path.splitext(os.path.basename(path))[0] + (" (seen)" if seen else "")
+        label = model_label(path) + (" (seen)" if seen else "")
         rows.append((label, s))
-        print(f"{label}: {json.dumps({k: s[k] for k in s if not k.endswith('seen')})}",
+        print(f"{label}: {json.dumps({k: s[k] for k in s if not k.endswith('seen') and k not in ('onnx_sha256', 'drives')})}",
               flush=True)
     print(table(rows))
     if args.json:
