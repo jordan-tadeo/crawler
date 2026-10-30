@@ -18,6 +18,7 @@ and removed only when the owner deletes one; nothing automatic ever takes
 one away or writes over one. migrate() reads the version 1 patrol.json.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -81,9 +82,25 @@ def migrate(data):
     if version == 1 and int(data.get("frame", 0) or 0) != 0:
         walls = []
     mode = data.get("mode") if data.get("mode") in ("once", "loop", "patrol") else "loop"
+    base = data.get("base")
+    edits = data.get("edits")
     return {"version": VERSION, "name": clean_name(data.get("name")), "mode": mode,
             "points": points, "walls": walls,
-            "saved_at": float(data.get("saved_at") or 0.0)}
+            "saved_at": float(data.get("saved_at") or 0.0),
+            # The lap report's track id (patrol.Patrol.track_id): the base
+            # the track was saved or started as, and the edits since. A file
+            # from before these has neither, and gets a base off its points.
+            "base": base if isinstance(base, str) and base else None,
+            "edits": edits if isinstance(edits, int) and not isinstance(edits, bool)
+            and edits >= 0 else 0}
+
+
+def base_of(data):
+    """A short hash of a track's name, mode and points (to the centimetre):
+    the same file gives the same one on every boot."""
+    pts = [[round(float(x), 2), round(float(y), 2)] for x, y in data.get("points") or []]
+    text = json.dumps([data.get("name"), data.get("mode"), pts])
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:6]
 
 
 class Library:

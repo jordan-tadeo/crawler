@@ -134,6 +134,20 @@ FIT_GROWTH = 1.15
 AUTOSAVE = "kept {:%m-%d %H:%M:%S}"
 # Journal lines kept for the map page.
 SAID_KEPT = 6
+# /patrol/event messages waiting for the control loop to send (pop_event);
+# it sends one a pass, so this only fills with nothing taking them.
+EVENTS_KEPT = 32
+# The /footprint columns the patrol fills (row_fields), as they read with
+# no patrol. tools/lap_report.py joins each decision to its lap on these.
+ROW_FIELDS = {
+    "patrol_use": "",       # goal / patrol / follow, "" with none
+    "patrol_state": "",     # state(): driving, paused, finished...
+    "patrol_track": "",     # track_id()
+    "patrol_index": -1,     # the current waypoint, from 0
+    "patrol_count": 0,
+    "patrol_lap": -1,       # laps done
+    "patrol_stuck_s": -1.0,  # the current waypoint's seconds with no PROGRESS_M closer
+}
 
 
 class _Waypoint(gl.ClickGoal):
@@ -312,6 +326,15 @@ class Patrol(gl.Goal):
         self._fit_occ = 0
         self._fit_why = None
         self.said = collections.deque(maxlen=SAID_KEPT)
+        # The track id (track_id()): the base it was saved or started as,
+        # and the edits to the list since, so an edited track's laps are
+        # never counted with the one it was before.
+        self._base = None
+        self._edits = 0
+        # Each pass, skip, start and pause, for /patrol/event (pop_event).
+        self._events = collections.deque(maxlen=EVENTS_KEPT)
+        self._event_seq = 0
+        self._ran_track = None        # the track id the last start drove
         # Whether a stuck waypoint is skipped: the settings file's, else
         # the default given (--patrol-skip-stuck).
         self.settings = settings      # a Store of {"skip_stuck": bool}, or None
@@ -381,7 +404,7 @@ class Patrol(gl.Goal):
             return False
         self._in_row = 0
         self.passed_on_path += 1
-        self._advance()
+        self._advance("path")
         if crop is not None and getattr(crop, "present", False):
             self._measure(crop)
         return True
@@ -462,11 +485,13 @@ class Patrol(gl.Goal):
                       f"skipped: {why}, {d:.2f} m off")
             if self._in_row >= len(self.points):
                 self.running = False
+                self._event("skip", self.index, "stuck")
+                self._event("pause", self.index, "all skipped")
                 self._log("warning", "Every waypoint skipped in a row - the patrol "
                           "is paused; holding neutral")
                 self._save()
                 return
-            self._advance()
+            self._advance("stuck")
             self._measure(crop)
 
     def command(self, msg, crop=None):
@@ -490,13 +515,23 @@ class Patrol(gl.Goal):
                 self._log("warning", "Start refused: no waypoints")
                 return False
             self.use = "patrol"
-            if self.finished or not (0 <= self.index < len(self.points)):
+            restart = self.finished or not (0 <= self.index < len(self.points))
+            if restart:
                 self.index, self.direction, self.laps, self.finished = 0, 1, 0, False
+            # Fresh: from the first, or on a list it has not driven as it is
+            # now; a resume carries on the waypoint it was paused on.
+            fresh = restart or self._ran_track != self.track_id()
+            self._ran_track = self.track_id()
+            was_running = self.running
             self.running, self._in_row = True, 0
             self._reset_clock()
+            if not was_running:
+                self._event("start", self.index, "fresh" if fresh else "resume")
             self._log("info", f"Patrol {self.mode} started at waypoint {self.index + 1} "
                       f"of {len(self.points)}")
         elif name == "pause":
+            if self.running:
+                self._event("pause", self.index, "pause")
             self.running = False
             self._dwell_until = None
             self._log("info", "Patrol paused - holding neutral")
@@ -515,6 +550,7 @@ class Patrol(gl.Goal):
             self.index, self.direction = 0, 1
             self._strokes, self.name, self.dirty = [], None, False
             self._walls, self._walls_frame = None, None
+            self._base, self._edits = None, 0
             self._log("info", "Patrol cleared")
         elif name in ("stroke", "unstroke", "move", "delete"):
             if self._edit(name, msg, crop) is False:
@@ -545,6 +581,8 @@ class Patrol(gl.Goal):
             if mode not in MODES:
                 self._log("warning", f"Patrol has no mode {mode!r}; one of {', '.join(MODES)}")
                 return False
+            if mode != self.mode and self.points:
+                self._changed()
             self.mode = mode
             self.finished = False
             self._log("info", f"Patrol mode {mode}")
@@ -586,6 +624,7 @@ class Patrol(gl.Goal):
         if self._pending is not None:
             self._keep_pending("a new waypoint was set before it was placed")
         self.points.append(self._waypoint(x, y, frame))
+        self._changed()
         if stroke and self._strokes:
             self._strokes[-1] += 1
         else:
@@ -624,6 +663,7 @@ class Patrol(gl.Goal):
             self.running = False
             self._strokes = []
         self.dirty = True
+        self._changed()
 
     # ---- editing from the map page ---------------------------------------------------
 
@@ -679,6 +719,7 @@ class Patrol(gl.Goal):
         if i == self.index:
             self._reset_clock()
         self.dirty = True
+        self._changed()
         self._log("info", f"Waypoint {i + 1} moved to ({xy[0][0]:.2f}, {xy[0][1]:.2f})")
         return True
 
@@ -731,10 +772,15 @@ class Patrol(gl.Goal):
             if self.library.has(track_name) and not msg.get("overwrite"):
                 self._log("warning", f"Save refused: '{track_name}' is saved already")
                 return False
+            # Saved under a name, it is that track from here on: a base of
+            # its own, no edits, written into the file it is saved as.
+            base = tk.base_of(dict(data, name=track_name))
+            data.update(base=base, edits=0)
             self._later(self.library.save, track_name, data)
             if self._pending is not None:
-                self._pending["name"] = track_name
+                self._pending.update(name=track_name, base=base, edits=0)
             self.name, self.dirty = track_name, False
+            self._base, self._edits = base, 0
             self._log("info", f"Saved '{track_name}': {len(data['points'])} waypoints")
             return True
         if name == "forget":
@@ -766,6 +812,8 @@ class Patrol(gl.Goal):
     def _set_pending(self, data):
         self._pending = data
         self.name = data.get("name")
+        self._base = data.get("base") or tk.base_of(data)
+        self._edits = int(data.get("edits") or 0)
         self.mode = data["mode"] if data.get("mode") in MODES else self.mode
         self.dirty = False
         self._fit_reset()
@@ -973,7 +1021,7 @@ class Patrol(gl.Goal):
         if self._dwell_until is not None:
             if float(self.clock()) >= self._dwell_until:
                 self._dwell_until = None
-                self._advance()
+                self._advance("dwell")
                 self._measure(crop)
             return
         if db is None:
@@ -1003,18 +1051,27 @@ class Patrol(gl.Goal):
         n = len(self.points)
         return n == 1 or (self.mode == "once" and self.index >= n - 1)
 
-    def _advance(self):
+    def _advance(self, by="radius"):
+        """On from the current waypoint: passed within its radius ("radius"),
+        gone by on the path ("path"), after its dwell ("dwell"), or skipped
+        ("stuck")."""
         n = len(self.points)
         if n == 0:
             return
+        was = self.index
+        kind = "skip" if by == "stuck" else "pass"
         if self._last_stop():
             self.finished = True
             self.laps += 1
+            self._event("finish" if kind == "pass" else kind, was, by)
             self._log("info", f"Patrol done: waypoint {self.index + 1} of {n} reached - "
                       "holding neutral until start")
             self._save()
             return
         i, self.direction = self._next(self.index, self.direction)
+        # The event before the lap count and the index move on, so it says
+        # the waypoint it was about and the clock it had; next and lap after.
+        event = self._event(kind, was, by)
         if i == 0 and self.mode == "loop":
             self.laps += 1
             self._log("info", f"Lap {self.laps} of {n} waypoints done, "
@@ -1024,6 +1081,7 @@ class Patrol(gl.Goal):
             self._log("info", f"Lap {self.laps} there and back done, "
                       f"{self.skipped} skipped so far")
         self.index = i
+        event.update(next=int(i), lap=int(self.laps))
         self._reset_clock()
 
     def _next(self, i, direction):
@@ -1094,7 +1152,8 @@ class Patrol(gl.Goal):
         pts = [[float(p[0]), float(p[1])] for p in places if p is not None]
         walls = self._walls if (self._walls and self._walls_frame == frame) else []
         return {"version": tk.VERSION, "name": self.name, "mode": self.mode,
-                "points": pts, "walls": walls, "saved_at": time.time()}
+                "points": pts, "walls": walls, "saved_at": time.time(),
+                "base": self._base, "edits": int(self._edits)}
 
     def _save(self):
         """The working track to the store. Never while a saved track is
@@ -1102,6 +1161,55 @@ class Patrol(gl.Goal):
         if self.store is None or self._pending is not None:
             return
         self.store.save(self._saved())
+
+    # ---- the lap report's ids and events ---------------------------------------------
+
+    def _changed(self):
+        """The waypoint list (or its order) changed: one more edit on the
+        track id. A list started from nothing gets a base of its own."""
+        if self._base is None:
+            self._base = "n" + os.urandom(3).hex()
+        self._edits += 1
+
+    def track_id(self):
+        """The track the laps are on: "<name or unsaved>@<base>", with
+        "+<edits>" once the list has changed since that base. The base of a
+        saved track is the hash of its file (tracks.base_of), so the same
+        track loaded on another boot has the same id; "" with no list."""
+        if not self.points and self._pending is None:
+            return ""
+        out = f"{self.name or 'unsaved'}@{self._base or 'new'}"
+        return out + (f"+{self._edits}" if self._edits else "")
+
+    def _event(self, kind, index, by=""):
+        """One /patrol/event, queued for the control loop: kind pass, skip,
+        finish (the last stop of a once), start or pause; index the
+        waypoint it is about; wp_s and stuck_s that waypoint's clocks;
+        mono_s the patrol's clock at the decision it happened on. Returned,
+        so _advance can fill in next and lap once they have moved on."""
+        self._event_seq += 1
+        tx, ty, _ = self.pose if self.pose is not None else (0.0, 0.0, 0.0)
+        event = {"seq": self._event_seq, "kind": kind, "by": by, "index": int(index),
+                 "next": int(self.index), "count": len(self.points), "lap": int(self.laps),
+                 "mode": self.mode, "track": self.track_id(),
+                 "wp_s": round(float(self._wp_time), 2),
+                 "stuck_s": round(float(self._since_best), 2),
+                 "mono_s": float(self.clock()),
+                 "frame": -1 if self.frame_now is None else int(self.frame_now),
+                 "truck_x": float(tx), "truck_y": float(ty)}
+        self._events.append(event)
+        return event
+
+    def pop_event(self):
+        """The oldest /patrol/event not sent yet, or None."""
+        return self._events.popleft() if self._events else None
+
+    def row_fields(self):
+        """ROW_FIELDS for this decision's /footprint row."""
+        return {"patrol_use": self.use, "patrol_state": self.state(),
+                "patrol_track": self.track_id(), "patrol_index": int(self.index),
+                "patrol_count": len(self.points), "patrol_lap": int(self.laps),
+                "patrol_stuck_s": round(float(self._since_best), 2)}
 
     # ---- out -------------------------------------------------------------------------
 
@@ -1169,7 +1277,8 @@ class Patrol(gl.Goal):
                 "pending": self._pending is not None,
                 # The truck's map pose the waypoint is measured from, on the
                 # same map: a recording pairs the two with no other topic.
-                "truck_x": float(tx), "truck_y": float(ty), "truck_yaw_deg": float(tyaw)}
+                "truck_x": float(tx), "truck_y": float(ty), "truck_yaw_deg": float(tyaw),
+                "track": self.track_id()}
 
     def marker(self):
         """/patrol/marker's payload: the waypoints on the map the truck is on

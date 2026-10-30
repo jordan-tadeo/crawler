@@ -834,6 +834,15 @@ class FollowSwitch(gl.Goal):
     def patrol_status(self):
         return self.patrol.patrol_status()
 
+    def row_fields(self):
+        out = self.patrol.row_fields()
+        if self.following:
+            out["patrol_use"] = "follow"
+        return out
+
+    def pop_event(self):
+        return self.patrol.pop_event()
+
     def marker(self):
         return self.patrol.marker()
 

@@ -51,6 +51,7 @@ import math
 import time
 
 from crawler.autopilot import driver as dv
+from crawler.autopilot import patrol as patrol_mod
 from crawler.autopilot import policy_imu
 from crawler.autopilot import policy_input
 
@@ -133,6 +134,9 @@ AUTOPILOT_FIELDS = {
     "rear_stop": False,          # the rear stop ended or refused a reverse this decision
     # --lidar-near (driver.py, "the near field"): the front arc's path clearance.
     "front_lidar_clearance_mm": -1.0,  # front bumper to the nearest return in the path; -1 off / none
+    # With --goal: where the patrol is this decision (patrol.ROW_FIELDS), so
+    # tools/lap_report.py can put every row in its lap and segment.
+    **patrol_mod.ROW_FIELDS,
 }
 
 
@@ -150,6 +154,9 @@ def _driver_fields(driver, now):
     policy = getattr(driver, "policy_fields", None)
     if policy is not None:
         out.update(policy())
+    patrol = getattr(getattr(driver, "goal", None), "row_fields", None)
+    if patrol is not None:
+        out.update(patrol())
     return out
 
 

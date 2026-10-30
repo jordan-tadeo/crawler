@@ -292,6 +292,24 @@ the car if it fails.
        python tools/session_report.py ~/crawler/data/mcap/crawler-record-*.mcap
    ```
 
+   Which model gets round fastest with the least tipping:
+
+   ```sh
+   ~/crawler/train/bin/python tools/lap_report.py ~/crawler/data/mcap/crawler-20261030-*.mcap
+   ~/crawler/train/bin/python tools/lap_report.py --segments --json laps.json <files>
+   ```
+
+   A lap is every segment of one loop (there and back counts both ways) on
+   one track, with no break in the chain. A clean lap or segment had no
+   takeover, skip, tip or mapless fallback. The table per model gives the
+   median clean lap and clean seconds per metre of leg, and skips,
+   takeovers, tips and tilt blocks per lap and per 100 m, each with a 95%
+   bootstrap over laps. Lower is better on all of them. The track id
+   (`name@base+edits`) changes on every edit of the list, so laps from
+   before and after an edit are never compared. Recordings from before
+   `/patrol/event` are read off the 2 Hz status to +-0.25 s per pass, and
+   the report says so.
+
 3. **Train**, in its own venv. Torch never goes near the car or
    `pyproject.toml`:
 

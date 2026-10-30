@@ -179,6 +179,8 @@ INTERVALS = {
     # its waypoints on the map once a second.
     "patrol_status": 0.5,
     "patrol_marker": 1.0,
+    # An event channel, as /marks is: offered the pass it happened on.
+    "patrol_event": 0.0,
     # With --goal (autopilot/pathgoal.PathPlanner): what the goal model is
     # fed and why, twice a second, and the path with that point once a second.
     "path_status": 0.5,
@@ -587,6 +589,13 @@ JSON_SCHEMAS = {
         # --lidar-near: front bumper to the nearest return in the path
         # ahead, mm, -1 with the switch off or no fresh scan.
         "front_lidar_clearance_mm": _NUM,
+        # With --goal, the patrol this decision (patrol.ROW_FIELDS): use,
+        # state, the track id, the current waypoint from 0 (-1 with none),
+        # how many, laps done (-1 with none), and the current one's seconds
+        # without getting 0.3 m closer (-1 with none).
+        "patrol_use": _STR, "patrol_state": _STR, "patrol_track": _STR,
+        "patrol_index": _INT, "patrol_count": _INT, "patrol_lap": _INT,
+        "patrol_stuck_s": _NUM,
     }),
     # One revolution of the roof lidar, see crawler/hardware/lidar.py. bins
     # is lidar.BINS nearest ranges in mm from the middle of the car, bin i
@@ -694,6 +703,23 @@ JSON_SCHEMAS = {
         "passed_on_path": _INT, "x": _NUM, "y": _NUM, "frame_now": _INT, "on_map": _BOOL, "distance_m": _NUM,
         "approx": _BOOL, "approx_m": _NUM, "restored": _BOOL, "pending": _BOOL,
         "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
+        # The track id (patrol.Patrol.track_id), "" with no list.
+        "track": _STR,
+    }),
+    # One waypoint passed or skipped, or the patrol started or paused, with
+    # --goal: patrol.Patrol._event(), stamped at the decision it happened on
+    # (mono_s, which is the log time too). kind pass / skip / finish /
+    # start / pause; by radius / path / dwell / stuck for a pass or skip,
+    # fresh / resume for a start, pause / all skipped for a pause; index
+    # the waypoint it is about, next the current one after it, lap the laps
+    # done after it; track the track id (patrol.Patrol.track_id); wp_s the
+    # waypoint's time driven at, stuck_s its time without getting closer.
+    # seq counts them per process, so a lost one shows.
+    "patrol_event": _schema("crawler.PatrolEvent", {
+        "seq": _INT, "kind": _STR, "by": _STR, "index": _INT, "next": _INT,
+        "count": _INT, "lap": _INT, "mode": _STR, "track": _STR,
+        "wp_s": _NUM, "stuck_s": _NUM, "mono_s": _NUM, "frame": _INT,
+        "truck_x": _NUM, "truck_y": _NUM,
     }),
     # The path the goal model is pointed along, with --goal:
     # pathgoal.PathPlanner.status(). fed: what the goal input was the
@@ -833,6 +859,7 @@ JSON_TOPICS = {
     "nav_status": "/nav/status",
     "goal_status": "/goal/status",
     "patrol_status": "/patrol/status",
+    "patrol_event": "/patrol/event",
     "path_status": "/path/status",
     "follow_status": "/follow/status",
     "pantilt": "/pantilt",

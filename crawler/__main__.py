@@ -1650,6 +1650,14 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                         tele.offer("patrol_status", autopilot.goal.patrol_status(), now)
                     if tele.wants("patrol_marker", now):
                         tele.offer("patrol_marker", autopilot.goal.marker(), now)
+                # Each pass and skip, one a pass, stamped at the decision it
+                # happened on (the patrol's clock is this one).
+                pop_event = getattr(autopilot.goal, "pop_event", None)
+                event = pop_event() if pop_event is not None else None
+                if event is not None:
+                    at = event.get("mono_s", now)
+                    tele.offer_now("patrol_event", event,
+                                   at if 0.0 <= now - at < 5.0 else now)
                 # The path the goal model is pointed along, and the point fed.
                 path = getattr(autopilot, "path", None)
                 if path is not None:
