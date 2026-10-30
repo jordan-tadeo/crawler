@@ -148,7 +148,10 @@ def hindsight_goals(rows, k_s, poses):
 
 
 # Path goals (path_goals): the goal the car's planner feeds, a point this far
-# along the path ahead (pathgoal.LOOKAHEAD_M), drawn off the truck's own path.
+# along the path ahead, drawn off the truck's own path. pathgoal.LOOKAHEAD_M
+# is this, and the car feeds the lookahead a model's sidecar says its path
+# goals were drawn at (lookahead_of: policy_train --goal-path-m), this for a
+# model with none, so the two cannot drift.
 PATH_M = 1.5
 # A scan-to-scan pose step under this is SLAM's jitter, not travel: a parked
 # truck must not walk PATH_M off its own noise.
@@ -156,6 +159,46 @@ PATH_STEP_DEADBAND_M = 0.005
 # The path is looked along no further than this: a truck parked longer has
 # nowhere it is going.
 PATH_MAX_S = 20.0
+
+
+# Staging (pathgoal.PathPlanner): a bearing further round than STAGE_DEG is
+# fed as STAGE_DEG on its side, so a turn sharper than that is fed as a turn
+# the model follows, until the point comes round inside it. A bearing
+# BEHIND_DEG or more round is fed as it is: the goal is behind, and the
+# model turns round for it, backing up for about half of them. Measured on
+# fedcontrast2-1030 over the 2026-10-30 p1261 patrols, forward ticks: the
+# nose-into-the-goal command holds from 15 to 75 degrees on either side
+# (+0.20 to +0.41) but is +0.04 on the left at 75-90 and the wrong way past
+# 90 on the left (82% of ticks wrong-signed at 120-150). Its training labels
+# steer toward the goal on 84% of forward ticks at 45-60 degrees, 76% at
+# 60-75, 69% at 75-90, and are a coin toss past 150, where half the ticks
+# back up.
+STAGE_DEG = 60.0
+BEHIND_DEG = 150.0
+
+
+def stage(bearing, stage_deg=STAGE_DEG, behind_deg=BEHIND_DEG):
+    """A bearing (radians CCW from straight ahead; arrays broadcast) as it
+    is fed: past stage_deg and short of behind_deg, stage_deg on its own
+    side; anything else as it is. stage_deg None: every bearing as it is."""
+    b = np.asarray(bearing, float)
+    if stage_deg is None:
+        return b
+    lo, hi = math.radians(stage_deg), math.radians(behind_deg)
+    mag = np.abs(b)
+    return np.where((mag > lo) & (mag < hi), np.copysign(lo, b), b)
+
+
+def lookahead_of(meta):
+    """The lookahead, metres, to feed a model with sidecar `meta`: its
+    path goals' (goal_draw.path_m, written by policy_train --goal-path-m),
+    PATH_M for a model drawn on hindsight goals or with no sidecar."""
+    draw = (meta or {}).get("goal_draw") if isinstance(meta, dict) else None
+    try:
+        m = float(draw.get("path_m")) if isinstance(draw, dict) else None
+    except (TypeError, ValueError):
+        m = None
+    return m if m is not None and math.isfinite(m) and m > 0.0 else PATH_M
 
 
 def path_progress(poses):

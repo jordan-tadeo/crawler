@@ -1035,6 +1035,15 @@ class AutoPilot:
         d = policy.PolicyDriver(self.command, view, model, goal=self.goal,
                                 lidar=self.lidar, slam=self.slam, fallback=fallback)
         d.path = self.path if model.uses_goal else None
+        if d.path is not None:
+            # The lookahead the model's path goals were drawn at, so the point
+            # fed is the one it was trained on (policy_goal.lookahead_of).
+            from crawler.autopilot import policy_goal as pg
+            want = pg.lookahead_of(getattr(model, "meta", None))
+            if want != d.path.lookahead_m:
+                self.logger.log("info", "Path", f"{model.label} was trained on path goals "
+                                f"{want:g} m along: the point fed is {want:g} m along the path")
+                d.path.lookahead_m = want
         # Only the policy creeps, so only it reads the near field.
         d.lidar_near = self.lidar_near and self.lidar is not None
         if d.lidar_near:

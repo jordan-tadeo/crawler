@@ -219,7 +219,7 @@ def test_the_plan_through_the_next_waypoint_is_used_from_its_next_leg_until_the_
     # not the next waypoint itself fed straight.
     clock = Clock()
     pl = pgo.PathPlanner(MapSlam(world(size=ROOM)), background=False, clock=clock,
-                         every_s=10.0)
+                         every_s=10.0, stage_deg=None, aim_rate_dps=None)
     p = patrol(CURVE, clock=clock)
     c = crop_at(2.0, 0.0)
     p.poll(None, c)

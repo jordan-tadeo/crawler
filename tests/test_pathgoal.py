@@ -110,6 +110,10 @@ class Clock:
 
 def planner(view, **kw):
     clock = kw.pop("clock", Clock())
+    # The point as it is picked: staging and the rate limit are off unless
+    # asked for (their own tests are test_pathgoal_stage.py's).
+    kw.setdefault("stage_deg", None)
+    kw.setdefault("aim_rate_dps", None)
     return pgo.PathPlanner(MapSlam(view), background=False, clock=clock, **kw), clock
 
 

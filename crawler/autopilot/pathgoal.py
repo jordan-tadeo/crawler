@@ -90,6 +90,25 @@ goal. With no plan to use, the
 goal itself too, and /path/status says why: no map yet, no way through,
 the goal or the truck boxed in, a plan gone STALE_S old, the truck more
 than OFF_PATH_M off it, or a goal on another map frame.
+
+The lookahead is the one the model's path goals were drawn at (the car
+sets it off the sidecar, policy_goal.lookahead_of), LOOKAHEAD_M without.
+
+Staged
+------
+Whatever is picked, its bearing goes in staged (policy_goal.stage): one
+further round than STAGE_DEG from the nose is fed as STAGE_DEG on its side,
+as the goal models steer the wrong way for a goal well round to the left
+(policy_goal's measures), so a hairpin is fed as a hard turn until the point
+comes inside it. One BEHIND_DEG or more round goes in as it is: the goal is
+behind, and turning round for it, backing up included, is the model's. And
+the bearing fed turns on the map no faster than AIM_RATE_DPS from the last
+decision's, so a replan that moves the point round a corner (+15 to +120 in
+one tick at the 2026-10-30 hairpin) comes in over a second, not at once;
+the truck's own turning moves it freely. Coming round from a goal behind it
+turns through the staged band at that rate. Only the bearing changes:
+present and distance are the point's own, and aim (/path/status, so
+tools/fed_goals.py) is moved to the bearing fed, the point the model got.
 """
 
 import math
@@ -102,7 +121,17 @@ import numpy as np
 from crawler.autopilot import policy_goal as pg
 from crawler.nav import costmap as cmap
 
-LOOKAHEAD_M = 1.5
+LOOKAHEAD_M = pg.PATH_M
+# Staged and rate-limited (the docstring's "Staged"): policy_goal.stage's
+# band, and the most the bearing fed may turn on the map in a second. The
+# point picked turned at 127 deg/s or less on 95% of the 2026-10-30 p1261
+# decisions (replayed); the other 5% are the jumps, up to 179 in a tick.
+STAGE_DEG = pg.STAGE_DEG
+BEHIND_DEG = pg.BEHIND_DEG
+AIM_RATE_DPS = 120.0
+# Decisions further apart than this are not rate-limited: the first one
+# after is fed where it points.
+AIM_GAP_S = 0.5
 PLAN_EVERY_S = 0.5
 REPLAN_MOVE_M = 0.2
 PAD_M = 3.0
@@ -175,6 +204,10 @@ def _ahead(source, frame):
             break
         out.append((float(a[0]), float(a[1]), int(a[2])))
     return tuple(out)
+
+
+def _wrap(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _same(a, b):
@@ -410,9 +443,19 @@ class PathPlanner:
     own (background=False makes it in the caller when due, for tests)."""
 
     def __init__(self, slam, lookahead_m=LOOKAHEAD_M, every_s=PLAN_EVERY_S,
-                 background=True, clock=time.monotonic, say=None):
+                 background=True, clock=time.monotonic, say=None,
+                 stage_deg=STAGE_DEG, behind_deg=BEHIND_DEG, aim_rate_dps=AIM_RATE_DPS):
         self.slam = slam
         self.lookahead_m = float(lookahead_m)
+        # None turns staging, or the rate limit, off.
+        self.stage_deg = stage_deg
+        self.behind_deg = float(behind_deg)
+        self.aim_rate_dps = aim_rate_dps
+        self._last_fed = None      # (map bearing fed, crop t, frame) of the last decision
+        self._walking = False      # walking round from a goal behind
+        self.bearing_deg = 0.0     # the bearing fed this decision, truck frame
+        self.raw_bearing_deg = 0.0  # the one picked, before staging and the rate limit
+        self.staged = 0            # decisions fed other than the bearing picked
         self.every_s = float(every_s)
         self.background = bool(background)
         self.clock = clock
@@ -476,7 +519,57 @@ class PathPlanner:
 
     def encode(self, crop, source):
         """The goal input this decision: the encoding of the point along the
-        path, or the source's own (the goal itself) when there is none."""
+        path, or the source's own (the goal itself) when there is none,
+        staged and rate-limited (_shape)."""
+        return self._shape(crop, self._pick(crop, source))
+
+    def _shape(self, crop, g):
+        """The goal input g as it is fed: its bearing staged
+        (policy_goal.stage), then turned on the map no faster than
+        aim_rate_dps from the last decision's. Coming round from a goal
+        behind it turns through the staged band at that rate, and is
+        staged again once inside it. Present, distance and the encoding
+        are g's own; aim moves to the bearing fed at its own distance, so
+        /path/status (and tools/fed_goals.py off it) has the point the
+        model got."""
+        g = np.asarray(g, np.float32)
+        if (g.shape != (1, pg.SIZE) or not g[0, pg.PRESENT] > 0 or crop is None
+                or not getattr(crop, "present", False)):
+            self._last_fed, self._walking = None, False
+            self.bearing_deg = self.raw_bearing_deg = 0.0
+            return g
+        raw = math.atan2(float(g[0, pg.SIN]), float(g[0, pg.COS]))
+        want = float(pg.stage(raw, self.stage_deg, self.behind_deg))
+        yaw, t, frame = float(crop.yaw), float(crop.t), int(getattr(crop, "frame", 0))
+        heading = yaw + want
+        last = self._last_fed
+        if (self.aim_rate_dps is not None and last is not None and last[2] == frame
+                and 0.0 <= t - last[1] <= AIM_GAP_S):
+            step = math.radians(float(self.aim_rate_dps)) * (t - last[1])
+            heading = last[0] + max(-step, min(step, _wrap(heading - last[0])))
+        fed = _wrap(heading - yaw)
+        if self.stage_deg is not None:
+            lim = math.radians(float(self.stage_deg))
+            self._walking = abs(want) > lim or (self._walking and abs(fed) > lim)
+            if not self._walking:
+                fed = max(-lim, min(lim, fed))
+        self._last_fed = (yaw + fed, t, frame)
+        self.raw_bearing_deg = math.degrees(raw)
+        self.bearing_deg = math.degrees(fed)
+        if abs(_wrap(fed - raw)) < 1e-6:
+            return g
+        self.staged += 1
+        if self.aim is not None:
+            d = math.hypot(self.aim[0] - float(crop.x), self.aim[1] - float(crop.y))
+            self.aim = (float(crop.x) + d * math.cos(yaw + fed),
+                        float(crop.y) + d * math.sin(yaw + fed))
+        out = g.copy()
+        out[0, pg.SIN] = math.sin(fed)
+        out[0, pg.COS] = math.cos(fed)
+        return out
+
+    def _pick(self, crop, source):
+        """The goal input picked off the plan, before _shape."""
         self.update(crop, source)
         goal = getattr(source, "goal", None) if source is not None else None
         if goal is None or crop is None or not getattr(crop, "present", False):
@@ -668,7 +761,10 @@ class PathPlanner:
                 "lookahead_m": self.lookahead_m,
                 "clear_m": float(plan.cm.inscribed) if have else -1.0,
                 "route_n": len(plan.route) if have else 0,
-                "passes": int(self.passes)}
+                "passes": int(self.passes),
+                "bearing_deg": float(self.bearing_deg),
+                "raw_bearing_deg": float(self.raw_bearing_deg),
+                "staged": int(self.staged)}
 
     def marker(self):
         """/path's payload: the path from the truck on, and the point fed.

@@ -6,8 +6,9 @@ A hindsight goal (crawler/autopilot/policy_goal.py) is where my hand took the
 car anyway, so it says nothing the frame and the map do not. On a patrol or a
 clicked goal the car was told where to go, and that point is in the
 recording: /path/status's aim (the planner's subgoal, or the goal itself
-inside the lookahead) when the planner ran, else /goal/status's clicked
-point. Each is put in the truck's frame off the newest tracking
+inside the lookahead, at the bearing it was fed: staged and rate-limited
+since pathgoal's "Staged", the raw pick before) when the planner ran, else
+/goal/status's clicked point. Each is put in the truck's frame off the newest tracking
 /slam/status pose -- the same live map frame both are on -- so the vector is
 the one the model was fed, give or take the crop's own pose.
 

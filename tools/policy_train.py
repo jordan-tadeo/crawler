@@ -638,6 +638,14 @@ def load_maps(data, crops_dir):
 PATH_NEAR_SHARE = 0.25
 
 
+def goal_draw_meta(path_m):
+    """The sidecar's goal_draw: path goals path_m along, or "hindsight"
+    (None). The car reads its lookahead back off it (policy_goal.lookahead_of)."""
+    if path_m is None:
+        return "hindsight"
+    return {"path_m": float(path_m), "near_share": PATH_NEAR_SHARE}
+
+
 def load_fed_goals(data, fed_dir):
     """Pair every tick with the goal the car was fed (tools/fed_goals.py, one
     npz per session, by name): data gains fed_ok, fed_ahead, fed_left.
@@ -1509,8 +1517,10 @@ def main(argv=None):
     ap.add_argument("--contrast-steer-only", action="store_true",
                     help="the goal contrast on the steer alone, off the labelled gear's head")
     ap.add_argument("--goal-path-m", type=float, default=None, metavar="M",
-                    help="draw goals M metres along the truck's own path (the planner's "
-                         f"lookahead is {pg.PATH_M:g}) instead of hindsight goals k s ahead")
+                    help="draw goals M metres along the truck's own path instead of "
+                         "hindsight goals k s ahead; the sidecar says M, and the car's "
+                         "planner feeds the point M along its path to this model "
+                         f"(policy_goal.lookahead_of; {pg.PATH_M:g} with none)")
     ap.add_argument("--fed-goals", default=None, metavar="DIR",
                     help="tools/fed_goals.py output: the goal the car was fed, in place of "
                          "the drawn one on every tick that had one")
@@ -1792,8 +1802,7 @@ def main(argv=None):
             "goal_contrast": ({"weight": args.goal_contrast, "margin": GOAL_CONTRAST_MARGIN,
                                "steer_only": bool(args.contrast_steer_only)}
                               if args.goal_contrast > 0 else None),
-            "goal_draw": ({"path_m": args.goal_path_m, "near_share": PATH_NEAR_SHARE}
-                          if args.goal_path_m is not None else "hindsight"),
+            "goal_draw": goal_draw_meta(args.goal_path_m),
             "goal_fed": bool(args.fed_goals),
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}

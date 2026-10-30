@@ -649,12 +649,16 @@ JSON_SCHEMAS = {
     # 0.196 narrow through a tight gap; -1 with none); route_n the goals
     # the plan runs through (the goal and the patrol's next waypoints, 0
     # with none); passes, goals the truck went by on the path (gone_by).
+    # bearing_deg the bearing fed this decision, truck frame, CCW (aim is
+    # the point at it), raw_bearing_deg the one picked before staging and
+    # the rate limit, staged the decisions fed other than the one picked.
     "path_status": _schema("crawler.PathStatus", {
         "fed": _STR, "why": _STR, "aim_x": _NUM, "aim_y": _NUM, "path": _BOOL,
         "plan_why": _STR, "length_m": _NUM, "age_s": _NUM, "plan_ms": _NUM,
         "plan_cpu_ms": _NUM, "plan_ms_mean": _NUM, "plan_ms_max": _NUM,
         "plan_cpu_ms_mean": _NUM, "plans": _INT, "failed": _INT,
         "lookahead_m": _NUM, "clear_m": _NUM, "route_n": _INT, "passes": _INT,
+        "bearing_deg": _NUM, "raw_bearing_deg": _NUM, "staged": _INT,
     }),
     # Following a person, with --goal and --pantilt: follow.PersonGoal.
     # follow_status(). active the Follow switch; state off / waiting (on,
