@@ -1,3 +1,5 @@
+import time
+
 import pygame
 
 # xpadneo reports 11 buttons, which is the count I measured, and it puts the
@@ -137,8 +139,12 @@ def trigger_pull(value, rest: float = SAFE_TRIGGER_REST) -> float:
     return max(0.0, min(1.0, (v - r) / span))
 
 
+# How often try_connect() opens a handle when SDL says a pad is there.
+CONNECT_EVERY_S = 1.0
+
+
 class Joystick:
-    def __init__(self, disabled: bool = False, stop_event=None):
+    def __init__(self, disabled: bool = False, stop_event=None, wait: bool = True):
         if not pygame.joystick.get_init():
             pygame.joystick.init()
 
@@ -152,7 +158,11 @@ class Joystick:
             self.connected = True
             return
 
+        self._tried_at = None
         if pygame.joystick.get_count() == 0:
+            if not wait:
+                # Not connected; the control loop calls try_connect().
+                return
             # Can come back not connected, if the stop signal arrived first.
             self.wait_for_connection(stop_event)
             return
@@ -239,6 +249,35 @@ class Joystick:
         except Exception:
             return False
         return rt < TRIGGER_DEADZONE and lt < TRIGGER_DEADZONE
+
+    def try_connect(self, now=None) -> bool:
+        """One look for a pad, never waiting and never raising: the
+        control loop's, every pass it has no pad. True once one is attached.
+
+        Opens a handle at most every CONNECT_EVERY_S. A handle that will not
+        open is said and tried again, not raised: with no pad the loop is
+        still serving the map and the patrol, and a crash would cost those
+        for a pad that is not driving anything."""
+        if self.connected:
+            return True
+        now = time.monotonic() if now is None else now
+        tried = getattr(self, "_tried_at", None)
+        if tried is not None and now - tried < CONNECT_EVERY_S:
+            return False
+        self._tried_at = now
+        try:
+            if pygame.joystick.get_count() <= 0:
+                return False
+            self.joystick = pygame.joystick.Joystick(0)
+            self.joystick.init()
+        except Exception as e:
+            self.joystick = None
+            print(f"\nController would not open, trying again: {e}")
+            return False
+        self.connected = True
+        # New handle, possibly a new axis map. Measure rest again.
+        self._calibrate_triggers()
+        return True
 
     def wait_for_connection(self, stop_event=None, poll_interval: float = 1.0):
         """Wait for a controller. Returns True once one is attached.

@@ -61,12 +61,21 @@ def test_losing_the_pad_in_record_writes_the_row_first_then_ends_it(
     assert out["vecon"].last_throttle == 0.0
 
 
-def test_the_camera_stops_being_written_while_there_is_no_pad(monkeypatch):
+def test_only_the_cameras_pictures_stop_while_there_is_no_pad(monkeypatch):
+    """With no pad the pictures stop being written (bytes and encoding with
+    no driving in them) and nothing else: the map, the lidar, the IMU and
+    the status channels carry on, because mapping and editing a patrol do
+    not need a controller."""
     pad = DroppingPad(gone=10, back=20)
     out = run(pad, [()] * 40, monkeypatch=monkeypatch)
     tele = out["tele"]
     mutes = [e for e in tele.events if e[0] in ("mute", "unmute")]
-    assert mutes == [("mute", tm.CAMERA_KEYS), ("unmute",)]
+    assert mutes == [("mute", tm.PADLESS_MUTED_KEYS), ("unmute",)]
+    assert set(tm.PADLESS_MUTED_KEYS) == {"depth", "disparity", "rectified_left",
+                                         "pantilt_image", "depth_raw", "depth_small"}
+    assert not {"imu", "imu_batch", "lidar", "lidar_scan", "tf", "slam_status", "map",
+                "slam_path", "voxel_points", "voxel_low", "pantilt", "patrol_status",
+                "patrol_marker", "path", "goal_status"} & set(tm.PADLESS_MUTED_KEYS)
     assert {"imu", "imu_batch", "lidar", "depth", "disparity", "rectified_left",
             "depth_raw", "depth_small", "lidar_scan", "tf",
             "lidar_truck", "slam_status", "map",

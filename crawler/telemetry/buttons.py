@@ -41,13 +41,20 @@ messages in a phone, and it only asks while it is open and on screen:
                       (ClickGoals.push), so the control loop takes it in
                       order with everything else. Patrol commands only:
                       autopilot/patrol.COMMANDS; never throttle or steering.
+                      202 is "queued", not "done": a command with an "id"
+                      is answered in the state's patrol.acks once the
+                      control loop has applied it, and the page keeps what
+                      it drew until then. The loop takes them with or
+                      without a pad (__main__.padless_pass).
 
 Why stdlib http.server and not something in the WebSocket server: the
 foxglove SDK's server speaks WebSocket and nothing else, and every other
-option is a dependency. A plain HTTPServer answers one request at a time on
-one thread, which is plenty for a page and a few small requests a second.
-The thread sleeps in select() between requests (a wake every POLL_S to
-check for shutdown) and is niced on Linux, so a page can never get ahead of
+option is a dependency. A thread a connection (ThreadingHTTPServer, at most
+MAX_CONNECTIONS at once): it was one thread for everything, and a phone
+browser opens a spare connection and sends nothing on it, which held every
+other request -- the state, the map, a stroke -- for REQUEST_TIMEOUT_S
+(5.00 s measured behind one idle socket). The threads are niced on Linux
+(they inherit the serving thread's nice), so a page can never get ahead of
 the control loop.
 
 Like the rest of telemetry, start() never raises: a port already taken
@@ -72,16 +79,21 @@ PORT_TAG = '<meta name="ws-port" content="8765">'
 POLL_S = 1.0
 NICE = 10
 # A client that connects and sends nothing is dropped after this, so it
-# cannot hold the one serving thread.
+# cannot hold a thread for ever.
 REQUEST_TIMEOUT_S = 5.0
+# Connections served at once; one past it is closed straight away.
+MAX_CONNECTIONS = 16
 # The control loop builds the map page's state while the page has asked
-# within STATE_WANTED_S, at most every STATE_EVERY_S.
-STATE_WANTED_S = 3.0
+# within STATE_WANTED_S, at most every STATE_EVERY_S. Long enough to last
+# through a finger on the glass, when the page does not ask.
+STATE_WANTED_S = 10.0
 STATE_EVERY_S = 0.4
 CMD_MAX_BYTES = 32_000
 PENDING_WALLS = 1500
-# The map picture's colours, by grid code (unknown is clear).
-PALETTE = bytes((0, 0, 0, 52, 57, 66, 235, 235, 235))
+# The map picture's colours, by grid code: unknown is clear (the page draws
+# its own hatching there), free a slate plainly lighter than the page,
+# walls near white.
+PALETTE = bytes((0, 0, 0, 68, 78, 94, 235, 235, 235))
 
 
 def page_bytes(ws_port=8765):
@@ -116,6 +128,33 @@ def png_of(codes):
             + _chunk(b"tRNS", b"\x00")
             + _chunk(b"IDAT", zlib.compress(raw.tobytes(), 6))
             + _chunk(b"IEND", b""))
+
+
+class _Server(http.server.ThreadingHTTPServer):
+    """A thread a connection, at most MAX_CONNECTIONS of them. Each thread
+    is started by the serving thread, so on Linux it starts at its nice."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def _handler(page):
@@ -155,7 +194,13 @@ def _handler(page):
                     if got is None:
                         return self._send(204, b"", "image/png", head_only=head_only)
                     body, header = got
-                    return self._send(200, body, "image/png", [("X-Map", header)],
+                    # The same picture again is a 304 and nothing to decode.
+                    tag = '"%08x"' % (zlib.crc32(body) & 0xFFFFFFFF)
+                    if self.headers.get("If-None-Match") == tag:
+                        return self._send(304, b"", "image/png", [("ETag", tag)],
+                                          head_only=True)
+                    return self._send(200, body, "image/png",
+                                      [("X-Map", header), ("ETag", tag)],
                                       head_only=head_only)
             self.send_error(404)
 
@@ -316,7 +361,7 @@ class ButtonPage:
         try:
             self.body = page_bytes(self.ws_port)
             self.map_body = map_page_bytes() if self.goals is not None else None
-            server = http.server.HTTPServer((self.host, self.port), _handler(self))
+            server = _Server((self.host, self.port), _handler(self))
             server.timeout = REQUEST_TIMEOUT_S
         except Exception as e:
             self.error = str(e)

@@ -476,8 +476,8 @@ class MarkPad:
     def alarm(self, joystick, now):
         """One long pulse, now if the pad will take it. Never raises.
 
-        Tried at once, because the loop may be about to park in
-        wait_for_connection and stop polling. A pad that has gone does not
+        Tried at once, because with no pad the loop stops polling the mark
+        buttons until one is back. A pad that has gone does not
         take it, and that is not the pad saying it has no rumble: the attempt
         failing never switches rumble off, it just leaves the pulse owed for
         the first poll after the pad comes back, so I still find out why the

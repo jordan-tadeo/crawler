@@ -148,6 +148,10 @@ ROW_FIELDS = {
     "patrol_lap": -1,       # laps done
     "patrol_stuck_s": -1.0,  # the current waypoint's seconds with no PROGRESS_M closer
 }
+# A command that carries an "id" (the map page's) is answered in
+# page_state()'s acks, [id, taken], the newest ACKS_KEPT of them, so the
+# page can tell a stroke the car took from one still on its way.
+ACKS_KEPT = 64
 
 
 class _Waypoint(gl.ClickGoal):
@@ -335,6 +339,7 @@ class Patrol(gl.Goal):
         self._events = collections.deque(maxlen=EVENTS_KEPT)
         self._event_seq = 0
         self._ran_track = None        # the track id the last start drove
+        self.acks = collections.deque(maxlen=ACKS_KEPT)
         # Whether a stuck waypoint is skipped: the settings file's, else
         # the default given (--patrol-skip-stuck).
         self.settings = settings      # a Store of {"skip_stuck": bool}, or None
@@ -440,7 +445,10 @@ class Patrol(gl.Goal):
         self._follow(links)
         for kind, what in events:
             if kind == "cmd":
-                self.command(what, crop)
+                took = self.command(what, crop)
+                cid = what.get("id") if isinstance(what, dict) else None
+                if isinstance(cid, str) and 0 < len(cid) <= 64:
+                    self.acks.append([cid, took is True])
             elif self.use == "goal":
                 self.single.poll(_One(what), crop)
             else:
@@ -1322,4 +1330,5 @@ class Patrol(gl.Goal):
                 "stuck_s": round(float(self._since_best), 1),
                 "skip_stuck": bool(self.skip_stuck),
                 "strokes": len(self._strokes), "pending": pending, "fit": fit,
-                "said": [list(x) for x in self.said]}
+                "said": [list(x) for x in self.said],
+                "acks": [list(a) for a in self.acks]}

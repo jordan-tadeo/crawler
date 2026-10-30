@@ -121,6 +121,9 @@ AUTO_VIEW = "auto"
 # a mark is, lives in marks.py -- this file only polls it.
 
 LOOP_INTERVAL = 0.01
+# With no pad the loop runs at 10 Hz: the goal, the patrol's commands, the
+# map page and the status channels, the wheels held at neutral every pass.
+PADLESS_INTERVAL = 0.1
 AUTO_TICK_INTERVAL = 0.1
 # The interpreter's GIL switch interval with --nav (see main()): CPython's
 # default is 5 ms.
@@ -1429,10 +1432,20 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     # for whoever wanted it; only its channels stop.
                     _mute_camera(tele)
                     vecon.return_neutral()
+                # No pad: everything but driving carries on. The wheels are
+                # held at neutral on every one of these passes (pigpio keeps
+                # the last pulse forever, so it is commanded, not assumed),
+                # and the pad is looked for again. Nothing in here reads the
+                # pad, so nothing can start auto or record: START is a pad
+                # button. This used to be joystick.wait_for_connection(),
+                # which parked the whole loop -- the patrol's commands, the
+                # map page and every status channel with it.
+                padless_pass(joystick, vecon, autopilot, modes, tele, page,
+                             now, last_error, markpad)
                 # Interruptible, so a systemctl stop does not sit here until
                 # TimeoutStopSec runs out and systemd SIGKILLs us past
                 # vecon.close().
-                joystick.wait_for_connection(stop_event)
+                stop_event.wait(PADLESS_INTERVAL)
                 continue
 
             if not was_connected:
@@ -1638,46 +1651,10 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             if (getattr(nav_driver, "nav_path", None) is not None
                     and tele.wants("nav_path", now)):
                 tele.offer("nav_path", nav_driver.nav_path(), now)
-            # --goal: the clicked goal, from the truck, and its disc.
-            if getattr(autopilot, "clicks", None) is not None:
-                if tele.wants("goal_status", now):
-                    tele.offer("goal_status", autopilot.goal.status(), now)
-                if tele.wants("goal_marker", now):
-                    tele.offer("goal_marker", autopilot.goal_marker(), now)
-                # The patrol: where it is in the list, and the list on the map.
-                if hasattr(autopilot.goal, "patrol_status"):
-                    if tele.wants("patrol_status", now):
-                        tele.offer("patrol_status", autopilot.goal.patrol_status(), now)
-                    if tele.wants("patrol_marker", now):
-                        tele.offer("patrol_marker", autopilot.goal.marker(), now)
-                # Each pass and skip, one a pass, stamped at the decision it
-                # happened on (the patrol's clock is this one).
-                pop_event = getattr(autopilot.goal, "pop_event", None)
-                event = pop_event() if pop_event is not None else None
-                if event is not None:
-                    at = event.get("mono_s", now)
-                    tele.offer_now("patrol_event", event,
-                                   at if 0.0 <= now - at < 5.0 else now)
-                # The path the goal model is pointed along, and the point fed.
-                path = getattr(autopilot, "path", None)
-                if path is not None:
-                    if tele.wants("path_status", now):
-                        tele.offer("path_status", path.status(), now)
-                    if tele.wants("path", now):
-                        tele.offer("path", path.marker(), now)
-                # The map page (telemetry/buttons.py), only while it is open.
-                if (page is not None and getattr(autopilot, "patrol", None) is not None
-                        and page.wants_state(now)):
-                    page.offer_state(map_page_state(autopilot), now)
-                # Following a person: who, where, and the goal input fed.
-                if hasattr(autopilot.goal, "follow_status"):
-                    if tele.wants("follow_status", now):
-                        crop = (autopilot.slam.crop()
-                                if autopilot.slam is not None else None)
-                        tele.offer("follow_status",
-                                   autopilot.goal.follow_status(crop), now)
-                    if tele.wants("follow_marker", now):
-                        tele.offer("follow_marker", autopilot.goal.follow_marker(), now)
+            # --goal: the clicked goal, the patrol, the path, the map page and
+            # the person followed. The same with or without a pad.
+            goal_telemetry(tele, autopilot, page, now, pad=True,
+                           mode=modes.mode)
 
             if tele.wants("diagnostics", now):
                 elapsed = now - window_started
@@ -1747,6 +1724,117 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
         markpad.stop()
 
 
+def boot_mode(modes, joystick, autopilot, log):
+    """--mode auto at boot drives only with a pad there to take it back: no
+    pad, manual, and START once it is connected. Otherwise as it always was."""
+    if modes.mode != AUTO:
+        return
+    if not joystick.is_connected():
+        modes.mode = MANUAL
+        log.log("warning", "Mode", "No controller, booting into manual; "
+                "START once it is connected")
+    elif not autopilot.resume():
+        modes.mode = MANUAL
+        log.log("warning", "Mode", "Auto refused to start, booting into manual")
+
+
+def goal_telemetry(tele, autopilot, page, now, pad=True, mode=None):
+    """--goal's status channels and the map page's state, off what the goal,
+    the patrol and the planner already hold. Every pass, pad or not: none of
+    it drives anything. `pad` and `mode` are for the map page, which says
+    when there is no controller to drive with."""
+    # --goal: the clicked goal, from the truck, and its disc.
+    if getattr(autopilot, "clicks", None) is not None:
+        if tele.wants("goal_status", now):
+            tele.offer("goal_status", autopilot.goal.status(), now)
+        if tele.wants("goal_marker", now):
+            tele.offer("goal_marker", autopilot.goal_marker(), now)
+        # The patrol: where it is in the list, and the list on the map.
+        if hasattr(autopilot.goal, "patrol_status"):
+            if tele.wants("patrol_status", now):
+                tele.offer("patrol_status", autopilot.goal.patrol_status(), now)
+            if tele.wants("patrol_marker", now):
+                tele.offer("patrol_marker", autopilot.goal.marker(), now)
+        # Each pass and skip, one a pass, stamped at the decision it
+        # happened on (the patrol's clock is this one).
+        pop_event = getattr(autopilot.goal, "pop_event", None)
+        event = pop_event() if pop_event is not None else None
+        if event is not None:
+            at = event.get("mono_s", now)
+            tele.offer_now("patrol_event", event,
+                           at if 0.0 <= now - at < 5.0 else now)
+        # The path the goal model is pointed along, and the point fed.
+        path = getattr(autopilot, "path", None)
+        if path is not None:
+            if tele.wants("path_status", now):
+                tele.offer("path_status", path.status(), now)
+            if tele.wants("path", now):
+                tele.offer("path", path.marker(), now)
+        # The map page (telemetry/buttons.py), only while it is open.
+        if (page is not None and getattr(autopilot, "patrol", None) is not None
+                and page.wants_state(now)):
+            page.offer_state(map_page_state(autopilot, pad=pad, mode=mode), now)
+        # Following a person: who, where, and the goal input fed.
+        if hasattr(autopilot.goal, "follow_status"):
+            if tele.wants("follow_status", now):
+                crop = (autopilot.slam.crop()
+                        if autopilot.slam is not None else None)
+                tele.offer("follow_status",
+                           autopilot.goal.follow_status(crop), now)
+            if tele.wants("follow_marker", now):
+                tele.offer("follow_marker", autopilot.goal.follow_marker(), now)
+
+
+def padless_pass(joystick, vecon, autopilot, modes, tele, page, now,
+                 last_error="", markpad=None):
+    """One control pass with no pad attached. Never raises.
+
+    The wheels: neutral, commanded every pass. The mode: nothing here
+    changes it, and the lost-pad block has already parked auto and ended
+    record, so it is manual. Everything else runs as it does with a pad:
+    the clicks and patrol commands are drained into the goal (goal_step),
+    the planner plans, the map page and the status channels get their
+    state. Then one cheap look for a pad (Joystick.try_connect)."""
+    if modes.mode != MANUAL:
+        # Not reachable through the loop (the lost-pad block parks auto and
+        # ends record first), but a pass with no pad is never a driving one.
+        try:
+            autopilot.pause()
+        except Exception:
+            pass
+        modes.mode = MANUAL
+    try:
+        vecon.return_neutral()
+    except Exception as e:
+        print(f"[padless] neutral failed: {e}", file=sys.stderr)
+    goal_step = getattr(autopilot, "goal_step", None)
+    if goal_step is not None:
+        goal_step()
+    try:
+        goal_telemetry(tele, autopilot, page, now, pad=False, mode=modes.mode)
+        if tele.wants("diagnostics", now):
+            payload = {
+                "mode": modes.mode,
+                "controller_connected": False,
+                "auto_available": not autopilot.unavailable,
+                "camera_state": autopilot.camera_state(),
+                "camera_error": autopilot.camera_error(),
+                "last_error": last_error,
+                **tele.recording_status(),
+            }
+            if markpad is not None:
+                payload.update(markpad.counts())
+            tele.offer("diagnostics", payload, now)
+    except Exception as e:
+        print(f"[padless] {e}", file=sys.stderr)
+    try_connect = getattr(joystick, "try_connect", None)
+    if try_connect is not None:
+        try:
+            try_connect(now)
+        except Exception as e:
+            print(f"[padless] pad: {e}", file=sys.stderr)
+
+
 def _offer_connection(tele, now, mode, connected, last_error, autopilot,
                       tick_max_ms, markpad):
     """The /diagnostics row for a pad that just went or came back.
@@ -1780,7 +1868,7 @@ def _offer_connection(tele, now, mode, connected, last_error, autopilot,
 def _mute_camera(tele):
     from crawler.telemetry import telemetry as tm
     try:
-        tele.mute(tm.CAMERA_KEYS)
+        tele.mute(tm.PADLESS_MUTED_KEYS)
     except Exception:
         pass
 
@@ -2143,10 +2231,11 @@ def track_library(args, slam, log):
     return library, fitter
 
 
-def map_page_state(autopilot):
+def map_page_state(autopilot, pad=True, mode=None):
     """The map page's snapshot, built on the control loop's thread: the
-    patrol's page_state() and the planner's path."""
-    out = {"patrol": autopilot.patrol.page_state()}
+    patrol's page_state(), the planner's path, and whether there is a pad to
+    drive with (the page says so when there is not) and the mode."""
+    out = {"patrol": autopilot.patrol.page_state(), "pad": bool(pad), "mode": mode}
     path = getattr(autopilot, "path", None)
     if path is not None:
         m = path.marker()
@@ -2255,11 +2344,9 @@ def main(argv=None):
 
     modes = ModeSwitch(args.mode, log)
 
-    # Before the joystick, because Joystick() blocks waiting for a pad and I
-    # want the server already listening and the recording already running
-    # while it waits -- that wait is one of the things worth watching from
-    # the laptop, and "I booted the car and it never found the pad" is
-    # exactly the kind of run I want written down. start() never raises: a
+    # Before the joystick, so the server is listening and the recording is
+    # running from the start -- "I booted the car and it never found the pad"
+    # is exactly the kind of run I want written down. start() never raises: a
     # missing foxglove-sdk, a port somebody else is already on, or a card
     # with no room on it all cost telemetry and nothing else.
     #
@@ -2434,15 +2521,17 @@ def main(argv=None):
     tap = fp.FootprintTap(view=hub.view("footprint"), tele=tele,
                           auto_view=hub.view(AUTO_VIEW))
 
-    # Booting with no pad is the same as losing one: the camera may already
-    # be up, and nothing it writes before there is a pad has driving in it.
-    _mute_camera(tele)
-    joystick = js.Joystick(stop_event=stop_event)
-    _unmute_camera(tele)
+    # The pad, if there is one, without waiting for it: everything but
+    # driving runs without a pad, and the control loop looks for one at
+    # 10 Hz (padless_pass). Booting with no pad is the same as losing one:
+    # the camera's pictures are not written until there is a pad.
+    joystick = js.Joystick(stop_event=stop_event, wait=False)
+    if not joystick.is_connected():
+        _mute_camera(tele)
+        log.log("warning", "Controller", "No controller: running, holding "
+                "neutral; connect it to drive")
 
-    if modes.mode == AUTO and not autopilot.resume():
-        modes.mode = MANUAL
-        log.log("warning", "Mode", "Auto refused to start, booting into manual")
+    boot_mode(modes, joystick, autopilot, log)
 
     log.log("info", "Startup", f"Running in {modes.mode} mode")
 

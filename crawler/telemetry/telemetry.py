@@ -940,12 +940,10 @@ ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
             + tuple(SLAM_CHANNELS) + tuple(VOXEL_CHANNELS)
             + tuple(NAV_CHANNELS))
 
-# Everything the camera produces, which is what stops being written while
-# there is no pad: a file of nothing but pictures and IMU has no driving in it
-# to pair them with, and one afternoon of those was 77 MB. The control loop's
-# own channels are not in here -- /diagnostics is what says the pad went.
-# /lidar is, for the same reason: it is a sensor with no driving in it, and
-# so is its 3D view, the transform and the outline with it.
+# Everything the sensors produce: the camera's channels, the IMU, the lidar
+# and its 3D view, the SLAM map and the voxels. The control loop's own
+# channels are not in here. (With no pad only the pictures stop:
+# PADLESS_MUTED_KEYS.)
 CAMERA_KEYS = frozenset(("imu", "imu_batch", "lidar", "slam_status", "pantilt")
                         + tuple(IMAGE_CHANNELS)
                         + tuple(RAW_DEPTH_CHANNELS)
@@ -953,6 +951,14 @@ CAMERA_KEYS = frozenset(("imu", "imu_batch", "lidar", "slam_status", "pantilt")
                         + tuple(SLAM_CHANNELS)
                         + tuple(VOXEL_CHANNELS))
 
+
+# What stops being written while there is no pad: the camera's pictures,
+# the bytes and the encoding of a recording. A file of nothing but pictures
+# has no driving in it to pair them with; one afternoon of pictures and IMU
+# was 77 MB. Everything else runs without a pad as it does with one -- the
+# IMU, the lidar, the SLAM map and path, the voxels, the pan-tilt status --
+# because mapping and editing a patrol do not need a controller.
+PADLESS_MUTED_KEYS = frozenset(tuple(IMAGE_CHANNELS) + tuple(RAW_DEPTH_CHANNELS))
 
 class Telemetry:
     """The channels, the WebSocket server, the recorder, and the one thread.
@@ -1242,8 +1248,8 @@ class Telemetry:
         """offer(), past the rate gate. For an event that must not wait.
 
         A pad that comes or goes is one row I cannot afford to have a 4 Hz
-        gate eat: the loop parks in wait_for_connection straight after, so
-        there is no next pass for it to go out on. Still nothing unless
+        gate eat: it is a state change, and the next gated pass may be a
+        quarter of a second off. Still nothing unless
         something is listening -- a file or Studio -- and still never blocks.
         True if it was handed over.
         """

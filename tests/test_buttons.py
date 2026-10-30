@@ -359,3 +359,54 @@ def test_the_map_page_state_is_the_patrols_and_the_planners():
     json.dumps(st)
     assert st["path"] == [[0.12, 4.57]] and st["aim"] == [1.0, 2.0]
     assert st["patrol"]["points"] == []
+    assert st["pad"] is True and st["mode"] is None
+    st = cm.map_page_state(ap, pad=False, mode="manual")
+    assert st["pad"] is False and st["mode"] == "manual"
+
+
+def test_a_connection_that_says_nothing_holds_up_nobody_else(mapped):
+    """A phone browser opens a spare connection and sends nothing on it. With
+    one thread for everything that held every request for REQUEST_TIMEOUT_S
+    (5.00 s measured)."""
+    page, goals, clock, url = mapped
+    idle = [socket.create_connection(("127.0.0.1", page.port)) for _ in range(3)]
+    try:
+        t = time.monotonic()
+        assert get(url + "/api/state")[0] == 200
+        assert post(url + "/api/cmd", b'{"cmd": "start"}')[0] == 202
+        assert time.monotonic() - t < 1.0
+    finally:
+        for s in idle:
+            s.close()
+
+
+def test_the_same_map_picture_again_is_a_304(mapped):
+    page, goals, clock, url = mapped
+    status, headers, body = get(url + "/api/map.png")
+    tag = headers["ETag"]
+    assert status == 200 and tag
+    req = urllib.request.Request(url + "/api/map.png", headers={"If-None-Match": tag})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=5)
+    assert e.value.code == 304
+    req = urllib.request.Request(url + "/api/map.png", headers={"If-None-Match": '"0"'})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert r.status == 200 and r.read() == body
+
+
+def test_a_command_with_an_id_is_answered_in_the_patrols_acks():
+    """The page's ack: [id, taken] once the control loop has applied it,
+    taken or refused, and nothing for a command with no id (Foxglove's)."""
+    from test_goal_reseed import crop_at
+    from crawler.autopilot import patrol as pt
+    goals = click.ClickGoals()
+    page = bt.ButtonPage(goals=goals)
+    p = pt.Patrol()
+    for body in ({"cmd": "stroke", "points": [[0, 0], [1, 0]], "id": "k-1"},
+                 {"cmd": "move", "i": 9, "x": 0, "y": 0, "id": "k-2"},
+                 {"cmd": "start"},
+                 {"cmd": "pause", "id": 7}):
+        assert page.command(json.dumps(body).encode())[0]
+    p.poll(goals, crop_at())
+    assert p.page_state()["acks"] == [["k-1", True], ["k-2", False]]
+    assert len(p.points) == 2
