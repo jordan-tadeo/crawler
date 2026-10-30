@@ -1,18 +1,18 @@
 {
   "camera": {
-    "device": "/dev/v4l/by-id/usb-Suyin_HD_Camera_200910120001-video-index0",
-    "width": 320,
-    "height": 240,
+    "device": "/dev/v4l/by-id/usb-Global_Shutter_Camera_Global_Shutter_Camera_01.00.00-video-index0",
+    "width": 1280,
+    "height": 720,
     "fps": 15,
     "fourcc": "MJPG",
-    "hfov_deg": 60.0,
-    "vfov_deg": 46.0
+    "hfov_deg": 105.0,
+    "vfov_deg": 72.5
   },
   "mount": {
-    "kind": "servo",
+    "kind": "none",
     "yaw_deg": 0.0,
-    "pitch_deg": 0.0,
-    "x_m": 0.0,
+    "pitch_deg": 45.0,
+    "x_m": 0.15,
     "y_m": 0.0,
     "pan": {
       "channel": 10,
@@ -32,7 +32,8 @@
     },
     "pan_control": "pan_absolute",
     "tilt_control": "tilt_absolute",
-    "units_per_deg": 3600.0
+    "units_per_deg": 3600.0,
+    "z_m": 0.22
   },
   "detector": {
     "model": "models/person.onnx",

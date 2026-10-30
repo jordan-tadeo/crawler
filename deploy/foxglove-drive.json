@@ -101,6 +101,9 @@
         },
         "/path": {
           "visible": true
+        },
+        "/follow/marker": {
+          "visible": true
         }
       },
       "layers": {
@@ -125,7 +128,7 @@
           "order": 1
         }
       },
-      "foxglovePanelTitle": "SLAM map, the truck outline is the car; Publish pose (toolbar) on the map sets the goal, the green disc, or in patrol edit the next waypoint, the numbered blue discs; the model is pointed along the cyan path at the magenta disc (/map, /slam/path, scan in orange; voxels in the topic list)",
+      "foxglovePanelTitle": "SLAM map, the truck outline is the car; Publish pose (toolbar) on the map sets the goal, the green disc, or in patrol edit the next waypoint, the numbered blue discs; the model is pointed along the cyan path at the magenta disc, a followed person is the yellow pillar (/map, /slam/path, scan in orange; voxels in the topic list)",
       "publish": {
         "type": "pose",
         "poseTopic": "/move_base_simple/goal",
@@ -329,6 +332,34 @@
       "showFullMessageForDiff": false,
       "topicPath": "/path/status",
       "foxglovePanelTitle": "Path"
+    },
+    "RawMessages!follow": {
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "topicPath": "/follow/status",
+      "foxglovePanelTitle": "Follow"
+    },
+    "Publish!follow_on": {
+      "topicName": "/follow/cmd",
+      "datatype": "crawler.FollowCommand",
+      "buttonText": "Follow on",
+      "buttonTooltip": "The nearest person is the goal; hold 1.2 m off them",
+      "buttonColor": "#d9b31a",
+      "advancedView": false,
+      "value": "{\"cmd\": \"on\"}",
+      "foxglovePanelTitle": "Follow on"
+    },
+    "Publish!follow_off": {
+      "topicName": "/follow/cmd",
+      "datatype": "crawler.FollowCommand",
+      "buttonText": "Follow off",
+      "buttonTooltip": "Back to the patrol or the clicked goal",
+      "buttonColor": "#6b6b6b",
+      "advancedView": false,
+      "value": "{\"cmd\": \"off\"}",
+      "foxglovePanelTitle": "Follow off"
     }
   },
   "layout": {
@@ -358,46 +389,61 @@
             "second": {
               "direction": "row",
               "first": "RawMessages!patrol",
-              "second": "RawMessages!path",
-              "splitPercentage": 50
+              "second": {
+                "direction": "row",
+                "first": "RawMessages!path",
+                "second": "RawMessages!follow",
+                "splitPercentage": 50
+              },
+              "splitPercentage": 33.34
             },
-            "splitPercentage": 33
+            "splitPercentage": 25
           },
           "second": {
             "direction": "column",
             "first": {
-              "direction": "row",
+              "direction": "column",
               "first": {
                 "direction": "row",
-                "first": "Publish!patrol_edit",
-                "second": "Publish!patrol_goal",
+                "first": {
+                  "direction": "row",
+                  "first": "Publish!patrol_edit",
+                  "second": "Publish!patrol_goal",
+                  "splitPercentage": 50.0
+                },
+                "second": {
+                  "direction": "row",
+                  "first": "Publish!patrol_start",
+                  "second": "Publish!patrol_pause",
+                  "splitPercentage": 50.0
+                },
                 "splitPercentage": 50.0
               },
               "second": {
                 "direction": "row",
-                "first": "Publish!patrol_start",
-                "second": "Publish!patrol_pause",
+                "first": {
+                  "direction": "row",
+                  "first": "Publish!patrol_undo",
+                  "second": "Publish!patrol_clear",
+                  "splitPercentage": 50.0
+                },
+                "second": {
+                  "direction": "row",
+                  "first": "Publish!patrol_mode",
+                  "second": "Publish!patrol_trace",
+                  "splitPercentage": 50.0
+                },
                 "splitPercentage": 50.0
               },
-              "splitPercentage": 50.0
+              "splitPercentage": 50
             },
             "second": {
               "direction": "row",
-              "first": {
-                "direction": "row",
-                "first": "Publish!patrol_undo",
-                "second": "Publish!patrol_clear",
-                "splitPercentage": 50.0
-              },
-              "second": {
-                "direction": "row",
-                "first": "Publish!patrol_mode",
-                "second": "Publish!patrol_trace",
-                "splitPercentage": 50.0
-              },
+              "first": "Publish!follow_on",
+              "second": "Publish!follow_off",
               "splitPercentage": 50.0
             },
-            "splitPercentage": 50
+            "splitPercentage": 67
           },
           "splitPercentage": 60
         },

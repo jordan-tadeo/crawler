@@ -20,6 +20,7 @@ bearing and elevation off the truck, the boxes and the detector's rate;
 
 import threading
 import time
+from typing import NamedTuple
 
 from crawler.vision import track as tk
 
@@ -31,6 +32,18 @@ IDLE_SAMPLE_S = 1.0
 ERROR_LOG_S = 60.0
 # Boxes older than this are not drawn on /pantilt/image.
 BOX_SHOW_S = 1.0
+
+
+class Sighting(NamedTuple):
+    """One detector answer, for whoever wants to know where people are
+    (autopilot/follow.PersonGoal): every person in the frame, the monotonic
+    time the frame was read (not when the answer came, which is a few
+    hundred milliseconds later on the Pi), and the mount's angles then."""
+    seq: int
+    t: float
+    people: tuple
+    pan_deg: float
+    tilt_deg: float
 
 
 class PanTiltRunner:
@@ -63,6 +76,9 @@ class PanTiltRunner:
         self._infer_sum = 0.0
         self._last_people = []
         self._last_people_t = None
+        # The newest Sighting. One attribute swapped whole, so a reader on
+        # another thread (the control loop) never sees half of one.
+        self._sighting = None
         self._detector_state = None
         self._backoff_logged = 1.0
         self._last_step = None
@@ -143,13 +159,14 @@ class PanTiltRunner:
         at = self._pending.pop(seq, None)
         if at is None:
             return
-        pan, tilt = at
+        pan, tilt, frame_t = at
         self.answers += 1
         self.last_infer_s = infer_s
         self._infer_sum += infer_s
         self._last_people = people
         self._last_people_t = now
         self.tracker.on_detections(people, pan, tilt, now)
+        self._sighting = Sighting(seq, frame_t, tuple(people), pan, tilt)
         self.governor.update(infer_s=infer_s, idle_frac=None)
 
     def _sample_idle(self, now):
@@ -184,8 +201,12 @@ class PanTiltRunner:
             # The angles the mount had for this frame: the tracker turns the
             # answer into an absolute target off these, however late it is.
             self._pending = {self._seq: (self.mount.pan_deg,
-                                         self.mount.tilt_deg)}
+                                         self.mount.tilt_deg, t)}
             self._next_submit = now + self.governor.interval
+
+    def sighting(self):
+        """The newest Sighting, or None before the first answer. Any thread."""
+        return self._sighting
 
     # ---- the journal -----------------------------------------------------
 

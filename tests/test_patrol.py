@@ -485,7 +485,9 @@ def test_the_drive_layout_has_a_button_for_every_patrol_command_and_draws_the_li
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     layout = json.load(open(os.path.join(root, "deploy", "foxglove-drive.json")))
     cfg = layout["configById"]
-    buttons = {k: v for k, v in cfg.items() if k.startswith("Publish!")}
+    # The Follow buttons are on /follow/cmd (test_follow.py checks them).
+    buttons = {k: v for k, v in cfg.items() if k.startswith("Publish!")
+               and v["topicName"] != ck.FOLLOW_TOPIC}
     sent = set()
     for key, b in buttons.items():
         assert b["topicName"] == ck.PATROL_TOPIC, key

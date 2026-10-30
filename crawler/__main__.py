@@ -805,7 +805,7 @@ class AutoPilot:
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
                  slam=None, nav=False, map_source=None, goals=None,
                  fallback_path=None, clicks=None, patrol_store=None,
-                 lidar_near=False, path=None):
+                 lidar_near=False, path=None, person=None):
         self.vecon = vecon
         # --lidar-near: the creep's stop under the stereo clamp comes off the
         # lidar's front arc (driver.py, "the near field"). Set on every
@@ -843,6 +843,12 @@ class AutoPilot:
         # walls to self.goal instead of the goal itself. Planned on its own
         # thread; it never steers. None without --goal.
         self.path = path
+        # With --pantilt as well, a person to follow (autopilot/follow.py):
+        # the Follow buttons on /follow/cmd switch the goal between the
+        # patrol and the person, and nothing else changes.
+        if clicks is not None and person is not None:
+            from crawler.autopilot import follow
+            self.goal = follow.FollowSwitch(self.goal, person)
         # The roof lidar's reader with --lidar, else None: handed to the
         # driver for its rear stop, which only ever asks it latest().
         self.lidar = lidar
@@ -1617,6 +1623,15 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                         tele.offer("path_status", path.status(), now)
                     if tele.wants("path", now):
                         tele.offer("path", path.marker(), now)
+                # Following a person: who, where, and the goal input fed.
+                if hasattr(autopilot.goal, "follow_status"):
+                    if tele.wants("follow_status", now):
+                        crop = (autopilot.slam.crop()
+                                if autopilot.slam is not None else None)
+                        tele.offer("follow_status",
+                                   autopilot.goal.follow_status(crop), now)
+                    if tele.wants("follow_marker", now):
+                        tele.offer("follow_marker", autopilot.goal.follow_marker(), now)
 
             if tele.wants("diagnostics", now):
                 elapsed = now - window_started
@@ -2015,6 +2030,28 @@ def nav_map_source(args, slam, lidar, voxels, log):
     return live.SlamMap(slam, lidar=lidar, voxels=voxels, low_obstacles=low)
 
 
+def follow_person(args, pantilt, lidar, slam, hub, log):
+    """With --goal and --pantilt, the person to follow (autopilot/follow.py),
+    off until the Follow on button; else None. Never raises."""
+    if not getattr(args, "goal", False) or pantilt is None or slam is None:
+        return None
+    try:
+        from crawler.autopilot import follow
+        cam = follow.CameraGeometry.from_config(pantilt.cfg)
+        oakd = follow.OakdRange()
+        if hub is not None:
+            hub.depth_listeners.append(oakd.on_depth)
+        person = follow.PersonGoal(cam, sightings=pantilt, lidar=lidar,
+                                   pose_at=getattr(slam, "pose_at", None),
+                                   oakd=oakd, say=log.log)
+        log.log("info", "Follow", "Follow on and off on /follow/cmd; the "
+                f"person is the goal, holding {person.gap_m:g} m off")
+        return person
+    except Exception as e:
+        log.log("warning", "Follow", f"No follow: {type(e).__name__}: {e}")
+        return None
+
+
 def start_pantilt(args, vecon, tele, log):
     """--pantilt's runner, started, or None. Never raises: a bad config, no
     camera or no model costs the pan/tilt, said in the journal."""
@@ -2190,7 +2227,8 @@ def main(argv=None):
                           clicks=goals if args.goal else None,
                           patrol_store=(patrol.Store(lg.log_path(PATROL_FILE))
                                         if args.goal else None),
-                          lidar_near=args.lidar_near, path=path_planner)
+                          lidar_near=args.lidar_near, path=path_planner,
+                          person=follow_person(args, pantilt, lidar, slam, hub, log))
 
     # Who gets the device opened at startup, and who waits for it:
     #

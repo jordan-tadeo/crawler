@@ -37,6 +37,10 @@ autopilot/patrol.py). Any schema name, JSON only, and it must be an object
 with a string "cmd". Clicks and commands go into one queue in the order they
 came (take_events), because "edit" then three clicks is three waypoints and
 three clicks then "goal" is not.
+
+Follow commands. With --goal and --pantilt, the Follow on and Follow off
+buttons send {"cmd": "on"} or {"cmd": "off"} on FOLLOW_TOPIC
+(autopilot/follow.py), the same way, as ("follow", dict) in the same queue.
 """
 
 import collections
@@ -54,6 +58,7 @@ POSE_SCHEMAS = ("foxglove.PoseInFrame",
 POINT_SCHEMAS = ("geometry_msgs/PointStamped", "geometry_msgs/msg/PointStamped")
 ENCODING = "json"
 PATROL_TOPIC = "/patrol/cmd"
+FOLLOW_TOPIC = "/follow/cmd"
 # Events held for a reader that is not draining them (--nav only take()s).
 EVENTS_KEPT = 256
 
@@ -201,14 +206,15 @@ class ClickGoals:
             if info is None:
                 return
             topic, schema, encoding = info
-            if topic == PATROL_TOPIC:
+            if topic in (PATROL_TOPIC, FOLLOW_TOPIC):
                 command = parse_command(data) if encoding == ENCODING else None
+                kind = "cmd" if topic == PATROL_TOPIC else "follow"
                 with self._lock:
                     if command is None:
                         self.rejected += 1
                     else:
                         self.received += 1
-                        self._events.append(("cmd", command))
+                        self._events.append((kind, command))
                 return
             if schema not in POSE_SCHEMAS + POINT_SCHEMAS:
                 return

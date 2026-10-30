@@ -1,8 +1,39 @@
 """The hood camera's pan/tilt mount and its picture.
 
-What is on the car (2026-10-29)
--------------------------------
-The camera is a Suyin "HD Camera", USB 1e45:8022, UVC, on the Pi's USB-2
+What is on the car (2026-10-29, late)
+-------------------------------------
+The pan/tilt mount broke in a crash and is gone. The camera now is a fixed
+UVC "Global Shutter Camera", USB 32e4:0234 (an AR0234 sensor, 1920x1200
+global shutter, MJPG up to 90 fps), on the windshield and looking about 45
+degrees up, by id
+/dev/v4l/by-id/usb-Global_Shutter_Camera_Global_Shutter_Camera_01.00.00-video-index0.
+deploy/pantilt.json describes it: mount.kind "none" (NullMount, no servo
+writes), 1280x720 at 15 fps, pitch_deg 45.
+
+Its field of view, fitted on a recording rather than read off a datasheet
+(the lens is not named anywhere on the device): 21 pairs of a person's box
+against the same person in the roof lidar's 0.5 degree scan, the truck
+standing still, 2026-10-30 03:33Z. The ray through each box edge and centre
+(track.ray(), pitch 45) was fitted against the lidar's bearing to the
+cluster seen from the camera's place. The fit is flat from 100 to 115
+degrees across (4.0-4.2 degrees rms) and clearly worse at the old guess of
+90 (5.1) and below; 105 is the middle of the flat. vfov follows from square
+pixels at 1280x720 (tan(vfov/2) = tan(hfov/2) * 720/1280): 72.5. Both are
+ESTIMATES good to about 10 degrees: a person's box is wider than the slice
+the lidar cuts through them, boxes near the frame's edge are clipped, and
+the lens is wide enough to bend straight lines, which a pinhole does not
+model. The camera was unplugged when this was done, so nothing was read
+off v4l2. To do better, with the camera back: stand one person still at
+2 m, 0 / +-20 / +-40 degrees by the lidar, and grab one frame at each;
+the u of the person's centre against the lidar bearing is the curve.
+
+x_m, y_m, z_m say where the lens is from the lidar's centre: x 0.15 forward
+(on the windshield, between the lidar and the OAK-D's lens at 0.235), z
+0.22 above the floor. Both are ESTIMATES, not taped.
+
+The servo mount and the camera before (deploy/pantilt-servo.json)
+------------------------------------------------------------------
+The camera was a Suyin "HD Camera", USB 1e45:8022, UVC, on the Pi's USB-2
 hub at 480 Mbit/s. It shows up as /dev/video0 and by id as
 /dev/v4l/by-id/usb-Suyin_HD_Camera_200910120001-video-index0, which is the
 name used here because video numbers move. MJPG at 320x240 up to 1280x800,
@@ -120,8 +151,9 @@ class MountConfig:
     kind: str = "servo"            # servo | uvc | none
     yaw_deg: float = 0.0           # where pan 0 points, left of straight ahead
     pitch_deg: float = 0.0         # where tilt 0 points, above level
-    x_m: float = 0.0               # from the lidar origin, forward
+    x_m: float = 0.0               # the lens from the lidar origin, forward
     y_m: float = 0.0               # left
+    z_m: float = 0.22              # and above the floor
     pan: AxisConfig = field(
         default_factory=lambda: AxisConfig(channel=PAN_CHANNEL))
     tilt: AxisConfig = field(

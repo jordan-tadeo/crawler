@@ -1,0 +1,60 @@
+{
+  "camera": {
+    "device": "/dev/v4l/by-id/usb-Suyin_HD_Camera_200910120001-video-index0",
+    "width": 320,
+    "height": 240,
+    "fps": 15,
+    "fourcc": "MJPG",
+    "hfov_deg": 60.0,
+    "vfov_deg": 46.0
+  },
+  "mount": {
+    "kind": "servo",
+    "yaw_deg": 0.0,
+    "pitch_deg": 0.0,
+    "x_m": 0.0,
+    "y_m": 0.0,
+    "pan": {
+      "channel": 10,
+      "min_us": 1100.0,
+      "max_us": 1900.0,
+      "centre_us": 1500.0,
+      "invert": false,
+      "deg_per_us": 0.09
+    },
+    "tilt": {
+      "channel": 11,
+      "min_us": 1100.0,
+      "max_us": 1900.0,
+      "centre_us": 1500.0,
+      "invert": false,
+      "deg_per_us": 0.09
+    },
+    "pan_control": "pan_absolute",
+    "tilt_control": "tilt_absolute",
+    "units_per_deg": 3600.0,
+    "z_m": 0.22
+  },
+  "detector": {
+    "model": "models/person.onnx",
+    "conf": 0.4,
+    "iou": 0.45,
+    "base_hz": 3.0,
+    "min_hz": 0.5,
+    "max_duty": 0.5,
+    "low_idle": 0.15,
+    "recover_idle": 0.35,
+    "worker": "process",
+    "nice": 10,
+    "threads": 1
+  },
+  "track": {
+    "gain": 0.7,
+    "deadband_deg": 1.5,
+    "rate_deg_s": 120.0,
+    "step_hz": 20.0,
+    "lost_s": 3.0,
+    "on_lost": "centre",
+    "scan_deg_s": 25.0
+  }
+}

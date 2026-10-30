@@ -53,6 +53,30 @@ def pixel_angles(u, v, hfov_deg, vfov_deg):
     return left, up
 
 
+def ray(u, v, hfov_deg, vfov_deg, yaw_deg=0.0, pitch_deg=0.0):
+    """(bearing, elevation) degrees off the truck of the ray through the
+    point at fractions u, v of the frame, on a camera whose optical axis is
+    yaw_deg left of straight ahead and pitch_deg above level.
+
+    A pinhole, then the pitch, then the yaw. On a camera that is pitched,
+    the bearing is not the pixel's angle left of the axis: the fixed
+    windshield camera looks 45 degrees up, so a point a third of the way
+    from the middle to the edge on the middle row is atan(x / cos 45), 41%
+    further round than the pixel angle says. pixel_angles() is the special
+    case of no pitch."""
+    tx = math.tan(math.radians(hfov_deg) / 2.0)
+    ty = math.tan(math.radians(vfov_deg) / 2.0)
+    left = (1.0 - 2.0 * u) * tx
+    up = (1.0 - 2.0 * v) * ty
+    p = math.radians(pitch_deg)
+    fwd = math.cos(p) - up * math.sin(p)
+    z = math.sin(p) + up * math.cos(p)
+    b = math.degrees(math.atan2(left, fwd)) + yaw_deg
+    b = (b + 180.0) % 360.0 - 180.0
+    return (180.0 if b == -180.0 else b,
+            math.degrees(math.atan2(z, math.hypot(fwd, left))))
+
+
 def pick(detections, prefer=None, gate=None):
     """The person to follow, or None.
 
@@ -148,8 +172,11 @@ class Tracker:
         self.last_seen = now
         self.last_box = (d.cx, d.cy)
         self.person = d
-        self.bearing_deg = bearing(self.mount_yaw, pan_at_frame, left)
-        self.elevation_deg = self.mount_pitch + tilt_at_frame + up
+        # Off the whole ray, not pan + the pixel angle: on a pitched camera
+        # the two differ (ray()). With no pitch the bearing is the same.
+        self.bearing_deg, self.elevation_deg = ray(
+            d.cx, d.cy, self.cam.hfov_deg, self.cam.vfov_deg,
+            self.mount_yaw + pan_at_frame, self.mount_pitch + tilt_at_frame)
         return d
 
     def step(self, now, dt):

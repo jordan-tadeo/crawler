@@ -278,12 +278,53 @@ def test_config_rejects_unknown_keys_and_wrong_types():
         pt.config_from_dict({"mount": {"pan": {"channel": 11}}})  # = tilt
 
 
-def test_the_committed_config_loads(tmp_path):
-    cfg = pt.load_config(str(ROOT / "deploy" / "pantilt.json"))
-    assert cfg.mount.kind == "servo"
+@pytest.mark.parametrize("name,kind", [("pantilt.json", "none"),
+                                       ("pantilt-servo.json", "servo")])
+def test_the_committed_configs_load(tmp_path, name, kind):
+    # The fixed windshield camera is the default; the servo mount stays one
+    # config away.
+    cfg = pt.load_config(str(ROOT / "deploy" / name))
+    assert cfg.mount.kind == kind
     out = tmp_path / "c.json"
     pt.save_config(cfg, str(out))
     assert pt.load_config(str(out)) == cfg
+
+
+def test_the_fixed_camera_is_the_one_on_the_windshield():
+    cfg = pt.load_config(str(ROOT / "deploy" / "pantilt.json"))
+    assert "Global_Shutter_Camera" in cfg.camera.device
+    assert cfg.mount.pitch_deg == pytest.approx(45.0)
+    assert isinstance(pt.build_mount(cfg), pt.NullMount)
+    # Square pixels: the vfov is the hfov's at 1280x720.
+    tv = math.tan(math.radians(cfg.camera.hfov_deg) / 2) * cfg.camera.height / cfg.camera.width
+    assert cfg.camera.vfov_deg == pytest.approx(2 * math.degrees(math.atan(tv)), abs=0.1)
+
+
+def test_a_ray_off_a_pitched_camera():
+    # No pitch: the pixel angle, as pixel_angles says.
+    b, e = tk.ray(0.75, 0.5, 60, 46)
+    assert b == pytest.approx(pixel_left(0.75))
+    assert e == pytest.approx(0.0, abs=1e-9)
+    # The middle of the frame is the axis, whatever the pitch and yaw.
+    assert tk.ray(0.5, 0.5, 105, 72.5, yaw_deg=10, pitch_deg=45) == pytest.approx((10.0, 45.0))
+    # Pitched 45 up, a point off to the side on the middle row is further
+    # round than its pixel angle: atan(x / cos 45).
+    x = (1 - 2 * 0.25) * math.tan(math.radians(52.5))
+    b, _ = tk.ray(0.25, 0.5, 105, 72.5, pitch_deg=45)
+    assert b == pytest.approx(math.degrees(math.atan(x / math.cos(math.radians(45)))))
+    assert b > tk.pixel_angles(0.25, 0.5, 105, 72.5)[0] + 5
+    # The bottom row of a camera pitched up by half its vfov is level.
+    assert tk.ray(0.5, 1.0, 105, 72.5, pitch_deg=36.25)[1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_tracker_reports_the_bearing_off_the_whole_ray():
+    cfg = pt.config_from_dict({"camera": {"hfov_deg": 105.0, "vfov_deg": 72.5}})
+    t = tk.Tracker(cfg.track, cfg.camera, ((0, 0), (0, 0)), 0.0, 45.0)
+    t.on_detections([box(0.25, 0.5)], 0.0, 0.0, now=0.0)
+    assert t.bearing_deg == pytest.approx(tk.ray(0.25, 0.5, 105, 72.5, 0.0, 45.0)[0])
+    # Off to the side on the middle row is lower than the axis, not on it.
+    assert t.elevation_deg == pytest.approx(tk.ray(0.25, 0.5, 105, 72.5, 0.0, 45.0)[1])
+    assert t.elevation_deg < 45.0 - 5
 
 
 # ---- the tracker -------------------------------------------------------------

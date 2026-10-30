@@ -158,6 +158,11 @@ INTERVALS = {
     # fed and why, twice a second, and the path with that point once a second.
     "path_status": 0.5,
     "path": 1.0,
+    # With --goal and --pantilt (autopilot/follow.py): following a person,
+    # five times a second so a recorded session pairs the goal input with
+    # the wheels closely enough to be labels; the person on the map twice.
+    "follow_status": 0.2,
+    "follow_marker": 0.5,
     # With --pantilt (vision/runner.py): the mount and the person at 10 Hz,
     # and the hood camera's picture at 2 Hz. The picture is a 320x240 JPEG,
     # about 15 KB, so 30 KiB/s.
@@ -646,6 +651,26 @@ JSON_SCHEMAS = {
         "plan_cpu_ms_mean": _NUM, "plans": _INT, "failed": _INT,
         "lookahead_m": _NUM,
     }),
+    # Following a person, with --goal and --pantilt: follow.PersonGoal.
+    # follow_status(). active the Follow switch; state off / searching /
+    # following / gap / lost; x, y the person on map frame `frame` (-1 with
+    # nobody yet) against frame_now; distance_m and bearing_deg from the
+    # truck (-1 / 0 with no goal); seen_age_s since the frame they were last
+    # placed off; source the distance's (lidar / oakd / box); people in the
+    # newest sighting; placed, unplaced (no distance), ignored (somebody
+    # else) and acquired counts; holding the neutral hold (gap or lost);
+    # gap_m, resume_m, lost_s the rule's numbers; goal_input the model's
+    # goal input as fed (policy_goal: present, dist/FAR_M, sin, cos); and
+    # the truck's map pose on the same frame.
+    "follow_status": _schema("crawler.FollowStatus", {
+        "active": _BOOL, "state": _STR, "x": _NUM, "y": _NUM, "frame": _INT,
+        "frame_now": _INT, "distance_m": _NUM, "bearing_deg": _NUM,
+        "seen_age_s": _NUM, "source": _STR, "people": _INT, "placed": _INT,
+        "unplaced": _INT, "ignored": _INT, "acquired": _INT, "holding": _BOOL,
+        "gap_m": _NUM, "resume_m": _NUM, "lost_s": _NUM,
+        "goal_input": {"type": "array", "items": _NUM},
+        "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
+    }),
     # The hood camera's pan/tilt, with --pantilt: vision/runner.status().
     # state idle / tracking / lost; pan and tilt what the mount was told,
     # degrees, pan left positive, tilt up; the target it is slewing to.
@@ -728,6 +753,7 @@ JSON_TOPICS = {
     "goal_status": "/goal/status",
     "patrol_status": "/patrol/status",
     "path_status": "/path/status",
+    "follow_status": "/follow/status",
     "pantilt": "/pantilt",
 }
 
@@ -796,6 +822,9 @@ NAV_CHANNELS = {
     # The path the goal model is pointed along (--goal), path_view.scene:
     # the path as a line and the point fed as a disc; empty clears both.
     "path": "/path",
+    # The person followed (--goal, --pantilt), follow_view.scene: a pillar
+    # where they are on the map and the follow gap round them; empty clears.
+    "follow_marker": "/follow/marker",
 }
 
 ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
@@ -1355,6 +1384,9 @@ class Telemetry:
         if key == "path":
             from crawler.telemetry import path_view
             return path_view.scene(payload, log_time)
+        if key == "follow_marker":
+            from crawler.telemetry import follow_view
+            return follow_view.scene(payload, log_time)
         if key in ("nav_path", "goal_marker"):
             from crawler.telemetry import nav_view
             return nav_view.path_scene(payload, log_time)
