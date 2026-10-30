@@ -61,6 +61,21 @@ window counts --good-weight times in every head's loss. 2 by default: enough
 that a stretch I said was right pulls, not so much that a few seconds of it
 outvote the rest of the session.
 
+Accepted auto (--accepted-weight W): the car's own decisions that I let
+stand, as weak labels. A tick the model drove (policy_drove, source auto)
+counts when there is no takeover in the ACCEPT_AFTER_S after it or the
+ACCEPT_BEFORE_S before it, the session goes on for the whole ACCEPT_AFTER_S
+with no hole in its ticks (an excluded window is a hole: whatever happened
+in there is not "let stand"), and it is not in a tip's run-up. Its label is
+what the car sent, at W a tick. 0, the default, is no auto tick a label at
+all, as every model before it. It is there because takeovers are 77% of the
+gear loss, and they are the moments the car was wrong: a model that only
+ever sees those learns that the floor is a place to reverse on.
+
+--class-weight-power P raises the gear's class weights (square-rooted
+inverse frequency, normalised to forward 1) to P: 1 is the weights as they
+always were, 0.5 half their log, 0 none.
+
 The val split
 -------------
 --val holds out whole sessions, which is the honest split when there are
@@ -145,8 +160,16 @@ GOOD_WEIGHT = 2.0
 # labels: at 3 they are about 3% of the loss, enough to be heard and not
 # enough to drown the sessions they correct.
 TAKEOVER_WEIGHT = 3.0
+# Accepted auto (--accepted-weight): how long after and before a takeover an
+# auto tick is not one I let stand, and the longest hole in a session's
+# ticks that still counts as the car driving on.
+ACCEPT_AFTER_S = 3.0
+ACCEPT_BEFORE_S = 2.0
+ACCEPT_HOLE_S = 1.0
 # policy_dataset.SOURCES, by name: what the dataset's "source" array indexes.
 SOURCE_RECORD = "record"
+SOURCE_AUTO = "auto"
+SOURCE_TAKEOVER = "takeover"
 INTERVENTION_SOURCES = ("takeover", "manual_after_auto")
 # How much a tick inside a switch window counts in the mode loss. My one
 # session has 4 toggles and 36 window ticks against 1900; at 10 the window is
@@ -255,6 +278,24 @@ def scorecard_sessions(path=SCORECARD_FILE):
     with open(path) as f:
         return [line.split("#", 1)[0].strip() for line in f
                 if line.split("#", 1)[0].strip()]
+
+
+# Drives the owner sent back off the car: tools/policy_scorecard.py replays
+# them (drive_open_rev), so no model trains on them either. Same format as
+# the scorecard; add a drive, never take one off.
+REJECTED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rejected_drives.txt")
+
+
+def rejected_sessions(path=REJECTED_FILE):
+    """The rejected drives' session names, [] with no file."""
+    return scorecard_sessions(path)
+
+
+def held_out_sessions():
+    """Every session no model trains on unless told: the scorecard's, then
+    the rejected drives'."""
+    names = scorecard_sessions()
+    return names + [n for n in rejected_sessions() if n not in names]
 
 
 def scorecard_mask(data, names):
@@ -769,12 +810,63 @@ def intervention_ticks(data):
     return np.isin(sources_of(data), INTERVENTION_SOURCES)
 
 
+def takeover_near(data, after_s, before_s=0.0, hole_s=None):
+    """Per tick, whether an intervention tick (a takeover, or manual after
+    auto) of the same session falls in the
+    after_s after it (strictly later) or the before_s before it (strictly
+    earlier). With hole_s, also true where the session's ticks stop, or
+    skip more than hole_s, inside the after_s: nothing says what came next."""
+    src = intervention_ticks(data)
+    sess = np.asarray(data["session"])
+    t = np.asarray(data["t_ns"], np.int64)
+    out = np.zeros(len(t), bool)
+    after, before = int(after_s * 1e9), int(before_s * 1e9)
+    for sid in np.unique(sess):
+        rows = np.flatnonzero(sess == sid)
+        rows = rows[np.argsort(t[rows], kind="stable")]
+        tr = t[rows]
+        tk = tr[src[rows]]
+        if len(tk):
+            j = np.searchsorted(tk, tr, side="right")
+            nxt = np.where(j < len(tk), tk[np.minimum(j, len(tk) - 1)], np.iinfo(np.int64).max)
+            out[rows] |= nxt - tr <= after
+            if before > 0:
+                k = np.searchsorted(tk, tr, side="left") - 1
+                prv = np.where(k >= 0, tk[np.maximum(k, 0)], np.iinfo(np.int64).min // 2)
+                out[rows] |= tr - prv <= before
+        if hole_s is not None:
+            # Where each hole starts (the last tick before it) and the end.
+            gap = np.flatnonzero(np.diff(tr) > hole_s * 1e9)
+            stops = np.append(tr[gap], tr[-1])
+            j = np.searchsorted(stops, tr, side="left")
+            out[rows] |= stops[np.minimum(j, len(stops) - 1)] - tr < after
+    return out
+
+
+def accepted_auto(data, after_s=ACCEPT_AFTER_S, before_s=ACCEPT_BEFORE_S,
+                  hole_s=ACCEPT_HOLE_S):
+    """The auto decisions the model drove that I let stand (--accepted-weight):
+    no takeover in the after_s after or the before_s before, the session on
+    for all of after_s without a hole over hole_s, outside a BAD mark and,
+    where there is an up vector, outside a tip and its run-up."""
+    ok = ((sources_of(data) == SOURCE_AUTO)
+          & np.asarray(data.get("policy_drove", np.zeros(len(data["t_ns"]), bool)), bool)
+          & np.asarray(data["decision"], bool) & ~pe.bad_marked(data)
+          & ~takeover_near(data, after_s, before_s, hole_s))
+    if "imu" in data:
+        tipped, runup = tip_marks(data)
+        ok &= ~tipped & ~runup
+    return ok
+
+
 def tick_weights(data, idx, good_weight, takeover_weight=TAKEOVER_WEIGHT):
     """Per training tick loss weight: good_weight inside a GOOD mark, times
-    takeover_weight on an intervention, else 1."""
+    takeover_weight on an intervention, times the accepted-auto weight on
+    one of those (data["accepted_w"], set by --accepted-weight), else 1."""
     good = np.where(pe.marks_of(data)[idx] == pe.MARK_GOOD, float(good_weight), 1.0)
     fix = np.where(intervention_ticks(data)[idx], float(takeover_weight), 1.0)
-    return (good * fix).astype(np.float32)
+    weak = np.asarray(data["accepted_w"])[idx] if "accepted_w" in data else 1.0
+    return (good * fix * weak).astype(np.float32)
 
 
 def loss_shares(data, train_mask, label_mode, good_weight, takeover_weight,
@@ -791,7 +883,7 @@ def loss_shares(data, train_mask, label_mode, good_weight, takeover_weight,
     idx = np.flatnonzero(train_mask)
     w = tick_weights(data, idx, good_weight, takeover_weight).astype(np.float64)
     fix = intervention_ticks(data)[idx]
-    steer_ok, throttle_ok = (m[idx] for m in pe.label_masks(data, label_mode))
+    steer_ok, throttle_ok = (m[idx] for m in label_masks(data, label_mode))
     action = np.asarray(data["action"])[idx]
     cw = (np.asarray(class_weights, dtype=np.float64)[action] if class_weights is not None
           else np.ones(len(idx)))
@@ -840,6 +932,24 @@ def chunk_index(data, k, link_s=pl.CHUNK_LINK_S):
             good &= ok[s:len(ok) - i + 1 + s]
         fut[o[:len(o) - i][good], i] = o[i:][good]
     return fut
+
+
+def label_masks(data, label_mode):
+    """policy_eval.label_masks, and the accepted-auto ticks (data["accepted"],
+    set by --accepted-weight) as both labels too."""
+    steer, throttle = pe.label_masks(data, label_mode)
+    if "accepted" in data:
+        weak = np.asarray(data["accepted"], bool)
+        steer, throttle = steer | weak, throttle | weak
+    return steer, throttle
+
+
+def soften_weights(weights, power=1.0):
+    """The gear's class weights to the power `power` (--class-weight-power):
+    1 as they are, 0.5 half their log, 0 all 1. A class with no example
+    keeps its 0."""
+    w = np.asarray(weights, np.float64)
+    return np.where(w > 0, np.power(np.where(w > 0, w, 1.0), float(power)), 0.0)
 
 
 def training_mask(data, in_val, labelled):
@@ -1010,7 +1120,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE,
           mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam",
           lowband=None, tip_mask=None, tip_weight=0.0, label_off=None, contrast_weight=0.0,
-          goal_path_m=None, contrast_steer_only=False):
+          goal_path_m=None, contrast_steer_only=False, class_weight_power=1.0):
     """tip_mask: the rows the tip penalty goes on (tip_rows), trained beside
     train_mask with no label of their own. label_off: ticks that are never a
     label, at any chunk offset either (tip_marks' tipped and run-up)."""
@@ -1059,7 +1169,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     gear_of = torch.from_numpy(gears_all[idx]) if per_gear else None
     w_all = torch.from_numpy(tick_weights(data, idx, good_weight, takeover_weight))
     w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
-    steer_all, throttle_all = pe.label_masks(data, label_mode)
+    steer_all, throttle_all = label_masks(data, label_mode)
     if label_off is not None:
         keep = ~np.asarray(label_off, bool)
         steer_all, throttle_all = steer_all & keep, throttle_all & keep
@@ -1071,7 +1181,12 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     steer_ok = torch.from_numpy(steer_all[idx])
     throttle_ok = torch.from_numpy(throttle_all[idx])
 
-    counts = np.bincount(data["action"][idx][throttle_ok.numpy()],
+    # An accepted-auto tick counts its weight here, so a pile of weak forward
+    # labels does not read as a class the strong ones are rarer against.
+    weak_w = (np.asarray(data["accepted_w"], np.float64)[idx] if "accepted_w" in data
+              else np.ones(len(idx)))
+    tok = throttle_ok.numpy()
+    counts = np.bincount(data["action"][idx][tok], weights=weak_w[tok],
                          minlength=len(pl.ACTIONS)).astype(np.float64)
     # Inverse frequency, square-rooted. Plain inverse frequency on the smoke
     # set (901 forward to 25 reverse) weighted a reverse 36x and the model
@@ -1080,6 +1195,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                        np.sqrt(counts.sum() / np.maximum(counts, 1) / len(pl.ACTIONS)), 0.0)
     weights = weights / max(weights[counts > 0].min(), 1e-9)
     weights = np.minimum(weights, 10.0)  # one example of a class must not own the loss
+    weights = soften_weights(weights, class_weight_power)
     ce = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32),
                              reduction="none")
     ce_mode = nn.CrossEntropyLoss(reduction="none")
@@ -1546,6 +1662,13 @@ def main(argv=None):
                     help="loss weight of an intervention tick: a takeover, or manual "
                          f"right after auto (default {TAKEOVER_WEIGHT}; build the dataset "
                          "with policy_dataset.py --drive-logs DIR to have any)")
+    ap.add_argument("--accepted-weight", type=float, default=0.0,
+                    help="loss weight of an auto tick the model drove and I let stand "
+                         f"(accepted_auto: no takeover {ACCEPT_AFTER_S:g} s after or "
+                         f"{ACCEPT_BEFORE_S:g} s before); 0, the default, is none a label")
+    ap.add_argument("--class-weight-power", type=float, default=1.0,
+                    help="raise the gear's class weights to this power: 1 as they are "
+                         "(the default), 0.5 half their log, 0 none")
     ap.add_argument("--switch-weight", type=float, default=MODE_SWITCH_WEIGHT,
                     help="mode-loss weight of a tick inside a switch window "
                          f"(default {MODE_SWITCH_WEIGHT})")
@@ -1649,17 +1772,23 @@ def main(argv=None):
 
     import torch
 
-    steer_ok, throttle_ok = pe.label_masks(data, args.labels)
+    if args.accepted_weight > 0:
+        weak = accepted_auto(data)
+        data["accepted"] = weak
+        data["accepted_w"] = np.where(weak, args.accepted_weight, 1.0).astype(np.float32)
+        print(f"accepted auto: {int(weak.sum())} decisions the model drove and I let stand, "
+              f"at {args.accepted_weight:g} a tick")
+    steer_ok, throttle_ok = label_masks(data, args.labels)
     labelled = steer_ok | throttle_ok
     # The scorecard's sessions are never trained on (unless asked): every
     # mask below is off `labelled`, so this one line keeps them out of the
     # folds, the final model and --val alike.
-    held_card = [] if args.train_on_scorecard else [n for n in scorecard_sessions()
+    held_card = [] if args.train_on_scorecard else [n for n in held_out_sessions()
                                                      if n in sessions]
     if held_card:
         labelled = labelled & ~scorecard_mask(data, held_card)
         print(f"scorecard: {len(held_card)} sessions kept out of training "
-              f"({SCORECARD_FILE})")
+              f"({SCORECARD_FILE}, {REJECTED_FILE})")
     tip_on = args.tip_weight > 0 or args.tip_hygiene
     runup = label_off = None
     if tip_on:
@@ -1693,7 +1822,8 @@ def main(argv=None):
                map_act=args.map_act, optimizer=args.optimizer, lowband=args.lowband,
                tip_weight=args.tip_weight, label_off=label_off,
                contrast_weight=args.goal_contrast, goal_path_m=args.goal_path_m,
-               contrast_steer_only=args.contrast_steer_only)
+               contrast_steer_only=args.contrast_steer_only,
+               class_weight_power=args.class_weight_power)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1804,6 +1934,11 @@ def main(argv=None):
                               if args.goal_contrast > 0 else None),
             "goal_draw": goal_draw_meta(args.goal_path_m),
             "goal_fed": bool(args.fed_goals),
+            "accepted_auto": ({"weight": args.accepted_weight, "after_s": ACCEPT_AFTER_S,
+                               "before_s": ACCEPT_BEFORE_S, "hole_s": ACCEPT_HOLE_S,
+                               "train_ticks": int((train_mask & data["accepted"]).sum())}
+                              if args.accepted_weight > 0 else None),
+            "class_weight_power": args.class_weight_power,
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
                if args.lidar else {}),
@@ -1859,7 +1994,7 @@ def _base_meta(meta_in, args, val_ids, val_names):
         "labels": args.labels,
         "train_sessions": [s for i, s in enumerate(sessions) if i not in val_ids
                            and (getattr(args, "train_on_scorecard", False)
-                                or s not in scorecard_sessions())],
+                                or s not in held_out_sessions())],
         "val_sessions": val_names,
         "good_weight": args.good_weight,
         "takeover_weight": getattr(args, "takeover_weight", TAKEOVER_WEIGHT),
@@ -1869,6 +2004,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
         "optimizer": getattr(args, "optimizer", "adam"),
         "scorecard_sessions": ([] if getattr(args, "train_on_scorecard", False)
                                else [n for n in scorecard_sessions() if n in sessions]),
+        "rejected_sessions": ([] if getattr(args, "train_on_scorecard", False)
+                              else [n for n in rejected_sessions() if n in sessions]),
     }
 
 

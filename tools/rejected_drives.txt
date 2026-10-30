@@ -1,0 +1,6 @@
+# Drives I sent back off the car: tools/policy_scorecard.py --drives replays
+# each model through them (drive_open_rev, drive_open_stop), so
+# policy_train.py keeps every model off them as it does the scorecard.
+# Names only; the recordings stay in ~/crawler/data. Add to it, never take
+# one off, or old numbers stop meaning the same thing.
+crawler-20261030-205939Z-p1276-001  # fedcontrast3-1030: reversed on open floor, 2026-10-30
