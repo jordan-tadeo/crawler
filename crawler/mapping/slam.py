@@ -86,10 +86,20 @@ the fresh map's walls land on the shelf's walls, not its open floor
 
 Across a restart. The map worth keeping (Slam.kept: the bigger of the
 current one and the shelf's) is saved by the runner to a file every few
-seconds and on a clean stop (mapfile.py), and on boot the Slam starts lost
-on it (Slam.restore): found round where it was saved, it is the map again,
-in the same frame, as if nothing had happened; not found in RESEED_LOST_S,
-it goes on the shelf and is searched for from the fresh map like any other.
+seconds and on a clean stop (mapfile.py), as a record of the run: a boot
+starts a fresh map and does not load it. Only when asked (the runner's
+restore_map, --slam-map-restore) the Slam starts lost on it (Slam.restore):
+found round where it was saved, it is the map again, in the same frame, as
+if nothing had happened; not found in RESEED_LOST_S, it goes on the shelf
+and is searched for from the fresh map like any other.
+
+Held to the gyro. The band holds one fit to the gyro, and only after a fit
+that did not fail; the reckoning above holds what a reseed hangs off, not
+what is written. A run of fits each inside the band can still turn the
+truck where the gyro did not, and from the first one good enough to write
+the map is written at that heading and fits itself there for good. So every
+fit's turn past the gyro goes into a leaky sum, and past GYRO_LOST_DEG the
+truck is lost (Slam.gyro_lost) on the gyro's heading.
 
 How a fresh map sits on the one before it. A fresh map goes on from the
 pose the truck was last believed at, which after a loss is where it froze,
@@ -290,6 +300,22 @@ DR_AGREE_DEG = 5.0
 DR_STEP_DEG = 3.0
 DR_TRUST_RUN = 10
 
+# The fitted heading held to the gyro's. Every fit adds how far it turned the
+# truck past what the gyro turned it to a sum that leaks away with
+# GYRO_ERR_TAU_S, so a slow parting (the bias, the fits' own wobble) is let
+# go and a fast one is not. Past GYRO_LOST_DEG the pose is not believed and
+# the truck is lost, searched for round the gyro's heading on a map nothing
+# was written into at the wrong one. 10-30 at 11:33 (p1261) the truck was up
+# a rock for ten seconds on fits too poor to write; coming off it, fits at
+# half their points turned it 24 degrees in half a second while the gyro
+# turned it 4 the other way (the band was off: a failed fit the scan
+# before), the first fit good enough to write came 0.7 s later at that
+# heading, and it fitted the walls it was writing from then on: the top of
+# the house went on the map a second time, turned, and that map was saved
+# and restored at the next two boots.
+GYRO_ERR_TAU_S = 5.0
+GYRO_LOST_DEG = 12.0
+
 # A shelved map keeps reckoning where the truck is on it (Shelf.here, see
 # "Where the truck is on the shelf"), and a merge is held to that. Its
 # heading may be off the reckoned one by the shelving link's err_yaw plus
@@ -471,6 +497,12 @@ class Slam:
         self._dr_blind = False
         # Good fits in a row that each turned as the gyro did.
         self._dr_run = 0
+        # The fits' heading less the gyro's, leaking away (GYRO_ERR_TAU_S),
+        # radians; and how many times it has had the truck lost.
+        self._yaw_err = 0.0
+        self.gyro_lost = 0
+        # Lost by that: only found again within GYRO_LOST_DEG of the gyro.
+        self._gyro_hold = False
         self._link = ()
         self._shelved = False
 
@@ -504,6 +536,7 @@ class Slam:
             # truck has turned about the vertical while it is over.
             if not self.lost:
                 self._lost_yaw = float(self.pose[2])
+            self._gyro_hold = False
             rolled_rate = (imu.rate_between(last_t, t, self.bias)
                            if last_t is not None else None)
             self._carry_yaw(rolled_rate,
@@ -516,6 +549,7 @@ class Slam:
             self._search = None
             self._pending = None
             self.vel[:] = 0.0
+            self._yaw_err = 0.0
             self.last_t = t
             return self._result(t, ROLLED, False, False, "rolled", None,
                                 returns, 0, 0, tilt, t0)
@@ -550,19 +584,28 @@ class Slam:
         fit = None
         recovered = False
         poor_out = False
+        off_gyro = False
         if not self.started:
             newpose, good = pose.copy(), True
             self.started = True
         elif self._tree is None:
             newpose, good = pred, False
         elif self.lost:
+            self._yaw_err = 0.0
             if self._lost_since is None:
                 # Restored from a file (restore()): lost from the first scan.
                 self._lost_since = t
             self._carry_yaw(imu_rate, dt)
             fit, good = self._relocalize(p, nrm, pred, self._lost_yaw)
+            if (good and self._gyro_hold and self._lost_yaw is not None
+                    and abs(_wrap(fit.pose[2] - self._lost_yaw))
+                    > math.radians(GYRO_LOST_DEG)):
+                # Found on the heading it was lost for, not the gyro's: the
+                # same wrong walls (reloc's prior lets in 30 degrees).
+                good = False
             newpose = np.array(fit.pose) if good else pose.copy()
             if good:
+                self._gyro_hold = False
                 self.lost = False
                 self._lost_since = None
                 self.fails = 0
@@ -593,6 +636,11 @@ class Slam:
             elif good and self._poor_too_long(fit, dt):
                 good = False
                 poor_out = True
+            if self._off_gyro(newpose, pose, imu_rate, dt) and good:
+                # Turned where the gyro did not: the scan on the wrong walls.
+                # Not written, and lost below, on the gyro's heading.
+                good = False
+                off_gyro = True
 
         trusted = (good and not self._reseed
                    and (recovered or last_t is None
@@ -613,14 +661,19 @@ class Slam:
         if self._tree is not None and not good and not self.lost:
             self.fails += 1
             self.vel *= 0.5
-            if self.fails >= MAX_FAILS or poor_out:
+            if self.fails >= MAX_FAILS or poor_out or off_gyro:
                 self.lost = True
                 self._lost_since = t
                 self._poor_s = 0.0
                 # The failing scans went on the IMU's heading (pred), so it
-                # is still the gyro's from here.
-                self._lost_yaw = (float(newpose[2]) if imu_rate is not None
-                                  else None)
+                # is still the gyro's from here; a fit off the gyro is the
+                # gyro's heading once the sum it is off by is taken back.
+                self._lost_yaw = (None if imu_rate is None
+                                  else float(newpose[2]) - self._yaw_err
+                                  if off_gyro else float(newpose[2]))
+                self._yaw_err = 0.0
+                self.gyro_lost += int(off_gyro)
+                self._gyro_hold = off_gyro
                 self.vel[:] = 0.0
                 newpose = pose.copy()
         elif good:
@@ -716,6 +769,19 @@ class Slam:
             self._poor_s += min(max(dt, 0.0), BAND_MAX_GAP_S)
         return self._poor_s >= POOR_LOST_S - 1e-9
 
+    def _off_gyro(self, newpose, pose, rate, dt):
+        """Whether the fitted heading has parted from the gyro's by more
+        than GYRO_LOST_DEG: the leaky sum (GYRO_ERR_TAU_S) of how far each
+        step turned past the gyro. With no gyro it says nothing and the sum
+        starts again."""
+        if rate is None or not math.isfinite(rate) or not dt > 0.0:
+            self._yaw_err = 0.0
+            return False
+        step = _wrap(float(newpose[2]) - float(pose[2]) - rate * dt)
+        self._yaw_err = (self._yaw_err * math.exp(-dt / GYRO_ERR_TAU_S)
+                         + step)
+        return abs(self._yaw_err) > math.radians(GYRO_LOST_DEG)
+
     def _seeds(self, pred):
         """Where to start again from when a fit is poor: the last pose at
         heading offsets, then the prediction moved a quarter metre each way."""
@@ -755,6 +821,7 @@ class Slam:
         self._pending = None
         self.fails = 0
         self._poor_s = 0.0
+        self._yaw_err = 0.0
         self.vel[:] = 0.0
         self._map_writes = 0
         self.reseeds += 1
@@ -1121,6 +1188,7 @@ class Slam:
         self._tree = None
         self._tree_at = None
         self.vel[:] = 0.0
+        self._yaw_err = 0.0
         self.merges += 1
         self._link = (float(T[0]), float(T[1]), float(T[2]), 0.0, 0.0,
                       float(self.pose[0]), float(self.pose[1]))

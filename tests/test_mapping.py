@@ -739,6 +739,36 @@ def test_a_poor_fit_while_tilted_is_not_counted_towards_lost():
     assert all(r.state == sl.TILTED for r in out)
 
 
+def test_fits_that_turn_the_truck_where_the_gyro_did_not_are_lost():
+    # 10-30 at 11:33 (p1261): fits that each sat inside the band turned the
+    # truck 24 degrees the gyro never saw, and the map was written at that
+    # heading from then on. Here the truck stands still, the gyro reads
+    # nothing, and every scan fits perfectly 3 degrees on from the last:
+    # lost, and not found again on the turned heading either (the search
+    # alone lets in 30 degrees round the gyro's).
+    imu = ImuTrack()
+    slam = sl.Slam(imu=imu)
+    drive(slam, 60, imu=imu)
+    still = path_pose(6.0)
+    out, lost_yaw = [], None
+    for k in range(30):
+        t = 6.0 + (k + 1) * PERIOD
+        for j in range(10):
+            imu.add(t - PERIOD + (j + 1) * 0.01, (0.0, 0.0, 0.0), LEVEL)
+        turned = still + np.array([0.0, 0.0, math.radians(3.0 * (k + 1))])
+        out.append(slam.step(t, scan_at(t, lambda _t: turned)))
+        if out[-1].state == sl.LOST and lost_yaw is None:
+            lost_yaw = slam._lost_yaw
+    assert lost_yaw is not None, "never lost"
+    assert slam.gyro_lost == 1
+    assert abs(wrap(lost_yaw - still[2])) < math.radians(2.0), \
+        "searched for round the gyro's heading, not the fits'"
+    off = [math.degrees(abs(wrap(r.yaw - still[2])))
+           for r in out if r.written]
+    assert max(off, default=0.0) <= sl.GYRO_LOST_DEG + 3.0, \
+        [round(d) for d in off]
+
+
 def test_a_map_that_does_not_fit_its_next_scan_is_started_again():
     # 182749Z: the first scans were the truck at rest, then it was carried
     # 1.7 m before the mapper's first result. The map was those scans and
