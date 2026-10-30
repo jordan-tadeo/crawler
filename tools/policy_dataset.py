@@ -119,6 +119,7 @@ the tests exercise.
 
 import argparse
 import bisect
+import datetime
 import glob
 import json
 import math
@@ -1022,9 +1023,43 @@ def drive_logs(directory):
 # leave out the same sessions.
 EXCLUDE_FILE = os.environ.get("CRAWLER_EXCLUDE", "~/crawler-data/exclude.txt")
 
+# A rule can instead take only a stretch of a run: "<prefix>@FROM..TO <why>",
+# FROM and TO UTC ISO times with a Z (2026-10-30T00:41:03Z), either one left
+# out for an open end, and "<prefix>@FROM" for FROM to the end. The session
+# still trains; only its ticks inside the window go. For a drive whose first
+# half is good and whose second is not: crawler-20261030-003550Z-p1201 had a
+# tight-spot takeover worth keeping at 00:40:19Z and the battery at the ESC's
+# cutoff from 00:41:03Z, where every takeover was the motor cutting out.
+WINDOW_MARK = "@"
+WINDOW_SEP = ".."
+
+
+def _utc_ns(stamp):
+    if not stamp.endswith("Z"):
+        raise ValueError(f"exclude window time {stamp!r} is not UTC with a Z")
+    t = datetime.datetime.fromisoformat(stamp[:-1] + "+00:00")
+    return int(round(t.timestamp() * 1e9))
+
+
+def parse_window(text):
+    """"FROM..TO" / "FROM" / "..TO" -> (start_ns, end_ns), an open end as
+    -inf / +inf. Raises ValueError on anything else."""
+    start, sep, end = text.partition(WINDOW_SEP)
+    if not sep:
+        end = ""
+    if not start and not end:
+        raise ValueError("an exclude window needs at least one end")
+    lo = _utc_ns(start) if start else -math.inf
+    hi = _utc_ns(end) if end else math.inf
+    if lo >= hi:
+        raise ValueError(f"exclude window {text!r} ends before it starts")
+    return lo, hi
+
 
 def read_excludes(path=EXCLUDE_FILE):
-    """[(prefix, why)] off the exclude file; [] when there is none."""
+    """[(prefix, why)] off the exclude file; [] when there is none. A window
+    rule's prefix keeps its @window, which excluded() never matches and
+    drop_excluded_windows() reads; a window that does not parse raises."""
     path = os.path.expanduser(path) if path else ""
     if not path or not os.path.exists(path):
         return []
@@ -1035,20 +1070,43 @@ def read_excludes(path=EXCLUDE_FILE):
             if not line:
                 continue
             prefix, _, why = line.partition(" ")
+            if WINDOW_MARK in prefix:
+                parse_window(prefix.partition(WINDOW_MARK)[2])
             rules.append((prefix, why.strip() or "on the exclude list"))
     return rules
 
 
 def excluded(path, rules):
-    """The why of the first rule whose prefix the session's name starts with,
-    else None."""
+    """The why of the first whole-session rule whose prefix the session's
+    name starts with, else None. A window rule never takes a whole session."""
     name = os.path.basename(path)
     if name.endswith(".mcap"):
         name = name[:-len(".mcap")]
     for prefix, why in rules:
-        if name.startswith(prefix):
+        if WINDOW_MARK not in prefix and name.startswith(prefix):
             return why
     return None
+
+
+def drop_excluded_windows(name, ticks, rules):
+    """(ticks left, {why: ticks cut}): every tick of session `name` whose
+    t_ns falls inside a window rule on its prefix, start inclusive, end
+    exclusive."""
+    windows = []
+    for prefix, why in rules:
+        run, mark, window = prefix.partition(WINDOW_MARK)
+        if mark and name.startswith(run):
+            windows.append((*parse_window(window), why))
+    if not windows:
+        return ticks, {}
+    kept, cut = [], Counter()
+    for t in ticks:
+        hit = next((why for lo, hi, why in windows if lo <= t.t_ns < hi), None)
+        if hit is None:
+            kept.append(t)
+        else:
+            cut[hit] += 1
+    return kept, dict(cut)
 
 
 def format_interventions(summary, ticks):
@@ -1164,6 +1222,9 @@ def main(argv=None):
         caps_by_session[session.name] = [list(c) for c in caps]
         timeline = []
         ticks, drops, errors = align(session, args.max_age_ms, rules, timeline)
+        ticks, cut = drop_excluded_windows(session.name, ticks, excludes)
+        for why, n in cut.items():
+            drops[f"excluded window: {why}"] += n
         toggles_by_session[session.name] = [t for t, _ in toggles_of(session.commands)]
         splits = sum(1 for c in session.commands if _is_split(c))
         front_only = sum(1 for c in session.commands if _rear_off_pair(c))

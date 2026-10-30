@@ -52,7 +52,11 @@ The junk rules. A session trains unless one of these says it is junk:
   excluded    its name starts with a prefix in ~/crawler-data/exclude.txt
               (policy_dataset.EXCLUDE_FILE, --exclude-file): a drive I said
               never to learn from, the takeovers I made because the car kept
-              stopping on 10-29 the first of them.
+              stopping on 10-29 the first of them. A rule with a window
+              (prefix@FROM..TO) keeps the session and policy_dataset drops
+              only its ticks inside the window; that reads the default
+              exclude file, so a different --exclude-file here is the
+              session rules only.
 
 The folds are policy_train.py's --blocks N, so the numbers are the ones a plain
 `policy_train.py --blocks 5` prints. The deployed model is graded as it is, a
