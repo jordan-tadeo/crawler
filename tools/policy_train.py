@@ -74,7 +74,20 @@ ever sees those learns that the floor is a place to reverse on.
 
 --class-weight-power P raises the gear's class weights (square-rooted
 inverse frequency, normalised to forward 1) to P: 1 is the weights as they
-always were, 0.5 half their log, 0 none.
+always were, 0.5 half their log, 0 none. --gear-weights F,R,S sets them
+outright instead (in pl.ACTIONS order), so one class can keep its weight
+while another's is softened.
+
+--accepted-own DIR (tools/auto_overrides.py) keeps an accepted-auto tick
+only where the command was the model's own: not the goal's "goal reached",
+the floor's hold, the rear stop, the tilt veto or a recover. Those are the
+car's rules, and a stop they made is no stop the model chose.
+
+--intervention-share P sets the takeover and accepted weights off the
+training ticks' own counts, as Sirius (Liu et al., RSS 2023) does: the
+interventions P of the gear's ticks by weight, the record ticks the share
+they have, the accepted auto the rest. --accept-after-s is the window before
+a takeover that is not "let stand" (their pre-intervention, weight 0).
 
 The val split
 -------------
@@ -859,6 +872,51 @@ def accepted_auto(data, after_s=ACCEPT_AFTER_S, before_s=ACCEPT_BEFORE_S,
     return ok
 
 
+def load_accepted_own(data, own_dir):
+    """Per tick, whether the command was the model's own (tools/auto_overrides.py,
+    one npz per session, by name): the newest /footprint row at or before
+    the tick, no more than STALE_S old. A session with no file, or a tick
+    with no row, is own: there is nothing to say otherwise. Returns (own,
+    sessions with a file)."""
+    import auto_overrides as ao
+    names = data["meta"]["sessions"]
+    own = np.ones(len(data["t_ns"]), bool)
+    found = 0
+    for sid, name in enumerate(names):
+        path = os.path.join(own_dir, name + ".npz")
+        if not os.path.exists(path):
+            continue
+        z = np.load(path)
+        if str(z["layout"]) != ao.LAYOUT:
+            raise ValueError(f"{path}: layout {z['layout']}, this trainer reads {ao.LAYOUT}")
+        found += 1
+        ticks = np.flatnonzero(data["session"] == sid)
+        j = ao.pair(z["log_t"], data["t_ns"][ticks] / 1e9)
+        has = j >= 0
+        own[ticks[has]] = z["own"][j[has]]
+    return own, found
+
+
+def intervention_share_weights(data, mask, share):
+    """(takeover_weight, accepted_weight) that make the intervention ticks
+    `share` of the summed tick weight over `mask`, the record ticks the
+    share they have unweighted, and the accepted auto (data["accepted"]) the
+    rest: Sirius's P*(intv), P*(demo) = P(demo), P*(robot) the remainder,
+    each class's weight P*(c) / P(c). Raises when there is no room left for
+    the accepted ticks, or a class is empty."""
+    mask = np.asarray(mask, bool)
+    intv = mask & intervention_ticks(data)
+    robot = mask & np.asarray(data.get("accepted", np.zeros(len(mask), bool)), bool) & ~intv
+    demo = mask & ~intv & ~robot
+    n_i, n_r, n_d = int(intv.sum()), int(robot.sum()), int(demo.sum())
+    n = n_i + n_r + n_d
+    rest = 1.0 - float(share) - n_d / max(n, 1)
+    if not n_i or not n_r or rest <= 0:
+        raise ValueError(f"no intervention share {share:g}: {n_i} interventions, {n_r} accepted, "
+                         f"{n_d} record of {n}")
+    return float(share) * n / n_i, rest * n / n_r
+
+
 def tick_weights(data, idx, good_weight, takeover_weight=TAKEOVER_WEIGHT):
     """Per training tick loss weight: good_weight inside a GOOD mark, times
     takeover_weight on an intervention, times the accepted-auto weight on
@@ -950,6 +1008,24 @@ def soften_weights(weights, power=1.0):
     keeps its 0."""
     w = np.asarray(weights, np.float64)
     return np.where(w > 0, np.power(np.where(w > 0, w, 1.0), float(power)), 0.0)
+
+
+def gear_class_weights(counts, power=1.0, override=None):
+    """The gear's class weights off its (weighted) per-class label counts:
+    inverse frequency, square-rooted, the commonest class at 1, capped at 10,
+    then to `power` (soften_weights). `override` (--gear-weights), when
+    given, is used as it is instead."""
+    if override is not None:
+        return np.asarray(override, np.float64)
+    counts = np.asarray(counts, np.float64)
+    # Inverse frequency, square-rooted. Plain inverse frequency on the smoke
+    # set (901 forward to 25 reverse) weighted a reverse 36x and the model
+    # answered by reversing at a third of open floor; the square root is 6x.
+    weights = np.where(counts > 0,
+                       np.sqrt(counts.sum() / np.maximum(counts, 1) / len(pl.ACTIONS)), 0.0)
+    weights = weights / max(weights[counts > 0].min(), 1e-9)
+    weights = np.minimum(weights, 10.0)  # one example of a class must not own the loss
+    return soften_weights(weights, power)
 
 
 def training_mask(data, in_val, labelled):
@@ -1120,7 +1196,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           map_dropout=MAP_DROPOUT, chunk=1, uses_goal=False, no_goal_share=pg.NO_GOAL_SHARE,
           mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam",
           lowband=None, tip_mask=None, tip_weight=0.0, label_off=None, contrast_weight=0.0,
-          goal_path_m=None, contrast_steer_only=False, class_weight_power=1.0):
+          goal_path_m=None, contrast_steer_only=False, class_weight_power=1.0,
+          gear_weights=None):
     """tip_mask: the rows the tip penalty goes on (tip_rows), trained beside
     train_mask with no label of their own. label_off: ticks that are never a
     label, at any chunk offset either (tip_marks' tipped and run-up)."""
@@ -1188,14 +1265,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     tok = throttle_ok.numpy()
     counts = np.bincount(data["action"][idx][tok], weights=weak_w[tok],
                          minlength=len(pl.ACTIONS)).astype(np.float64)
-    # Inverse frequency, square-rooted. Plain inverse frequency on the smoke
-    # set (901 forward to 25 reverse) weighted a reverse 36x and the model
-    # answered by reversing at a third of open floor; the square root is 6x.
-    weights = np.where(counts > 0,
-                       np.sqrt(counts.sum() / np.maximum(counts, 1) / len(pl.ACTIONS)), 0.0)
-    weights = weights / max(weights[counts > 0].min(), 1e-9)
-    weights = np.minimum(weights, 10.0)  # one example of a class must not own the loss
-    weights = soften_weights(weights, class_weight_power)
+    weights = gear_class_weights(counts, class_weight_power, gear_weights)
     ce = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32),
                              reduction="none")
     ce_mode = nn.CrossEntropyLoss(reduction="none")
@@ -1666,6 +1736,19 @@ def main(argv=None):
                     help="loss weight of an auto tick the model drove and I let stand "
                          f"(accepted_auto: no takeover {ACCEPT_AFTER_S:g} s after or "
                          f"{ACCEPT_BEFORE_S:g} s before); 0, the default, is none a label")
+    ap.add_argument("--gear-weights", default=None, metavar="F,R,S",
+                    help="the gear's class weights outright, in the order "
+                         f"{','.join(pl.ACTIONS)}, in place of the computed ones")
+    ap.add_argument("--accepted-own", default=None, metavar="DIR",
+                    help="tools/auto_overrides.py output: with --accepted-weight, only the "
+                         "ticks whose command was the model's own")
+    ap.add_argument("--accept-after-s", type=float, default=ACCEPT_AFTER_S,
+                    help="with --accepted-weight: an auto tick this long or less before a "
+                         f"takeover is not let stand (default {ACCEPT_AFTER_S:g})")
+    ap.add_argument("--intervention-share", type=float, default=None, metavar="P",
+                    help="with --accepted-weight: set the takeover and accepted weights so "
+                         "interventions are P of the training ticks by weight, record ticks "
+                         "their own share, accepted auto the rest (Sirius)")
     ap.add_argument("--class-weight-power", type=float, default=1.0,
                     help="raise the gear's class weights to this power: 1 as they are "
                          "(the default), 0.5 half their log, 0 none")
@@ -1772,8 +1855,30 @@ def main(argv=None):
 
     import torch
 
+    gear_weights = None
+    if args.gear_weights:
+        try:
+            gear_weights = [float(v) for v in args.gear_weights.split(",")]
+        except ValueError:
+            gear_weights = []
+        if len(gear_weights) != len(pl.ACTIONS) or min(gear_weights) <= 0:
+            print(f"--gear-weights: {len(pl.ACTIONS)} positive numbers, "
+                  f"{','.join(pl.ACTIONS)}")
+            return 2
+    if (args.accepted_own or args.intervention_share is not None) and args.accepted_weight <= 0:
+        print("--accepted-own and --intervention-share need --accepted-weight")
+        return 2
     if args.accepted_weight > 0:
-        weak = accepted_auto(data)
+        weak = accepted_auto(data, after_s=args.accept_after_s)
+        if args.accepted_own:
+            try:
+                own, found = load_accepted_own(data, args.accepted_own)
+            except ValueError as e:
+                print(e)
+                return 1
+            print(f"accepted own: {int((weak & ~own).sum())} of {int(weak.sum())} accepted "
+                  f"ticks were the car's rules, not the model ({found} sessions with a file)")
+            weak = weak & own
         data["accepted"] = weak
         data["accepted_w"] = np.where(weak, args.accepted_weight, 1.0).astype(np.float32)
         print(f"accepted auto: {int(weak.sum())} decisions the model drove and I let stand, "
@@ -1807,6 +1912,21 @@ def main(argv=None):
             return None
         return tip_rows(data, out_of | card_mask, runup)
 
+    if args.intervention_share is not None:
+        # Off every labelled decision, the folds' and the final model's alike.
+        every = training_mask(data, np.zeros(len(data["t_ns"]), bool), labelled)
+        try:
+            tw, aw = intervention_share_weights(
+                data, every & label_masks(data, args.labels)[1], args.intervention_share)
+        except ValueError as e:
+            print(e)
+            return 1
+        args.takeover_weight = tw
+        args.accepted_weight = aw
+        data["accepted_w"] = np.where(data["accepted"], aw, 1.0).astype(np.float32)
+        print(f"intervention share {args.intervention_share:g}: takeover weight {tw:.3f}, "
+              f"accepted weight {aw:.3f}")
+
     data["x"] = encode_frames(data["frames"], args.representation, args.lowband,
                               frame_pitch(data, args.lowband))
     fit = dict(representation=args.representation, label_mode=args.labels,
@@ -1823,7 +1943,7 @@ def main(argv=None):
                tip_weight=args.tip_weight, label_off=label_off,
                contrast_weight=args.goal_contrast, goal_path_m=args.goal_path_m,
                contrast_steer_only=args.contrast_steer_only,
-               class_weight_power=args.class_weight_power)
+               class_weight_power=args.class_weight_power, gear_weights=gear_weights)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -1934,11 +2054,14 @@ def main(argv=None):
                               if args.goal_contrast > 0 else None),
             "goal_draw": goal_draw_meta(args.goal_path_m),
             "goal_fed": bool(args.fed_goals),
-            "accepted_auto": ({"weight": args.accepted_weight, "after_s": ACCEPT_AFTER_S,
+            "accepted_auto": ({"weight": args.accepted_weight, "after_s": args.accept_after_s,
                                "before_s": ACCEPT_BEFORE_S, "hole_s": ACCEPT_HOLE_S,
-                               "train_ticks": int((train_mask & data["accepted"]).sum())}
+                               "train_ticks": int((train_mask & data["accepted"]).sum()),
+                               "own_only": bool(args.accepted_own),
+                               "intervention_share": args.intervention_share}
                               if args.accepted_weight > 0 else None),
             "class_weight_power": args.class_weight_power,
+            "gear_weights": gear_weights,
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
                if args.lidar else {}),
