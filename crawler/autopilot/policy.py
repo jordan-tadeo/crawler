@@ -415,12 +415,14 @@ MOVING_FLOOR_REVERSE = -dv.ESCAPE_SPEED
 #
 # The floor's distance is REVERSE_FLOOR_MM plus how far the car can overrun
 # while the picture ages, and that overrun is worked out at the cap
-# (forward_speed, 0.4: 363 mm). A forward at CREEP_THROTTLE overruns less --
-# driver.forward_floor_mm(0.2) is 282 mm -- so when the cap's floor holds a
-# map model's forward and the creep's does not, the forward goes out at no
-# more than CREEP_THROTTLE instead of 0, on the model's own steering. The
-# line it stops at, REVERSE_FLOOR_MM, is the same; only the overrun follows
-# the speed. A probe latched blind holds the creep as it holds the cap.
+# (forward_speed, 0.4: 363 mm). A forward at CREEP_THROTTLE overruns less,
+# so when the cap's floor holds a map model's forward and the creep's
+# (driver.CREEP_FLOOR_MM, 185 mm off the lens, 150 off the front bumper) does
+# not, the forward goes out at no more than CREEP_THROTTLE instead of 0, on
+# the model's own steering. The creep's floor is its own measured line,
+# not the cap's arithmetic at 0.2 (that was 282, and it boxed the car in with
+# 6 in in front of it); driver.py says how it was measured. A probe latched
+# blind holds the creep as it holds the cap. Only the throttle is held.
 #
 # Why: 191314Z held a map model's forward for 9.9 s and 10.3 s (19:17:47,
 # 19:18:18) with the nearest thing in front at 291-348 mm on every tick and
@@ -428,7 +430,9 @@ MOVING_FLOOR_REVERSE = -dv.ESCAPE_SPEED
 # full lock on the steering it was asking for. Every one of those ticks
 # clears the creep's floor. The hand rules keep their standoff back-out.
 # CREEP_THROTTLE is the least that moves the car, so a creep is as slow as a
-# forward goes; raise it and the creep's floor moves out with it.
+# forward goes. The overrun behind the creep's floor was measured at
+# driver.CREEP_SPEED, so raising this means measuring it again
+# (tests/test_policy_map.py holds the two together).
 CREEP_THROTTLE = MOVING_FLOOR_FORWARD
 CREEP_REASON = "model creep"
 
@@ -2123,7 +2127,7 @@ class PolicyDriver(dv.Driver):
                   else "model rear masked" if rear_masked else "model")
         held = action == FORWARD and self.floor_veto.vetoes()
         if (held and not self.hand_rules
-                and not self.floor_veto.vetoes(CREEP_THROTTLE)):
+                and not self.floor_veto.vetoes(floor_mm=dv.CREEP_FLOOR_MM)):
             # Held at the cap, clear at the creep: the creep (see
             # CREEP_THROTTLE), never faster than the model asked.
             throttle = min(slowed_throttle(self.forward_speed * magnitude, scale,

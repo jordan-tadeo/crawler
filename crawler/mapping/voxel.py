@@ -58,7 +58,10 @@ CAMERA_HEIGHT_M = dv.CAMERA_HEIGHT_MM / 1000.0
 # drives, grid search then refine: x 0.22 m, yaw -0.25 deg. 0.22 is plausible
 # against the tape (front bumper 0.27 m ahead of the lidar, the camera a few
 # cm behind it). The offset sideways was not separable from zero.
-CAMERA_X_M = 0.22
+# The x is driver.LENS_X_MM now, 235 mm: the centre probe against the lidar
+# straight ahead with the car standing still, four scenes, 228-246. One
+# number for the lens, so the map and the stops agree on where it is.
+CAMERA_X_M = dv.LENS_X_MM / 1000.0
 CAMERA_Y_M = 0.0
 CAMERA_YAW = math.radians(-0.25)
 

@@ -1225,19 +1225,28 @@ REAR_STOP_SECTOR = (180.0, 20.0)
 # bumper. REAR_BUMPER_X_MM is measured, 9.75 in from the lidar.
 REAR_SELF_MM = abs(_lidar.REAR_BUMPER_X_MM)
 
-# How near the bumper is too near: the 120 mm of margin I asked for, plus how
-# far the car goes before the stop takes, ESTIMATED. At ESCAPE_SPEED the
-# ground speed is ESTIMATED REVERSE_CREDIT_MM_S x |ESCAPE_SPEED| (98 mm/s at
-# -0.6, never measured). The return can be a revolution old (0.1 s at 10 Hz)
-# and the decision a tick late (0.1 s) before the neutral goes out, the
-# revolution itself takes 0.1 s, and the car coasts a little after: call it
-# REAR_STOP_LAG_S 0.5 s, 49 mm at -0.6, rounded up to the next 10 mm: 170.
-# The margin is the one number, mine to judge on the floor. A literal, because
-# REVERSE_CREDIT_MM_S is defined further down; tests/test_rear_stop.py holds
-# it to the sum, so a faster ESCAPE_SPEED cannot leave it short.
-REAR_STOP_MARGIN_MM = 120.0
-REAR_STOP_LAG_S = 0.5
-REAR_STOP_CLEAR_MM = 170.0
+# How near the bumper is too near: what the car still loses past the line
+# once the stop fires, MEASURED, plus a margin. This was 170, 120 mm of margin
+# on an ESTIMATED 49 mm of travel, and it boxed the car in with a good 6 in
+# behind it, so it is the measurement now.
+#
+# Every rear stop that cut a moving -0.6 reverse on 003550Z and 011928Z: it
+# fired on a reading 7-26 mm under the 170 line (a tick of reverse is about
+# 26 mm at the 0.256 m/s -0.6 makes), and the car coasted on 51-75 mm after
+# it, so it ended 77-112 mm off the bumper. Line less end, the loss: 58, 80,
+# 84 and 93 mm. REAR_STOP_LOSS_MM is the worst of those, rounded up.
+#
+# The margin is 40: the lidar reads a contact to about +-8 mm (the bumper was
+# confirmed at 244 against the tape's 247.65), a scan a tick late is another
+# 26 mm of reverse, and the swing of the tail at lock is outside the sector
+# altogether. 40 + 95 = 135. Only four stops were measured, so this is
+# mine to judge on the floor, and the loss is good at -0.6 only:
+# REAR_STOP_LOSS_AT pins it, and tests/test_rear_stop.py fails the day
+# ESCAPE_SPEED moves without the loss being measured again.
+REAR_STOP_LOSS_MM = 95.0
+REAR_STOP_LOSS_AT = -0.60
+REAR_STOP_MARGIN_MM = 40.0
+REAR_STOP_CLEAR_MM = 135.0
 
 
 def rear_clearance_mm(bins):
@@ -1506,6 +1515,51 @@ def forward_floor_mm(forward_speed=None) -> float:
 FORWARD_FLOOR_MM = forward_floor_mm(FORWARD_SPEED)
 
 
+# ---- the creep's floor: how near a 0.2 forward may go -----------------------
+#
+# The policy's creep (policy.CREEP_THROTTLE) is a map model's forward at 0.2
+# once the cap's floor above holds it. It was held at forward_floor_mm(0.2),
+# 282 mm off the lens, which is the same ESTIMATED travel-while-the-picture-
+# ages arithmetic as the cap's. That boxed the car in: 011928Z held a forward
+# at lock for 39 s at 258-261 mm with the rear 131 mm off the bumper. So it is
+# a line off the front bumper now, from what a creep was measured to do.
+#
+# Where the lens is. The probes measure from the lens, the bumpers are
+# measured from the lidar. Off the drives, the centre probe against the lidar
+# straight ahead on ticks with no throttle for 0.6 s (so the two clocks do
+# not matter): 228, 232, 234 and 246 mm over four scenes at 290-900 mm,
+# 330 ticks. Moving, the same comparison reads 250 forward and 264 reverse,
+# which is the half-tick between a scan and a frame, not the mount. 235.
+# The voxel fit had 220 (mapping/voxel.py), off a different comparison.
+LENS_X_MM = 235.0
+# The front bumper is ESTIMATED (lidar.FRONT_BUMPER_X_MM, never taped), so
+# this is too: 35 mm. A tape from the lens to the bumper face replaces it.
+LENS_TO_FRONT_BUMPER_MM = _lidar.FRONT_BUMPER_X_MM - LENS_X_MM
+
+# The speed the overrun below was measured at, and the creep's throttle.
+CREEP_SPEED = 0.2
+# How far a creep held at its floor still closes, MEASURED. 011928Z, the
+# creep runs at 0.2 that the floor ended with the motor moving the car: the
+# probe that held went on to close 57, 6 and 21 mm after the hold, the first
+# reading under the line already 1-13 mm under it. The one where the motor
+# did not move the car is left out. 57 plus a tick of creep (21 mm at the
+# ESTIMATED 210 mm/s of 0.2) is 78.
+CREEP_OVERRUN_MM = 78.0
+# The stereo pair's near clamp: fx 441.25 x the 75 mm baseline / 208 px of
+# disparity is 159 mm, and nearer than that a probe reads 159 (thousands of
+# them on 011928Z, never less). A floor has to sit a tick of creep above it,
+# or the reading under the floor could be the clamp and not a distance.
+STEREO_NEAR_MM = 159.0
+# What is left between the bumper and the thing after the overrun, at least.
+CREEP_MARGIN_MM = 40.0
+# The line itself, off the bumper: 150 (about 6 in), which leaves
+# 150 - 78 = 72 mm after the worst overrun, past the 40 margin; nearer than
+# that the near clamp, not the overrun, is what binds: 185 off the lens is
+# 26 mm, a tick and a bit of creep, above 159. Mine to judge on the floor.
+CREEP_STOP_CLEAR_MM = 150.0
+CREEP_FLOOR_MM = CREEP_STOP_CLEAR_MM + LENS_TO_FRONT_BUMPER_MM
+
+
 class FloorLatch(NamedTuple):
     """What the forward veto remembers. Immutable; the functions below make
     the next one.
@@ -1630,9 +1684,10 @@ def floor_travel_mm(throttle, seconds) -> float:
     return ground_speed_mm_s(t) * seconds
 
 
-def forward_floor_vetoes(latch, scan, forward_speed=None) -> bool:
-    """Hold a forward? Pure. Anything NEAR under the forward floor, or any
-    probe latched blind. A missing scan is a veto: no picture is not a clear
+def forward_floor_vetoes(latch, scan, forward_speed=None, floor_mm=None) -> bool:
+    """Hold a forward? Pure. Anything NEAR under the forward floor (or under
+    `floor_mm`, when a caller has its own line: the creep's), or any probe
+    latched blind. A missing scan is a veto: no picture is not a clear
     picture. Reverse is never asked about -- the camera cannot see behind.
 
     R1's NO_RETURN veto and the sweep check are the autopilot's reasons not
@@ -1641,7 +1696,7 @@ def forward_floor_vetoes(latch, scan, forward_speed=None) -> bool:
     """
     if scan is None:
         return True
-    floor = forward_floor_mm(forward_speed)
+    floor = forward_floor_mm(forward_speed) if floor_mm is None else float(floor_mm)
     for i in range(len(scan.reason)):
         if scan.reason[i] == NEAR and float(scan.distance_mm[i]) < floor:
             return True
@@ -1694,12 +1749,13 @@ class ForwardFloorVeto:
         self._throttle = t if math.isfinite(t) else 0.0
         self._throttle_at = now
 
-    def vetoes(self, forward_speed=None) -> bool:
+    def vetoes(self, forward_speed=None, floor_mm=None) -> bool:
         """Hold a forward at the cap, or at `forward_speed` if one is given:
-        a slower forward overruns less, so its floor is nearer. The latch is
-        the same either way."""
+        a slower forward overruns less, so its floor is nearer. `floor_mm` is
+        a line of the caller's own instead (CREEP_FLOOR_MM). The latch is the
+        same either way."""
         speed = self.forward_speed if forward_speed is None else forward_speed
-        return forward_floor_vetoes(self.latch, self.scan, speed)
+        return forward_floor_vetoes(self.latch, self.scan, speed, floor_mm)
 
 
 class Driver:

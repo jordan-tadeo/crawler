@@ -413,7 +413,7 @@ def test_the_safety_layer_still_cuts_a_map_models_throttle():
     assert d.controller.throttles[-1] == dv.ESCAPE_SPEED
     # The floor holds a forward into a wall at 0, and never backs out for it.
     wall = clear()
-    wall[150:350, 220:420] = 250  # inside the creep's floor too
+    wall[150:350, 220:420] = 170  # inside the creep's floor too
     model = MapStub(FORWARD, steer=0.5)
     slam = FakeSlam()
     d = driver(model, slam, depth=wall)
@@ -468,7 +468,7 @@ def test_a_map_models_reverse_into_the_rear_stop_goes_forward_if_it_would():
     assert d.controller.steerings[-1][0] == pytest.approx(0.75 * pl.STEER_SCALE)
     # And the floor still holds it, as any forward.
     wall = clear()
-    wall[150:350, 220:420] = 250  # inside the creep's floor too
+    wall[150:350, 220:420] = 170  # inside the creep's floor too
     d = driver(MapStub((1.0, 5.0, 0.0)), FakeSlam(), depth=wall,
                lidar=reader(near))
     d.tick(T0)
@@ -494,8 +494,28 @@ def _boxed(front_mm, model, rear_off_bumper=100):
     return d
 
 
+def test_the_boxed_in_scenes_of_011928Z_are_free_one_way():
+    """011928Z 18:23:33, 39 s held: the model asked forward at lock with the
+    front 258-261 mm off the lens and the rear 127-134 off the bumper. The
+    creep's floor was 282 then, so it held; it creeps now. 18:26:30, 8.8 s:
+    front 270, rear 133-142, the same."""
+    for front, rear in ((260, 131), (270, 141)):
+        d = _boxed(front, MapStub(FORWARD, throttle=0.8, steer=0.7),
+                   rear_off_bumper=rear)
+        assert d.last_decision.reason == "model creep", (front, rear)
+        assert d.controller.throttles[-1] == pytest.approx(pl.CREEP_THROTTLE)
+    # At 18:26:30 the rear is clear of the new line, so a reverse goes too;
+    # at 131 behind it is still the rear stop.
+    d = _boxed(270, MapStub(REVERSE, throttle=1.0), rear_off_bumper=141)
+    assert d.controller.throttles[-1] == dv.ESCAPE_SPEED
+    d = _boxed(270, MapStub((0.0, 5.0, 1.0), throttle=1.0), rear_off_bumper=131)
+    assert d.controller.throttles[-1] == 0
+    assert d.last_decision.reason == "rear stop"
+
+
 def test_a_map_models_forward_the_floor_holds_at_the_cap_creeps_if_the_creep_clears():
-    assert dv.forward_floor_mm(pl.CREEP_THROTTLE) < 291 < dv.FORWARD_FLOOR_MM
+    assert dv.CREEP_FLOOR_MM < 291 < dv.FORWARD_FLOOR_MM
+    assert pl.CREEP_THROTTLE == dv.CREEP_SPEED, "the overrun was measured at it"
     d = _boxed(320, MapStub(FORWARD, throttle=0.8, steer=-0.95))
     assert all(t == pytest.approx(pl.CREEP_THROTTLE) for t in d.controller.throttles[-20:]), \
         "it creeps, at the creep's throttle and no faster"
@@ -506,7 +526,7 @@ def test_a_map_models_forward_the_floor_holds_at_the_cap_creeps_if_the_creep_cle
     d = _boxed(320, MapStub(FORWARD, throttle=0.3))
     assert d.controller.throttles[-1] == pytest.approx(0.3 * d.forward_speed)
     # Inside the creep's own floor it is held at 0, as before.
-    d = _boxed(int(dv.forward_floor_mm(pl.CREEP_THROTTLE)) - 30, MapStub(FORWARD))
+    d = _boxed(int(dv.CREEP_FLOOR_MM) - 15, MapStub(FORWARD))
     assert all(t == 0 for t in d.controller.throttles[-20:])
     assert d.last_decision.reason == "model floor"
     # A reverse into the rear stop that becomes a forward creeps too.
@@ -692,7 +712,7 @@ def test_a_stop_under_my_trigger_is_not_logged(capsys):
 
 def test_a_floor_blip_is_quiet_and_a_floor_hold_is_logged(capsys):
     wall = clear()
-    wall[150:350, 220:420] = 250  # inside the creep's floor too
+    wall[150:350, 220:420] = 170  # inside the creep's floor too
     model, slam = MapStub(FORWARD), FakeSlam()
     d = driver(model, slam, depth=wall)
     t = T0

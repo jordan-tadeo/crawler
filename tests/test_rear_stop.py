@@ -263,13 +263,24 @@ def test_the_rear_clearance_is_from_the_bumper_and_drops_the_car_itself():
     assert not dv.rear_blocked(dv.REAR_STOP_CLEAR_MM)
 
 
-def test_the_rear_stop_covers_the_margin_and_the_travel_at_the_escape_speed():
-    """REAR_STOP_CLEAR_MM is the margin plus how far ESCAPE_SPEED carries the
-    car in REAR_STOP_LAG_S, ESTIMATED off REVERSE_CREDIT_MM_S -- and rounded
-    up by less than 10 mm, so it follows ESCAPE_SPEED both ways."""
-    travel = dv.REAR_STOP_LAG_S * dv.REVERSE_CREDIT_MM_S * -dv.ESCAPE_SPEED
-    need = dv.REAR_STOP_MARGIN_MM + travel
-    assert need <= dv.REAR_STOP_CLEAR_MM < need + 10.0
+def test_the_rear_stop_covers_the_margin_and_the_measured_loss():
+    """REAR_STOP_CLEAR_MM is the margin plus the most the car was measured to
+    lose past the line at ESCAPE_SPEED (the reading under the line when it
+    fired, and the coast after), rounded up by less than 5 mm."""
+    need = dv.REAR_STOP_MARGIN_MM + dv.REAR_STOP_LOSS_MM
+    assert need <= dv.REAR_STOP_CLEAR_MM < need + 5.0
+    assert dv.REAR_STOP_CLEAR_MM == 135.0
+    # Every rear stop that cut a moving -0.6 reverse (003550Z, 011928Z) ended
+    # this far short of the 170 line; the loss covers the worst of them.
+    measured_losses = (170 - 90, 170 - 77, 170 - 112, 170 - 86)
+    assert dv.REAR_STOP_LOSS_MM >= max(measured_losses)
+    assert dv.REAR_STOP_CLEAR_MM - max(measured_losses) >= dv.REAR_STOP_MARGIN_MM
+
+
+def test_the_rear_stop_loss_is_only_good_at_the_speed_it_was_measured_at():
+    """The loss is a measurement at -0.6, not a model of speed, so a faster
+    ESCAPE_SPEED cannot quietly keep this line: it has to be measured again."""
+    assert dv.ESCAPE_SPEED == dv.REAR_STOP_LOSS_AT
 
 
 # --- the rear stop on the policy's reverses -----------------------------------

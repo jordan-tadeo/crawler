@@ -2480,6 +2480,47 @@ def test_the_forward_floor_moves_with_the_speed(monkeypatch):
     assert dv.ForwardFloorVeto().vetoes()  # no scan yet is held
 
 
+def test_the_creep_floor_is_measured_from_the_front_bumper():
+    """The creep's line is CREEP_STOP_CLEAR_MM off the front bumper, read on
+    the probes, which measure from the lens: so the bumper's lead on the lens
+    is added. The lens is LENS_X_MM ahead of the lidar, measured off the
+    drives; the bumper is lidar.FRONT_BUMPER_X_MM, ESTIMATED."""
+    from crawler.hardware import lidar as ld
+    assert dv.LENS_X_MM == 235.0
+    assert dv.LENS_TO_FRONT_BUMPER_MM == pytest.approx(
+        ld.FRONT_BUMPER_X_MM - dv.LENS_X_MM)
+    assert dv.CREEP_FLOOR_MM == pytest.approx(
+        dv.CREEP_STOP_CLEAR_MM + dv.LENS_TO_FRONT_BUMPER_MM)
+    assert dv.CREEP_FLOOR_MM == pytest.approx(185.0)
+
+
+def test_the_creep_floor_leaves_the_margin_after_the_measured_overrun():
+    """A creep held at the floor still ends CREEP_MARGIN_MM off the bumper
+    after the measured overrun, and the floor sits above the stereo pair's
+    near clamp by a tick of creep, so the probe always reads a number under
+    it before it can read nothing."""
+    end = dv.CREEP_FLOOR_MM - dv.CREEP_OVERRUN_MM - dv.LENS_TO_FRONT_BUMPER_MM
+    assert end >= dv.CREEP_MARGIN_MM
+    tick = dv.ground_speed_mm_s(dv.CREEP_SPEED) * 0.1
+    assert dv.CREEP_FLOOR_MM >= dv.STEREO_NEAR_MM + tick
+    # Nearer than the cap's floor, which is unchanged.
+    assert dv.STEREO_NEAR_MM < dv.CREEP_FLOOR_MM < dv.FORWARD_FLOOR_MM
+    assert dv.FORWARD_FLOOR_MM == pytest.approx(362.96, abs=0.01)
+
+
+def test_the_veto_asked_at_the_creep_floor():
+    """vetoes(floor_mm=...) holds on that line instead of the cap's; the
+    latch holds either way."""
+    said = []
+    for p in ("N300", "N200", "N180"):
+        veto = dv.ForwardFloorVeto()
+        veto.observe(centre(p), 0.0)
+        said.append((veto.vetoes(), veto.vetoes(floor_mm=dv.CREEP_FLOOR_MM)))
+    assert said == [(True, False), (True, False), (True, True)]
+    _, veto = replay([centre("N400"), centre("N300"), centre("N190"), centre("?")])
+    assert veto.vetoes(floor_mm=dv.CREEP_FLOOR_MM), "latched blind holds the creep"
+
+
 def test_an_approach_stays_held_through_the_blind_tick():
     said, veto = replay([centre("N400"), centre("N300"), centre("N190"),
                          centre("?"), centre("?")])
