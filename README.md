@@ -16,6 +16,9 @@ drive can be read back afterwards instead of remembered.
 - LDRobot STL-19P 2D lidar (the D500 kit) on the roof, arrow to the truck's
   right. Read and recorded with `--lidar`; nothing drives on it yet.
 - An Xbox pad over Bluetooth, driven by xpadneo.
+- A USB webcam (Suyin "HD Camera", 1e45:8022) on the hood, on two pan/tilt
+  servos on the same PCA9685. `--pantilt` turns it to follow a person; it
+  never drives.
 
 ## Layout
 
@@ -24,6 +27,7 @@ crawler/            the code that runs on the car, one package
   __main__.py       the app: `python -m crawler`
   hardware/         ESC and servos, the pad, the OAK-D, the camera hub
   autopilot/        the rules driver, the learned policy and its inputs, marks
+  vision/           the hood camera's person detector and pan/tilt tracker
   telemetry/        Foxglove channels, MCAP recording, the log, the dashboard
 tools/              laptop tools: dataset, training, eval, the models registry
 scripts/            run.sh, models.sh, pull-recordings.sh; scratch/ for one-off checks
@@ -130,6 +134,38 @@ sits on the cab roof on the centre line, which is the frame's origin, so its off
 0, 0. Then add `--lidar` to the
 service's ExecStart with `sudo systemctl edit crawler`, and `/lidar` is in
 every recording.
+
+## The hood camera
+
+`--pantilt` points the hood camera at the nearest person and keeps them in
+the middle of the picture. It never commands throttle or steering: the only
+thing it moves is the mount, and it refuses the steering channels. The
+detector is a YOLO model on onnxruntime in a process of its own, at a rate
+that backs off when the Pi is busy (`crawler/vision/person.py` says why this
+one, and what it should cost). `/pantilt` has the angles and the person's
+bearing off the truck, `/pantilt/image` the picture with the boxes on, and
+the drive layout shows it under the OAK-D's three.
+
+Once, on the Mac, export the model and copy it over (it is not in the repo):
+
+```sh
+uvx --python 3.11 --from 'ultralytics==8.3.40' --with onnx --with onnxslim \
+    --with 'torch<2.6' --with 'torchvision<0.21' \
+    yolo export model=yolo11n.pt format=onnx imgsz=256,320 opset=12
+scp yolo11n.onnx jt@jtpi.local:Documents/py/crawler/models/person.onnx
+```
+
+On the car, find the servos' centre, limits and direction. It writes only
+the two pan/tilt channels and is safe with the service running:
+
+```sh
+./.venv/bin/python tools/pantilt_cal.py --pan-channel 12 --tilt-channel 13
+```
+
+`save` writes `models/pantilt.json`, which is untracked like the model, so
+the checkout stays clean for the next pull. Then add
+`--pantilt models/pantilt.json` to the service's ExecStart with
+`sudo systemctl edit crawler`.
 
 ## Modes and controls
 

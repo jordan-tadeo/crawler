@@ -1912,6 +1912,21 @@ def parse_args(argv=None):
              "obstacles the camera sees under the lidar (advisory; off "
              "unless given)",
     )
+    # Off unless named. The hood camera on its pan/tilt servos turns to keep
+    # the nearest person in the middle of the picture (crawler/vision/). It
+    # never drives: the only thing it moves is the mount, on the PCA9685's
+    # pan and tilt channels. Bare --pantilt reads deploy/pantilt.json; the
+    # detector's model is models/person.onnx, see docs/PANTILT.md. A camera,
+    # model or config that is missing costs the pan/tilt and nothing else.
+    parser.add_argument(
+        "--pantilt",
+        nargs="?",
+        const="deploy/pantilt.json",
+        default=None,
+        metavar="CONFIG",
+        help="point the hood camera at the nearest person; CONFIG is the "
+             "mount's JSON (default deploy/pantilt.json). Off unless given",
+    )
     args = parser.parse_args(argv)
     if args.goal and args.nav:
         parser.error("--goal and --nav both take the Foxglove clicks; give one")
@@ -1950,6 +1965,26 @@ def nav_map_source(args, slam, lidar, voxels, log):
         low = False
     from crawler.nav import live
     return live.SlamMap(slam, lidar=lidar, voxels=voxels, low_obstacles=low)
+
+
+def start_pantilt(args, vecon, tele, log):
+    """--pantilt's runner, started, or None. Never raises: a bad config, no
+    camera or no model costs the pan/tilt, said in the journal."""
+    if not getattr(args, "pantilt", None):
+        return None
+    try:
+        from crawler.hardware import pantilt as pt
+        from crawler.vision import runner as ptr
+        cfg = pt.load_config(args.pantilt)
+        runner = ptr.build(cfg, pca=getattr(vecon, "pca", None), tele=tele,
+                           logger=log)
+        runner.start()
+        log.log("info", "PanTilt", f"Pan/tilt on {cfg.camera.device}, "
+                f"{cfg.mount.kind} mount, model {cfg.detector.model}")
+        return runner
+    except Exception as e:
+        log.log("warning", "PanTilt", f"No pan/tilt: {type(e).__name__}: {e}")
+        return None
 
 
 def main(argv=None):
@@ -2091,6 +2126,7 @@ def main(argv=None):
             log.log("info", "Goal", "Taking goals from Foxglove's Publish pose "
                     "tool on /move_base_simple/goal, in the map frame, and patrol "
                     "commands on /patrol/cmd")
+    pantilt = start_pantilt(args, vecon, tele if channels_live else None, log)
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           fallback_path=args.fallback_policy,
                           lidar=lidar, slam=slam, nav=args.nav,
@@ -2169,6 +2205,8 @@ def main(argv=None):
             # two things in this process that do not matter -- and because a
             # USB device that refuses to close must not get between SIGTERM
             # and the ESC reaching neutral.
+            if pantilt is not None:
+                pantilt.close()
             if lidar is not None:
                 lidar.close()
             if voxels is not None:
@@ -2207,6 +2245,8 @@ def main(argv=None):
     finally:
         stop_event.set()
         worker.join(timeout=5)
+        if pantilt is not None:
+            pantilt.close()
         if lidar is not None:
             lidar.close()
         if voxels is not None:

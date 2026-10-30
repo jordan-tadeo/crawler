@@ -154,6 +154,11 @@ INTERVALS = {
     # its waypoints on the map once a second.
     "patrol_status": 0.5,
     "patrol_marker": 1.0,
+    # With --pantilt (vision/runner.py): the mount and the person at 10 Hz,
+    # and the hood camera's picture at 2 Hz. The picture is a 320x240 JPEG,
+    # about 15 KB, so 30 KiB/s.
+    "pantilt": 0.1,
+    "pantilt_image": 0.5,
 }
 
 # What the map channels (/map, /slam/path, /voxel/points, /voxel/low) may
@@ -612,6 +617,27 @@ JSON_SCHEMAS = {
         "approx": _BOOL, "approx_m": _NUM, "restored": _BOOL, "pending": _BOOL,
         "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
     }),
+    # The hood camera's pan/tilt, with --pantilt: vision/runner.status().
+    # state idle / tracking / lost; pan and tilt what the mount was told,
+    # degrees, pan left positive, tilt up; the target it is slewing to.
+    # bearing_deg (left positive, off the truck's straight ahead) and
+    # elevation_deg of the followed person, 0 with nobody; box that person
+    # and boxes everyone in the last detection, each [x0, y0, x1, y1(,
+    # score)] in fractions of the frame. det_ms the last inference,
+    # interval_s the governor's wait between detections, cpu_idle the Pi's
+    # idle fraction (-1 unknown).
+    "pantilt": _schema("crawler.PanTilt", {
+        "state": _STR, "person": _BOOL,
+        "pan_deg": _NUM, "tilt_deg": _NUM,
+        "target_pan_deg": _NUM, "target_tilt_deg": _NUM,
+        "bearing_deg": _NUM, "elevation_deg": _NUM, "score": _NUM,
+        "box": {"type": "array", "items": _NUM},
+        "people": _INT,
+        "boxes": {"type": "array", "items": {"type": "array", "items": _NUM}},
+        "detector": _STR, "det_ms": _NUM, "interval_s": _NUM,
+        "cpu_idle": _NUM, "camera_up": _BOOL, "frames": _INT,
+        "mount": _STR, "writes": _INT, "acquired": _INT,
+    }),
 }
 
 # The image channels, which do get a well-known schema: foxglove.CompressedImage,
@@ -620,6 +646,8 @@ IMAGE_CHANNELS = {
     "depth": "/camera/depth",
     "disparity": "/camera/disparity",
     "rectified_left": "/camera/rectified_left",
+    # The hood camera with --pantilt, boxes drawn on (vision/runner.annotate).
+    "pantilt_image": "/pantilt/image",
 }
 
 # How to turn each one's raw frame into something that can be looked at.
@@ -633,11 +661,19 @@ IMAGE_CHANNELS = {
 DEPTH_JET = "depth_jet"
 DISPARITY_JET = "disparity_jet"
 GREY = "grey"
+# A BGR frame that is already a picture: downscale and JPEG, nothing else.
+COLOUR = "colour"
 
 IMAGE_RENDER = {
     "depth": DEPTH_JET,
     "disparity": DISPARITY_JET,
     "rectified_left": GREY,
+    "pantilt_image": COLOUR,
+}
+
+# frame_id on an image channel's messages; "oakd" for anything not named.
+IMAGE_FRAME_IDS = {
+    "pantilt_image": "pantilt",
 }
 
 # The window depth is colourmapped across, in millimetres. The same numbers
@@ -662,6 +698,7 @@ JSON_TOPICS = {
     "nav_status": "/nav/status",
     "goal_status": "/goal/status",
     "patrol_status": "/patrol/status",
+    "pantilt": "/pantilt",
 }
 
 # Raw depth: the uint16 millimetres exactly as the driver scans them, as a
@@ -739,7 +776,8 @@ ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
 # own channels are not in here -- /diagnostics is what says the pad went.
 # /lidar is, for the same reason: it is a sensor with no driving in it, and
 # so is its 3D view, the transform and the outline with it.
-CAMERA_KEYS = frozenset(("imu", "lidar", "slam_status") + tuple(IMAGE_CHANNELS)
+CAMERA_KEYS = frozenset(("imu", "lidar", "slam_status", "pantilt")
+                        + tuple(IMAGE_CHANNELS)
                         + tuple(RAW_DEPTH_CHANNELS)
                         + tuple(LIDAR_VIEW_CHANNELS)
                         + tuple(SLAM_CHANNELS)
@@ -1241,7 +1279,7 @@ class Telemetry:
             CompressedImage(
                 timestamp=Timestamp(sec=log_time // 1_000_000_000,
                                     nsec=log_time % 1_000_000_000),
-                frame_id="oakd",
+                frame_id=IMAGE_FRAME_IDS.get(key, "oakd"),
                 data=data,
                 format="jpeg",
             ),

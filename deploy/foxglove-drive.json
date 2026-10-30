@@ -318,6 +318,17 @@
       "advancedView": false,
       "value": "{\"cmd\": \"trace\"}",
       "foxglovePanelTitle": "Trace"
+    },
+    "Image!pantilt": {
+      "synchronize": false,
+      "imageMode": {
+        "imageTopic": "/pantilt/image",
+        "imageSchemaName": "foxglove.CompressedImage",
+        "rotation": 0,
+        "flipHorizontal": false,
+        "flipVertical": false
+      },
+      "foxglovePanelTitle": "Hood pan/tilt (2 Hz)"
     }
   },
   "layout": {
@@ -328,10 +339,15 @@
       "second": {
         "direction": "column",
         "first": "Image!cam_disparity",
-        "second": "Image!cam_left",
-        "splitPercentage": 50
+        "second": {
+          "direction": "column",
+          "first": "Image!cam_left",
+          "second": "Image!pantilt",
+          "splitPercentage": 50
+        },
+        "splitPercentage": 33.34
       },
-      "splitPercentage": 33.34
+      "splitPercentage": 25
     },
     "second": {
       "direction": "row",
