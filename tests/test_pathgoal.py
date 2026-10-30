@@ -14,6 +14,7 @@ the wall with the planner, stuck against it without.
 
 import json
 import math
+import threading
 import time
 from types import SimpleNamespace
 
@@ -68,9 +69,11 @@ def wall_clearance(pts, wall=WALL):
     return np.hypot(dx, dy)
 
 
-def sees(cm, a, b, clear=pgo.LOS_CLEAR_M):
-    """The line from a to b keeps `clear` off every wall, bar its first
-    LOS_SKIP_M: checked here every centimetre off the distance field."""
+def sees(cm, a, b, clear=None):
+    """The line from a to b keeps `clear` (the plan's own clearance, its
+    cost map's inscribed) off every wall, bar its first LOS_SKIP_M: checked
+    here every centimetre off the distance field."""
+    clear = cm.inscribed if clear is None else clear
     n = 400
     t = np.linspace(0.0, 1.0, n)
     x = a[0] + t * (b[0] - a[0])
@@ -162,6 +165,42 @@ def test_a_doorway_narrower_than_the_truck_is_not_a_way_through():
     assert np.abs(pts[:, 1]).max() < 0.3, "a 0.7 m house door: through it"
 
 
+def test_the_path_keeps_wide_of_a_corner_and_off_a_wall_it_runs_along():
+    # Round the corner of a box in an open room, where the truck hooked a
+    # wheel: the plan swings wide of it (0.28 m off it on the old 0.196 m
+    # hard clearance and 0.6 m band).
+    box = (1.0, -3.0, 2.0, 1.0)
+    pts, why, cm = pgo.find_path(world([box]), (0.0, 0.0), (3.0, 2.0))
+    assert why == "" and cm.inscribed == pytest.approx(tk.HALF_WIDTH_M + pgo.WIDE_MARGIN_M)
+    assert wall_clearance(pts[1:-1], box).min() >= 0.5, "wide of the corner"
+    # Along a wall, start and goal 0.4 m off it: out into the soft band on
+    # the way (0.6 m on the old band), not hugging the wall.
+    wall = (-2.0, -3.0, 6.0, -0.4)
+    pts, _, _ = pgo.find_path(world([wall]), (0.0, 0.0), (4.0, 0.0))
+    assert np.median(wall_clearance(pts[1:-1], wall)) >= 0.8, "off the wall it runs along"
+    # With the old clearance and band, the corner is shaved: the wide is
+    # what keeps the truck off it.
+    pts, _, _ = pgo.find_path(world([box]), (0.0, 0.0), (3.0, 2.0),
+                              margins=(pgo.NARROW_MARGIN_M,), soft_m=0.6, cost_weight=2.0)
+    assert wall_clearance(pts[1:-1], box).min() < 0.5
+
+
+def test_a_gap_too_tight_for_the_wide_clearance_is_still_planned_through_at_the_narrow():
+    def door(gap):
+        h = gap / 2.0
+        return [(1.95, -3.0, 2.05, -h), (1.95, h, 2.05, 3.0)]
+    # 0.7 m: wide. 0.4 m: no way at the wide, so made again at the truck's
+    # own fit and through it; /path/status says which.
+    for gap, clear in ((0.7, tk.HALF_WIDTH_M + pgo.WIDE_MARGIN_M),
+                       (0.4, tk.HALF_WIDTH_M + pgo.NARROW_MARGIN_M)):
+        pts, why, cm = pgo.find_path(world(door(gap)), (0.0, 0.0), (4.0, 0.0))
+        assert why == "" and np.abs(pts[:, 1]).max() < 0.3, f"{gap} m: through it"
+        assert cm.inscribed == pytest.approx(clear), f"{gap} m"
+    p, _ = planner(world(door(0.4)))
+    p.encode(crop_at(0.0, 0.0, 0.0), Source((4.0, 0.0, 0)))
+    assert p.status()["clear_m"] == pytest.approx(tk.HALF_WIDTH_M + pgo.NARROW_MARGIN_M)
+
+
 def test_a_goal_sealed_off_has_no_path_and_says_why():
     box = [(3.0, -1.0, 5.0, -0.9), (3.0, 0.9, 5.0, 1.0), (3.0, -1.0, 3.1, 1.0), (4.9, -1.0, 5.0, 1.0)]
     pts, why, _ = pgo.find_path(world(box), (0.0, 0.0), (4.0, 0.0))
@@ -189,17 +228,19 @@ def test_round_a_wall_the_model_is_fed_a_point_along_the_path_in_sight_not_the_g
 
 def test_the_point_is_the_farthest_one_in_sight_so_a_corner_is_not_cut():
     # An L: the path turns 90 degrees round the corner of a wall 0.6 m on.
-    p, _ = planner(world([(0.6, -3.0, 0.7, 1.0)]))
+    # The plan now swings wide enough of the corner that LOOKAHEAD_M along
+    # it is all in sight; 3 m along, the corner hides the rest.
+    p, _ = planner(world([(0.6, -3.0, 0.7, 1.0)]), lookahead_m=3.0)
     src = Source((1.5, 0.0, 0))
-    crop = crop_at(0.0, 1.6, 0.0)
+    crop = crop_at(0.0, 1.2, 0.0)
     p.encode(crop, src)
     pts = p._plan.points
     assert p.fed == "subgoal"
-    assert sees(p._plan.cm, (0.0, 1.6), p.aim), "the corner is not cut"
+    assert sees(p._plan.cm, (0.0, 1.2), p.aim), "the corner is not cut"
     # Farther along the path than every point it can see is one it cannot.
     k = int(np.argmin(np.hypot(pts[:, 0] - p.aim[0], pts[:, 1] - p.aim[1])))
-    within = pts[k + 1:][p._plan.cum[k + 1:] <= pgo.LOOKAHEAD_M]
-    assert len(within) and all(not sees(p._plan.cm, (0.0, 1.6), q) for q in within)
+    within = pts[k + 1:][p._plan.cum[k + 1:] <= p.lookahead_m]
+    assert len(within) and all(not sees(p._plan.cm, (0.0, 1.2), q) for q in within)
 
 
 def test_in_a_clear_line_and_close_the_model_is_fed_the_goal_itself_exactly():
@@ -292,20 +333,41 @@ def test_a_map_from_before_a_reseed_is_not_planned_on():
     assert p.fed == "subgoal"
 
 
+class HeldSlam(MapSlam):
+    """map() waits until let go: a plan cannot finish before the test says."""
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.entered = threading.Event()
+        self.go = threading.Event()
+
+    def map(self):
+        self.entered.set()
+        self.go.wait(10.0)
+        return self.view
+
+
 def test_the_plan_is_made_on_its_own_thread_and_update_returns_at_once():
-    p = pgo.PathPlanner(MapSlam(world([WALL])), every_s=0.05)
+    # Synchronised, not timed, so a loaded machine cannot fail it: the map
+    # is held, so update() can only have returned without the plan if it
+    # never waits on it; and the planning thread is seen inside it.
+    slam = HeldSlam(world([WALL]))
+    p = pgo.PathPlanner(slam, every_s=0.05)
     src = Source((4.0, 0.0, 0))
     try:
-        t0 = time.perf_counter()
         p.update(crop_at(0.0, 0.0), src)
-        assert time.perf_counter() - t0 < 0.005 or p.plans == 0
-        deadline = time.monotonic() + 3.0
+        assert p.plans == 0, "update() returned with the plan still being made"
+        assert slam.entered.wait(10.0), "the plan is being made, elsewhere"
+        assert p._thread is not None and p._thread.name == "path-planner"
+        slam.go.set()
+        deadline = time.monotonic() + 10.0
         while p.plans == 0 and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert p.plans >= 1 and p._thread.name == "path-planner"
+        assert p.plans >= 1
         p.encode(crop_at(0.0, 0.0), src)
         assert p.fed == "subgoal"
     finally:
+        slam.go.set()
         p.stop()
 
 

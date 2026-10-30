@@ -27,11 +27,17 @@ the truck and the goal padded by PAD_M, unknown past the edge of what has
 been seen:
 
   inflated  nav.costmap.build: a cell is out of bounds within the truck's
-            half-width plus costmap.MARGIN_M of an occupied one (0.196 m),
-            and costs more the closer it is out to costmap.INFLATION_M, so
-            a path keeps to the middle of a doorway.
-  unknown   costed, never banned (costmap.UNKNOWN_COST, 1.6x a free metre
-            at COST_WEIGHT), so a goal past the edge of the map gets a path
+            half-width plus WIDE_MARGIN_M of an occupied one (0.266 m), and
+            costs more the closer it is, out to SOFT_M, paid at SOFT_WEIGHT,
+            so a path runs down the middle of a gap and goes wide round a
+            corner instead of shaving it (the truck rubbed walls and caught
+            a wheel on corners on the old 0.196 m and 0.6 m band). With no
+            way through at that, the plan is made again at the truck's own
+            fit, NARROW_MARGIN_M (0.196 m), soft band and all, so a tight
+            doorway still routes: on the 10 cm map an opening of 0.55 m
+            and up is planned wide, down to about 0.35-0.4 m narrow.
+            /path/status says which (clear_m).
+  unknown   costed, never banned (costmap.UNKNOWN_COST), so a goal past the edge of the map gets a path
             into the unknown towards it, and the truck maps it on the way.
   search    Dijkstra out from the goal over the 8-connected free cells
             (nav.planner.grid_distances, scipy's), then down the distances
@@ -48,7 +54,8 @@ Each decision, off the newest plan and the crop the model is fed:
 
   the path point nearest the truck, then the farthest point at most
   LOOKAHEAD_M on along the path that the truck can see in a straight line
-  (no wall within LOS_CLEAR_M of the line). LOOKAHEAD_M 1.5 m is inside
+  (no wall within the plan's own clearance of the line, wide or narrow).
+  LOOKAHEAD_M 1.5 m is inside
   what the goal head was trained on: hindsight goals 3 to 15 s ahead, on
   the ticks the truck was moving in, are 0.9 m at the 25th percentile and
   1.9 m at the median (maps-pose, all drives to 2026-10-29).
@@ -75,9 +82,19 @@ PLAN_EVERY_S = 0.5
 REPLAN_MOVE_M = 0.2
 PAD_M = 3.0
 SNAP_M = 0.6
-COST_WEIGHT = 2.0
+# Off the walls. The plan is first looked for with the truck's middle kept
+# WIDE_MARGIN_M past its half-width off every wall (hard), and paying more
+# the nearer than SOFT_M it goes (the soft band, costmap.build's, at
+# SOFT_WEIGHT), so it runs down the middle of a gap and swings wide of a
+# corner; with nothing through that way, again at costmap.MARGIN_M (the
+# narrow, the truck's own fit), so a tight doorway still routes.
+WIDE_MARGIN_M = 0.13
+SOFT_M = 1.0
+SOFT_WEIGHT = 4.0
+NARROW_MARGIN_M = cmap.MARGIN_M
 # The line to the point keeps as clear of walls as the path itself must:
-# the truck drives the chord, not the path.
+# the truck drives the chord, not the path. The plan's own clearance (its
+# cost map's inscribed), this when there is none to hand.
 LOS_CLEAR_M = cmap.INSCRIBED_M
 LOS_STEP_M = 0.05
 # The first of the line this close to the truck is where it already is.
@@ -144,12 +161,26 @@ def _window(view, start, goal, pad=PAD_M):
                       (x0 + i0 * res, y0 + j0 * res), (start[0], start[1], 0.0))
 
 
-def find_path(view, start, goal, cost_weight=COST_WEIGHT, snap_m=SNAP_M):
+def find_path(view, start, goal, cost_weight=SOFT_WEIGHT, snap_m=SNAP_M,
+              margins=(WIDE_MARGIN_M, NARROW_MARGIN_M), soft_m=SOFT_M):
     """(points (n, 2) or None, why, CostMap) from map point `start` to map
     point `goal` on a runner.MapView. The points run from start itself to
-    goal itself through the centres of the cells between."""
+    goal itself through the centres of the cells between. Tried at each of
+    `margins` in turn (the hard clearance off the walls past the truck's
+    half-width), the first with a path kept; the CostMap's `inscribed` says
+    which. With none, the last one's why."""
+    win = _window(view, start, goal)
+    out = None
+    for margin in margins:
+        out = _find_at(win, start, goal, margin, soft_m, cost_weight, snap_m)
+        if out[0] is not None:
+            return out
+    return out
+
+
+def _find_at(win, start, goal, margin, soft_m, cost_weight, snap_m):
     from crawler.nav import planner as pl
-    cm = cmap.build(_window(view, start, goal))
+    cm = cmap.build(win, margin=margin, inflation=soft_m)
     g = pl.grid_distances(cm, [goal[:2]], coarsen=1, cost_weight=cost_weight,
                           snap_m=snap_m)
     if not np.isfinite(g.dist).any():
@@ -185,9 +216,12 @@ def find_path(view, start, goal, cost_weight=COST_WEIGHT, snap_m=SNAP_M):
     return pts, "", cm
 
 
-def line_clear(cm, a, b, clear_m=LOS_CLEAR_M, step=LOS_STEP_M, skip_m=LOS_SKIP_M):
+def line_clear(cm, a, b, clear_m=None, step=LOS_STEP_M, skip_m=LOS_SKIP_M):
     """Whether the straight line from map point a to b keeps clear_m from
-    every wall, bar its first skip_m."""
+    every wall, bar its first skip_m. clear_m None: the cost map's own
+    inscribed, the clearance its plan was found at."""
+    if clear_m is None:
+        clear_m = float(getattr(cm, "inscribed", LOS_CLEAR_M))
     length = math.hypot(b[0] - a[0], b[1] - a[1])
     if length <= skip_m:
         return True
@@ -456,7 +490,8 @@ class PathPlanner:
                 "plan_ms_mean": self.ms_total / n, "plan_ms_max": float(self.ms_max),
                 "plan_cpu_ms_mean": self.cpu_total / n,
                 "plans": int(self.plans), "failed": int(self.failed),
-                "lookahead_m": self.lookahead_m}
+                "lookahead_m": self.lookahead_m,
+                "clear_m": float(plan.cm.inscribed) if have else -1.0}
 
     def marker(self):
         """/path's payload: the path from the truck on, and the point fed.

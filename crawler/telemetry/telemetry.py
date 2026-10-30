@@ -643,13 +643,15 @@ JSON_SCHEMAS = {
     # plan_why why the newest has none; length_m along it (-1 with none);
     # age_s of the newest; plan_ms and plan_cpu_ms its wall and thread CPU
     # time, with the mean and max over the run; plans made and failed;
-    # lookahead_m, how far along the path the point is.
+    # lookahead_m, how far along the path the point is; clear_m the
+    # truck-middle-to-wall clearance the plan was found at (0.266 wide,
+    # 0.196 narrow through a tight gap; -1 with none).
     "path_status": _schema("crawler.PathStatus", {
         "fed": _STR, "why": _STR, "aim_x": _NUM, "aim_y": _NUM, "path": _BOOL,
         "plan_why": _STR, "length_m": _NUM, "age_s": _NUM, "plan_ms": _NUM,
         "plan_cpu_ms": _NUM, "plan_ms_mean": _NUM, "plan_ms_max": _NUM,
         "plan_cpu_ms_mean": _NUM, "plans": _INT, "failed": _INT,
-        "lookahead_m": _NUM,
+        "lookahead_m": _NUM, "clear_m": _NUM,
     }),
     # Following a person, with --goal and --pantilt: follow.PersonGoal.
     # follow_status(). active the Follow switch; state off / waiting (on,
