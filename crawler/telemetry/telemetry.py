@@ -150,6 +150,10 @@ INTERVALS = {
     # marker on the map once a second.
     "goal_status": 0.5,
     "goal_marker": 1.0,
+    # With --goal (autopilot/patrol.Patrol): the patrol, twice a second, and
+    # its waypoints on the map once a second.
+    "patrol_status": 0.5,
+    "patrol_marker": 1.0,
 }
 
 # What the map channels (/map, /slam/path, /voxel/points, /voxel/low) may
@@ -589,6 +593,25 @@ JSON_SCHEMAS = {
         "arrive_m": _NUM, "clicks": _INT, "refused": _INT,
         "approx": _BOOL, "approx_m": _NUM,
     }),
+    # The patrol, with --goal: patrol.Patrol.patrol_status(). use is "goal"
+    # (a click is the goal) or "patrol"; state empty / paused / driving /
+    # dwell / finished / tracing (or goal); mode once / loop / patrol;
+    # index the current waypoint from 0 and number from 1 (0 with none),
+    # count of them, laps done, skipped so far. x, y the current one on the
+    # map the truck is on (frame_now), on_map whether it is placed there,
+    # distance_m from the truck (-1 with none), approx and approx_m as for
+    # the goal. restored: the list came back from before a restart;
+    # pending: a saved list is waiting for the map to be checked.
+    # truck_x, truck_y, truck_yaw_deg: the truck's map pose off the crop the
+    # distance is from, so a recording has the waypoint and the pose in one
+    # message on one map frame.
+    "patrol_status": _schema("crawler.PatrolStatus", {
+        "use": _STR, "state": _STR, "mode": _STR, "running": _BOOL, "tracing": _BOOL,
+        "index": _INT, "number": _INT, "count": _INT, "laps": _INT, "skipped": _INT,
+        "x": _NUM, "y": _NUM, "frame_now": _INT, "on_map": _BOOL, "distance_m": _NUM,
+        "approx": _BOOL, "approx_m": _NUM, "restored": _BOOL, "pending": _BOOL,
+        "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
+    }),
 }
 
 # The image channels, which do get a well-known schema: foxglove.CompressedImage,
@@ -638,6 +661,7 @@ JSON_TOPICS = {
     "slam_status": "/slam/status",
     "nav_status": "/nav/status",
     "goal_status": "/goal/status",
+    "patrol_status": "/patrol/status",
 }
 
 # Raw depth: the uint16 millimetres exactly as the driver scans them, as a
@@ -699,6 +723,9 @@ NAV_CHANNELS = {
     # The clicked goal (--goal) as a disc in "map", nav_view.path_scene with
     # the goal only; an empty payload clears it.
     "goal_marker": "/goal/marker",
+    # The patrol's waypoints (--goal), patrol_view.scene: numbered, joined in
+    # order, the current one lit; an empty list clears them.
+    "patrol_marker": "/patrol/marker",
 }
 
 ALL_KEYS = (tuple(JSON_TOPICS) + tuple(IMAGE_CHANNELS)
@@ -1251,6 +1278,9 @@ class Telemetry:
         if key == "voxel_points":
             from crawler.telemetry import voxel_view
             return voxel_view.points_message(payload, log_time)
+        if key == "patrol_marker":
+            from crawler.telemetry import patrol_view
+            return patrol_view.scene(payload, log_time)
         if key in ("nav_path", "goal_marker"):
             from crawler.telemetry import nav_view
             return nav_view.path_scene(payload, log_time)

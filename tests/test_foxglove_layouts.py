@@ -23,8 +23,9 @@ PUBLISHED = (set(tm.JSON_TOPICS.values()) | set(tm.IMAGE_CHANNELS.values())
              | set(tm.SLAM_CHANNELS.values()) | set(tm.VOXEL_CHANNELS.values())
              | set(tm.NAV_CHANNELS.values()))
 
-# The one topic Foxglove publishes to the car: a goal from the 3D panel's
-# pose tool, which nav/click.py listens for.
+# A goal from the 3D panel's pose tool, which nav/click.py listens for. The
+# other topic Foxglove publishes to the car is /patrol/cmd, the Publish panel
+# buttons (test_patrol.py checks those).
 GOAL_TOPIC = "/move_base_simple/goal"
 
 

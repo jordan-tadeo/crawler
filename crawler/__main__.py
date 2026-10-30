@@ -63,6 +63,7 @@ import time
 from crawler.hardware import camera
 from crawler.autopilot import driver as dv
 from crawler.autopilot import goal
+from crawler.autopilot import patrol
 from crawler.telemetry import logger as lg
 
 MANUAL = "manual"
@@ -100,6 +101,10 @@ STEER_SPLIT_BUTTON = "LS"
 # safe direction and should never be hard. Nothing else on the pad reads Y.
 RECORD_BUTTON = "Y"
 RECORD_HOLD_SECONDS = 1.0
+
+# --goal's patrol waypoints, kept across a restart (autopilot/patrol.py says
+# when they come back). Under log/, which is untracked.
+PATROL_FILE = "log/patrol.json"
 
 # The camera view the autopilot's driver reads. The footprint tap reads the
 # same one (never takes from it) for the frame behind each auto decision.
@@ -799,7 +804,7 @@ class AutoPilot:
 
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
                  slam=None, nav=False, map_source=None, goals=None,
-                 fallback_path=None, clicks=None):
+                 fallback_path=None, clicks=None, patrol_store=None):
         self.vecon = vecon
         self.logger = logger
         self.driver = None
@@ -817,14 +822,17 @@ class AutoPilot:
         # map is lost, instead of neutral (policy.PolicyDriver, "fallback").
         self.fallback_path = fallback_path
         # Whether the car has arrived, for a learned driver's stop (goal.py).
-        # With --goal, the goal clicked in Foxglove (goal.ClickGoal): fed to
-        # a goal model, and the arrival hold. Else a flag nothing sets.
-        # --goal's click listener (nav/click.ClickGoals), drained into the
-        # goal every pass in every mode by goal_step(): a click before auto
-        # is the goal auto drives to.
+        # With --goal, the goal clicked in Foxglove, or the current waypoint
+        # of a patrol (patrol.Patrol, which keeps the single goal.ClickGoal
+        # too): fed to a goal model, and the arrival hold. Else a flag
+        # nothing sets. --goal's click listener (nav/click.ClickGoals),
+        # drained into it every pass in every mode by goal_step(): a click
+        # or a patrol command before auto is what auto drives to.
+        # patrol_store (a patrol.Store) keeps the waypoints across a restart.
         self.clicks = clicks
-        self.goal = (goal.ClickGoal(say=logger.log) if clicks is not None
-                     else goal.Goal())
+        self.goal = (patrol.Patrol(say=logger.log, store=patrol_store,
+                                   map_view=getattr(slam, "map", None))
+                     if clicks is not None else goal.Goal())
         # The roof lidar's reader with --lidar, else None: handed to the
         # driver for its rear stop, which only ever asks it latest().
         self.lidar = lidar
@@ -855,6 +863,8 @@ class AutoPilot:
         or nothing, which clears the disc. A goal carried across a reseed
         (goal.ClickGoal) says approx_m, how far off it may be, and is drawn
         as wide as that."""
+        if getattr(self.goal, "use", "goal") == "patrol":
+            return {}           # the patrol's own markers (/patrol/marker)
         st = self.goal.status()
         if st["goal_set"] and st["frame"] == st["frame_now"]:
             if st.get("approx"):
@@ -1574,6 +1584,12 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     tele.offer("goal_status", autopilot.goal.status(), now)
                 if tele.wants("goal_marker", now):
                     tele.offer("goal_marker", autopilot.goal_marker(), now)
+                # The patrol: where it is in the list, and the list on the map.
+                if hasattr(autopilot.goal, "patrol_status"):
+                    if tele.wants("patrol_status", now):
+                        tele.offer("patrol_status", autopilot.goal.patrol_status(), now)
+                    if tele.wants("patrol_marker", now):
+                        tele.offer("patrol_marker", autopilot.goal.marker(), now)
 
             if tele.wants("diagnostics", now):
                 elapsed = now - window_started
@@ -2073,13 +2089,16 @@ def main(argv=None):
                     "to go on, so every one is refused")
         else:
             log.log("info", "Goal", "Taking goals from Foxglove's Publish pose "
-                    "tool on /move_base_simple/goal, in the map frame")
+                    "tool on /move_base_simple/goal, in the map frame, and patrol "
+                    "commands on /patrol/cmd")
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
                           fallback_path=args.fallback_policy,
                           lidar=lidar, slam=slam, nav=args.nav,
                           map_source=nav_map_source(args, slam, lidar, voxels, log),
                           goals=goals if args.nav else None,
-                          clicks=goals if args.goal else None)
+                          clicks=goals if args.goal else None,
+                          patrol_store=(patrol.Store(lg.log_path(PATROL_FILE))
+                                        if args.goal else None))
 
     # Who gets the device opened at startup, and who waits for it:
     #

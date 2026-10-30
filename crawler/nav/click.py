@@ -30,8 +30,16 @@ other frame is refused, never guessed at.
 
 The orientation is kept (yaw) but the navigator only drives to the position;
 a goal heading is an extra the planner can take later.
+
+Patrol commands. With --goal, Foxglove's Publish panel sends a JSON object
+on PATROL_TOPIC, one button a command ({"cmd": "start"} and so on, see
+autopilot/patrol.py). Any schema name, JSON only, and it must be an object
+with a string "cmd". Clicks and commands go into one queue in the order they
+came (take_events), because "edit" then three clicks is three waypoints and
+three clicks then "goal" is not.
 """
 
+import collections
 import json
 import math
 import threading
@@ -45,6 +53,9 @@ POSE_SCHEMAS = ("foxglove.PoseInFrame",
                 "geometry_msgs/PoseStamped", "geometry_msgs/msg/PoseStamped")
 POINT_SCHEMAS = ("geometry_msgs/PointStamped", "geometry_msgs/msg/PointStamped")
 ENCODING = "json"
+PATROL_TOPIC = "/patrol/cmd"
+# Events held for a reader that is not draining them (--nav only take()s).
+EVENTS_KEPT = 256
 
 
 class ClickGoal(NamedTuple):
@@ -107,6 +118,17 @@ def parse(schema_name, data, topic="", now=None) -> Optional[ClickGoal]:
                      time.monotonic() if now is None else float(now))
 
 
+def parse_command(data):
+    """A patrol command dict off one JSON message, or None if it is not one."""
+    try:
+        msg = json.loads(bytes(data).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(msg, dict) or not isinstance(msg.get("cmd"), str):
+        return None
+    return msg
+
+
 def to_map(goal, pose):
     """(x, y, yaw) of a ClickGoal in the map frame, given the truck's map
     pose (x, y, yaw); None for a frame it cannot place."""
@@ -139,6 +161,8 @@ class ClickGoals:
         self._lock = threading.Lock()
         self._channels = {}     # (client id, channel id) -> (topic, schema, encoding)
         self._goal = None
+        # ("goal", ClickGoal) and ("cmd", dict), oldest first.
+        self._events = collections.deque(maxlen=EVENTS_KEPT)
         self.received = 0
         self.rejected = 0
 
@@ -177,6 +201,15 @@ class ClickGoals:
             if info is None:
                 return
             topic, schema, encoding = info
+            if topic == PATROL_TOPIC:
+                command = parse_command(data) if encoding == ENCODING else None
+                with self._lock:
+                    if command is None:
+                        self.rejected += 1
+                    else:
+                        self.received += 1
+                        self._events.append(("cmd", command))
+                return
             if schema not in POSE_SCHEMAS + POINT_SCHEMAS:
                 return
             goal = parse(schema, data, topic) if encoding == ENCODING else None
@@ -186,6 +219,7 @@ class ClickGoals:
                 else:
                     self.received += 1
                     self._goal = goal
+                    self._events.append(("goal", goal))
         except Exception:
             pass
 
@@ -194,6 +228,14 @@ class ClickGoals:
         with self._lock:
             goal, self._goal = self._goal, None
         return goal
+
+    def take_events(self):
+        """Every click and patrol command since the last take_events(), in
+        the order they came."""
+        with self._lock:
+            out = list(self._events)
+            self._events.clear()
+        return out
 
     def server_options(self):
         """The start_server() arguments that let Foxglove publish to it."""

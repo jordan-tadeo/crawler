@@ -183,6 +183,22 @@ once each, then switch between them from the Layouts menu.
   taken in any mode and kept until the next one; a goal model drives to it
   whenever auto drives, and within 0.25 m auto holds neutral until I click
   somewhere else. The lidar panel follows the truck, front up.
+
+  Patrols, also `--goal`. The buttons under the Goal and Patrol panels
+  publish on `/patrol/cmd`. **Edit patrol**, then every Publish pose click is
+  the next waypoint, numbered on the map in blue and joined in order;
+  **Undo** drops the last, **Clear** all of them. **Trace** on, drive the
+  route by hand, Trace off, and it has dropped a waypoint every metre.
+  **Mode** goes once (stop at the last), loop (laps) and patrol (there and
+  back) in turn, and **Start** / **Pause** drive it. The model drives to the
+  amber one through the same goal input as a click, and the next one is the
+  goal as soon as the truck is within 0.5 m. A waypoint it gets no closer to
+  for 20 s, or does not reach in 120 s, is skipped with a journal line.
+  **Single goal** goes back to one click being the goal, the list kept. The
+  list is saved to `log/patrol.json`, and after a restart it only comes back
+  if the new map's walls line up with the old one's: the map is not saved,
+  so that means the truck booted where it did last time. Otherwise it is
+  cleared and the journal says so. `autopilot/patrol.py` has the rules.
 - `foxglove-telemetry.json`: commands, ESC, pad axes, IMU, loop health, SLAM
   fit and cost, the mode and SLAM state strips, and `/footprint` and
   `/diagnostics` raw.

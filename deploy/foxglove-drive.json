@@ -106,6 +106,9 @@
           "colorMode": "colormap",
           "colorField": "z",
           "colorMap": "turbo"
+        },
+        "/patrol/marker": {
+          "visible": true
         }
       },
       "layers": {
@@ -130,7 +133,7 @@
           "order": 1
         }
       },
-      "foxglovePanelTitle": "SLAM map, the truck outline is the car; Publish pose (toolbar) on the map sets the goal, the green disc (/map, /slam/path, scan in orange; voxels in the topic list)",
+      "foxglovePanelTitle": "SLAM map, the truck outline is the car; Publish pose (toolbar) on the map sets the goal, the green disc, or in patrol edit the next waypoint, the numbered blue discs (/map, /slam/path, scan in orange; voxels in the topic list)",
       "publish": {
         "type": "pose",
         "poseTopic": "/move_base_simple/goal",
@@ -227,6 +230,94 @@
       "showFullMessageForDiff": false,
       "topicPath": "/goal/status",
       "foxglovePanelTitle": "Goal"
+    },
+    "RawMessages!patrol": {
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "topicPath": "/patrol/status",
+      "foxglovePanelTitle": "Patrol"
+    },
+    "Publish!patrol_edit": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Edit patrol",
+      "buttonTooltip": "Every pose click from now on is the next waypoint",
+      "buttonColor": "#2f6fd6",
+      "advancedView": false,
+      "value": "{\"cmd\": \"edit\"}",
+      "foxglovePanelTitle": "Edit patrol"
+    },
+    "Publish!patrol_goal": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Single goal",
+      "buttonTooltip": "A pose click is the one goal again; the waypoints are kept",
+      "buttonColor": "#6b6b6b",
+      "advancedView": false,
+      "value": "{\"cmd\": \"goal\"}",
+      "foxglovePanelTitle": "Single goal"
+    },
+    "Publish!patrol_start": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Start",
+      "buttonTooltip": "Drive the waypoints in order",
+      "buttonColor": "#00a871",
+      "advancedView": false,
+      "value": "{\"cmd\": \"start\"}",
+      "foxglovePanelTitle": "Start"
+    },
+    "Publish!patrol_pause": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Pause",
+      "buttonTooltip": "Hold neutral, keep the place in the list",
+      "buttonColor": "#d68b00",
+      "advancedView": false,
+      "value": "{\"cmd\": \"pause\"}",
+      "foxglovePanelTitle": "Pause"
+    },
+    "Publish!patrol_undo": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Undo",
+      "buttonTooltip": "Drop the last waypoint",
+      "buttonColor": "#6b6b6b",
+      "advancedView": false,
+      "value": "{\"cmd\": \"undo\"}",
+      "foxglovePanelTitle": "Undo"
+    },
+    "Publish!patrol_clear": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Clear",
+      "buttonTooltip": "Drop every waypoint and pause",
+      "buttonColor": "#c43c3c",
+      "advancedView": false,
+      "value": "{\"cmd\": \"clear\"}",
+      "foxglovePanelTitle": "Clear"
+    },
+    "Publish!patrol_mode": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Mode",
+      "buttonTooltip": "once, loop, patrol, round in turn",
+      "buttonColor": "#2f6fd6",
+      "advancedView": false,
+      "value": "{\"cmd\": \"mode\"}",
+      "foxglovePanelTitle": "Mode"
+    },
+    "Publish!patrol_trace": {
+      "topicName": "/patrol/cmd",
+      "datatype": "crawler.PatrolCommand",
+      "buttonText": "Trace",
+      "buttonTooltip": "On, then off: a waypoint every metre I drive",
+      "buttonColor": "#2f6fd6",
+      "advancedView": false,
+      "value": "{\"cmd\": \"trace\"}",
+      "foxglovePanelTitle": "Trace"
     }
   },
   "layout": {
@@ -248,8 +339,53 @@
       "second": {
         "direction": "column",
         "first": "3D!lidar",
-        "second": "RawMessages!goal",
-        "splitPercentage": 70
+        "second": {
+          "direction": "column",
+          "first": {
+            "direction": "row",
+            "first": "RawMessages!goal",
+            "second": "RawMessages!patrol",
+            "splitPercentage": 50
+          },
+          "second": {
+            "direction": "column",
+            "first": {
+              "direction": "row",
+              "first": {
+                "direction": "row",
+                "first": "Publish!patrol_edit",
+                "second": "Publish!patrol_goal",
+                "splitPercentage": 50.0
+              },
+              "second": {
+                "direction": "row",
+                "first": "Publish!patrol_start",
+                "second": "Publish!patrol_pause",
+                "splitPercentage": 50.0
+              },
+              "splitPercentage": 50.0
+            },
+            "second": {
+              "direction": "row",
+              "first": {
+                "direction": "row",
+                "first": "Publish!patrol_undo",
+                "second": "Publish!patrol_clear",
+                "splitPercentage": 50.0
+              },
+              "second": {
+                "direction": "row",
+                "first": "Publish!patrol_mode",
+                "second": "Publish!patrol_trace",
+                "splitPercentage": 50.0
+              },
+              "splitPercentage": 50.0
+            },
+            "splitPercentage": 50
+          },
+          "splitPercentage": 60
+        },
+        "splitPercentage": 55
       },
       "splitPercentage": 62
     },

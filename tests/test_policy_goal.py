@@ -409,7 +409,8 @@ def test_the_goal_flag_parses_and_will_not_go_with_nav():
 def test_a_click_is_taken_in_manual_and_is_the_goal_auto_drives_to():
     clicks = Clicks(click(2.0, 0.0))
     mn, log, slam, pilot = _pilot(clicks)
-    assert isinstance(pilot.goal, gl.ClickGoal)
+    # The patrol, holding the single clicked goal until a patrol is edited.
+    assert isinstance(pilot.goal.single, gl.ClickGoal) and pilot.goal.use == "goal"
     pilot.goal_step()            # manual: auto never started
     assert pilot.goal.goal == (2.0, 0.0, 0)
     assert pilot.goal_marker() == {"goal": (2.0, 0.0)}
