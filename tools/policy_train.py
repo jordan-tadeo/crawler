@@ -1209,10 +1209,12 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam",
           lowband=None, tip_mask=None, tip_weight=0.0, label_off=None, contrast_weight=0.0,
           goal_path_m=None, contrast_steer_only=False, class_weight_power=1.0,
-          gear_weights=None):
+          gear_weights=None, steer_tick_w=None):
     """tip_mask: the rows the tip penalty goes on (tip_rows), trained beside
     train_mask with no label of their own. label_off: ticks that are never a
-    label, at any chunk offset either (tip_marks' tipped and run-up)."""
+    label, at any chunk offset either (tip_marks' tipped and run-up).
+    steer_tick_w: a per-tick factor on the steer loss alone, every chunk
+    offset at its own tick's (--keyframe-steer-only)."""
     import torch
     from torch import nn
 
@@ -1257,6 +1259,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     gears_all = steer_gears(data, stop_gear_s) if per_gear else None
     gear_of = torch.from_numpy(gears_all[idx]) if per_gear else None
     w_all = torch.from_numpy(tick_weights(data, idx, good_weight, takeover_weight))
+    w_steer = (w_all * torch.from_numpy(np.asarray(steer_tick_w, np.float32)[idx])
+               if steer_tick_w is not None else w_all)
     w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
     steer_all, throttle_all = label_masks(data, label_mode)
     if label_off is not None:
@@ -1295,6 +1299,8 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
         c_sok = torch.from_numpy((fut >= 0) & steer_all[fut0] & ~bad[fut0])
         c_w = torch.from_numpy(tick_weights(data, fut0.ravel(), good_weight, takeover_weight)
                                .reshape(fut0.shape))
+        c_ws = (c_w * torch.from_numpy(np.asarray(steer_tick_w, np.float32)[fut0])
+                if steer_tick_w is not None else c_w)
         # Training ticks are decision ticks outside BAD marks, so offset 0 is
         # exactly the one-step labels.
         assert bool((c_tok[:, 0] == throttle_ok).all() and (c_sok[:, 0] == steer_ok).all())
@@ -1419,7 +1425,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                                                 wc[ta[:, i], i])
                     if sa[:, i].any():
                         turn = turn + _weighted((so[sa[:, i], i] - sc[sa[:, i], i]).abs(),
-                                                wc[sa[:, i], i])
+                                                c_ws[bb][sa[:, i], i])
                 loss = loss + gear / chunk + turn / chunk
                 if moving.any():
                     loss = loss + _weighted((t_out[moving, 0] - mag[bb][moving]).abs(), wb[moving])
@@ -1439,15 +1445,16 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
                 # Which way, on every steering label; how far, only where it
                 # is a turn: a straight label says nothing about how hard.
                 d_out, g_out = out[2], out[3]
-                loss = loss + _weighted(ce_steer(d_out[sok], db[sok]), wb[sok])
+                ws = w_steer[bb]
+                loss = loss + _weighted(ce_steer(d_out[sok], db[sok]), ws[sok])
                 turn = sok & (db != straight)
                 if turn.any():
-                    loss = loss + _weighted((g_out[turn, 0] - sb[turn].abs()).abs(), wb[turn])
+                    loss = loss + _weighted((g_out[turn, 0] - sb[turn].abs()).abs(), ws[turn])
             elif sok.any() and per_gear:
                 so = torch.where(gear_of[bb] == GEAR_REVERSE, out[3][:, 0], out[2][:, 0])
-                loss = loss + _weighted((so[sok] - sb[sok]).abs(), wb[sok])
+                loss = loss + _weighted((so[sok] - sb[sok]).abs(), w_steer[bb][sok])
             elif sok.any():
-                loss = loss + _weighted((out[2][sok, 0] - sb[sok]).abs(), wb[sok])
+                loss = loss + _weighted((out[2][sok, 0] - sb[sok]).abs(), w_steer[bb][sok])
             if sok.any():
                 loss = loss + _weighted(ce_mode(m_out[sok], mode[bb][sok]), w_mode[bb][sok])
             if use_tip:
@@ -1768,6 +1775,9 @@ def main(argv=None):
                     help="with --keyframe-weight: the top P of decisions by the copycat's error")
     ap.add_argument("--keyframe-history", type=int, default=pk.HISTORY, metavar="K",
                     help="with --keyframe-weight: past decisions the copycat sees")
+    ap.add_argument("--keyframe-steer-only", action="store_true",
+                    help="with --keyframe-weight: rank by the steer's error alone and weight "
+                         "only the steer loss")
     ap.add_argument("--class-weight-power", type=float, default=1.0,
                     help="raise the gear's class weights to this power: 1 as they are "
                          "(the default), 0.5 half their log, 0 none")
@@ -1946,7 +1956,10 @@ def main(argv=None):
         print(f"intervention share {args.intervention_share:g}: takeover weight {tw:.3f}, "
               f"accepted weight {aw:.3f}")
 
-    keyframe = None
+    keyframe = steer_tick_w = None
+    if args.keyframe_steer_only and args.keyframe_weight <= 0:
+        print("--keyframe-steer-only needs --keyframe-weight")
+        return 2
     if args.keyframe_weight > 0:
         if not 0 < args.keyframe_share < 1 or args.keyframe_history < 1:
             print("--keyframe-share is between 0 and 1, --keyframe-history 1 or more")
@@ -1957,8 +1970,16 @@ def main(argv=None):
         k_steer, k_throttle = label_masks(data, args.labels)
         ape, parts = pk.action_prediction_error(data, every, k_steer, k_throttle,
                                                 k=args.keyframe_history)
-        data["keyframe_w"], keyframe = pk.keyframe_weights(ape, every, args.keyframe_weight,
-                                                           args.keyframe_share)
+        if args.keyframe_steer_only:
+            # The steer's own surprises, on the steer's loss alone: the gear
+            # keeps the weights it had, so a stop is no likelier for it.
+            ape = parts["steer"]
+        kf_w, keyframe = pk.keyframe_weights(ape, every, args.keyframe_weight,
+                                             args.keyframe_share)
+        if args.keyframe_steer_only:
+            steer_tick_w = kf_w
+        else:
+            data["keyframe_w"] = kf_w
         past = pk.history_index(data, args.keyframe_history)
         print(f"keyframes: {int(keyframe.sum())} of {int(every.sum())} decisions at "
               f"{args.keyframe_weight:g}, {pk.gear_changes(data, keyframe, past)} of them a "
@@ -1980,7 +2001,8 @@ def main(argv=None):
                tip_weight=args.tip_weight, label_off=label_off,
                contrast_weight=args.goal_contrast, goal_path_m=args.goal_path_m,
                contrast_steer_only=args.contrast_steer_only,
-               class_weight_power=args.class_weight_power, gear_weights=gear_weights)
+               class_weight_power=args.class_weight_power, gear_weights=gear_weights,
+               steer_tick_w=steer_tick_w)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -2079,9 +2101,15 @@ def main(argv=None):
         idx = np.flatnonzero(train_mask)
         base = tick_weights({k: v for k, v in data.items() if k != "keyframe_w"}, idx,
                             args.good_weight, args.takeover_weight)
-        kshare = pk.weight_share(base, data["keyframe_w"][idx], keyframe[idx])
+        if args.keyframe_steer_only:
+            # Of the steer loss's weight, over the ticks with a steer label.
+            on = label_masks(data, args.labels)[0][idx]
+            kshare = pk.weight_share(base[on], kf_w[idx][on], keyframe[idx][on])
+        else:
+            kshare = pk.weight_share(base, kf_w[idx], keyframe[idx])
         keyframe_meta = {"weight": args.keyframe_weight, "share": args.keyframe_share,
                          "history": args.keyframe_history,
+                         "steer_only": bool(args.keyframe_steer_only),
                          "train_ticks": int((train_mask & keyframe).sum()),
                          "loss_weight_share": kshare}
         print(f"keyframes: {keyframe_meta['train_ticks']} of {int(train_mask.sum())} training "
