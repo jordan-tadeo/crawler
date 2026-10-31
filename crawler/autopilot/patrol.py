@@ -92,6 +92,13 @@ automatic deletes or writes over a named track; an unplaced or unsaved
 track that is about to be replaced is kept in the library first under a
 name of its own (AUTOSAVE).
 
+Explore (autopilot/explore.py): {"cmd": "explore"} (the map page's Explore
+button) makes the goal the search's frontier, then wander, target instead of
+a waypoint, use "explore"; the list is kept, paused. It and the patrol are
+never both on: explore on pauses the patrol, and start, pause, a single goal,
+edit or trace turn explore off, holding neutral. /patrol/status, /goal/status
+and the /footprint row say use "explore", state exploring or holding.
+
 Editing from the map page (telemetry/map.html), on the map the truck is on:
 "stroke" appends a run of points drawn with a finger as one step that
 "unstroke" takes back, and makes the patrol a loop; "move" and "delete"
@@ -117,7 +124,7 @@ MODES = ("once", "loop", "patrol")
 # sends them and MAP_COMMANDS, which take points, indices or names.
 BUTTON_COMMANDS = ("edit", "goal", "start", "pause", "undo", "clear", "mode", "trace")
 MAP_COMMANDS = ("stroke", "unstroke", "move", "delete", "save", "load", "forget", "place",
-                "skip", "near")
+                "skip", "near", "explore")
 COMMANDS = BUTTON_COMMANDS + MAP_COMMANDS
 # Within this of a waypoint it is passed and the next is the goal. Wider
 # than ARRIVE_M: a waypoint on the way is somewhere to go past, not to stop
@@ -183,13 +190,14 @@ EVENTS_KEPT = 32
 # The /footprint columns the patrol fills (row_fields), as they read with
 # no patrol. tools/lap_report.py joins each decision to its lap on these.
 ROW_FIELDS = {
-    "patrol_use": "",       # goal / patrol / follow, "" with none
-    "patrol_state": "",     # state(): driving, paused, finished...
+    "patrol_use": "",       # goal / patrol / explore / follow, "" with none
+    "patrol_state": "",     # state(): driving, paused, finished... (exploring, holding)
     "patrol_track": "",     # track_id()
     "patrol_index": -1,     # the current waypoint, from 0
     "patrol_count": 0,
     "patrol_lap": -1,       # laps done
-    "patrol_stuck_s": -1.0,  # the current waypoint's seconds with no PROGRESS_M closer
+    "patrol_stuck_s": -1.0,  # the current waypoint's (explore: target's) seconds with no
+                             # PROGRESS_M closer
 }
 # A command that carries an "id" (the map page's) is answered in
 # page_state()'s acks, [id, taken, why], the newest ACKS_KEPT of them, so the
@@ -370,7 +378,13 @@ class Patrol(gl.Goal):
         self.store = store
         self.map_view = map_view
         self.clock = clock
-        self.use = "goal"
+        self.use = "goal"           # goal / patrol / explore
+        # Explore (autopilot/explore.py): on while use is "explore", its
+        # target the goal; the waypoint list is kept, paused, meanwhile.
+        # (Imported here: search.py takes the patrol's clock numbers.)
+        from crawler.autopilot import explore as ex
+        self.explore = ex.Explore(map_view=map_view, say=self._explore_say)
+        self._explore_last = None     # (distance, bearing) to its target
         self.mode = "loop"
         self.running = False
         self.finished = False
@@ -466,6 +480,17 @@ class Patrol(gl.Goal):
             except Exception:
                 pass
 
+    def _explore_say(self, level, topic, text):
+        """Explore's journal lines (it prints them itself): the journal under
+        its own topic, and the map page's toasts as the patrol's are."""
+        self.said.append((level, text))
+        self._said_n += 1
+        if self._say is not None:
+            try:
+                self._say(level, topic, text)
+            except Exception:
+                pass
+
     # ---- the goal the model is fed ---------------------------------------------------
 
     @property
@@ -473,6 +498,8 @@ class Patrol(gl.Goal):
         """(x, y, frame) the model drives to now, or None."""
         if self.use == "goal":
             return self.single.goal
+        if self.use == "explore":
+            return self.explore.target
         if not self.running or self.holding():
             return None
         place = self.current_place()
@@ -523,6 +550,9 @@ class Patrol(gl.Goal):
     def reached(self):
         if self.use == "goal":
             return self.single.reached()
+        if self.use == "explore":
+            # Nothing picked yet (no map, nowhere left): the arrival hold.
+            return self.explore.target is None
         return self.holding()
 
     def encode(self, crop):
@@ -565,6 +595,10 @@ class Patrol(gl.Goal):
         current waypoint's clock."""
         self._follow(getattr(crop, "links", ()) if crop is not None else ())
         self._place(crop)
+        if self.use == "explore":
+            # Its target's clock, on the crop's time, only here: in auto.
+            self.explore.step(crop)
+            self._measure_explore(crop)
         now = float(self.clock())
         dt = 0.0 if self._last_obs is None else min(max(now - self._last_obs, 0.0),
                                                    CLOCK_STEP_MAX_S)
@@ -622,6 +656,44 @@ class Patrol(gl.Goal):
     def command(self, msg, crop=None):
         """One {"cmd": ...}. True if it did something, False if it was
         refused (said why), None if it is not a command at all."""
+        was = self.use
+        took = self._command(msg, crop)
+        if was == "explore" and self.use != "explore":
+            # Start, pause, a single goal or an edit: explore and the patrol
+            # are never both on.
+            self._stop_explore()
+        return took
+
+    def _stop_explore(self):
+        self.explore.stop()
+        self._explore_last = None
+        self._log("info", "Explore off" + (" - the patrol has the goal" if self.running
+                                            else " - holding neutral"))
+
+    def _explore_command(self, msg, crop):
+        on = msg.get("on")
+        if on is None:
+            on = self.use != "explore"
+        if not isinstance(on, bool):
+            self._log("warning", f"Explore refused: on is {on!r}, not true or false")
+            return False
+        if not on:
+            if self.use == "explore":
+                # command() says it and stops it, as for any way off.
+                self.use, self.running = "patrol", False
+            return True
+        if self.use == "explore":
+            return True
+        if self.running:
+            self._event("pause", self.index, "explore")
+        self.use, self.running, self.tracing = "explore", False, False
+        self._dwell_until = None
+        self.explore.start(crop)
+        self._log("info", "Explore on: the edge of the map is the goal, then the far "
+                  "corners; START on the pad drives it")
+        return True
+
+    def _command(self, msg, crop=None):
         name = msg.get("cmd") if isinstance(msg, dict) else None
         if name not in COMMANDS:
             self._log("warning", f"{name!r} is not a patrol command; one of "
@@ -654,7 +726,11 @@ class Patrol(gl.Goal):
                 self._event("start", self.index, "fresh" if fresh else "resume")
             self._log("info", f"Patrol {self.mode} started at waypoint {self.index + 1} "
                       f"of {len(self.points)}")
+        elif name == "explore":
+            return self._explore_command(msg, crop)
         elif name == "pause":
+            if self.use == "explore":
+                self.use = "patrol"
             if self.running:
                 self._event("pause", self.index, "pause")
             self.running = False
@@ -837,7 +913,8 @@ class Patrol(gl.Goal):
             if len(self.points) == had:
                 return False
             self.mode, self.finished = "loop", False
-            if self.use != "patrol":
+            if self.use not in ("patrol", "explore"):
+                # Drawn while exploring: kept, paused, for a Start.
                 self.use, self.running = "patrol", False
             self._log("info", f"Drew waypoints {had + 1}-{len(self.points)}; the loop "
                       f"closes back to 1")
@@ -940,7 +1017,8 @@ class Patrol(gl.Goal):
         self.index, self.direction, self._strokes = 0, 1, []
         self._walls, self._walls_frame = None, None
         self._set_pending(data)
-        self.use = "patrol"
+        if self.use != "explore":
+            self.use = "patrol"
         self._log("info", f"Loaded '{track_name}': {len(data['points'])} waypoints, "
                   "placing it on this map")
         return True
@@ -1007,7 +1085,10 @@ class Patrol(gl.Goal):
         self._walls_frame = frame if walls else None
         self._walls_at = None
         self.name, self.dirty = data.get("name"), False
-        self.use, self.running, self.restored = "patrol", False, True
+        if self.use != "explore":
+            # A track placed while exploring waits paused; explore goes on.
+            self.use = "patrol"
+        self.running, self.restored = False, True
         self.fit_state = dict(self.fit_state, state="placed", why=how)
         self._save()
         name = f"'{self.name}'" if self.name else "The saved track"
@@ -1092,6 +1173,7 @@ class Patrol(gl.Goal):
             if L.seq <= self._seq:
                 continue
             self._seq = L.seq
+            self.explore.follow(L)
             self._carry_walls(L)
             moved = snapped = 0
             offs, errs = [], []
@@ -1145,6 +1227,9 @@ class Patrol(gl.Goal):
             self.pose = (float(crop.x), float(crop.y), float(crop.yaw))
         if self.use == "goal":
             self.single.observe(crop)
+        if self.use == "explore":
+            self.explore.step(crop, clocked=False)
+            self._measure_explore(crop)
         if self._pending is not None:
             self._fit_pending(crop)
         if not self.present:
@@ -1206,6 +1291,12 @@ class Patrol(gl.Goal):
         if self._near_moved < NEAR_MOVE_M:
             return None
         return near_miss(db[0], db[1], self._closest, self.near_pass_m, self.pass_m)
+
+    def _measure_explore(self, crop):
+        g = self.explore.target
+        self._explore_last = (pg.distance_bearing(crop, g)
+                              if (g is not None and self.present
+                                  and int(g[2]) == self.frame_now) else None)
 
     def _measure(self, crop):
         """self.last: (distance, bearing) from this crop to the current
@@ -1378,16 +1469,19 @@ class Patrol(gl.Goal):
 
     def row_fields(self):
         """ROW_FIELDS for this decision's /footprint row."""
+        stuck = self.explore.since_best() if self.use == "explore" else self._since_best
         return {"patrol_use": self.use, "patrol_state": self.state(),
                 "patrol_track": self.track_id(), "patrol_index": int(self.index),
                 "patrol_count": len(self.points), "patrol_lap": int(self.laps),
-                "patrol_stuck_s": round(float(self._since_best), 2)}
+                "patrol_stuck_s": round(float(stuck), 2)}
 
     # ---- out -------------------------------------------------------------------------
 
     def state(self):
         if self.use == "goal":
             return "goal"
+        if self.use == "explore":
+            return "exploring" if self.explore.target is not None else "holding"
         if self.tracing:
             return "tracing"
         if not self.points:
@@ -1400,7 +1494,17 @@ class Patrol(gl.Goal):
             return "dwell"
         return "driving"
 
+    def _explore_place(self):
+        """(x, y, 0.0) of explore's target on the map the truck is on, or
+        None: what current_place() is for a waypoint."""
+        g = self.explore.target
+        if g is None or self.frame_now is None or int(g[2]) != self.frame_now:
+            return None
+        return (g[0], g[1], 0.0)
+
     def approx_m(self):
+        if self.use == "explore":
+            return 0.0
         place = self.current_place()
         return float(place[2]) if place is not None else 0.0
 
@@ -1408,12 +1512,17 @@ class Patrol(gl.Goal):
         """/goal/status: the goal the model is fed, in goal.ClickGoal's schema."""
         if self.use == "goal":
             return self.single.status()
-        place = self.current_place()
-        d, b = self.last if self.last is not None else (-1.0, 0.0)
+        if self.use == "explore":
+            place = self._explore_place()
+            last = self._explore_last
+        else:
+            place, last = self.current_place(), self.last
+        d, b = last if last is not None else (-1.0, 0.0)
         have = place is not None
         x, y = (place[0], place[1]) if have else (0.0, 0.0)
         e = self.approx_m()
-        return {"goal_set": bool(self.points), "x": float(x), "y": float(y),
+        goal_set = have if self.use == "explore" else bool(self.points)
+        return {"goal_set": bool(goal_set), "x": float(x), "y": float(y),
                 "frame": int(self.frame_now) if have else -1,
                 "frame_now": -1 if self.frame_now is None else int(self.frame_now),
                 "on_map": bool(have and self.present),
@@ -1428,9 +1537,12 @@ class Patrol(gl.Goal):
         """/patrol/status."""
         tx, ty, tyaw = self.pose if self.pose is not None else (0.0, 0.0, 0.0)
         tyaw = math.degrees(tyaw)
-        place = self.current_place()
+        exploring = self.use == "explore"
+        # Exploring: the place and distance are its target's.
+        place = self._explore_place() if exploring else self.current_place()
+        last = self._explore_last if exploring else self.last
         have = place is not None
-        d = self.last[0] if (self.last is not None and have) else -1.0
+        d = last[0] if (last is not None and have) else -1.0
         x, y = (place[0], place[1]) if have else (0.0, 0.0)
         e = self.approx_m()
         return {"use": self.use, "state": self.state(), "mode": self.mode,
@@ -1440,7 +1552,8 @@ class Patrol(gl.Goal):
                 "skipped": int(self.skipped),
                 # The current waypoint's time without getting PROGRESS_M
                 # closer, and whether that skips it at NO_PROGRESS_S.
-                "stuck_s": round(float(self._since_best), 2),
+                "stuck_s": round(float(self.explore.since_best() if exploring
+                                       else self._since_best), 2),
                 "skip_stuck": bool(self.skip_stuck),
                 "passed_on_path": int(self.passed_on_path),
                 # Those passed as a near miss, and the radius (0: off).
@@ -1488,6 +1601,13 @@ class Patrol(gl.Goal):
                        "id": id(self._pending)}
         fit = dict(self.fit_state)
         fit["busy"] = bool(getattr(self.fitter, "busy", False))
+        place = self._explore_place()
+        explore = dict(self.explore.counts(), on=self.use == "explore",
+                       target=None if place is None else [round(place[0], 3),
+                                                           round(place[1], 3)],
+                       kind=self.explore.kind,
+                       distance_m=round(float(self._explore_last[0]), 2)
+                       if (self._explore_last is not None and place is not None) else -1.0)
         return {"frame": frame, "present": bool(self.present),
                 "pose": list(self.pose) if (self.pose is not None and self.present) else None,
                 "use": self.use, "state": self.state(), "mode": self.mode,
@@ -1497,5 +1617,6 @@ class Patrol(gl.Goal):
                 "stuck_s": round(float(self._since_best), 1),
                 "skip_stuck": bool(self.skip_stuck), "near_pass_m": float(self.near_pass_m),
                 "strokes": len(self._strokes), "pending": pending, "fit": fit,
+                "explore": explore,
                 "said": [list(x) for x in self.said],
                 "acks": [list(a) for a in self.acks]}

@@ -589,7 +589,8 @@ JSON_SCHEMAS = {
         # --lidar-near: front bumper to the nearest return in the path
         # ahead, mm, -1 with the switch off or no fresh scan.
         "front_lidar_clearance_mm": _NUM,
-        # With --goal, the patrol this decision (patrol.ROW_FIELDS): use,
+        # With --goal, the patrol this decision (patrol.ROW_FIELDS): use
+        # (goal / patrol / explore / follow),
         # state, the track id, the current waypoint from 0 (-1 with none),
         # how many, laps done (-1 with none), and the current one's seconds
         # without getting 0.3 m closer (-1 with none).

@@ -11,12 +11,15 @@ const BASE = "http://car.test";
 function car() {
   // The car's side: the patrol's points and acks, and what it was sent.
   const c = { points: [], acks: [], said: [], posts: [], gets: [], ready: true, pad: true,
-    apply: true, refuse: false, down: false, running: false, strokes: [], refuseUndo: false };
+    apply: true, refuse: false, down: false, running: false, strokes: [], refuseUndo: false,
+    exploring: false };
   c.state = () => c.ready ? {
     ready: true, age_s: 0.2, turn_radius_m: 0.7, tracks: [], pad: c.pad, mode: "manual",
     patrol: { frame: 0, present: true, pose: [0, 0, 0], use: "patrol", state: "editing", mode: "loop",
       running: c.running, index: 0, points: c.points.slice(), name: null, dirty: true, stuck_s: 0,
-      skip_stuck: false, strokes: c.strokes.length, pending: null, fit: {}, said: c.said.slice(), acks: c.acks.slice() },
+      skip_stuck: false, strokes: c.strokes.length, pending: null, fit: {}, said: c.said.slice(), acks: c.acks.slice(),
+      explore: { on: c.exploring, target: c.exploring ? [1.0, 0.5] : null, kind: c.exploring ? "frontier" : "",
+        distance_m: c.exploring ? 1.1 : -1, targets: 0, arrived: 0, skipped: 0, frontiers: 1 } },
   } : { ready: false, age_s: null, turn_radius_m: 0.7, tracks: [] };
   return c;
 }
@@ -42,7 +45,8 @@ async function open(b, c) {
           else { took = false; why = "Nothing to undo: every stroke is already taken back"; }
         }
         if (!took) c.said.push(["warning", why]);
-        if (body.cmd === "start") c.running = true;
+        if (body.cmd === "start") { c.running = true; c.exploring = false; }
+        if (body.cmd === "explore") { c.exploring = body.on; if (body.on) c.running = false; }
         c.acks.push([body.id, took, took ? "" : why]);
       }
       return route.fulfill({ status: 202, contentType: "application/json", body: '{"ok":true,"why":""}' });
@@ -311,6 +315,36 @@ const text = (page, id) => page.evaluate((i) => {
     const far = new Set(px.far), free = new Set(px.free);
     must(far.size >= 2, "unknown is flat: " + [...far]);
     must(free.size === 1 && !far.has([...free][0]), "free " + [...free] + " against unknown " + [...far]);
+    await ctx.close();
+  });
+
+  await check("explore_is_a_toggle_next_to_start_and_draws_its_target", async () => {
+    const c = car(), { ctx, page } = await open(b, c);
+    const sub = async () => page.evaluate(() => document.querySelector("#b_explore .sub").textContent);
+    must(await sub() === "off", "off: " + await sub());
+    await page.tap("#b_explore");
+    await page.waitForTimeout(900);
+    const on = c.posts.filter(p => p.cmd === "explore");
+    must(on.length === 1 && on[0].on === true, "sent: " + JSON.stringify(on));
+    must(/Armed\. START on the pad to drive/.test(await page.evaluate(() =>
+      document.getElementById("toast").textContent)), "not armed");
+    must(await sub() === "on", "not shown on: " + await sub());
+    // The target's ring, in its own colour, where the car says it is.
+    const hit = await page.evaluate(() => {
+      const cv = document.getElementById("cv"), g = cv.getContext("2d"), d = window.devicePixelRatio;
+      const w = cv.width / d, h = cv.height / d;
+      let n = 0;
+      for (let dx = -14; dx <= 14; dx++) for (let dy = -14; dy <= 14; dy++) {
+        const a = g.getImageData(Math.round((w / 2 + 40 + dx) * d), Math.round((h / 2 - 20 + dy) * d), 1, 1).data;
+        if (a[0] > 200 && a[1] > 130 && a[1] < 190 && a[2] < 90) n++; }
+      return n;
+    });
+    must(hit > 5, "no target ring: " + hit);
+    await page.tap("#b_explore");
+    await page.waitForTimeout(900);
+    const off = c.posts.filter(p => p.cmd === "explore");
+    must(off.length === 2 && off[1].on === false, "off sent: " + JSON.stringify(off));
+    must(await sub() === "off", "not off again: " + await sub());
     await ctx.close();
   });
 

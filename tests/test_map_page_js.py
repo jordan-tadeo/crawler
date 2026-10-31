@@ -68,6 +68,7 @@ def results(tmp_path_factory):
     "a_finger_down_never_times_out_a_stroke_the_car_took",
     "the_not_ready_banner_says_why",
     "unknown_is_drawn_apart_from_free",
+    "explore_is_a_toggle_next_to_start_and_draws_its_target",
 ])
 def test_the_map_page(results, name):
     assert results.get(name) == "ok", results.get(name)

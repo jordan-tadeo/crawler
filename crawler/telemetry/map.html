@@ -92,7 +92,8 @@ max-width:520px;max-height:80%;overflow:auto;padding:14px 14px max(14px,env(safe
 <button id="b_unstroke">Undo<span class="sub">last stroke</span></button>
 <button id="b_del" disabled>Delete<span class="sub">waypoint</span></button>
 <button id="b_menu">Track<span class="sub">save, load</span></button>
-<button id="b_run" class="go" style="grid-column:span 2">Start</button>
+<button id="b_run" class="go">Start</button>
+<button id="b_explore">Explore<span class="sub">off</span></button>
 <button id="b_skip">Skip<span class="sub">stuck: off</span></button>
 <button id="b_adj">Nudge<span class="sub">turn or shift</span></button>
 </div>
@@ -125,7 +126,7 @@ var net=null;               // why the last poll failed, or null
 var map=null;               // {img, x0, y0, res, nx, ny, codes: Uint8Array, tag}
 var view={cx:0,cy:0,s:40};  // world centre, px per metre (css px)
 var centred=false;
-var drawMode=false,sel=-1;
+var drawMode=false,sel=-1,xon=false; // xon: exploring
 var stroke=null;            // the live stroke {pts, drops, acc, drawn, dots}
 var edits=[];               // sent, not answered yet, or not taken: {id, cmd, body, state, at, why}
 var drag=null;              // {i, x, y} a waypoint being moved
@@ -145,7 +146,7 @@ var stats=window.__mapStats={draws:0,overlay:0,polls:0,mapDecodes:0,
 function toast(msg,kind){var t=$("toast");t.textContent=msg;t.className="show "+(kind||"");
   clearTimeout(toast.h);toast.h=setTimeout(function(){t.className=kind||"";},3500);}
 
-// ---- commands: sent once, kept here until the car says it took them ----------
+// ---- commands: sent once, kept here until the car says it took them ----
 function send(cmd,extra){
   var e={id:page+"-"+(++seq),cmd:cmd,body:Object.assign({cmd:cmd},extra||{}),state:"sent",at:Date.now(),why:"",tries:0};
   edits.push(e);post(e);return e;
@@ -206,7 +207,7 @@ function errBar(){
 $("e_retry").onclick=function(){edits.forEach(function(e){if(e.state==="failed")post(e);});schedule();};
 $("e_drop").onclick=function(){edits=edits.filter(function(e){return e.state!=="failed";});errBar();schedule();};
 
-// ---- view ------------------------------------------------------------------
+// ---- view ----
 var hatch=null;
 // The canvas is the map box, and the box changes height without the window
 // resizing: a banner above it (no controller, not ready, an error) comes and
@@ -232,7 +233,7 @@ function zoomAt(f,px,py){var a=toW(px,py);view.s=Math.max(4,Math.min(400,view.s*
 function T(tr,p){var c=Math.cos(tr[0]),s=Math.sin(tr[0]);
   return [c*p[0]-s*p[1]+tr[1],s*p[0]+c*p[1]+tr[2]];}
 
-// ---- the waypoints the page shows -----------------------------------------
+// ---- the waypoints the page shows ----
 function points(){return st&&st.patrol&&st.patrol.points?st.patrol.points:[];}
 function shown(){
   // [[x,y]|null]: the car's list, with every edit it has not taken yet on top.
@@ -255,7 +256,7 @@ function occupied(x,y){
   if(i<0||j<0||i>=map.nx||j>=map.ny)return false;
   return map.codes[(map.ny-1-j)*map.nx+i]===2;}
 
-// ---- the estimated drive line ---------------------------------------------
+// ---- the estimated drive line ----
 // Straight between waypoints, each corner rounded to the truck's turning
 // radius. Where the legs are too short for that circle (or the corner is a
 // hairpin) the corner is drawn with the circle that fits, in red: the truck
@@ -302,7 +303,7 @@ function strokeLine(L){
   ctx.restore();
 }
 
-// ---- drawing -----------------------------------------------------------------
+// ---- drawing ----
 // The whole picture, at most once a frame and never while a stroke is being
 // drawn: the live stroke goes on its own canvas (ov), a segment at a time.
 var queued=false;
@@ -330,6 +331,8 @@ function draw(){
     ctx.beginPath();st.path.forEach(function(q,i){var s=toS(q[0],q[1]);i?ctx.lineTo(s[0],s[1]):ctx.moveTo(s[0],s[1]);});
     ctx.stroke();ctx.restore();}
   if(st&&st.aim){var A=toS(st.aim[0],st.aim[1]);ctx.fillStyle="#16a874";ctx.beginPath();ctx.arc(A[0],A[1],5,0,7);ctx.fill();}
+  var ex=xon&&st.patrol.explore.target;
+  if(ex){var E=toS(ex[0],ex[1]);ctx.strokeStyle="#e0a030";ctx.lineWidth=3;ctx.beginPath();ctx.arc(E[0],E[1],10,0,7);ctx.stroke();}
   // The legs between waypoints, thin, and the markers, numbered.
   var vis=p.filter(function(a){return a;});
   if(vis.length>1){ctx.save();ctx.strokeStyle="rgba(232,236,242,.35)";ctx.lineWidth=1.5;ctx.beginPath();
@@ -384,7 +387,7 @@ function chips(bad){
   if(!st.ready){c.textContent="Car not ready";c.className="chip warn";}
   else if(st.patrol&&pt.running&&pt.stuck_s>=20){
     c.innerHTML="<b>stuck</b> on "+(pt.index+1)+", "+pt.stuck_s.toFixed(0)+" s";c.className="chip warn";}
-  else{c.innerHTML="<b>"+esc(pt.state||"")+"</b>"+(pt.running&&st.pad&&st.mode!=="auto"?" START on the pad to drive":"");c.className="chip";}
+  else{c.innerHTML="<b>"+esc(pt.state||"")+"</b>"+((pt.running||xon)&&st.pad&&st.mode!=="auto"?" START on the pad to drive":"");c.className="chip";}
   var n=(pt.points||[]).length;
   var name=pt.name?pt.name:"unsaved";
   t.style.display="";t.className="chip"+(bad?" bad":"");
@@ -402,7 +405,7 @@ function notReady(){
   if(!st.ready)return ["warn","Car not ready: the control loop has not sent the map any state yet. The service may be starting; if this stays, it is stuck."];
   if(st.age_s>STALE_S&&pollsSinceUp>=2)return ["warn","Car not ready: no fresh state for "+st.age_s.toFixed(0)+" s. The control loop is not answering."];
   if(!st.patrol||st.patrol.frame===null||st.patrol.frame===undefined)return ["warn","Car not ready: no SLAM map yet, so waypoints have nowhere to go."];
-  if(st.pad===false)return ["info",(st.patrol.running?"Patrol armed. ":"No controller. Drawing and editing work. ")+"Connect the controller to drive."];
+  if(st.pad===false)return ["info",(st.patrol.running?"Patrol armed. ":xon?"Explore armed. ":"No controller. Drawing and editing work. ")+"Connect the controller to drive."];
   return null;
 }
 function banner(){var r=notReady(),b=$("nr"),c=r?"banner show "+r[0]:"banner";
@@ -411,7 +414,7 @@ function banner(){var r=notReady(),b=$("nr"),c=r?"banner show "+r[0]:"banner";
   if(b.className!==c){b.className=c;if(!window.ResizeObserver)resize();}}
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
 
-// ---- touch ---------------------------------------------------------------------
+// ---- touch ----
 var ptrs={},gest=null,hold=null;
 // A finger in the drawing's px (W() by H()), not the box's: the same until
 // the box changes size, and right even in the frame before resize() runs.
@@ -515,7 +518,7 @@ function rotateAbout(da,c){ // turn adj.T by da about world point c
 function adjCentre(){var p=adj.pts.filter(function(a){return a;}).map(function(q){return T(adj.T,q);});
   if(!p.length)return toW(W()/2,H()/2);var x=0,y=0;p.forEach(function(q){x+=q[0];y+=q[1];});return [x/p.length,y/p.length];}
 
-// ---- the buttons ---------------------------------------------------------------
+// ---- the buttons ----
 $("b_zin").onclick=function(){zoomAt(1.4,W()/2,H()/2);};
 $("b_zout").onclick=function(){zoomAt(1/1.4,W()/2,H()/2);};
 $("b_ctr").onclick=function(){var p=st&&st.patrol&&st.patrol.pose;if(p){view.cx=p[0];view.cy=p[1];schedule();}};
@@ -533,13 +536,14 @@ $("b_unstroke").onclick=function(){
   if(!queued&&st&&st.patrol&&(st.patrol.strokes||0)<=undoing){toast("Nothing to undo","warn");return;}
   send("unstroke");};
 $("b_del").onclick=function(){if(sel<0)return;var i=sel;sel=-1;this.disabled=true;send("delete",{i:i});schedule();};
-// Start arms the patrol. The car drives it only in auto, which is START on
-// the pad: with no pad there is nothing to engage it with.
+// Start arms the patrol, Explore the car's own goals; each stops the other.
+// The car drives only in auto, START on the pad: no pad, nothing engages it.
+function armed(){if(st&&st.pad===false)toast("Armed. Connect the controller to drive.","warn");
+  else if(st&&st.mode!=="auto")toast("Armed. START on the pad to drive.");}
 $("b_run").onclick=function(){var running=st&&st.patrol&&st.patrol.running;
-  send(running?"pause":"start");
-  if(!running&&st&&st.pad===false)toast("Armed. Connect the controller to drive.","warn");
-  else if(!running&&st&&st.mode!=="auto")toast("Armed. START on the pad to drive.");};
+  send(running?"pause":"start");if(!running)armed();};
 $("b_adj").onclick=function(){startAdjust();};
+$("b_explore").onclick=function(){var on=!xon;send("explore",{on:on});if(on)armed();};
 // The stuck-waypoint skip: off, a waypoint with no 0.3 m gained in 20 s
 // stays the goal; on, it is skipped.
 $("b_skip").onclick=function(){var on=!(st&&st.patrol&&st.patrol.skip_stuck);
@@ -570,7 +574,7 @@ function startAdjust(){
 }
 function stopAdjust(){adj=null;document.body.classList.remove("adjusting");schedule();}
 
-// ---- the track menu ------------------------------------------------------------
+// ---- the track menu ----
 function sheet(html){$("sheetin").innerHTML=html;$("sheet").classList.add("show");}
 function closeSheet(){$("sheet").classList.remove("show");}
 $("sheet").addEventListener("click",function(e){if(e.target.id==="sheet")closeSheet();});
@@ -601,7 +605,7 @@ $("b_menu").onclick=function(){
   };});
 };
 
-// ---- polling, only while the page is on screen and no finger is down ----------
+// ---- polling, only while the page is on screen and no finger is down ----
 var lastSaid=null;
 function pollState(){
   if(document.hidden||down)return;
@@ -615,6 +619,7 @@ function pollState(){
       if(lastSaid!==null&&key!==lastSaid)toast(s[1],s[0]==="warning"?"warn":"");lastSaid=key;}
     if(!centred&&pt.pose){view.cx=pt.pose[0];view.cy=pt.pose[1];centred=true;}
     var b=$("b_run");b.textContent=pt.running?"Pause":"Start";b.className=pt.running?"hold":"go";
+    xon=!!(pt.explore&&pt.explore.on);b=$("b_explore");b.classList.toggle("on",xon);b.lastChild.textContent=xon?"on":"off";
     $("b_adj").innerHTML=pt.pending?"Place<span class=\"sub\">by hand</span>":"Nudge<span class=\"sub\">turn or shift</span>";
     var k=$("b_skip");k.classList.toggle("on",!!pt.skip_stuck);
     k.innerHTML="Skip<span class=\"sub\">stuck: "+(pt.skip_stuck?"on":"off")+"</span>";

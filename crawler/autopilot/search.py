@@ -211,11 +211,16 @@ class Search:
     """The search's current target, rotated on arrival or no progress.
 
     map_view  t -> runner.MapView or None (mapping runner's map), optional
+    topic     the journal topic its lines go under, and noun / doing the
+              words they use: follow's search by default, Explore's
+              (autopilot/explore.py) with "Explore", "Explore", "Exploring"
     """
 
-    def __init__(self, map_view=None, say=None):
+    def __init__(self, map_view=None, say=None, topic="Follow", noun="Search",
+                 doing="Searching"):
         self.map_view = map_view
         self._say = say
+        self.topic, self.noun, self.doing = topic, noun, doing
         self.target = None          # (x, y, frame) or None
         self.kind = ""              # along / frontier / wander / ""
         self.targets = 0            # picked since the search began
@@ -239,7 +244,7 @@ class Search:
         print(text)
         if self._say is not None:
             try:
-                self._say("info", "Follow", text)
+                self._say("info", self.topic, text)
             except Exception:
                 pass
 
@@ -287,9 +292,11 @@ class Search:
             return None
         return view
 
-    def step(self, crop):
+    def step(self, crop, clocked=True):
         """One pass: the target's clock, and a new target when it is done.
-        A crop without a map place does nothing."""
+        A crop without a map place does nothing. clocked False: only a
+        target picked when there is none (a pass that is not driving, so
+        the target is on the map before auto), its clock left alone."""
         if not self.active or crop is None or not getattr(crop, "present", False):
             return
         t = float(crop.t)
@@ -298,10 +305,13 @@ class Search:
             # The first frame seen: any map; a new frame: one made since.
             self._frame_since = -math.inf if self._frame is None else t
             self._frame = frame
-        dt = 0.0 if self._t is None else min(max(t - self._t, 0.0), CLOCK_STEP_MAX_S)
-        self._t = t
         if self.target is not None and self.target[2] != frame:
             self.target = None
+        if self.target is not None and not clocked:
+            return
+        if clocked:
+            dt = 0.0 if self._t is None else min(max(t - self._t, 0.0), CLOCK_STEP_MAX_S)
+            self._t = t
         if self.target is not None:
             d = math.hypot(self.target[0] - crop.x, self.target[1] - crop.y)
             self._age += dt
@@ -321,7 +331,7 @@ class Search:
                 why = f"skipped, not there in {TARGET_MAX_S:.0f} s"
             if why is None:
                 return
-            self._log(f"Search target ({self.kind}) {why}, {d:.1f} m off")
+            self._log(f"{self.noun} target ({self.kind}) {why}, {d:.1f} m off")
             self._remember(self.target)
             self.target = None
         if self._retry_t is not None and t - self._retry_t < RETRY_S:
@@ -345,7 +355,7 @@ class Search:
         self._best = math.hypot(x - crop.x, y - crop.y)
         self._since_best, self._age = 0.0, 0.0
         self._retry_t, self._idle_said = None, False
-        self._log(f"Searching: heading for a {kind} point {self._best:.1f} m off")
+        self._log(f"{self.doing}: heading for a {kind} point {self._best:.1f} m off")
 
     def _pick(self, crop, frame, t):
         view = self._view(crop)
@@ -373,4 +383,4 @@ class Search:
         self._retry_t, self.kind = t, ""
         if not self._idle_said:
             self._idle_said = True
-            self._log("Searching: nowhere to go on the map yet - holding neutral")
+            self._log(f"{self.doing}: nowhere to go on the map yet - holding neutral")
