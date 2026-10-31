@@ -107,7 +107,7 @@ def test_with_no_pad_the_patrol_takes_the_pages_commands_and_the_page_gets_its_s
     st = json.loads(page.state_json())
     assert st["ready"] is True
     assert st["pad"] is False and st["mode"] == mn.MANUAL
-    assert st["patrol"]["acks"] == [["a-1", True]]
+    assert st["patrol"]["acks"] == [["a-1", True, ""]]
     assert len(st["patrol"]["points"]) == 3
     assert pad.tries == 10, "a look for the pad every pass"
     assert out["modes"].mode == mn.MANUAL
@@ -122,7 +122,7 @@ def test_with_no_pad_start_arms_the_patrol_and_nothing_drives(monkeypatch):
     pilot = PatrolPilot(clicks, hub=FakeHub())
     out = run_padless(monkeypatch, NoPad(), 30, pilot=pilot, clicks=clicks)
     assert pilot.patrol.running is True
-    assert list(pilot.patrol.acks) == [["s-1", True]]
+    assert list(pilot.patrol.acks) == [["s-1", True, ""]]
     v = out["vecon"]
     assert pilot.resumes == 0 and pilot.steps == 0
     assert out["modes"].mode == mn.MANUAL

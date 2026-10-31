@@ -149,8 +149,9 @@ ROW_FIELDS = {
     "patrol_stuck_s": -1.0,  # the current waypoint's seconds with no PROGRESS_M closer
 }
 # A command that carries an "id" (the map page's) is answered in
-# page_state()'s acks, [id, taken], the newest ACKS_KEPT of them, so the
-# page can tell a stroke the car took from one still on its way.
+# page_state()'s acks, [id, taken, why], the newest ACKS_KEPT of them, so the
+# page can tell a stroke the car took from one still on its way. why is ""
+# when taken, else the warning the refusal said (refusal_why).
 ACKS_KEPT = 64
 
 
@@ -330,6 +331,7 @@ class Patrol(gl.Goal):
         self._fit_occ = 0
         self._fit_why = None
         self.said = collections.deque(maxlen=SAID_KEPT)
+        self._said_n = 0              # lines said ever, for refusal_why
         # The track id (track_id()): the base it was saved or started as,
         # and the edits to the list since, so an edited track's laps are
         # never counted with the one it was before.
@@ -357,6 +359,7 @@ class Patrol(gl.Goal):
     def _log(self, level, text):
         print(text)
         self.said.append((level, text))
+        self._said_n += 1
         if self._say is not None:
             try:
                 self._say(level, "Patrol", text)
@@ -445,10 +448,12 @@ class Patrol(gl.Goal):
         self._follow(links)
         for kind, what in events:
             if kind == "cmd":
+                said = self._said_n
                 took = self.command(what, crop)
                 cid = what.get("id") if isinstance(what, dict) else None
                 if isinstance(cid, str) and 0 < len(cid) <= 64:
-                    self.acks.append([cid, took is True])
+                    why = "" if took is True else self.refusal_why(what, said)
+                    self.acks.append([cid, took is True, why])
             elif self.use == "goal":
                 self.single.poll(_One(what), crop)
             else:
@@ -502,6 +507,18 @@ class Patrol(gl.Goal):
             self._advance("stuck")
             self._measure(crop)
 
+    def refusal_why(self, msg, said_before):
+        """Why a command was refused, for its ack: the newest warning it
+        said (said_before is _said_n before it ran), else its name. The page
+        shows this word for word, so a refusal never reads as just "refused"
+        or as some older, unrelated warning."""
+        k = min(self._said_n - said_before, len(self.said))
+        for level, text in reversed(list(self.said)[len(self.said) - k:]):
+            if level == "warning":
+                return text
+        name = msg.get("cmd") if isinstance(msg, dict) else None
+        return f"{str(name).capitalize()} refused"
+
     def command(self, msg, crop=None):
         """One {"cmd": ...}. True if it did something, False if it was
         refused (said why), None if it is not a command at all."""
@@ -545,6 +562,7 @@ class Patrol(gl.Goal):
             self._log("info", "Patrol paused - holding neutral")
         elif name == "undo":
             if not self.points:
+                self._log("warning", "Nothing to undo: no waypoints")
                 return False
             self._remove(len(self.points) - 1)
             self._log("info", f"Waypoint {len(self.points) + 1} undone, "
@@ -679,6 +697,8 @@ class Patrol(gl.Goal):
         """stroke, unstroke, move, delete. False if refused."""
         if name == "unstroke":
             if not self._strokes:
+                self._log("warning", "Nothing to undo: every stroke is already "
+                          "taken back")
                 return False
             n = self._strokes[-1]
             for _ in range(n):
@@ -694,6 +714,7 @@ class Patrol(gl.Goal):
         if name == "stroke":
             pts = _xy_list(msg.get("points"))
             if not pts:
+                self._log("warning", "Stroke refused: it had no points the car could read")
                 return False
             if self._pending is not None:
                 self._keep_pending("a new track was drawn before it was placed")

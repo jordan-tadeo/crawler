@@ -11,12 +11,12 @@ const BASE = "http://car.test";
 function car() {
   // The car's side: the patrol's points and acks, and what it was sent.
   const c = { points: [], acks: [], said: [], posts: [], gets: [], ready: true, pad: true,
-    apply: true, refuse: false, down: false, running: false };
+    apply: true, refuse: false, down: false, running: false, strokes: [], refuseUndo: false };
   c.state = () => c.ready ? {
     ready: true, age_s: 0.2, turn_radius_m: 0.7, tracks: [], pad: c.pad, mode: "manual",
     patrol: { frame: 0, present: true, pose: [0, 0, 0], use: "patrol", state: "editing", mode: "loop",
       running: c.running, index: 0, points: c.points.slice(), name: null, dirty: true, stuck_s: 0,
-      skip_stuck: false, strokes: 0, pending: null, fit: {}, said: c.said.slice(), acks: c.acks.slice() },
+      skip_stuck: false, strokes: c.strokes.length, pending: null, fit: {}, said: c.said.slice(), acks: c.acks.slice() },
   } : { ready: false, age_s: null, turn_radius_m: 0.7, tracks: [] };
   return c;
 }
@@ -32,10 +32,18 @@ async function open(b, c) {
     if (req.method() === "POST" && p === "/api/cmd") {
       const body = JSON.parse(req.postData()); c.posts.push(body);
       if (c.apply) {
-        if (body.cmd === "stroke" && !c.refuse) body.points.forEach(q => c.points.push(q));
-        if (c.refuse) c.said.push(["warning", "Stroke refused: no SLAM map yet"]);
+        // As the patrol answers: [id, taken, why], why the refusal's own words.
+        let took = !c.refuse, why = c.refuse ? "Stroke refused: no SLAM map yet" : "";
+        if (body.cmd === "stroke" && took) {
+          body.points.forEach(q => c.points.push(q)); c.strokes.push(body.points.length);
+        }
+        if (body.cmd === "unstroke" && took) {
+          if (c.strokes.length && !c.refuseUndo) c.points.splice(c.points.length - c.strokes.pop());
+          else { took = false; why = "Nothing to undo: every stroke is already taken back"; }
+        }
+        if (!took) c.said.push(["warning", why]);
         if (body.cmd === "start") c.running = true;
-        c.acks.push([body.id, !c.refuse]);
+        c.acks.push([body.id, took, took ? "" : why]);
       }
       return route.fulfill({ status: 202, contentType: "application/json", body: '{"ok":true,"why":""}' });
     }
@@ -52,9 +60,9 @@ async function open(b, c) {
   return { ctx, page, cdp };
 }
 
-async function drag(page, cdp, n, during) {
+async function drag(page, cdp, n, during, at) {
   const box = await page.locator("#cv").boundingBox();
-  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+  const cx = at ? at.x : box.x + box.width / 2, cy = at ? at.y : box.y + box.height / 2;
   const pts = [];
   for (let k = 0; k <= n; k++) pts.push({ x: cx - 120 + 240 * k / n, y: cy + 40 * Math.sin(k / 6) });
   await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [pts[0]] });
@@ -134,13 +142,14 @@ const text = (page, id) => page.evaluate((i) => {
     await page.waitForTimeout(6500);
     const n = c.posts[0].points.length;
     const msg = await text(page, "err");
-    must(/Car didn't take it/.test(msg) && /no answer/.test(msg), "error: " + msg);
+    must(/Car didn't take the stroke/.test(msg) && /no answer/.test(msg), "error: " + msg);
     must(await shown(page) === n, "the points went with the error");
     c.apply = true;
     await page.tap("#e_retry");
     await page.waitForTimeout(1500);
     must(c.posts.length === 2 && c.posts[1].cmd === "stroke"
       && JSON.stringify(c.posts[1].points) === JSON.stringify(c.posts[0].points), "retry sent something else");
+    must(c.posts[1].id !== c.posts[0].id, "a retry under the same id as the try the car already answered");
     must(await text(page, "err") === "", "the error stayed after it was taken");
     must(await shown(page) === n && (await edits(page)).length === 0, "after the retry");
     await ctx.close();
@@ -153,11 +162,113 @@ const text = (page, id) => page.evaluate((i) => {
     await drag(page, cdp, 40);
     await page.waitForTimeout(1500);
     const msg = await text(page, "err");
-    must(/Car didn't take it: Stroke refused: no SLAM map yet/.test(msg), "error: " + msg);
+    must(/Car didn't take the stroke of \d+ waypoints: Stroke refused: no SLAM map yet\. Retry/.test(msg), "error: " + msg);
     must(await shown(page) === c.posts[0].points.length, "points dropped on a refusal");
+    // The map comes up; Retry is a new try the car takes, not the old
+    // refusal read again off its acks.
+    c.refuse = false;
+    await page.tap("#e_retry");
+    await page.waitForTimeout(1500);
+    must(await text(page, "err") === "", "still an error after the retry was taken: " + await text(page, "err"));
+    must(await shown(page) === c.posts[0].points.length && c.points.length === c.posts[0].points.length,
+      "shown " + await shown(page) + ", the car has " + c.points.length);
+    // Refused again and discarded: gone.
+    c.refuse = true;
+    await drag(page, cdp, 40);
+    await page.waitForTimeout(1500);
+    must(/Car didn't take the stroke/.test(await text(page, "err")), "second refusal not said");
     await page.tap("#e_drop");
     await page.waitForTimeout(200);
-    must(await shown(page) === 0 && await text(page, "err") === "", "discard");
+    must(await shown(page) === c.points.length && await text(page, "err") === "", "discard");
+    await ctx.close();
+  });
+
+  await check("a_waypoint_lands_under_the_finger_after_a_banner", async () => {
+    // The owner's "20 to 100 px above my finger": the page sized its drawing
+    // at load, then a banner (no controller, here) took height off the map
+    // box and the drawing was squashed into it, so what went under the
+    // finger showed up higher, more so further down the screen.
+    const c = car(), { ctx, page, cdp } = await open(b, c);
+    await page.tap("#b_draw");
+    c.pad = false;                               // the no-controller banner comes up
+    await page.waitForTimeout(900);
+    must(/No controller/.test(await text(page, "nr")), "no banner to move the map");
+    const box = await page.locator("#cv").boundingBox(), worst = [];
+    for (const f of [0.15, 0.5, 0.9]) {
+      const at = { x: box.x + box.width * 0.3, y: box.y + box.height * f };
+      const n0 = c.posts.length;
+      await page.touchscreen.tap(at.x, at.y);
+      await page.waitForTimeout(250);
+      const q = c.posts[n0].points[0], s = await page.evaluate((q) => window.__mapStats.screen(q[0], q[1]), q);
+      worst.push(Math.hypot(s[0] - at.x, s[1] - at.y));
+      // The first point of a drawn stroke, too.
+      const m0 = c.posts.length;
+      await drag(page, cdp, 30, null, { x: box.x + box.width * 0.7, y: box.y + box.height * f });
+      await page.waitForTimeout(250);
+      const p = c.posts[m0].points[0], t = await page.evaluate((q) => window.__mapStats.screen(q[0], q[1]), p);
+      worst.push(Math.hypot(t[0] - (box.x + box.width * 0.7 - 120), t[1] - (box.y + box.height * f)));
+    }
+    must(Math.max(...worst) < 2, "px off the finger: " + worst.map(d => d.toFixed(1)).join(" "));
+    // And the drawing is the box's size: nothing stretched.
+    const fit = await page.evaluate(() => { const cv = document.getElementById("cv"), r = cv.getBoundingClientRect();
+      return [cv.width, Math.round(r.width * devicePixelRatio), cv.height, Math.round(r.height * devicePixelRatio)]; });
+    must(fit[0] === fit[1] && fit[2] === fit[3], "backing store " + fit);
+    await ctx.close();
+  });
+
+  await check("a_refused_undo_never_comes_back_for_the_next_loop", async () => {
+    // What the owner hit: an Undo with nothing left to undo was refused and
+    // kept with a Retry; the next loop drawn showed "Car didn't take it", and
+    // Retry sent that old Undo again, which took the new loop back.
+    const c = car(), { ctx, page, cdp } = await open(b, c);
+    await page.tap("#b_draw");
+    await drag(page, cdp, 40);
+    await page.waitForTimeout(1200);
+    await page.tap("#b_unstroke");
+    await page.waitForTimeout(1200);
+    must(c.points.length === 0, "the first undo was not taken");
+    const n0 = c.posts.length;
+    await page.tap("#b_unstroke");               // nothing left to undo
+    await page.waitForTimeout(600);
+    must(c.posts.length === n0, "an Undo sent with nothing to undo");
+    must(/Nothing to undo/.test(await page.evaluate(() => document.getElementById("toast").textContent)), "not said");
+    // The car refuses one anyway (its own count): said, and gone.
+    c.strokes.push(0); c.refuseUndo = true;
+    await page.waitForTimeout(700);
+    await page.tap("#b_unstroke");
+    await page.waitForTimeout(1200);
+    c.strokes.pop(); c.refuseUndo = false;
+    must(c.posts.length === n0 + 1 && c.posts[n0].cmd === "unstroke", "the refused undo not sent");
+    must(/Nothing to undo/.test(await page.evaluate(() => document.getElementById("toast").textContent)), "refusal not said");
+    must((await edits(page)).length === 0 && await text(page, "err") === "", "a refused undo was kept");
+    // The loop the owner is happy with: taken, no error, nothing resent.
+    await drag(page, cdp, 60);
+    await page.waitForTimeout(1500);
+    must(await text(page, "err") === "", "an error next to a loop the car took: " + await text(page, "err"));
+    must(c.points.length > 4 && await shown(page) === c.points.length, "the loop");
+    must(c.posts.slice(n0 + 1).every(p => p.cmd === "stroke"), "something besides the stroke went");
+    await ctx.close();
+  });
+
+  await check("a_finger_down_never_times_out_a_stroke_the_car_took", async () => {
+    // Polls stop while a finger is down, so the car's ack cannot arrive.
+    // The page gave up after 5 s of clock regardless, then kept the stroke
+    // as not taken even once the ack came: shown twice and "didn't take it".
+    const c = car(); c.apply = false;
+    const { ctx, page, cdp } = await open(b, c);
+    await page.tap("#b_draw");
+    await drag(page, cdp, 30);
+    await page.waitForTimeout(100);
+    const first = c.posts[0];
+    c.points.push(...first.points); c.strokes.push(first.points.length); c.acks.push([first.id, true, ""]);
+    const box = await page.locator("#cv").boundingBox();
+    await drag(page, cdp, 30, async () => { await page.waitForTimeout(7000); },
+      { x: box.x + box.width / 2, y: box.y + box.height * 0.8 });
+    await page.waitForTimeout(1500);
+    const e = await edits(page);
+    must(!e.some(x => x.state === "failed") && !/no answer/.test(await text(page, "err")),
+      "gave up on the first stroke: " + JSON.stringify(e));
+    must(e.length === 1 && e[0].state === "sent", "the second is waiting: " + JSON.stringify(e));
     await ctx.close();
   });
 

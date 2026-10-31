@@ -4,7 +4,9 @@ touch events: tests/js/map_page.js against a stand-in car.
 What it holds the page to: a stroke is one command, sent on the lift, with
 nothing sent, polled or redrawn whole while the finger is down; a state poll
 never takes an unanswered stroke off the screen; no answer in a few seconds,
-or a refusal, is a "car didn't take it" with the points kept and a Retry;
+or a refusal, is a "car didn't take it" with the points kept and a Retry
+(a stroke only: a refused Undo is said and dropped, never resent); a
+waypoint lands under the finger after a banner resizes the map box;
 the not-ready banner says why; unknown space is drawn apart from free.
 
 Needs node and the playwright package with its Chromium. NODE_PATH (or
@@ -61,6 +63,9 @@ def results(tmp_path_factory):
     "poll_never_clobbers_an_unanswered_stroke",
     "no_answer_is_an_error_with_retry",
     "a_refusal_says_why_and_keeps_the_points",
+    "a_waypoint_lands_under_the_finger_after_a_banner",
+    "a_refused_undo_never_comes_back_for_the_next_loop",
+    "a_finger_down_never_times_out_a_stroke_the_car_took",
     "the_not_ready_banner_says_why",
     "unknown_is_drawn_apart_from_free",
 ])

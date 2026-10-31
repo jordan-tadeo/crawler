@@ -131,11 +131,15 @@ var edits=[];               // sent, not answered yet, or not taken: {id, cmd, b
 var drag=null;              // {i, x, y} a waypoint being moved
 var adj=null;               // {kind:"pending"|"nudge", T:[yaw,x,y], pts, walls}
 var pendingWalls={id:null,walls:[]};
-var dpr=1, down=0, pollsSinceUp=9;
+var dpr=1, down=0, pollsSinceUp=9, gotAt=0;
 var page=Math.random().toString(36).slice(2,8), seq=0;
 // Counters and a read-only look at what is on screen, for the page's tests.
 var stats=window.__mapStats={draws:0,overlay:0,polls:0,mapDecodes:0,
   shown:function(){return shown();},
+  // Where a map point is on the phone's screen, in client px: the drawing's
+  // px scaled to the box the browser shows it in.
+  screen:function(x,y){var s=toS(x,y),r=cv.getBoundingClientRect();
+    return [r.left+s[0]*r.width/W(),r.top+s[1]*r.height/H()];},
   edits:function(){return edits.map(function(e){return {cmd:e.cmd,state:e.state,why:e.why};});}};
 
 function toast(msg,kind){var t=$("toast");t.textContent=msg;t.className="show "+(kind||"");
@@ -143,10 +147,13 @@ function toast(msg,kind){var t=$("toast");t.textContent=msg;t.className="show "+
 
 // ---- commands: sent once, kept here until the car says it took them ----------
 function send(cmd,extra){
-  var e={id:page+"-"+(++seq),cmd:cmd,body:Object.assign({cmd:cmd},extra||{}),state:"sent",at:Date.now(),why:""};
+  var e={id:page+"-"+(++seq),cmd:cmd,body:Object.assign({cmd:cmd},extra||{}),state:"sent",at:Date.now(),why:"",tries:0};
   edits.push(e);post(e);return e;
 }
 function post(e){
+  // A fresh id each time it goes: the car's answer to an earlier try is
+  // still in its acks, and must not be read as the answer to this one.
+  if(e.tries++)e.id=page+"-"+(++seq);
   e.state="sent";e.at=Date.now();e.why="";e.body.id=e.id;
   fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(e.body)})
     .then(function(r){return r.json().catch(function(){return {ok:false,why:"HTTP "+r.status};});})
@@ -154,26 +161,46 @@ function post(e){
     .catch(function(){fail(e,"no connection to the car");});
   errBar();
 }
-function fail(e,why){if(edits.indexOf(e)<0||e.state==="failed")return;e.state="failed";e.why=why;errBar();schedule();}
+// Only a stroke is kept on screen with a Retry when the car does not take
+// it: it is the finger's work, and sending it again is safe. Anything else
+// (Undo, Delete, a move, Start...) refused is said once and dropped. A
+// refused Undo kept with a Retry was sent again later, after the next loop
+// was drawn, and took that loop back.
+function fail(e,why){if(edits.indexOf(e)<0||e.state==="failed")return;
+  if(e.cmd!=="stroke"){edits.splice(edits.indexOf(e),1);toast(why,"warn");}
+  else{e.state="failed";e.why=why;}errBar();schedule();}
 function answer(){
-  // Each edit the car has answered (patrol.acks) is gone from here: taken,
-  // it is in the state now; not taken, it stays on screen with a Retry.
-  var acks={};((st&&st.patrol&&st.patrol.acks)||[]).forEach(function(a){acks[a[0]]=a[1];});
-  var now=Date.now(),changed=false;
+  // Each edit the car has answered (patrol.acks, [id, taken, why]) is gone
+  // from here when taken: it is in the state now. Not taken, a stroke stays
+  // on screen with a Retry. A stroke given up on for no answer that the car
+  // then does take is gone too, not shown twice.
+  var acks={};((st&&st.patrol&&st.patrol.acks)||[]).forEach(function(a){acks[a[0]]=a;});
+  var now=Date.now(),changed=false,refused=[];
   edits=edits.filter(function(e){
+    var a=acks[e.id];
+    if(a&&a[1]){changed=true;return false;}
     if(e.state!=="sent")return true;
-    if(e.id in acks){changed=true;if(acks[e.id])return false;
-      e.state="failed";e.why=lastWarning()||"refused";return true;}
-    if(now-e.at>ACK_MS){changed=true;e.state="failed";e.why="no answer in "+ACK_MS/1000+" s";}
+    if(a){changed=true;refused.push([e,refusal(e,a)]);return true;}
+    // No answer: only once the car has sent fresh state for ACK_MS since it
+    // went. While a finger is down the page does not poll at all, so the
+    // clock alone would give up on a stroke the car took long ago.
+    if(now-e.at>ACK_MS&&gotAt-e.at>ACK_MS){changed=true;refused.push([e,"no answer in "+ACK_MS/1000+" s"]);}
     return true;});
+  refused.forEach(function(r){fail(r[0],r[1]);});
   if(changed)errBar();
 }
-function lastWarning(){var s=(st&&st.patrol&&st.patrol.said)||[];
-  for(var i=s.length-1;i>=0;i--)if(s[i][0]==="warning")return s[i][1];return "";}
+function refusal(e,a){
+  // The car's own reason (a car from before acks carried one: its last warning).
+  if(a[2])return a[2];
+  var s=(st&&st.patrol&&st.patrol.said)||[];
+  for(var i=s.length-1;i>=0;i--)if(s[i][0]==="warning")return s[i][1];
+  return e.cmd.charAt(0).toUpperCase()+e.cmd.slice(1)+" refused";}
 function errBar(){
   var bad=edits.filter(function(e){return e.state==="failed";}),b=$("err");
   if(!bad.length){b.classList.remove("show");return;}
-  $("err_msg").textContent="Car didn't take it"+(bad.length>1?" ("+bad.length+" edits)":"")+": "+bad[bad.length-1].why;
+  var e=bad[bad.length-1],n=e.body.points.length;
+  $("err_msg").textContent="Car didn't take "+(bad.length>1?bad.length+" strokes":"the stroke of "+n+" waypoint"+(n>1?"s":""))
+    +": "+e.why.replace(/\.$/,"")+". Retry sends it again, Discard drops it.";
   b.classList.add("show");
 }
 $("e_retry").onclick=function(){edits.forEach(function(e){if(e.state==="failed")post(e);});schedule();};
@@ -181,11 +208,20 @@ $("e_drop").onclick=function(){edits=edits.filter(function(e){return e.state!=="
 
 // ---- view ------------------------------------------------------------------
 var hatch=null;
+// The canvas is the map box, and the box changes height without the window
+// resizing: a banner above it (no controller, not ready, an error) comes and
+// goes. With only the window's resize the drawing kept its old height
+// stretched into the new box, so a waypoint showed up to a banner's height
+// above the finger that put it there. The box is watched instead.
 function resize(){dpr=window.devicePixelRatio||1;var r=cv.getBoundingClientRect();
+  if(!r.width||!r.height)return;
+  if(cv.width===Math.round(r.width*dpr)&&cv.height===Math.round(r.height*dpr)&&hatch)return;
   cv.width=ov.width=Math.round(r.width*dpr);cv.height=ov.height=Math.round(r.height*dpr);
   var h=document.createElement("canvas");h.width=h.height=Math.round(10*dpr);var g=h.getContext("2d");
   g.fillStyle="#0a0c10";g.fillRect(0,0,h.width,h.height);g.strokeStyle="#1b2029";g.lineWidth=dpr;
   g.beginPath();g.moveTo(0,h.height);g.lineTo(h.width,0);g.stroke();hatch=ctx.createPattern(h,"repeat");
+  // A stroke being drawn lost its overlay with the resize: draw it again.
+  if(stroke){stroke.drawn=0;stroke.dots=0;overlay();}
   schedule();}
 function W(){return cv.width/dpr;}function H(){return cv.height/dpr;}
 function toS(x,y){return [(x-view.cx)*view.s+W()/2,H()/2-(y-view.cy)*view.s];}
@@ -369,14 +405,18 @@ function notReady(){
   if(st.pad===false)return ["info",(st.patrol.running?"Patrol armed. ":"No controller. Drawing and editing work. ")+"Connect the controller to drive."];
   return null;
 }
-function banner(){var r=notReady(),b=$("nr");
-  if(!r){b.className="banner";return;}
-  b.className="banner show "+r[0];$("nr_msg").textContent=r[1];}
+function banner(){var r=notReady(),b=$("nr"),c=r?"banner show "+r[0]:"banner";
+  if(r)$("nr_msg").textContent=r[1];
+  // Without a ResizeObserver, the box's new height is caught here.
+  if(b.className!==c){b.className=c;if(!window.ResizeObserver)resize();}}
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
 
 // ---- touch ---------------------------------------------------------------------
 var ptrs={},gest=null,hold=null;
-function pos(e){var r=cv.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top];}
+// A finger in the drawing's px (W() by H()), not the box's: the same until
+// the box changes size, and right even in the frame before resize() runs.
+function pos(e){var r=cv.getBoundingClientRect();
+  return [(e.clientX-r.left)*(r.width?W()/r.width:1),(e.clientY-r.top)*(r.height?H()/r.height:1)];}
 function beginStroke(px,py){var w=toW(px,py);stroke={pts:[w],drops:[w],acc:0,drawn:0,dots:0};clearOverlay();overlay();}
 function extendStroke(px,py){
   var w=toW(px,py),last=stroke.pts[stroke.pts.length-1];
@@ -482,7 +522,16 @@ $("b_ctr").onclick=function(){var p=st&&st.patrol&&st.patrol.pose;if(p){view.cx=
 $("b_draw").onclick=function(){drawMode=!drawMode;this.classList.toggle("on",drawMode);
   document.body.classList.toggle("drawing",drawMode);
   this.querySelector(".sub").textContent=drawMode?"on: drag to draw":"off: pan";};
-$("b_unstroke").onclick=function(){send("unstroke");};
+// Undo takes back the newest stroke: one the car has not taken yet is
+// dropped here (sending an Undo for it would take back the one before), and
+// with nothing to take back nothing is sent.
+$("b_unstroke").onclick=function(){
+  for(var i=edits.length-1;i>=0;i--)if(edits[i].cmd==="stroke"&&edits[i].state==="failed"){
+    edits.splice(i,1);errBar();schedule();return;}
+  var queued=edits.some(function(e){return e.cmd==="stroke";}),
+    undoing=edits.filter(function(e){return e.cmd==="unstroke";}).length;
+  if(!queued&&st&&st.patrol&&(st.patrol.strokes||0)<=undoing){toast("Nothing to undo","warn");return;}
+  send("unstroke");};
 $("b_del").onclick=function(){if(sel<0)return;var i=sel;sel=-1;this.disabled=true;send("delete",{i:i});schedule();};
 // Start arms the patrol. The car drives it only in auto, which is START on
 // the pad: with no pad there is nothing to engage it with.
@@ -559,7 +608,7 @@ function pollState(){
   stats.polls++;
   fetch("/api/state",{cache:"no-store"}).then(function(r){
     if(!r.ok)throw new Error("HTTP "+r.status);return r.json();}).then(function(j){
-    st=j;net=null;pollsSinceUp++;
+    st=j;net=null;pollsSinceUp++;gotAt=Date.now();
     var pt=j.patrol||{};
     answer();
     if(pt.said&&pt.said.length){var s=pt.said[pt.said.length-1];var key=s.join("|");
@@ -590,6 +639,7 @@ function pollMap(){
 }
 document.addEventListener("visibilitychange",function(){if(!document.hidden){pollState();pollMap();}});
 window.addEventListener("resize",resize);
+if(window.ResizeObserver)new ResizeObserver(function(){resize();}).observe($("wrap"));
 setInterval(pollState,POLL_MS);setInterval(pollMap,MAP_MS);
 setInterval(function(){if(edits.length){answer();schedule();}},1000);
 resize();pollState();pollMap();

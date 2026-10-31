@@ -395,8 +395,9 @@ def test_the_same_map_picture_again_is_a_304(mapped):
 
 
 def test_a_command_with_an_id_is_answered_in_the_patrols_acks():
-    """The page's ack: [id, taken] once the control loop has applied it,
-    taken or refused, and nothing for a command with no id (Foxglove's)."""
+    """The page's ack: [id, taken, why] once the control loop has applied
+    it, taken or refused, and nothing for a command with no id (Foxglove's).
+    why is the refusal's own warning, word for word."""
     from test_goal_reseed import crop_at
     from crawler.autopilot import patrol as pt
     goals = click.ClickGoals()
@@ -408,5 +409,32 @@ def test_a_command_with_an_id_is_answered_in_the_patrols_acks():
                  {"cmd": "pause", "id": 7}):
         assert page.command(json.dumps(body).encode())[0]
     p.poll(goals, crop_at())
-    assert p.page_state()["acks"] == [["k-1", True], ["k-2", False]]
+    assert p.page_state()["acks"] == [["k-1", True, ""],
+                                      ["k-2", False, "Move refused: no waypoint 9"]]
     assert len(p.points) == 2
+
+
+def test_a_silent_refusal_still_says_why_in_its_ack():
+    """An Undo with nothing left to undo was refused with no word said, and
+    the page fell back on whatever warning was last said (or "refused"),
+    then kept it on screen next to the next loop drawn. Each refusal now
+    names itself, and an older warning is never borrowed for it."""
+    from test_goal_reseed import crop_at
+    from crawler.autopilot import patrol as pt
+    goals = click.ClickGoals()
+    page = bt.ButtonPage(goals=goals)
+    p = pt.Patrol()
+    p._log("warning", "Something old and unrelated")
+    for body in ({"cmd": "unstroke", "id": "u-1"},
+                 {"cmd": "stroke", "points": [], "id": "u-2"},
+                 {"cmd": "stroke", "points": [[0, 0], [1, 0]], "id": "u-3"},
+                 {"cmd": "unstroke", "id": "u-4"},
+                 {"cmd": "unstroke", "id": "u-5"}):
+        assert page.command(json.dumps(body).encode())[0]
+    p.poll(goals, crop_at())
+    acks = p.page_state()["acks"]
+    assert [a[:2] for a in acks] == [["u-1", False], ["u-2", False], ["u-3", True],
+                                     ["u-4", True], ["u-5", False]]
+    assert acks[0][2] == acks[4][2] == "Nothing to undo: every stroke is already taken back"
+    assert acks[1][2].startswith("Stroke refused")
+    assert all("unrelated" not in a[2] for a in acks)
