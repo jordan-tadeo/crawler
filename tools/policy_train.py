@@ -83,6 +83,13 @@ only where the command was the model's own: not the goal's "goal reached",
 the floor's hold, the rear stop, the tilt veto or a recover. Those are the
 car's rules, and a stop they made is no stop the model chose.
 
+Keyframes (--keyframe-weight W, policy_keyframes): a copycat of my last
+--keyframe-history decisions alone predicts each one, out of fold by
+session, and the --keyframe-share of decisions it gets most wrong (its
+action prediction error) count W times on top of every other weight -- the
+moments I changed my mind, which a policy can most easily coast through
+(Wen et al. 2021, W 5 on the top 10%). 0, the default, is no keyframes.
+
 --intervention-share P sets the takeover and accepted weights off the
 training ticks' own counts, as Sirius (Liu et al., RSS 2023) does: the
 interventions P of the gear's ticks by weight, the record ticks the share
@@ -166,6 +173,7 @@ from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
 from crawler.mapping import egomap as em  # noqa: E402
 import policy_eval as pe  # noqa: E402
+import policy_keyframes as pk  # noqa: E402
 
 GOOD_WEIGHT = 2.0
 # How much an intervention tick counts against a record tick. 77 takeover
@@ -1004,11 +1012,15 @@ def intervention_share_weights(data, mask, share):
 def tick_weights(data, idx, good_weight, takeover_weight=TAKEOVER_WEIGHT):
     """Per training tick loss weight: good_weight inside a GOOD mark, times
     takeover_weight on an intervention, times the accepted-auto weight on
-    one of those (data["accepted_w"], set by --accepted-weight), else 1."""
+    one of those (data["accepted_w"], set by --accepted-weight), times the
+    keyframe weight (data["keyframe_w"], set by --keyframe-weight), else 1."""
     good = np.where(pe.marks_of(data)[idx] == pe.MARK_GOOD, float(good_weight), 1.0)
     fix = np.where(intervention_ticks(data)[idx], float(takeover_weight), 1.0)
     weak = np.asarray(data["accepted_w"])[idx] if "accepted_w" in data else 1.0
-    return (good * fix * weak).astype(np.float32)
+    w = good * fix * weak
+    if "keyframe_w" in data:
+        w = w * np.asarray(data["keyframe_w"])[idx]
+    return w.astype(np.float32)
 
 
 def loss_shares(data, train_mask, label_mode, good_weight, takeover_weight,
@@ -1846,6 +1858,13 @@ def main(argv=None):
                     help="with --accepted-weight: set the takeover and accepted weights so "
                          "interventions are P of the training ticks by weight, record ticks "
                          "their own share, accepted auto the rest (Sirius)")
+    ap.add_argument("--keyframe-weight", type=float, default=0.0, metavar="W",
+                    help="the decisions a copycat of my past actions gets most wrong count "
+                         "W times (policy_keyframes); 0, the default, none")
+    ap.add_argument("--keyframe-share", type=float, default=pk.KEYFRAME_SHARE, metavar="P",
+                    help="with --keyframe-weight: the top P of decisions by the copycat's error")
+    ap.add_argument("--keyframe-history", type=int, default=pk.HISTORY, metavar="K",
+                    help="with --keyframe-weight: past decisions the copycat sees")
     ap.add_argument("--class-weight-power", type=float, default=1.0,
                     help="raise the gear's class weights to this power: 1 as they are "
                          "(the default), 0.5 half their log, 0 none")
@@ -2027,6 +2046,24 @@ def main(argv=None):
         print(f"intervention share {args.intervention_share:g}: takeover weight {tw:.3f}, "
               f"accepted weight {aw:.3f}")
 
+    keyframe = None
+    if args.keyframe_weight > 0:
+        if not 0 < args.keyframe_share < 1 or args.keyframe_history < 1:
+            print("--keyframe-share is between 0 and 1, --keyframe-history 1 or more")
+            return 2
+        # Off every labelled decision, the folds' and the final model's
+        # alike, and the same for every --seed: the copycat's own seed is 0.
+        every = training_mask(data, np.zeros(len(data["t_ns"]), bool), labelled)
+        k_steer, k_throttle = label_masks(data, args.labels)
+        ape, parts = pk.action_prediction_error(data, every, k_steer, k_throttle,
+                                                k=args.keyframe_history)
+        data["keyframe_w"], keyframe = pk.keyframe_weights(ape, every, args.keyframe_weight,
+                                                           args.keyframe_share)
+        past = pk.history_index(data, args.keyframe_history)
+        print(f"keyframes: {int(keyframe.sum())} of {int(every.sum())} decisions at "
+              f"{args.keyframe_weight:g}, {pk.gear_changes(data, keyframe, past)} of them a "
+              f"gear change; copycat mean Brier {parts['gear'][every & k_throttle].mean():.3f}, "
+              f"steer squared error {parts['steer'][every & k_steer].mean():.4f}")
     data["x"] = encode_frames(data["frames"], args.representation, args.lowband,
                               frame_pitch(data, args.lowband))
     fit = dict(representation=args.representation, label_mode=args.labels,
@@ -2138,6 +2175,18 @@ def main(argv=None):
     shares = loss_shares(data, train_mask, args.labels, args.good_weight,
                          args.takeover_weight, weights)
     print(format_shares(shares, args.takeover_weight))
+    keyframe_meta = None
+    if keyframe is not None:
+        idx = np.flatnonzero(train_mask)
+        base = tick_weights({k: v for k, v in data.items() if k != "keyframe_w"}, idx,
+                            args.good_weight, args.takeover_weight)
+        kshare = pk.weight_share(base, data["keyframe_w"][idx], keyframe[idx])
+        keyframe_meta = {"weight": args.keyframe_weight, "share": args.keyframe_share,
+                         "history": args.keyframe_history,
+                         "train_ticks": int((train_mask & keyframe).sum()),
+                         "loss_weight_share": kshare}
+        print(f"keyframes: {keyframe_meta['train_ticks']} of {int(train_mask.sum())} training "
+              f"decisions, {kshare:.1%} of the summed tick weight")
 
     meta = {**_base_meta(meta_in, args, val_ids, val_names), **mode_meta(args.switch_weight),
             "train_decisions": int(train_mask.sum()),
@@ -2163,6 +2212,7 @@ def main(argv=None):
                               if args.accepted_weight > 0 else None),
             "class_weight_power": args.class_weight_power,
             "gear_weights": gear_weights,
+            **({"keyframes": keyframe_meta} if keyframe_meta is not None else {}),
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
                if args.lidar else {}),
