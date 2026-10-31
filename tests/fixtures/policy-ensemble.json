@@ -1,0 +1,80 @@
+{
+  "input_contract": "depth_small",
+  "representation": "profile",
+  "actions": [
+    "forward",
+    "reverse",
+    "stop"
+  ],
+  "uses_prev_action": false,
+  "steer_head": "per_gear",
+  "outputs": [
+    "logits",
+    "throttle",
+    "steer_forward",
+    "steer_reverse",
+    "mode_logits"
+  ],
+  "steer_scale": 0.7,
+  "labels": "pad",
+  "note": "untrained weights, seed 0: a test fixture for the per-gear steer head (chunk 5), not a driver",
+  "steer_modes": [
+    "unified",
+    "split"
+  ],
+  "mode_switch": {
+    "threshold": 0.7,
+    "dwell_s": 0.5,
+    "min_interval_s": 2.0
+  },
+  "mode_rear": {
+    "unified": "steering_pair(front)",
+    "split": 0.0
+  },
+  "mode_not_modelled": "split with the right stick on the rear (|rear| > split_rear_rest); the dataset drops those rows",
+  "mode_switch_weight": 10.0,
+  "chunk": 5,
+  "ensemble_m": -0.5,
+  "ensemble_link_s": 0.25,
+  "steer_gears": [
+    "forward",
+    "reverse"
+  ],
+  "steer_stop_gear_s": 2.0,
+  "train_sessions": [],
+  "seed": [
+    null,
+    null,
+    null
+  ],
+  "train_command": "tools/policy_ensemble.py tests/fixtures/policy-ensemble.onnx tests/fixtures/policy-per-gear.onnx tests/fixtures/policy-ens-m1.onnx tests/fixtures/policy-ens-m2.onnx",
+  "ensemble": {
+    "rule": "gear softmax averaged per chunk offset, as its log (+1e-9); every other output averaged",
+    "members": [
+      {
+        "onnx": "policy-per-gear.onnx",
+        "onnx_sha256": "639413f2ad89284af7a475aa9efad0bd0f71f012f6d13ad2d3e9c466868dd20f",
+        "json_sha256": "ec7b62398d2bc8387c75c107092dec2e531b18ec6ec2721c4aba0865eef18dfc",
+        "seed": null,
+        "created": null,
+        "train_command": null
+      },
+      {
+        "onnx": "policy-ens-m1.onnx",
+        "onnx_sha256": "1a3320696b23345f52da6e6fa1d35c37005bdc82dd4e8bb307cf88ef9b0075ac",
+        "json_sha256": "65e98cb9fbdcb02626ff2e0f2e3db8a49f958805a40ef87bf6caa40d2b9b375d",
+        "seed": null,
+        "created": null,
+        "train_command": null
+      },
+      {
+        "onnx": "policy-ens-m2.onnx",
+        "onnx_sha256": "36889ff826bd7d67098a87aed006053b21d998024cc6f748c046a449ecaeffb1",
+        "json_sha256": "436f1ab79f21f94631dd914294754d50c02e8a7f32752a6047273e6f4d25a1c4",
+        "seed": null,
+        "created": null,
+        "train_command": null
+      }
+    ]
+  }
+}

@@ -75,7 +75,8 @@ share of the open-floor ticks the model reverses and stops on, pooled.
 
 A model given as A.onnx+B.onnx+C.onnx is the ensemble of them: each run on
 the same inputs, the gear's probabilities averaged per chunk offset and
-every other output averaged (Ensemble).
+every other output averaged (Ensemble). tools/policy_ensemble.py merges them
+into one .onnx that does the same inside the graph, for the car to run.
 
 With --tips TIPS.npz, a dataset of drives that went over (built like any
 other, never trained on), each model is also run through those whole drives
