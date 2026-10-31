@@ -1,0 +1,170 @@
+{
+  "input_contract": "depth_small",
+  "representation": "profile",
+  "actions": [
+    "forward",
+    "reverse",
+    "stop"
+  ],
+  "uses_prev_action": false,
+  "uses_imu": true,
+  "imu_features": [
+    "gyro_y",
+    "gyro_z",
+    "accel_x",
+    "accel_y",
+    "accel_z",
+    "accel_peak",
+    "pitch_roll_peak",
+    "valid",
+    "up_x",
+    "up_y",
+    "up_z",
+    "tilt_valid"
+  ],
+  "imu_window": 5,
+  "imu_tilt": false,
+  "imu_yaw": false,
+  "imu_scales": {
+    "gyro_rad_s": 2.0,
+    "accel_m_s2": 10.0,
+    "clip": 3.0,
+    "max_age_ms": 250.0,
+    "gap_s": 0.25
+  },
+  "uses_lidar": true,
+  "lidar_layout": "bins72_5deg",
+  "lidar_size": 145,
+  "lidar_clip_mm": 4000.0,
+  "lidar_stale_s": 0.3,
+  "lidar_dropout": 0.3,
+  "lidar_features": 16,
+  "uses_map": true,
+  "map_layout": "ego64_10cm_trail60",
+  "map_size": 64,
+  "map_res_m": 0.1,
+  "map_trail_s": 60.0,
+  "map_stale_s": 0.3,
+  "map_dropout": 0.3,
+  "map_features": 32,
+  "map_act": "leaky",
+  "uses_goal": true,
+  "goal_layout": "goal4_far8",
+  "goal_size": 4,
+  "goal_far_m": 8.0,
+  "goal_near_s": 3.0,
+  "goal_far_s": 15.0,
+  "goal_no_goal_share": 0.3,
+  "goal_features": 16,
+  "steer_head": "per_gear",
+  "outputs": [
+    "logits",
+    "throttle",
+    "steer_forward",
+    "steer_reverse",
+    "mode_logits"
+  ],
+  "steer_gears": [
+    "forward",
+    "reverse"
+  ],
+  "steer_stop_gear_s": 2.0,
+  "chunk": 5,
+  "ensemble_m": 0.0,
+  "ensemble_link_s": 0.25,
+  "lowband": "lower_third",
+  "lowband_fraction": 0.3333333333333333,
+  "lowband_camera_height_mm": 165.1,
+  "lowband_fy_at_400": 441.25,
+  "steer_scale": 0.7,
+  "labels": "pad",
+  "good_weight": 2.0,
+  "takeover_weight": 1.0,
+  "epochs": 0,
+  "seed": 0,
+  "mirror": "coin",
+  "optimizer": "adamw",
+  "scorecard_sessions": [
+    "crawler-20261029-050853Z-p1258-002",
+    "crawler-20261029-192229Z-p1194-002",
+    "crawler-20261029-204034Z-p1432-003",
+    "crawler-20261029-221228Z-p1974-001",
+    "crawler-20261029-222244Z-p1974-002"
+  ],
+  "rejected_sessions": [],
+  "steer_modes": [
+    "unified",
+    "split"
+  ],
+  "mode_switch": {
+    "threshold": 0.7,
+    "dwell_s": 0.5,
+    "min_interval_s": 2.0
+  },
+  "mode_rear": {
+    "unified": "steering_pair(front)",
+    "split": 0.0
+  },
+  "mode_not_modelled": "split with the right stick on the rear (|rear| > split_rear_rest); the dataset drops those rows",
+  "mode_switch_weight": 10.0,
+  "train_decisions": 83857,
+  "class_weights": [
+    1.0,
+    1.363,
+    3.256
+  ],
+  "good_marked_train_ticks": 536,
+  "bad_marked_left_out": 626,
+  "intervention_train_ticks": 26139,
+  "intervention_loss_share": {
+    "direction": 0.5507619710969125,
+    "throttle": 0.5133972445261437,
+    "steering": 0.5071715124246693
+  },
+  "tip": null,
+  "goal_contrast": {
+    "weight": 1.0,
+    "margin": 0.2,
+    "steer_only": true
+  },
+  "goal_draw": {
+    "path_m": 1.5,
+    "near_share": 0.25
+  },
+  "goal_fed": true,
+  "accepted_auto": {
+    "weight": 0.3,
+    "after_s": 3.0,
+    "before_s": 2.0,
+    "hole_s": 1.0,
+    "train_ticks": 49600,
+    "own_only": true,
+    "intervention_share": null
+  },
+  "class_weight_power": 1.0,
+  "gear_weights": [
+    1.0,
+    1.363,
+    3.256
+  ],
+  "lidar_train_ticks": 54009,
+  "map_train_ticks": 53442,
+  "train_commit": "23565737692f6fc75f9d48ee9780e610ed3fc4cd",
+  "train_commit_dirty": false,
+  "model_name": "kblock",
+  "goal_branches": {
+    "names": [
+      "none",
+      "left",
+      "ahead",
+      "right"
+    ],
+    "edge_deg": 20.0,
+    "soft_deg": 5.0,
+    "behind_deg": 15.0,
+    "width": 32
+  },
+  "train_sessions": [],
+  "val_sessions": [],
+  "note": "untrained, for the tests: B's inputs and outputs with goal branches; steer biases planted left +2, right -2, none and ahead 0"
+}
