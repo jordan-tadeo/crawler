@@ -90,6 +90,15 @@ action prediction error) count W times on top of every other weight -- the
 moments I changed my mind, which a policy can most easily coast through
 (Wen et al. 2021, W 5 on the top 10%). 0, the default, is no keyframes.
 
+Rescue reverses (--rescue-reverse-weight W, --drive-aways DIR): my takeover
+ticks labelled reverse on open floor (policy_scorecard.open_front) inside a
+drive-away window (tools/drive_aways.py: the patrol near-missed its waypoint
+or drove away from it) count W times. They are me backing the truck round
+after the patrol's mistake, not what to do on open floor: 154 of the 203
+open-floor reverse labels the 10-31 drives added, and with them every recipe
+reversed more on the rejected drive (drive_open_rev). 1, the default, is no
+change; dropping those sessions instead cost dir_acc and onset.
+
 --intervention-share P sets the takeover and accepted weights off the
 training ticks' own counts, as Sirius (Liu et al., RSS 2023) does: the
 interventions P of the gear's ticks by weight, the record ticks the share
@@ -173,6 +182,7 @@ from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
 from crawler.mapping import egomap as em  # noqa: E402
 import policy_eval as pe  # noqa: E402
+import drive_aways as da  # noqa: E402
 import policy_keyframes as pk  # noqa: E402
 
 GOOD_WEIGHT = 2.0
@@ -964,6 +974,42 @@ def accepted_auto(data, after_s=ACCEPT_AFTER_S, before_s=ACCEPT_BEFORE_S,
     return ok
 
 
+def load_drive_aways(data, away_dir):
+    """Per tick, whether it falls in a drive-away window (tools/drive_aways.py,
+    one npz per session, by name). A session with no file has none. Returns
+    (in_window, sessions with a file)."""
+    names = data["meta"]["sessions"]
+    out = np.zeros(len(data["t_ns"]), bool)
+    found = 0
+    for sid, name in enumerate(names):
+        path = os.path.join(away_dir, name + ".npz")
+        if not os.path.exists(path):
+            continue
+        z = np.load(path)
+        if str(z["layout"]) != da.LAYOUT:
+            raise ValueError(f"{path}: layout {z['layout']}, this trainer reads {da.LAYOUT}")
+        found += 1
+        ticks = np.flatnonzero(data["session"] == sid)
+        out[ticks] = da.inside(z["t0"], z["t1"], data["t_ns"][ticks] / 1e9)
+    return out, found
+
+
+def rescue_reverses(data, in_window):
+    """The --rescue-reverse-weight ticks: my intervention decisions labelled
+    reverse on open floor (policy_scorecard.open_front, the scorecard's own
+    test) inside a drive-away window."""
+    import policy_scorecard as sc
+    rev = np.asarray(data["action"]) == pl.ACTIONS.index(pl.REVERSE)
+    opened = sc.open_front(data, np.arange(len(data["t_ns"])))
+    return (intervention_ticks(data) & np.asarray(data["decision"], bool) & rev & opened
+            & np.asarray(in_window, bool))
+
+
+def rescue_weights(rescue, weight):
+    """data["rescue_w"]: weight on the rescue ticks, 1 everywhere else."""
+    return np.where(np.asarray(rescue, bool), float(weight), 1.0).astype(np.float32)
+
+
 def load_accepted_own(data, own_dir):
     """Per tick, whether the command was the model's own (tools/auto_overrides.py,
     one npz per session, by name): the newest /footprint row at or before
@@ -1013,13 +1059,17 @@ def tick_weights(data, idx, good_weight, takeover_weight=TAKEOVER_WEIGHT):
     """Per training tick loss weight: good_weight inside a GOOD mark, times
     takeover_weight on an intervention, times the accepted-auto weight on
     one of those (data["accepted_w"], set by --accepted-weight), times the
-    keyframe weight (data["keyframe_w"], set by --keyframe-weight), else 1."""
+    keyframe weight (data["keyframe_w"], set by --keyframe-weight), times the
+    rescue-reverse weight (data["rescue_w"], set by --rescue-reverse-weight),
+    else 1."""
     good = np.where(pe.marks_of(data)[idx] == pe.MARK_GOOD, float(good_weight), 1.0)
     fix = np.where(intervention_ticks(data)[idx], float(takeover_weight), 1.0)
     weak = np.asarray(data["accepted_w"])[idx] if "accepted_w" in data else 1.0
     w = good * fix * weak
     if "keyframe_w" in data:
         w = w * np.asarray(data["keyframe_w"])[idx]
+    if "rescue_w" in data:
+        w = w * np.asarray(data["rescue_w"])[idx]
     return w.astype(np.float32)
 
 
@@ -1885,6 +1935,11 @@ def main(argv=None):
                     help="with --accepted-weight: set the takeover and accepted weights so "
                          "interventions are P of the training ticks by weight, record ticks "
                          "their own share, accepted auto the rest (Sirius)")
+    ap.add_argument("--rescue-reverse-weight", type=float, default=1.0, metavar="W",
+                    help="with --drive-aways: my open-floor reverse takeovers inside a "
+                         "drive-away window count W times; 1, the default, no change")
+    ap.add_argument("--drive-aways", default=None, metavar="DIR",
+                    help="tools/drive_aways.py output: the patrol's drive-away windows")
     ap.add_argument("--keyframe-weight", type=float, default=0.0, metavar="W",
                     help="the decisions a copycat of my past actions gets most wrong count "
                          "W times (policy_keyframes); 0, the default, none")
@@ -2076,6 +2131,22 @@ def main(argv=None):
         print(f"intervention share {args.intervention_share:g}: takeover weight {tw:.3f}, "
               f"accepted weight {aw:.3f}")
 
+    rescue = None
+    if args.rescue_reverse_weight != 1.0 or args.drive_aways:
+        if not args.drive_aways or args.rescue_reverse_weight < 0:
+            print("--rescue-reverse-weight needs --drive-aways and is 0 or more")
+            return 2
+        try:
+            in_window, found = load_drive_aways(data, args.drive_aways)
+        except ValueError as e:
+            print(e)
+            return 1
+        rescue = rescue_reverses(data, in_window)
+        data["rescue_w"] = rescue_weights(rescue, args.rescue_reverse_weight)
+        print(f"rescue reverses: {int(rescue.sum())} open-floor reverse takeovers in a "
+              f"drive-away window ({found} sessions with a file), at "
+              f"{args.rescue_reverse_weight:g} a tick")
+
     keyframe = steer_tick_w = None
     if args.keyframe_steer_only and args.keyframe_weight <= 0:
         print("--keyframe-steer-only needs --keyframe-weight")
@@ -2254,6 +2325,11 @@ def main(argv=None):
                               if args.accepted_weight > 0 else None),
             "class_weight_power": args.class_weight_power,
             "gear_weights": gear_weights,
+            **({"rescue_reverse": {"weight": args.rescue_reverse_weight,
+                                   "near_m": da.NEAR_M, "rise_m": da.RISE_M,
+                                   "ticks": int(rescue.sum()),
+                                   "train_ticks": int((train_mask & rescue).sum())}}
+               if rescue is not None else {}),
             **({"keyframes": keyframe_meta} if keyframe_meta is not None else {}),
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
