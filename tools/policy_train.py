@@ -353,9 +353,68 @@ MAP_DROPOUT = 0.3
 GOAL_FEATURES = 16
 
 
+# Branched heads by goal bearing (--goal-branches), after Codevilla et al.
+# 2018, "End-to-end driving via conditional imitation learning": a goal
+# that only goes into the trunk beside everything else is an input the
+# network is free to ignore, and the hindsight goal mostly says what the
+# frame and the map say already (goal6, the contrast's note). With branches
+# the goal picks which head answers: one with no goal, one each for a goal
+# off to the left, ahead and off to the right. Every head is learned; the
+# goal only weighs them.
+#
+# The weights are soft (goal_gate), never a hard pick: a bearing that drifts
+# across an edge as the truck turns towards its goal hands one head over to
+# the next across GOAL_BRANCH_SOFT_DEG, so the outputs never jump on a
+# degree. A row's loss reaches each head by its weight, so a goal well inside
+# a bin trains that bin's head alone, as a hard branch would.
+GOAL_BRANCH_COUNTS = (0, 3)
+# Where ahead ends and a side begins, degrees off straight ahead either way.
+GOAL_BRANCH_EDGE_DEG = 20.0
+# How soft the edge is: the logistic's scale, degrees. A side's weight is
+# 0.12 at 10 degrees inside the edge, 0.88 at 10 outside it.
+GOAL_BRANCH_SOFT_DEG = 5.0
+# Straight behind is no side: left and right are blended evenly over the
+# last GOAL_BRANCH_BEHIND_DEG to 180, so a goal crossing behind the truck
+# moves no output on a step either.
+GOAL_BRANCH_BEHIND_DEG = 15.0
+# The order of goal_gate's weights and of the branch heads.
+GOAL_BRANCHES = ("none", "left", "ahead", "right")
+# Each branch head's hidden width.
+GOAL_BRANCH_WIDTH = 32
+
+
+def goal_gate(g, xp=np):
+    """(N, pg.SIZE) goal inputs -> (N, 4) branch weights in GOAL_BRANCHES
+    order, each row summing to 1: all on "none" with no goal; with one, the
+    bearing's weights over left, ahead and right. Mirror-symmetric: the
+    mirrored goal (policy_goal.MIRROR) swaps left and right exactly. xp is
+    numpy or torch, so the trainer, the tests and the exported graph share
+    one gate."""
+    present = g[:, pg.PRESENT]
+    # A row with no goal is all zeros, and the exported atan2 is atan(y / x):
+    # 0 / 0 there is a NaN that the zero weight would not cancel. Its cos
+    # reads 1 instead, a bearing of 0; a goal's own cos is untouched.
+    cos = g[:, pg.COS] + (1.0 - present)
+    atan2 = np.arctan2 if xp is np else xp.atan2
+    b = atan2(g[:, pg.SIN], cos)
+    edge = np.radians(GOAL_BRANCH_EDGE_DEG)
+    soft = np.radians(GOAL_BRANCH_SOFT_DEG)
+    behind = np.radians(GOAL_BRANCH_BEHIND_DEG)
+    sig = (lambda v: 1.0 / (1.0 + np.exp(-v))) if xp is np else xp.sigmoid
+    left = sig((b - edge) / soft)
+    right = sig((-b - edge) / soft)
+    # 0 up to the last `behind` before 180 degrees, 1 straight behind: both
+    # sides pulled to a half there, from either way round.
+    h = xp.clip((xp.abs(b) - (np.pi - behind)) / behind, 0.0, 1.0)
+    left = left + h * (0.5 - left)
+    right = right + h * (0.5 - right)
+    ahead = 1.0 - left - right
+    return xp.stack([1.0 - present, present * left, present * ahead, present * right], 1)
+
+
 def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEER_REGRESSION,
                 uses_lidar=False, uses_map=False, chunk=1, uses_goal=False, map_act="relu",
-                lowband=None):
+                lowband=None, goal_branches=0):
     import torch
     from torch import nn
 
@@ -383,6 +442,14 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     if uses_goal and not uses_map:
         raise ValueError("a goal model needs the map: the goal is a point on it")
     goal_width = GOAL_FEATURES + 1 if uses_goal else 0
+    if goal_branches not in GOAL_BRANCH_COUNTS:
+        raise ValueError(f"goal branches {goal_branches}: one of {GOAL_BRANCH_COUNTS}")
+    if goal_branches and (not uses_goal or direction):
+        raise ValueError("goal branches need the goal and a regression steer head")
+    # One raw row per branch: the gear logits, the throttle before its
+    # sigmoid and the steer before its tanh (both gears' with per_gear).
+    n_steer = chunk * (2 if per_gear else 1)
+    n_raw = len(pl.ACTIONS) * chunk + 1 + n_steer
 
     class GoalBranch(nn.Module):
         """(N, pg.SIZE) -> (N, GOAL_FEATURES + 1): one layer over the goal
@@ -469,17 +536,25 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             self.goal = GoalBranch() if goal_width else None
             # A chunk model answers for this decision and the next chunk - 1:
             # offset i's gear logits at [3i, 3i + 3), its steer at i.
-            self.logits = nn.Linear(64, len(pl.ACTIONS) * chunk)
-            self.throttle = nn.Linear(64, 1)
-            if direction:
-                self.steer_dir = nn.Linear(64, len(pl.STEER_DIRS))
-                self.steer_mag = nn.Linear(64, 1)
-            elif per_gear:
-                # policy.GEAR_STEER_OUTPUTS: forward's steer, then reverse's.
-                self.steer_forward = nn.Linear(64, chunk)
-                self.steer_reverse = nn.Linear(64, chunk)
+            if goal_branches:
+                # GOAL_BRANCHES: the gear, throttle and steer heads once per
+                # branch, weighed by goal_gate. The mode head stays one.
+                self.branches = nn.ModuleList([
+                    nn.Sequential(nn.Linear(64, GOAL_BRANCH_WIDTH), nn.ReLU(),
+                                  nn.Linear(GOAL_BRANCH_WIDTH, n_raw))
+                    for _ in GOAL_BRANCHES])
             else:
-                self.steer = nn.Linear(64, chunk)
+                self.logits = nn.Linear(64, len(pl.ACTIONS) * chunk)
+                self.throttle = nn.Linear(64, 1)
+                if direction:
+                    self.steer_dir = nn.Linear(64, len(pl.STEER_DIRS))
+                    self.steer_mag = nn.Linear(64, 1)
+                elif per_gear:
+                    # policy.GEAR_STEER_OUTPUTS: forward's steer, then reverse's.
+                    self.steer_forward = nn.Linear(64, chunk)
+                    self.steer_reverse = nn.Linear(64, chunk)
+                else:
+                    self.steer = nn.Linear(64, chunk)
             self.mode = nn.Linear(64, pl.MODE_SIZE)
             # The mode going in, straight to the mode logits: "stay" is one
             # weight, and the trunk only has to learn when not to.
@@ -501,6 +576,14 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
             if goal_width:
                 parts.append(self.goal(goal))
             h = self.trunk(torch.cat(parts, dim=1))
+            if goal_branches:
+                w = goal_gate(goal, torch)
+                raw = sum(w[:, i:i + 1] * head(h) for i, head in enumerate(self.branches))
+                a = len(pl.ACTIONS) * chunk
+                logits, throttle = raw[:, :a], torch.sigmoid(raw[:, a:a + 1])
+                st = torch.tanh(raw[:, a + 1:])
+                steer = (st[:, :chunk], st[:, chunk:]) if per_gear else (st,)
+                return (logits, throttle, *steer, self.mode(h) + self.mode_skip(mode))
             steer = ((self.steer_dir(h), torch.sigmoid(self.steer_mag(h))) if direction
                      else (torch.tanh(self.steer_forward(h)), torch.tanh(self.steer_reverse(h)))
                      if per_gear else (torch.tanh(self.steer(h)),))
@@ -547,6 +630,7 @@ def build_model(representation, uses_imu=False, imu_yaw=True, steer_head=pl.STEE
     model.steer_head = steer_head
     model.chunk = int(chunk)
     model.lowband = lowband
+    model.goal_branches = int(goal_branches)
     return model
 
 
@@ -1197,7 +1281,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
           mirror="coin", stop_gear_s=STOP_GEAR_S, map_act="relu", optimizer="adam",
           lowband=None, tip_mask=None, tip_weight=0.0, label_off=None, contrast_weight=0.0,
           goal_path_m=None, contrast_steer_only=False, class_weight_power=1.0,
-          gear_weights=None):
+          gear_weights=None, goal_branches=0):
     """tip_mask: the rows the tip penalty goes on (tip_rows), trained beside
     train_mask with no label of their own. label_off: ticks that are never a
     label, at any chunk offset either (tip_marks' tipped and run-up)."""
@@ -1210,7 +1294,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
     model = build_model(representation, uses_imu, imu_yaw, steer_head, uses_lidar, uses_map,
-                        chunk, uses_goal, map_act, lowband)
+                        chunk, uses_goal, map_act, lowband, goal_branches)
     # The goals' draws on a generator of their own, so a model without the
     # goal is trained on exactly the draws it always was.
     goal_rng = np.random.default_rng([seed, 1])
@@ -1499,12 +1583,20 @@ def map_meta(uses_map, dropout=MAP_DROPOUT, act="relu"):
             "map_features": MAP_FEATURES, "map_act": act}
 
 
-def goal_meta(uses_goal, no_goal_share=pg.NO_GOAL_SHARE):
-    """The goal half of the sidecar: what policy.check_goal reads."""
+def goal_meta(uses_goal, no_goal_share=pg.NO_GOAL_SHARE, branches=0):
+    """The goal half of the sidecar: what policy.check_goal reads. The
+    branches are a record only: the gate is inside the graph, so the car
+    feeds a branched model exactly as any goal model."""
     if not uses_goal:
         return {}
-    return {"uses_goal": True, **pg.meta(), "goal_no_goal_share": float(no_goal_share),
-            "goal_features": GOAL_FEATURES}
+    out = {"uses_goal": True, **pg.meta(), "goal_no_goal_share": float(no_goal_share),
+           "goal_features": GOAL_FEATURES}
+    if branches:
+        out["goal_branches"] = {"names": list(GOAL_BRANCHES), "edge_deg": GOAL_BRANCH_EDGE_DEG,
+                                "soft_deg": GOAL_BRANCH_SOFT_DEG,
+                                "behind_deg": GOAL_BRANCH_BEHIND_DEG,
+                                "width": GOAL_BRANCH_WIDTH}
+    return out
 
 
 def lidar_meta(uses_lidar, dropout=LIDAR_DROPOUT):
@@ -1702,6 +1794,11 @@ def main(argv=None):
                          f"{GOAL_CONTRAST_MARGIN} of the real goal. Needs --goal; 0 is off")
     ap.add_argument("--contrast-steer-only", action="store_true",
                     help="the goal contrast on the steer alone, off the labelled gear's head")
+    ap.add_argument("--goal-branches", type=int, choices=GOAL_BRANCH_COUNTS, default=0,
+                    help="with --goal: 3 gives the gear, throttle and steer heads one branch "
+                         "per goal bearing (left, ahead, right, past "
+                         f"{GOAL_BRANCH_EDGE_DEG:g} degrees) and one with no goal, weighed "
+                         "softly by the goal inside the graph (default 0: one head)")
     ap.add_argument("--goal-path-m", type=float, default=None, metavar="M",
                     help="draw goals M metres along the truck's own path instead of "
                          "hindsight goals k s ahead; the sidecar says M, and the car's "
@@ -1779,6 +1876,9 @@ def main(argv=None):
         return 2
     if args.chunk > 1 and args.steer_head == pl.STEER_DIRECTION:
         print("--chunk needs a regression steer head (regression or per_gear)")
+        return 2
+    if args.goal_branches and (not args.goal or args.steer_head == pl.STEER_DIRECTION):
+        print("--goal-branches needs --goal and a regression steer head")
         return 2
     if args.lowband is not None and args.representation != pl.PROFILE:
         print("--lowband is a second column profile: it needs --representation profile")
@@ -1943,7 +2043,8 @@ def main(argv=None):
                tip_weight=args.tip_weight, label_off=label_off,
                contrast_weight=args.goal_contrast, goal_path_m=args.goal_path_m,
                contrast_steer_only=args.contrast_steer_only,
-               class_weight_power=args.class_weight_power, gear_weights=gear_weights)
+               class_weight_power=args.class_weight_power, gear_weights=gear_weights,
+               goal_branches=args.goal_branches)
     tmp = args.out if args.fold else os.path.splitext(args.out)[0] + ".fold.onnx"
 
     cv = None
@@ -2107,7 +2208,8 @@ def _base_meta(meta_in, args, val_ids, val_names):
                    getattr(args, "map_dropout", MAP_DROPOUT),
                    getattr(args, "map_act", "relu")),
         **goal_meta(bool(getattr(args, "goal", False)),
-                    getattr(args, "no_goal_share", pg.NO_GOAL_SHARE)),
+                    getattr(args, "no_goal_share", pg.NO_GOAL_SHARE),
+                    getattr(args, "goal_branches", 0)),
         **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
                      getattr(args, "straight_band", STRAIGHT_BAND),
                      getattr(args, "stop_gear_s", STOP_GEAR_S)),
