@@ -165,3 +165,37 @@ def test_the_gear_changes_among_the_keyframes_are_counted():
     keyframe = np.zeros(40, bool)
     keyframe[[20, 30, 31]] = True   # 20 a steer change, 30 into stop, 31 stop held
     assert pk.gear_changes(d, keyframe, past) == 1
+
+
+def test_steer_only_keyframes_rank_by_the_steer_and_weight_the_steer_loss_alone():
+    d = drive(1, n=40)
+    n = len(d["t_ns"])
+    every = np.ones(n, bool)
+    # The gear's surprise at the stops (30-32), the steer's at the turn (20).
+    parts = {"gear": np.where(np.isin(np.arange(n), [30, 31, 32]), 9.0, 0.1),
+             "steer": np.where(np.arange(n) == 20, 9.0, 0.1)}
+    ape = parts["gear"] + parts["steer"]
+    kf_w, keyframe, steer_w = pt.place_keyframes(ape, parts, every, 5.0, 0.025,
+                                                 steer_only=True)
+    assert list(np.flatnonzero(keyframe)) == [20] and steer_w is kf_w
+    idx = np.arange(n)
+    # The gear's weights stay as they were: nothing goes on data["keyframe_w"].
+    base = pt.tick_weights(d, idx, 2.0, 3.0)
+    assert "keyframe_w" not in d and (base == 1.0).all()
+    w = pt.steer_weights(base, steer_w, idx)
+    assert w.dtype == np.float32 and w[20] == 5.0 and (np.delete(w, 20) == 1.0).all()
+    # A chunk's (rows, offsets) take each offset at its own tick's weight.
+    fut0 = np.stack([idx, np.minimum(idx + 1, n - 1)], axis=1)
+    wc = pt.steer_weights(np.ones(fut0.shape, np.float32), steer_w, fut0)
+    assert wc[20, 0] == wc[19, 1] == 5.0 and wc[20, 1] == wc[19, 0] == 1.0
+
+
+def test_keyframes_on_every_head_rank_by_the_whole_ape_and_leave_the_steer_as_is():
+    n = 40
+    parts = {"gear": np.where(np.arange(n) == 31, 9.0, 0.1),
+             "steer": np.where(np.arange(n) == 20, 4.0, 0.1)}
+    ape = parts["gear"] + parts["steer"]
+    kf_w, keyframe, steer_w = pt.place_keyframes(ape, parts, np.ones(n, bool), 5.0, 0.025)
+    assert list(np.flatnonzero(keyframe)) == [31] and steer_w is None
+    base = np.ones(n, np.float32)
+    assert pt.steer_weights(base, None, np.arange(n)) is base

@@ -1023,6 +1023,27 @@ def tick_weights(data, idx, good_weight, takeover_weight=TAKEOVER_WEIGHT):
     return w.astype(np.float32)
 
 
+def place_keyframes(ape, parts, fit_mask, weight, share, steer_only=False):
+    """(keyframe weights, keyframe, steer_tick_w) off the copycat's errors
+    (pk.action_prediction_error's ape and parts). Steer only: the steer's own
+    surprises, ranked by parts["steer"] alone, and the weights come back as
+    steer_tick_w for the steer's loss alone, so the gear keeps the weights it
+    had and a stop is no likelier for it. Else ranked by the whole APE, and
+    steer_tick_w is None: the weights go on every head (data["keyframe_w"])."""
+    kf_w, keyframe = pk.keyframe_weights(parts["steer"] if steer_only else ape, fit_mask,
+                                         weight, share)
+    return kf_w, keyframe, (kf_w if steer_only else None)
+
+
+def steer_weights(base, steer_tick_w, rows):
+    """The steer loss's weight per row: base (tick_weights at rows, any
+    shape) times the steer-only keyframe weight at the same rows; base
+    itself, unchanged, without one."""
+    if steer_tick_w is None:
+        return base
+    return np.asarray(base, np.float32) * np.asarray(steer_tick_w, np.float32)[rows]
+
+
 def loss_shares(data, train_mask, label_mode, good_weight, takeover_weight,
                 class_weights=None):
     """What share of each head's loss weight comes off intervention ticks.
@@ -1342,9 +1363,9 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     straight = pl.STEER_DIRS.index(pl.STRAIGHT)
     gears_all = steer_gears(data, stop_gear_s) if per_gear else None
     gear_of = torch.from_numpy(gears_all[idx]) if per_gear else None
-    w_all = torch.from_numpy(tick_weights(data, idx, good_weight, takeover_weight))
-    w_steer = (w_all * torch.from_numpy(np.asarray(steer_tick_w, np.float32)[idx])
-               if steer_tick_w is not None else w_all)
+    w_np = tick_weights(data, idx, good_weight, takeover_weight)
+    w_all = torch.from_numpy(w_np)
+    w_steer = torch.from_numpy(steer_weights(w_np, steer_tick_w, idx))
     w_mode = w_all * torch.from_numpy(mode_weights(data, idx, switch_weight))
     steer_all, throttle_all = label_masks(data, label_mode)
     if label_off is not None:
@@ -1381,10 +1402,9 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
         c_gear = torch.from_numpy(gears_all[fut0]) if per_gear else None
         c_tok = torch.from_numpy((fut >= 0) & throttle_all[fut0] & ~bad[fut0])
         c_sok = torch.from_numpy((fut >= 0) & steer_all[fut0] & ~bad[fut0])
-        c_w = torch.from_numpy(tick_weights(data, fut0.ravel(), good_weight, takeover_weight)
-                               .reshape(fut0.shape))
-        c_ws = (c_w * torch.from_numpy(np.asarray(steer_tick_w, np.float32)[fut0])
-                if steer_tick_w is not None else c_w)
+        c_w_np = tick_weights(data, fut0.ravel(), good_weight, takeover_weight).reshape(fut0.shape)
+        c_w = torch.from_numpy(c_w_np)
+        c_ws = torch.from_numpy(steer_weights(c_w_np, steer_tick_w, fut0))
         # Training ticks are decision ticks outside BAD marks, so offset 0 is
         # exactly the one-step labels.
         assert bool((c_tok[:, 0] == throttle_ok).all() and (c_sok[:, 0] == steer_ok).all())
@@ -2070,15 +2090,10 @@ def main(argv=None):
         k_steer, k_throttle = label_masks(data, args.labels)
         ape, parts = pk.action_prediction_error(data, every, k_steer, k_throttle,
                                                 k=args.keyframe_history)
-        if args.keyframe_steer_only:
-            # The steer's own surprises, on the steer's loss alone: the gear
-            # keeps the weights it had, so a stop is no likelier for it.
-            ape = parts["steer"]
-        kf_w, keyframe = pk.keyframe_weights(ape, every, args.keyframe_weight,
-                                             args.keyframe_share)
-        if args.keyframe_steer_only:
-            steer_tick_w = kf_w
-        else:
+        kf_w, keyframe, steer_tick_w = place_keyframes(
+            ape, parts, every, args.keyframe_weight, args.keyframe_share,
+            args.keyframe_steer_only)
+        if steer_tick_w is None:
             data["keyframe_w"] = kf_w
         past = pk.history_index(data, args.keyframe_history)
         print(f"keyframes: {int(keyframe.sum())} of {int(every.sum())} decisions at "
