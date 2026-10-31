@@ -36,8 +36,8 @@ HARD_LEFT = [(3.0, 0.0), (3.0, 2.8)]
 MAX_JUMP_DEG = 22.0
 
 
-def patrol(points, mode="once", clock=None):
-    p = pt.Patrol(clock=clock or Clock())
+def patrol(points, mode="once", clock=None, near_pass_m=pt.NEAR_PASS_M):
+    p = pt.Patrol(clock=clock or Clock(), near_pass_m=near_pass_m)
     for x, y in points:
         p.append(x, y, 0)
     p.mode = mode
@@ -182,9 +182,10 @@ def test_round_a_hard_left_the_point_fed_never_jumps_and_the_last_waypoint_stops
 
 def test_a_corner_cut_wide_of_the_pass_radius_is_passed_on_the_path():
     # The truck has come round inside the waypoint and is on the next leg,
-    # 0.6 m from it: passed, not driven back to.
+    # 0.6 m from it: passed, not driven back to. The near pass (on by
+    # default) passes it first, behind the truck; off, the path does.
     pl, _ = planner(world(size=ROOM))
-    p = patrol(HARD_LEFT)
+    p = patrol(HARD_LEFT, near_pass_m=0.0)
     c = crop_at(2.0, 0.0)
     p.poll(None, c)
     pl.encode(c, p)
@@ -194,6 +195,10 @@ def test_a_corner_cut_wide_of_the_pass_radius_is_passed_on_the_path():
     pl.encode(c, p)
     assert p.index == 1 and p.passed_on_path == 1 and pl.status()["passes"] == 1
     assert pl.aim[1] > 0.55, "fed on up the next leg, not back to the corner"
+    q = patrol(HARD_LEFT)
+    q.poll(None, crop_at(2.0, 0.0))
+    q.poll(None, c)
+    assert q.index == 1 and q.passed_near == 1 and q.passed_on_path == 0
 
 
 def test_a_waypoint_the_path_comes_back_from_is_not_passed_on_the_path():

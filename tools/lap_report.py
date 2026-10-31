@@ -13,7 +13,9 @@ What a segment and a lap are
 
 A segment is the drive from one waypoint to the next: it opens on the event
 that made waypoint j the goal (waypoint i passed or skipped) and closes on
-the event that passes or skips j. One opened by a start rather than a pass
+the event that passes or skips j. A segment's "by" is how: radius, path,
+near (a near miss, patrol.near_miss: come within 1 m and left behind),
+dwell or stuck; a lap's "near" counts its near passes, which are passes. One opened by a start rather than a pass
 is an approach (from wherever the car stood): kept, but never "chained",
 and not timed against the others. A lap is the segments driven while the
 patrol's lap count read L, one chain on one track: full when it runs from
@@ -500,6 +502,7 @@ def laps_of(segments):
         for k in SUMS:
             out[k] = sum(s[k] for s in ss)
         out["skips"] = sum(s["skip"] for s in ss)
+        out["near"] = sum(s["by"] == "near" for s in ss)
         out["fallback"] = out["fallback_rows"] / out["rows"] if out["rows"] else 0.0
         tilts = [s["max_tilt_deg"] for s in ss if s["max_tilt_deg"] is not None]
         out["max_tilt_deg"] = max(tilts) if tilts else None
@@ -649,7 +652,7 @@ def _short(model):
 
 
 LAP_HEAD = (f"{'lap':>4} {'segs':>5} {'full':>4} {'clean':>5} {'time_s':>7} {'path_m':>6} "
-            f"{'skip':>4} {'stuck':>5} {'take_s':>6} {'take%':>5} {'rev_s':>5} {'zero_s':>6} "
+            f"{'skip':>4} {'near':>4} {'stuck':>5} {'take_s':>6} {'take%':>5} {'rev_s':>5} {'zero_s':>6} "
             f"{'rstop':>5} {'tilt':>4} {'tip':>3} {'maxdeg':>6} {'fb%':>4} {'mlost':>5}  model")
 
 
@@ -657,7 +660,8 @@ def _lap_line(lp):
     t = lp["time_s"]
     return (f"{lp['lap']:>4} {lp['segments']:>3}/{per_lap(lp['mode'], lp['count']):<2}"
             f"{'y' if lp['full'] else '-':>3} {'y' if lp['clean'] else '-':>5} "
-            f"{t:>7.1f} {lp['path_m']:>6.1f} {lp['skips']:>4} {lp['stuck_s']:>5.0f} "
+            f"{t:>7.1f} {lp['path_m']:>6.1f} {lp['skips']:>4} {lp['near']:>4} "
+            f"{lp['stuck_s']:>5.0f} "
             f"{lp['takeover_s']:>6.1f} {100 * lp['takeover_s'] / t if t else 0:>5.0f} "
             f"{lp['reverse_s']:>5.1f} {lp['zero_s']:>6.1f} {lp['rear_stops']:>5} "
             f"{lp['tilts']:>4} {lp['tips']:>3} {_f(lp['max_tilt_deg'], '{:.0f}'):>6} "
@@ -666,7 +670,8 @@ def _lap_line(lp):
 
 
 def _seg_line(s):
-    return (f"       {_f(s['from'], '{}'):>3}->{s['to']:<3} {s['end']:<6} "
+    end = "near" if s["by"] == "near" else s["end"]
+    return (f"       {_f(s['from'], '{}'):>3}->{s['to']:<3} {end:<6} "
             f"{s['time_s']:>6.1f} s {_f(s['leg_m'], '{:.1f}'):>5} m leg "
             f"{_f(s['s_per_m'], '{:.2f}'):>5} s/m  take {s['takeover_s']:.1f} s  "
             f"tips {s['tips']}  {'clean' if s['clean'] else ''}")

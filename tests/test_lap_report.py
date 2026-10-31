@@ -37,14 +37,17 @@ def row(p, x, y, **kw):
     return out
 
 
-def drive(laps=2.0, hooks=None, points=SQUARE, mode="loop", skip_stuck=False):
+def drive(laps=2.0, hooks=None, points=SQUARE, mode="loop", skip_stuck=False,
+          sideways=False):
     """(messages, patrol): the truck driven round `points` for `laps`, with
     hooks {decision k: fn(p, k) -> row overrides} for what happens on the
-    way. The clock is the log clock, as on the car."""
+    way. The clock is the log clock, as on the car. sideways: the nose kept
+    on +x whichever way it goes, so a waypoint off to the side is passed
+    near (patrol.near_miss) instead of on PASS_M."""
     hooks = hooks or {}
     p, _, clock = patrol_of(points=points, mode=mode, skip_stuck=skip_stuck)
     msgs = []
-    x, y = -1.0, -1.0
+    x, y, yaw = -1.0, -1.0, 0.0
     k = 0
     next_status = clock.t
     while p.laps + (p.index / len(p.points)) < laps and k < 20000:
@@ -59,9 +62,12 @@ def drive(laps=2.0, hooks=None, points=SQUARE, mode="loop", skip_stuck=False):
             d = math.hypot(dx, dy)
             step = min(SPEED * DT, d)
             if d > 0:
+                # Nose first, so the waypoint is ahead as on the car (a
+                # truck that slid sideways would pass it near).
                 x, y = x + dx / d * step, y + dy / d * step
-        p.poll(Events(), crop_at(x, y))
-        p.observe(crop_at(x, y))
+                yaw = 0.0 if sideways else math.atan2(dy, dx)
+        p.poll(Events(), crop_at(x, y, yaw))
+        p.observe(crop_at(x, y, yaw))
         while True:
             e = p.pop_event()
             if e is None:
@@ -113,6 +119,24 @@ def test_a_clean_loop_is_timed_to_the_decision_and_laps_are_full_and_clean():
     assert seg["s_per_m"] == pytest.approx(seg["time_s"] / 2.0)
     events = [e for tp, _, e in msgs if tp == "/patrol/event" and e["kind"] == "pass"]
     assert seg["t1"] == pytest.approx([e["mono_s"] for e in events if e["index"] == 0][1])
+
+
+def test_near_passes_end_segments_like_any_pass_and_say_so():
+    msgs, p = drive(laps=3.0, sideways=True)
+    assert p.passed_near > 0
+    r = lr.analyse_run("run", msgs)
+    assert not r["coarse"] and not r["warnings"]
+    rest = r["laps"][1:]
+    assert rest and all(lp["full"] and lp["clean"] and lp["segments"] == 4 for lp in rest)
+    by = {s["by"] for s in r["segments"] if s["chained"]}
+    assert "near" in by, "a segment ended by a near pass says so"
+    near = [e for tp, _, e in msgs if tp == "/patrol/event" and e.get("by") == "near"]
+    assert near and all(e["kind"] == "pass" for e in near)
+    assert len(near) == p.passed_near
+    assert sum(lp["near"] for lp in r["laps"]) == sum(s["by"] == "near" for s in r["segments"])
+    assert all(lp["near"] > 0 for lp in rest)
+    txt = lr.text([r], lr.summarise([r]), segments=True)
+    assert " near " in txt and "near" in lr.LAP_HEAD
 
 
 def test_a_takeover_a_skip_a_tip_and_the_fallback_each_make_a_lap_not_clean():

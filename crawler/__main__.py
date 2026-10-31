@@ -816,7 +816,8 @@ class AutoPilot:
                  slam=None, nav=False, map_source=None, goals=None,
                  fallback_path=None, clicks=None, patrol_store=None,
                  lidar_near=False, path=None, person=None, tilt_veto=True,
-                 library=None, fitter=None, skip_stuck=False, patrol_settings=None):
+                 library=None, fitter=None, skip_stuck=False, patrol_settings=None,
+                 near_pass_m=patrol.NEAR_PASS_M):
         self.vecon = vecon
         # --no-tilt-veto turns the policy's tilt veto off (driver.TiltVeto).
         # Set on every policy driver this builds.
@@ -854,7 +855,8 @@ class AutoPilot:
         self.goal = (patrol.Patrol(say=logger.log, store=patrol_store,
                                    map_view=getattr(slam, "map", None),
                                    library=library, fitter=fitter,
-                                   skip_stuck=skip_stuck, settings=patrol_settings)
+                                   skip_stuck=skip_stuck, settings=patrol_settings,
+                                   near_pass_m=near_pass_m)
                      if clicks is not None else goal.Goal())
         # The patrol itself, under the FollowSwitch if there is one.
         self.patrol = self.goal if clicks is not None else None
@@ -2143,6 +2145,19 @@ def parse_args(argv=None):
              "map page's toggle is kept across a restart and wins (off unless "
              "given: a stuck waypoint stays the goal until it is passed)",
     )
+    # patrol.near_miss: a waypoint come within this of and then left beside
+    # or behind counts as passed (only the goal the model is fed changes).
+    parser.add_argument(
+        "--patrol-near-pass-m",
+        type=float,
+        default=patrol.NEAR_PASS_M,
+        metavar="M",
+        help="with --goal, pass a patrol waypoint the truck came within M "
+             f"metres of once it is abeam, behind or going away (default "
+             f"{patrol.NEAR_PASS_M:g}; 0 passes within {patrol.PASS_M:g} m only). "
+             "Only the default: a {\"cmd\": \"near\", \"m\": M} is kept across "
+             "a restart and wins",
+    )
     # Off unless named. The OAK-D's low obstacles (--voxel-map) as extra
     # solid cells in the navigator's map, never clearing a lidar cell. Off
     # because how often it sees things that are not there is not settled.
@@ -2470,6 +2485,7 @@ def main(argv=None):
                           person=follow_person(args, pantilt, lidar, slam, hub, log),
                           library=library, fitter=fitter,
                           skip_stuck=args.patrol_skip_stuck,
+                          near_pass_m=args.patrol_near_pass_m,
                           patrol_settings=(patrol.Store(lg.log_path(PATROL_SETTINGS_FILE))
                                            if args.goal else None))
     buttons = start_buttons(args, tele, goals, log, slam=slam, library=library)

@@ -693,6 +693,8 @@ JSON_SCHEMAS = {
     # pending: a saved list is waiting for the map to be checked.
     # stuck_s: the current one's seconds without getting 0.3 m closer;
     # skip_stuck: whether that skips it at 20 s (off: kept, only said).
+    # passed_near: those passed as a near miss (patrol.near_miss), and
+    # near_pass_m the radius for one (0: off, PASS_M only).
     # truck_x, truck_y, truck_yaw_deg: the truck's map pose off the crop the
     # distance is from, so a recording has the waypoint and the pose in one
     # message on one map frame.
@@ -700,7 +702,7 @@ JSON_SCHEMAS = {
         "use": _STR, "state": _STR, "mode": _STR, "running": _BOOL, "tracing": _BOOL,
         "index": _INT, "number": _INT, "count": _INT, "laps": _INT, "skipped": _INT,
         "stuck_s": _NUM, "skip_stuck": _BOOL,
-        "passed_on_path": _INT, "x": _NUM, "y": _NUM, "frame_now": _INT, "on_map": _BOOL, "distance_m": _NUM,
+        "passed_on_path": _INT, "passed_near": _INT, "near_pass_m": _NUM, "x": _NUM, "y": _NUM, "frame_now": _INT, "on_map": _BOOL, "distance_m": _NUM,
         "approx": _BOOL, "approx_m": _NUM, "restored": _BOOL, "pending": _BOOL,
         "truck_x": _NUM, "truck_y": _NUM, "truck_yaw_deg": _NUM,
         # The track id (patrol.Patrol.track_id), "" with no list.
@@ -709,7 +711,8 @@ JSON_SCHEMAS = {
     # One waypoint passed or skipped, or the patrol started or paused, with
     # --goal: patrol.Patrol._event(), stamped at the decision it happened on
     # (mono_s, which is the log time too). kind pass / skip / finish /
-    # start / pause; by radius / path / dwell / stuck for a pass or skip,
+    # start / pause; by radius / path / near / dwell / stuck for a pass or
+    # skip (near: a near miss, patrol.near_miss),
     # fresh / resume for a start, pause / all skipped for a pause; index
     # the waypoint it is about, next the current one after it, lap the laps
     # done after it; track the track id (patrol.Patrol.track_id); wp_s the

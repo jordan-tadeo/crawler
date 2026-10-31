@@ -41,6 +41,22 @@ goal. dwell_s, 0 unless set, holds neutral that long at each waypoint first.
 "patrol" turns round at either end, a lap each time it is back at the first.
 One waypoint in a loop or a patrol is a "once": there is nowhere to go on to.
 
+A near miss. A waypoint the truck has come within near_pass_m of (1.0 m
+unless set) is passed too, by="near", once it can no longer be got to by
+driving on: it is abeam or behind (NEAR_ABEAM_DEG or more off the nose), the
+distance has risen NEAR_RISE_M past the closest it came, or it lies so far
+inside a forward turning circle (TURN_RADIUS_M) that no forward arc comes
+within PASS_M of it; and only once the truck has moved NEAR_MOVE_M since the
+waypoint became the goal. On the 2026-10-30 patrols 56 of 58 drives away from a
+waypoint began that way: within 0.5-1.3 m, never inside PASS_M, the
+waypoint stayed the goal beside or behind the truck, and the model drove on
+away from it for a median 26 s before it came back. Only the goal changes;
+the model still drives. Never at a last stop or with a dwell (both are
+places to stop on), and never for a waypoint the truck was not near: this is
+not the stuck skip. near_pass_m 0 is the old rule, PASS_M only. Set with
+--patrol-near-pass-m, or {"cmd": "near", "m": 1.0}, which is kept in the
+settings file across a restart and wins over the flag, as the skip is.
+
 A waypoint it cannot get to. While auto drives towards a waypoint on the map
 (a decision with the waypoint placed, observe(); not manual, not a lost map),
 its clock runs: no PROGRESS_M closer for NO_PROGRESS_S, or TIMEOUT_S in all,
@@ -101,12 +117,39 @@ MODES = ("once", "loop", "patrol")
 # sends them and MAP_COMMANDS, which take points, indices or names.
 BUTTON_COMMANDS = ("edit", "goal", "start", "pause", "undo", "clear", "mode", "trace")
 MAP_COMMANDS = ("stroke", "unstroke", "move", "delete", "save", "load", "forget", "place",
-                "skip")
+                "skip", "near")
 COMMANDS = BUTTON_COMMANDS + MAP_COMMANDS
 # Within this of a waypoint it is passed and the next is the goal. Wider
 # than ARRIVE_M: a waypoint on the way is somewhere to go past, not to stop
 # on, and a model asked to hit 0.25 m on the way round circles for it.
 PASS_M = 0.5
+# A near miss (the docstring's): within NEAR_PASS_M and then abeam, going
+# away, or deep inside the turning circle, and it is passed as well. Off the
+# 2026-10-30 patrols replayed (/patrol/status + /slam/status): 1.0 m takes
+# 39 of the 58 drives away off the evening's patrols and 58 of 120 off the
+# day's before; 1.3 m would take 56 and 91, but passes further from where
+# the owner put the point. NEAR_PASS_MAX_M is the most it can be set to.
+NEAR_PASS_M = 1.0
+NEAR_PASS_MAX_M = 2.0
+# Abeam: 80 degrees is past where the goal model's steer for the goal falls
+# off (policy_goal.STAGE_DEG's note: +0.04 at 75-90 on the left, wrong-way
+# past 90), so a waypoint this far round is one it will not turn in to.
+NEAR_ABEAM_DEG = 80.0
+# Going away: this much further than the closest it came. Well above the
+# SLAM pose's jitter; on the replay 0.15 m passed 11 and 13 more waypoints
+# (the two days) that the truck then got inside PASS_M of within 3 s, and
+# took off no more drives away.
+NEAR_RISE_M = 0.25
+# The tightest circle the truck drives forward (nav/truck.py
+# DRIVEN_TURN_RADIUS_M, kept equal by a test; not imported, as truck.py
+# brings the driver in). A waypoint closer than TURN_RADIUS_M - PASS_M to
+# either circle's centre cannot be got within PASS_M of on any forward arc.
+TURN_RADIUS_M = 0.70
+# A near pass only once the truck has moved this far from where it was as
+# the waypoint became the goal, so the waypoints of a tight bend drawn at
+# the map page's 1 m spacing are never passed one after another where the
+# truck stands. It cost the replay no drive away taken off.
+NEAR_MOVE_M = 0.25
 DWELL_S = 0.0
 # A waypoint's clock: skipped after this long without getting PROGRESS_M
 # closer, or TIMEOUT_S driving at it in all.
@@ -279,12 +322,47 @@ def _xy_list(v):
     return out
 
 
+def _near_m(v):
+    """A near pass radius, metres, off a setting or a command: a number from
+    0 to NEAR_PASS_MAX_M (bools are not), else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    return v if math.isfinite(v) and 0.0 <= v <= NEAR_PASS_MAX_M else None
+
+
+def _near_said(m):
+    if m <= 0.0:
+        return f"Near passes are off: a waypoint is passed within {PASS_M:.1f} m only"
+    return f"Near passes are on: a waypoint come within {m:.2f} m of is passed once it is behind"
+
+
+def near_miss(d, bearing, closest, near_m, pass_m=PASS_M, abeam_deg=NEAR_ABEAM_DEG,
+              rise_m=NEAR_RISE_M, turn_radius_m=TURN_RADIUS_M):
+    """Why a waypoint `d` metres off at `bearing` (radians CCW from the
+    nose), `closest` the nearest the truck has been to it (d included),
+    counts as passed though never within pass_m: "abeam", "away" or
+    "circle"; None if it does not (or near_m is 0, or it was never within
+    near_m)."""
+    if near_m <= 0.0 or closest > near_m:
+        return None
+    if abs(math.degrees(bearing)) >= abeam_deg:
+        return "abeam"
+    if d >= closest + rise_m:
+        return "away"
+    ahead, side = d * math.cos(bearing), abs(d * math.sin(bearing))
+    if d <= near_m and math.hypot(ahead, side - turn_radius_m) < turn_radius_m - pass_m:
+        return "circle"
+    return None
+
+
 class Patrol(gl.Goal):
     """The single clicked goal, or the patrol. Control loop only."""
 
     def __init__(self, arrive_m=pg.ARRIVE_M, pass_m=PASS_M, dwell_s=DWELL_S,
                  say=None, store=None, map_view=None, clock=time.monotonic,
-                 library=None, fitter=None, skip_stuck=False, settings=None):
+                 library=None, fitter=None, skip_stuck=False, settings=None,
+                 near_pass_m=NEAR_PASS_M):
         super().__init__()
         self.arrive_m, self.pass_m, self.dwell_s = float(arrive_m), float(pass_m), float(dwell_s)
         self._say = say
@@ -303,6 +381,11 @@ class Patrol(gl.Goal):
         self.laps = 0
         self.skipped = 0
         self.passed_on_path = 0       # passed by the path planner, not PASS_M
+        self.passed_near = 0          # passed as a near miss (near_pass_m)
+        self._closest = math.inf      # the closest the current one has been
+        self._closest_at = None       # (frame, x, y) it was measured to
+        self._near_from = None        # (frame, x, y): the truck as it became the goal
+        self._near_moved = 0.0        # the furthest the truck has been from there
         self.refused = 0
         self.restored = False
         self._in_row = 0              # skips since the last arrival
@@ -344,17 +427,34 @@ class Patrol(gl.Goal):
         self.acks = collections.deque(maxlen=ACKS_KEPT)
         # Whether a stuck waypoint is skipped: the settings file's, else
         # the default given (--patrol-skip-stuck).
-        self.settings = settings      # a Store of {"skip_stuck": bool}, or None
+        # The same for the near pass's radius (--patrol-near-pass-m).
+        self.settings = settings      # a Store of {"skip_stuck": bool, "near_pass_m": m}, or None
         saved = settings.load() if settings is not None else None
-        kept = saved.get("skip_stuck") if isinstance(saved, dict) else None
+        self._settings = dict(saved) if isinstance(saved, dict) else {}
+        kept = self._settings.get("skip_stuck")
         self.skip_stuck = kept if isinstance(kept, bool) else bool(skip_stuck)
         self._log("info", f"Stuck waypoints are {'skipped' if self.skip_stuck else 'kept'}"
                   f" (skip {'on' if self.skip_stuck else 'off'}, "
                   f"{'as last set' if isinstance(kept, bool) else 'the default'})")
+        near = _near_m(self._settings.get("near_pass_m"))
+        given = _near_m(near_pass_m)
+        if given is None:
+            self._log("warning", f"Near pass radius {near_pass_m!r} is not from 0 to "
+                      f"{NEAR_PASS_MAX_M:.1f} m; {NEAR_PASS_M:.1f} m instead")
+            given = NEAR_PASS_M
+        self.near_pass_m = near if near is not None else given
+        self._log("info", f"{_near_said(self.near_pass_m)} "
+                  f"({'as last set' if near is not None else 'the default'})")
         if store is not None:
             data = tk.migrate(store.load())
             if data and data.get("points"):
                 self._set_pending(data)
+
+    def _keep_setting(self, key, value):
+        """One setting into the settings file, the others in it kept."""
+        self._settings[key] = value
+        if self.settings is not None:
+            self.settings.save(dict(self._settings))
 
     def _log(self, level, text):
         print(text)
@@ -595,10 +695,19 @@ class Patrol(gl.Goal):
                 self._log("warning", f"Skip refused: on is {on!r}, not true or false")
                 return False
             self.skip_stuck = on
-            if self.settings is not None:
-                self.settings.save({"skip_stuck": on})
+            self._keep_setting("skip_stuck", on)
             self._log("info", "Stuck waypoints are skipped from now on" if on else
                       "Stuck waypoints are kept from now on: no timed skip")
+            return True
+        elif name == "near":
+            m = _near_m(msg.get("m"))
+            if m is None:
+                self._log("warning", f"Near refused: m is {msg.get('m')!r}, not a distance "
+                          f"from 0 to {NEAR_PASS_MAX_M:.1f} m")
+                return False
+            self.near_pass_m = m
+            self._keep_setting("near_pass_m", m)
+            self._log("info", f"{_near_said(m)}, from now on")
             return True
         elif name == "mode":
             mode = msg.get("mode")
@@ -1065,6 +1174,38 @@ class Patrol(gl.Goal):
             else:
                 self._advance()
                 self._measure(crop)
+            return
+        if self._last_stop() or self.dwell_s > 0.0:
+            return
+        why = self._near(db)
+        if why is not None:
+            self._in_row = 0
+            self.passed_near += 1
+            self._log("info", f"Waypoint {self.index + 1} of {len(self.points)} passed near "
+                      f"({why}): {self._closest:.2f} m at the closest, now {db[0]:.2f} m "
+                      f"at {math.degrees(db[1]):+.0f} deg")
+            self._advance("near")
+            self._measure(crop)
+
+    def _near(self, db):
+        """near_miss() for the current waypoint off this (distance,
+        bearing), with the closest it has come. The closest starts again
+        whenever the waypoint's place moves (a carry along a link, a move),
+        so a near pass is never off where the point used to be."""
+        place = self.current_place()
+        at = (self.frame_now, place[0], place[1])
+        if (self._closest_at is None or at[0] != self._closest_at[0]
+                or math.hypot(at[1] - self._closest_at[1], at[2] - self._closest_at[2]) > 0.05):
+            self._closest, self._closest_at = math.inf, at
+        self._closest = min(self._closest, db[0])
+        x, y = self.pose[0], self.pose[1]
+        if self._near_from is None or self._near_from[0] != self.frame_now:
+            self._near_from, self._near_moved = (self.frame_now, x, y), 0.0
+        self._near_moved = max(self._near_moved, math.hypot(x - self._near_from[1],
+                                                            y - self._near_from[2]))
+        if self._near_moved < NEAR_MOVE_M:
+            return None
+        return near_miss(db[0], db[1], self._closest, self.near_pass_m, self.pass_m)
 
     def _measure(self, crop):
         """self.last: (distance, bearing) from this crop to the current
@@ -1082,8 +1223,8 @@ class Patrol(gl.Goal):
 
     def _advance(self, by="radius"):
         """On from the current waypoint: passed within its radius ("radius"),
-        gone by on the path ("path"), after its dwell ("dwell"), or skipped
-        ("stuck")."""
+        gone by on the path ("path"), missed near and behind ("near"), after
+        its dwell ("dwell"), or skipped ("stuck")."""
         n = len(self.points)
         if n == 0:
             return
@@ -1127,6 +1268,8 @@ class Patrol(gl.Goal):
     def _reset_clock(self):
         self._wp_time, self._best, self._since_best = 0.0, math.inf, 0.0
         self._dwell_until = None
+        self._closest, self._closest_at = math.inf, None
+        self._near_from, self._near_moved = None, 0.0
 
     def _trace(self, crop):
         if not self.points:
@@ -1299,7 +1442,10 @@ class Patrol(gl.Goal):
                 # closer, and whether that skips it at NO_PROGRESS_S.
                 "stuck_s": round(float(self._since_best), 2),
                 "skip_stuck": bool(self.skip_stuck),
-                "passed_on_path": int(self.passed_on_path), "x": float(x), "y": float(y),
+                "passed_on_path": int(self.passed_on_path),
+                # Those passed as a near miss, and the radius (0: off).
+                "passed_near": int(self.passed_near), "near_pass_m": float(self.near_pass_m),
+                "x": float(x), "y": float(y),
                 "frame_now": -1 if self.frame_now is None else int(self.frame_now),
                 "on_map": bool(have and self.present), "distance_m": float(d),
                 "approx": e > 0.0, "approx_m": e, "restored": bool(self.restored),
@@ -1349,7 +1495,7 @@ class Patrol(gl.Goal):
                 "index": int(self.index), "points": pts, "laps": int(self.laps),
                 "skipped": int(self.skipped), "name": self.name, "dirty": bool(self.dirty),
                 "stuck_s": round(float(self._since_best), 1),
-                "skip_stuck": bool(self.skip_stuck),
+                "skip_stuck": bool(self.skip_stuck), "near_pass_m": float(self.near_pass_m),
                 "strokes": len(self._strokes), "pending": pending, "fit": fit,
                 "said": [list(x) for x in self.said],
                 "acks": [list(a) for a in self.acks]}
