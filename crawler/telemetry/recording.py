@@ -107,6 +107,15 @@ each other:
                    card is filling it and recording is the part of this
                    process that is allowed to lose.
 
+What the drive was, in the file
+-------------------------------
+metadata, a callable, gives {name: {key: value}} (strings both) and each one
+is written as an MCAP metadata record as a segment opens: the tags I set on
+the map page (telemetry/tags.py, METADATA_NAME), so a file says what it is
+from its first byte. A tag changed while the file is open is on
+/session/tags, a channel like any other. Asked on the publisher thread; one
+that raises costs the record and nothing else.
+
 Nothing in here can reach the hardware
 --------------------------------------
 Same contract telemetry.py has. Every public method swallows everything:
@@ -261,15 +270,18 @@ class Recorder:
                  segment_bytes=SEGMENT_BYTES,
                  max_total_bytes=MAX_TOTAL_BYTES,
                  min_free_bytes=MIN_FREE_BYTES,
-                 prefix=PREFIX):
+                 prefix=PREFIX, metadata=None):
         """`max_total_bytes` None means never prune, which is what a record
-        session asks for: the floor still stops it, the ring never eats it."""
+        session asks for: the floor still stops it, the ring never eats it.
+        `metadata`: see "What the drive was", above."""
         self.logger = logger
         self.directory = _repo_path(directory)
         self.prefix = prefix
         self.segment_bytes = segment_bytes
         self.max_total_bytes = max_total_bytes
         self.min_free_bytes = min_free_bytes
+        self.metadata = metadata
+        self.metadata_written = 0
 
         self.active = False
         self.path = None
@@ -482,12 +494,25 @@ class Recorder:
 
             self.path = path
             self.active = True
+            self._write_metadata()
             self._write_errors = 0
             self._next_check = time.monotonic() + CHECK_INTERVAL
             return True
 
         self._give_up("every segment name I tried already exists")
         return False
+
+    def _write_metadata(self) -> None:
+        if self.metadata is None or self._writer is None:
+            return
+        try:
+            records = self.metadata() or {}
+            for name, values in records.items():
+                self._writer.write_metadata(
+                    str(name), {str(k): str(v) for k, v in values.items()})
+                self.metadata_written += 1
+        except Exception as e:
+            self._log("warning", "Recording", f"No metadata in {self.path}: {e}")
 
     # ---- disk ------------------------------------------------------------
 

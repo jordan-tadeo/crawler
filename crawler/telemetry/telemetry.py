@@ -181,6 +181,9 @@ INTERVALS = {
     "patrol_marker": 1.0,
     # An event channel, as /marks is: offered the pass it happened on.
     "patrol_event": 0.0,
+    # The recordings' tags (telemetry/tags.py): once a second, and offered
+    # past the gate (offer_now) on the pass one changes.
+    "session_tags": 1.0,
     # With --goal (autopilot/pathgoal.PathPlanner): what the goal model is
     # fed and why, twice a second, and the path with that point once a second.
     "path_status": 0.5,
@@ -719,6 +722,12 @@ JSON_SCHEMAS = {
     # done after it; track the track id (patrol.Patrol.track_id); wp_s the
     # waypoint's time driven at, stuck_s its time without getting closer.
     # seq counts them per process, so a lost one shows.
+    # What I said this drive is (telemetry/tags.SessionTags.payload): each
+    # tag on or off, the ones on as a comma list, and seq, the changes
+    # since boot. A tick takes the newest at or before it.
+    "session_tags": _schema("crawler.SessionTags", {
+        "outdoor": _BOOL, "clean": _BOOL, "tags": _STR, "seq": _INT,
+    }),
     "patrol_event": _schema("crawler.PatrolEvent", {
         "seq": _INT, "kind": _STR, "by": _STR, "index": _INT, "next": _INT,
         "count": _INT, "lap": _INT, "mode": _STR, "track": _STR,
@@ -864,6 +873,7 @@ JSON_TOPICS = {
     "goal_status": "/goal/status",
     "patrol_status": "/patrol/status",
     "patrol_event": "/patrol/event",
+    "session_tags": "/session/tags",
     "path_status": "/path/status",
     "follow_status": "/follow/status",
     "pantilt": "/pantilt",

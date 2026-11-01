@@ -99,6 +99,11 @@ never both on: explore on pauses the patrol, and start, pause, a single goal,
 edit or trace turn explore off, holding neutral. /patrol/status, /goal/status
 and the /footprint row say use "explore", state exploring or holding.
 
+Tags (telemetry/tags.py): {"cmd": "tags", "outdoor": true, "clean": false}
+(the map page's Outdoor and Clean buttons) labels the recordings from then
+on. The patrol only passes it on to the SessionTags it was given; without
+one it is refused. Nothing about driving changes with a tag.
+
 Editing from the map page (telemetry/map.html), on the map the truck is on:
 "stroke" appends a run of points drawn with a finger as one step that
 "unstroke" takes back, and makes the patrol a loop; "move" and "delete"
@@ -124,7 +129,7 @@ MODES = ("once", "loop", "patrol")
 # sends them and MAP_COMMANDS, which take points, indices or names.
 BUTTON_COMMANDS = ("edit", "goal", "start", "pause", "undo", "clear", "mode", "trace")
 MAP_COMMANDS = ("stroke", "unstroke", "move", "delete", "save", "load", "forget", "place",
-                "skip", "near", "explore")
+                "skip", "near", "explore", "tags")
 COMMANDS = BUTTON_COMMANDS + MAP_COMMANDS
 # Within this of a waypoint it is passed and the next is the goal. Wider
 # than ARRIVE_M: a waypoint on the way is somewhere to go past, not to stop
@@ -370,7 +375,7 @@ class Patrol(gl.Goal):
     def __init__(self, arrive_m=pg.ARRIVE_M, pass_m=PASS_M, dwell_s=DWELL_S,
                  say=None, store=None, map_view=None, clock=time.monotonic,
                  library=None, fitter=None, skip_stuck=False, settings=None,
-                 near_pass_m=NEAR_PASS_M):
+                 near_pass_m=NEAR_PASS_M, tags=None):
         super().__init__()
         self.arrive_m, self.pass_m, self.dwell_s = float(arrive_m), float(pass_m), float(dwell_s)
         self._say = say
@@ -459,6 +464,11 @@ class Patrol(gl.Goal):
         self.near_pass_m = near if near is not None else given
         self._log("info", f"{_near_said(self.near_pass_m)} "
                   f"({'as last set' if near is not None else 'the default'})")
+        # The recordings' tags (telemetry/tags.SessionTags), or None. Its
+        # lines go where explore's do: the journal and the map page's toasts.
+        self.tags = tags
+        if tags is not None:
+            tags.say = self._explore_say
         if store is not None:
             data = tk.migrate(store.load())
             if data and data.get("points"):
@@ -775,6 +785,11 @@ class Patrol(gl.Goal):
             self._log("info", "Stuck waypoints are skipped from now on" if on else
                       "Stuck waypoints are kept from now on: no timed skip")
             return True
+        elif name == "tags":
+            if self.tags is None:
+                self._log("warning", "Tags refused: this car keeps no tags")
+                return False
+            return self.tags.command(msg)
         elif name == "near":
             m = _near_m(msg.get("m"))
             if m is None:
@@ -1618,5 +1633,6 @@ class Patrol(gl.Goal):
                 "skip_stuck": bool(self.skip_stuck), "near_pass_m": float(self.near_pass_m),
                 "strokes": len(self._strokes), "pending": pending, "fit": fit,
                 "explore": explore,
+                "tags": self.tags.state() if self.tags is not None else None,
                 "said": [list(x) for x in self.said],
                 "acks": [list(a) for a in self.acks]}

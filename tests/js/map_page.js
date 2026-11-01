@@ -12,14 +12,15 @@ function car() {
   // The car's side: the patrol's points and acks, and what it was sent.
   const c = { points: [], acks: [], said: [], posts: [], gets: [], ready: true, pad: true,
     apply: true, refuse: false, down: false, running: false, strokes: [], refuseUndo: false,
-    exploring: false };
+    exploring: false, tags: null };
   c.state = () => c.ready ? {
     ready: true, age_s: 0.2, turn_radius_m: 0.7, tracks: [], pad: c.pad, mode: "manual",
     patrol: { frame: 0, present: true, pose: [0, 0, 0], use: "patrol", state: "editing", mode: "loop",
       running: c.running, index: 0, points: c.points.slice(), name: null, dirty: true, stuck_s: 0,
       skip_stuck: false, strokes: c.strokes.length, pending: null, fit: {}, said: c.said.slice(), acks: c.acks.slice(),
       explore: { on: c.exploring, target: c.exploring ? [1.0, 0.5] : null, kind: c.exploring ? "frontier" : "",
-        distance_m: c.exploring ? 1.1 : -1, targets: 0, arrived: 0, skipped: 0, frontiers: 1 } },
+        distance_m: c.exploring ? 1.1 : -1, targets: 0, arrived: 0, skipped: 0, frontiers: 1 },
+      tags: c.tags ? Object.assign({}, c.tags) : null },
   } : { ready: false, age_s: null, turn_radius_m: 0.7, tracks: [] };
   return c;
 }
@@ -47,6 +48,7 @@ async function open(b, c) {
         if (!took) c.said.push(["warning", why]);
         if (body.cmd === "start") { c.running = true; c.exploring = false; }
         if (body.cmd === "explore") { c.exploring = body.on; if (body.on) c.running = false; }
+        if (body.cmd === "tags") ["outdoor", "clean"].forEach(k => { if (k in body) c.tags[k] = body[k]; });
         c.acks.push([body.id, took, took ? "" : why]);
       }
       return route.fulfill({ status: 202, contentType: "application/json", body: '{"ok":true,"why":""}' });
@@ -345,6 +347,34 @@ const text = (page, id) => page.evaluate((i) => {
     const off = c.posts.filter(p => p.cmd === "explore");
     must(off.length === 2 && off[1].on === false, "off sent: " + JSON.stringify(off));
     must(await sub() === "off", "not off again: " + await sub());
+    await ctx.close();
+  });
+
+  await check("the_tag_buttons_send_one_tag_and_show_the_cars", async () => {
+    const off = car(), o = await open(b, off);
+    must(await o.page.evaluate(() => document.getElementById("t_outdoor").disabled
+      && document.getElementById("t_clean").disabled), "enabled on a car that keeps no tags");
+    await o.ctx.close();
+    const c = car(); c.tags = { outdoor: false, clean: false };
+    const { ctx, page } = await open(b, c);
+    const look = async (id) => page.evaluate((i) => { const e = document.getElementById(i);
+      return (e.classList.contains("on") ? "on " : "off ") + e.querySelector(".sub").textContent; }, id);
+    must(await look("t_outdoor") === "off off" && await look("t_clean") === "off off", "not off at first");
+    await page.tap("#t_outdoor");
+    await page.waitForTimeout(900);
+    await page.tap("#t_clean");
+    await page.waitForTimeout(900);
+    const sent = c.posts.filter(p => p.cmd === "tags").map(p => { const q = Object.assign({}, p); delete q.id; return q; });
+    must(JSON.stringify(sent) === JSON.stringify([{ cmd: "tags", outdoor: true }, { cmd: "tags", clean: true }]),
+      "sent: " + JSON.stringify(sent));
+    must(await look("t_outdoor") === "on on" && await look("t_clean") === "on on", "not shown on");
+    // The car's word wins: a tag it says is off shows off.
+    c.tags.outdoor = false;
+    await page.waitForTimeout(900);
+    must(await look("t_outdoor") === "off off", "shows " + await look("t_outdoor"));
+    await page.tap("#t_outdoor");
+    await page.waitForTimeout(900);
+    must(c.posts.filter(p => p.cmd === "tags").pop().outdoor === true, "a tap sends the other side of the car's");
     await ctx.close();
   });
 

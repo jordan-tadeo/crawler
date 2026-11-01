@@ -95,6 +95,7 @@ import data_paths as dp  # noqa: E402
 import models as md  # noqa: E402
 import policy_adapters as pa  # noqa: E402
 import policy_dataset as pd  # noqa: E402
+import policy_tags as ptg  # noqa: E402
 import policy_eval as pe  # noqa: E402
 import policy_train as pt  # noqa: E402
 import pull_mcaps as pm  # noqa: E402
@@ -649,6 +650,18 @@ def _train_flags(extra):
     return known.representation, known.labels, known.lowband
 
 
+def tag_keep(data, extra):
+    """Per tick, kept by policy_train.py's --include-tags / --exclude-tags
+    in extra (all True without them): the deployed model is graded on the
+    same ticks the candidate's folds are."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--include-tags", default=None)
+    p.add_argument("--exclude-tags", default=None)
+    known, _ = p.parse_known_args(extra)
+    return ptg.keep_mask(ptg.tick_tags(data), ptg.parse_names(known.include_tags),
+                         ptg.parse_names(known.exclude_tags))
+
+
 def thread_env():
     """One thread count for every BLAS and OpenMP pool, said outright: the
     decodes and the frame encodes run --jobs at once as well."""
@@ -769,7 +782,8 @@ def main(argv=None):
     blocks = pt.time_blocks(data, args.blocks)
     names = data["meta"]["sessions"]
     dep_seen = trained_on(dep)
-    any_graded = np.any([held for held, _ in blocks], axis=0) & ~pe.bad_marked(data)
+    keep = tag_keep(data, extra)
+    any_graded = np.any([held for held, _ in blocks], axis=0) & ~pe.bad_marked(data) & keep
     held_names = unseen_sessions(names, data["session"], any_graded, dep_seen) if dep else []
 
     base = [data_path]
@@ -791,7 +805,7 @@ def main(argv=None):
     final = outs[args.blocks]
     steer_ok, throttle_ok = pe.label_masks(data, labels)
     labelled = steer_ok | throttle_ok
-    graded = [held & ~pe.bad_marked(data) for held, _ in blocks]
+    graded = [held & ~pe.bad_marked(data) & keep for held, _ in blocks]
     medians = [pe.median_training_magnitude(data, pt.training_mask(data, guard, labelled))
                for _, guard in blocks]
     dep_scores, dep_model = [None] * args.blocks, None

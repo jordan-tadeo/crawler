@@ -30,6 +30,7 @@ from crawler.autopilot import driver as dv
 from crawler.autopilot import policy as pl
 from crawler.autopilot import policy_imu as pimu
 from crawler.autopilot import policy_lidar as pli
+from crawler.telemetry import tags as tg
 
 # ---- legacy recordings -----------------------------------------------------
 
@@ -38,6 +39,9 @@ LEGACY_TOPICS = {
     "vehicle": "/vehicle",             # JSON, 20 Hz
     "controller": "/controller",       # JSON, 20 Hz
     "marks": "/marks",                 # JSON, one per press
+    # What I said the drive was (telemetry/tags.py), in any file recorded
+    # since; none is untagged: indoor, not clean.
+    "tags": tg.TOPIC,
 }
 LEGACY_VEHICLE = {
     "mode": "mode",
@@ -62,6 +66,7 @@ FOOTPRINT_TOPICS = {
     # One row per revolution of the roof lidar (--lidar), off the tick: the
     # policy's lidar input, paired with a tick by policy_lidar.scan_at.
     "lidar": "/lidar",
+    "tags": tg.TOPIC,
 }
 FOOTPRINT_VEHICLE = {
     "mode": "mode",
@@ -266,6 +271,9 @@ class Session(NamedTuple):
     by_seq: bool          # frames and commands share a seq
     vehicle: tuple = ()   # [(t_ns, mode, throttle, front)] off /vehicle; footprint files only
     lidar: tuple = ()     # [(t_ns, (BINS,) uint16 mm)] off /lidar, by time; footprint files only
+    # [(t_ns, tags.BITS mask)] off /session/tags, by time; the file's
+    # metadata record (the tags as it was opened) at t_ns 0. Empty: untagged.
+    tags: tuple = ()
 
 
 def _f(value, fallback=float("nan")):
@@ -428,6 +436,7 @@ class LegacyAdapter:
         self.session_name = session_name
         self.label_modes = tuple(label_modes)
         self.commands, self.frames, self.connected, self.marks = [], [], [], []
+        self.tags = []
 
     def feed(self, topic, t_ns, payload):
         """One decoded message. Images are dicts with 'data' (the JPEG bytes)."""
@@ -447,6 +456,13 @@ class LegacyAdapter:
             self.connected.append((int(t_ns), bool(payload.get(LEGACY_CONNECTED, False))))
         elif topic == LEGACY_TOPICS["marks"]:
             self.marks.append((int(t_ns), dict(payload)))
+        elif topic == LEGACY_TOPICS["tags"]:
+            self.tags.append((int(t_ns), tg.bits_of(payload)))
+
+    def feed_metadata(self, name, values):
+        """An MCAP metadata record: the tags as the file was opened."""
+        if name == tg.METADATA_NAME:
+            self.tags.append((0, tg.bits_of(values)))
 
     def feed_mm(self, t_ns, mm):
         """A decoded legacy frame, already in mm at LEGACY_SHAPE."""
@@ -460,7 +476,8 @@ class LegacyAdapter:
         return Session(self.session_name, self.name, self.contract,
                        sorted(self.commands), sorted(self.frames, key=lambda f: f.t_ns),
                        sorted(self.connected), sorted(self.marks, key=lambda m: m[0]),
-                       self.label_modes, False)
+                       self.label_modes, False,
+                       tags=tuple(sorted(self.tags, key=lambda e: e[0])))
 
 
 def decode_depth_small(payload):
@@ -495,6 +512,7 @@ class FootprintAdapter:
         self.session_name = session_name
         self.label_modes = tuple(label_modes)
         self.commands, self.frames, self.connected, self.marks = [], [], [], []
+        self.tags = []
         self.vehicle = []
         self.lidar = []
         self.bad_frames = 0
@@ -532,6 +550,8 @@ class FootprintAdapter:
             self.connected.append((int(t_ns), bool(payload.get(LEGACY_CONNECTED, False))))
         elif topic == FOOTPRINT_TOPICS["marks"]:
             self.marks.append((int(t_ns), dict(payload)))
+        elif topic == FOOTPRINT_TOPICS["tags"]:
+            self.tags.append((int(t_ns), tg.bits_of(payload)))
         elif topic == FOOTPRINT_TOPICS["vehicle"]:
             v = FOOTPRINT_VEHICLE
             self.vehicle.append((int(t_ns), str(payload.get(v["mode"], "")),
@@ -544,13 +564,19 @@ class FootprintAdapter:
                 return
             self.lidar.append((int(t_ns), bins))
 
+    def feed_metadata(self, name, values):
+        """An MCAP metadata record: the tags as the file was opened."""
+        if name == tg.METADATA_NAME:
+            self.tags.append((0, tg.bits_of(values)))
+
     def finish(self):
         by_seq = bool(self.frames) and all(f.seq >= 0 for f in self.frames)
         return Session(self.session_name, self.name, self.contract,
                        sorted(self.commands), sorted(self.frames, key=lambda f: f.t_ns),
                        sorted(self.connected), sorted(self.marks, key=lambda m: m[0]),
                        self.label_modes, by_seq, tuple(sorted(self.vehicle)),
-                       tuple(sorted(self.lidar, key=lambda r: r[0])))
+                       tuple(sorted(self.lidar, key=lambda r: r[0])),
+                       tuple(sorted(self.tags, key=lambda e: e[0])))
 
 
 def decode_lidar_bins(payload):

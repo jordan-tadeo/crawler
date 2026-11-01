@@ -83,6 +83,16 @@ other, never trained on), each model is also run through those whole drives
 and graded on the second before each tip (tip_scores: tip_go, tip_thr,
 calm_go). Those are the car's own ticks, not my labels.
 
+Indoor and outdoor are never graded together. --place indoor (the default)
+grades only the ticks not tagged outdoor (policy_tags; every recording made
+before the tags is indoor), --place outdoor only the outdoor ones, on every
+set above alike (the scorecard, --fed, --drives, --tips); run it once each
+for the two. --include-tags / --exclude-tags narrow it further, as
+policy_train.py's do (--include-tags clean). Outdoors, open_front's "no
+return inside OPEN_MM is open" means nothing -- grass, a kerb under the
+scan, nothing in range at all -- so an outdoor card says so and its
+open_*, L_* and drive_open_* are not open-floor numbers.
+
 What this cannot say: whether the car drives well. These are my own labels on
 moments I took over; the car's feel is mine to judge on a drive.
 """
@@ -105,6 +115,7 @@ from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
 from crawler.mapping import egomap as em  # noqa: E402
 import policy_eval as pe  # noqa: E402
+import policy_tags as ptg  # noqa: E402
 import policy_train as pt  # noqa: E402
 
 FWD, REV, STOP = (pl.ACTIONS.index(a) for a in (pl.FORWARD, pl.REVERSE, pl.STOP))
@@ -124,6 +135,10 @@ GOAL_PROBE_DEG = 60.0
 OPEN_MM = 1000.0
 OPEN_FRONT_DEG = 20.0
 ACCEPT_S = 3.0
+OUTDOOR_NOTE = ("outdoor: open_front counts no lidar return inside "
+                f"{OPEN_MM:.0f} mm as open floor, which outdoors says nothing "
+                "(grass, kerbs under the scan, nothing in range); open_fwd_*, "
+                "L_* and drive_open_* are not open-floor numbers here")
 
 
 def side(s, band=SIDE_BAND):
@@ -327,7 +342,14 @@ def drive_scores(model, data, ticks):
             "drive_open_stop": _rate(act == STOP, opened)}
 
 
-def tip_scores(model, data, tip_deg=pt.TIP_DEG, lead_s=pt.TIP_LEAD_S):
+def tag_keep(data, place, include=(), exclude=()):
+    """Per tick: at this place (indoor or outdoor) and passing the tag
+    filter (policy_tags)."""
+    bits = ptg.tick_tags(data)
+    return ptg.place_mask(bits, place) & ptg.keep_mask(bits, include, exclude)
+
+
+def tip_scores(model, data, tip_deg=pt.TIP_DEG, lead_s=pt.TIP_LEAD_S, keep=None):
     """The model run through drives that tipped (--tips), every decision
     tick but the tipped ones, in time order as the car runs it:
 
@@ -343,6 +365,8 @@ def tip_scores(model, data, tip_deg=pt.TIP_DEG, lead_s=pt.TIP_LEAD_S):
     gear in a run-up was, only that the one taken went over."""
     tipped, runup = pt.tip_marks(data, tip_deg, lead_s)
     dec = np.asarray(data["decision"], bool) & ~tipped
+    if keep is not None:
+        dec = dec & keep
     ticks = np.flatnonzero(dec)
     ticks = ticks[np.lexsort((data["t_ns"][ticks], data["session"][ticks]))]
     act, _, thr = decode(model, data, ticks, with_throttle=True)
@@ -615,7 +639,20 @@ def main(argv=None):
                     help="the crops for --drives, if not in --map")
     ap.add_argument("--drives-fed", default=None, metavar="FED_DIR",
                     help="the fed goals for --drives, if not in --fed")
+    ap.add_argument("--place", choices=ptg.PLACES, default="indoor",
+                    help="grade only the indoor ticks (default; untagged is indoor) "
+                         "or only the outdoor ones, never both together")
+    ap.add_argument("--include-tags", default=None, metavar="A,B",
+                    help="and only ticks with every one of these tags (clean, messy, ...)")
+    ap.add_argument("--exclude-tags", default=None, metavar="A,B",
+                    help="and no tick with any of these tags")
     args = ap.parse_args(argv)
+    try:
+        tag_in = ptg.parse_names(args.include_tags)
+        tag_out = ptg.parse_names(args.exclude_tags)
+    except ValueError as e:
+        print(e)
+        return 2
     names = pt.scorecard_sessions()
     if not names:
         print(f"no scorecard at {pt.SCORECARD_FILE}")
@@ -625,9 +662,23 @@ def main(argv=None):
     if missing:
         print(f"{args.data} has no {missing}: build the dataset with them in")
         return 1
+    keep = tag_keep(data, args.place, tag_in, tag_out)
     ticks = scorecard_ticks(data, names)
+    print(f"place {args.place}" + (f", tags {'+'.join(tag_in)}" if tag_in else "")
+          + (f", not {'/'.join(tag_out)}" if tag_out else "")
+          + f": {int(keep[ticks].sum())} of {len(ticks)} scorecard decision ticks ("
+          + ", ".join(f"{k} {v}" for k, v in ptg.counts(ptg.tick_tags(data)[ticks]).items())
+          + ")")
+    ticks = ticks[keep[ticks]]
+    if not len(ticks):
+        print(f"no scorecard tick is {args.place} with those tags: nothing to grade")
+        return 1
+    if args.place == "outdoor":
+        print(OUTDOOR_NOTE)
     tips = load(args.tips, args.tips_map or args.map) if args.tips else None
     every = session_ticks(data, names) if args.fed else None
+    if every is not None:
+        every = every[keep[every]]
     drives, drive_ticks = None, None
     if args.drives:
         drives = load(args.drives, args.drives_map or args.map, args.drives_fed or args.fed)
@@ -639,6 +690,7 @@ def main(argv=None):
             print("--drives needs --drives-fed or --fed: the car was fed a goal")
             return 1
         drive_ticks = session_ticks(drives, rejected)
+        drive_ticks = drive_ticks[tag_keep(drives, args.place, tag_in, tag_out)[drive_ticks]]
     rows = []
     for path in args.models:
         model = load_model(path)
@@ -653,7 +705,7 @@ def main(argv=None):
         s["onnx_sha256"] = (file_sha256(path) if "+" not in path
                             else [file_sha256(p) for p in path.split("+")])
         if tips is not None:
-            s.update(tip_scores(model, tips))
+            s.update(tip_scores(model, tips, keep=tag_keep(tips, args.place, tag_in, tag_out)))
             s["tips_seen"] = sorted(set(tips["meta"]["sessions"])
                                     & set(model.meta.get("train_sessions", [])))
         s["seen"] = seen
@@ -662,9 +714,14 @@ def main(argv=None):
         print(f"{label}: {json.dumps({k: s[k] for k in s if not k.endswith('seen') and k not in ('onnx_sha256', 'drives')})}",
               flush=True)
     print(table(rows))
+    if args.place == "outdoor":
+        print(OUTDOOR_NOTE)
     if args.json:
         with open(args.json, "w") as f:
-            json.dump({"sessions": names, "models": dict(rows)}, f, indent=2)
+            json.dump({"sessions": names, "place": args.place,
+                       "tags": {"include": tag_in, "exclude": tag_out},
+                       **({"note": OUTDOOR_NOTE} if args.place == "outdoor" else {}),
+                       "models": dict(rows)}, f, indent=2)
     return 0
 
 

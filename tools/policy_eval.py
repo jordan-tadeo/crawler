@@ -324,10 +324,13 @@ def median_training_magnitude(data, train_mask):
     return float(np.median(data["magnitude"][moving])) if moving.any() else 1.0
 
 
-def score(model, data, session_ids, label_mode, train_mask):
-    """Pooled val numbers over these sessions, plus one block per session."""
+def score(model, data, session_ids, label_mode, train_mask, keep=None):
+    """Pooled val numbers over these sessions, plus one block per session;
+    only the ticks in keep, given (policy_train's tag filter)."""
     median_mag = median_training_magnitude(data, train_mask)
     graded = data["decision"] & ~bad_marked(data)
+    if keep is not None:
+        graded = graded & np.asarray(keep, bool)
     pooled = np.flatnonzero(np.isin(data["session"], session_ids) & graded)
     out = score_ticks(model, data, pooled, label_mode, median_mag)
     out["median_magnitude"] = median_mag

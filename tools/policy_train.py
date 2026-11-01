@@ -96,6 +96,17 @@ interventions P of the gear's ticks by weight, the record ticks the share
 they have, the accepted auto the rest. --accept-after-s is the window before
 a takeover that is not "let stand" (their pre-intervention, weight 0).
 
+Tags (policy_tags, the dataset's "tags" array: what I said each drive was on
+the map page; a session recorded before them is indoor and messy, not
+clean). --include-tags A,B trains only on ticks with every one of them,
+--exclude-tags A,B never on a tick with any; the names are outdoor or
+indoor, clean or messy. The ticks left out are graded on by neither --val
+nor the folds, so a number never mixes what was trained apart.
+--tag-weight TAG=W (again for another tag) multiplies a tick's loss weight
+by W for each tag it has, on top of every other weight (tick_weights):
+--tag-weight clean=3, or --exclude-tags messy to try cutting the old ones.
+None of them given, every tick trains as before.
+
 The val split
 -------------
 --val holds out whole sessions, which is the honest split when there are
@@ -174,6 +185,7 @@ from crawler.autopilot import policy_lidar as pli  # noqa: E402
 from crawler.mapping import egomap as em  # noqa: E402
 import policy_eval as pe  # noqa: E402
 import policy_keyframes as pk  # noqa: E402
+import policy_tags as ptg  # noqa: E402
 
 GOOD_WEIGHT = 2.0
 # How much an intervention tick counts against a record tick. 77 takeover
@@ -1013,13 +1025,16 @@ def tick_weights(data, idx, good_weight, takeover_weight=TAKEOVER_WEIGHT):
     """Per training tick loss weight: good_weight inside a GOOD mark, times
     takeover_weight on an intervention, times the accepted-auto weight on
     one of those (data["accepted_w"], set by --accepted-weight), times the
-    keyframe weight (data["keyframe_w"], set by --keyframe-weight), else 1."""
+    keyframe weight (data["keyframe_w"], set by --keyframe-weight), times
+    the tags' (data["tag_w"], set by --tag-weight), else 1."""
     good = np.where(pe.marks_of(data)[idx] == pe.MARK_GOOD, float(good_weight), 1.0)
     fix = np.where(intervention_ticks(data)[idx], float(takeover_weight), 1.0)
     weak = np.asarray(data["accepted_w"])[idx] if "accepted_w" in data else 1.0
     w = good * fix * weak
     if "keyframe_w" in data:
         w = w * np.asarray(data["keyframe_w"])[idx]
+    if "tag_w" in data:
+        w = w * np.asarray(data["tag_w"])[idx]
     return w.astype(np.float32)
 
 
@@ -1895,6 +1910,13 @@ def main(argv=None):
     ap.add_argument("--keyframe-steer-only", action="store_true",
                     help="with --keyframe-weight: rank by the steer's error alone and weight "
                          "only the steer loss")
+    ap.add_argument("--include-tags", default=None, metavar="A,B",
+                    help="train only on ticks with every one of these tags "
+                         "(outdoor, indoor, clean, messy); untagged is indoor, messy")
+    ap.add_argument("--exclude-tags", default=None, metavar="A,B",
+                    help="never train on a tick with any of these tags")
+    ap.add_argument("--tag-weight", action="append", default=[], metavar="TAG=W",
+                    help="a tick with TAG counts W times in the loss; again for another tag")
     ap.add_argument("--class-weight-power", type=float, default=1.0,
                     help="raise the gear's class weights to this power: 1 as they are "
                          "(the default), 0.5 half their log, 0 none")
@@ -2032,8 +2054,27 @@ def main(argv=None):
         data["accepted_w"] = np.where(weak, args.accepted_weight, 1.0).astype(np.float32)
         print(f"accepted auto: {int(weak.sum())} decisions the model drove and I let stand, "
               f"at {args.accepted_weight:g} a tick")
+    try:
+        tag_in = ptg.parse_names(args.include_tags)
+        tag_out = ptg.parse_names(args.exclude_tags)
+        tag_w = ptg.parse_weights(args.tag_weight)
+    except ValueError as e:
+        print(e)
+        return 2
+    bits = ptg.tick_tags(data)
+    tag_keep = ptg.keep_mask(bits, tag_in, tag_out)
+    if tag_w:
+        data["tag_w"] = ptg.weights(bits, tag_w)
     steer_ok, throttle_ok = label_masks(data, args.labels)
     labelled = steer_ok | throttle_ok
+    decisions = labelled & data["decision"]
+    print("tags: labelled decisions " + ", ".join(
+        f"{k} {v}" for k, v in ptg.counts(bits, decisions).items())
+        + (f"; kept {int((decisions & tag_keep).sum())} of {int(decisions.sum())}"
+           f" ({'+'.join(tag_in) or 'any'}, not {'/'.join(tag_out) or 'none'})"
+           if tag_in or tag_out else "")
+        + (f"; weights {tag_w}" if tag_w else ""))
+    labelled = labelled & tag_keep
     # The scorecard's sessions are never trained on (unless asked): every
     # mask below is off `labelled`, so this one line keeps them out of the
     # folds, the final model and --val alike.
@@ -2131,7 +2172,7 @@ def main(argv=None):
             with torch.no_grad():
                 export(model, args.representation, tmp,
                        {**_base_meta(meta_in, args, [], []), **mode_meta(args.switch_weight)})
-            graded = held & ~pe.bad_marked(data)
+            graded = held & ~pe.bad_marked(data) & tag_keep
             s = pe.score_ticks(pl.PolicyModel(tmp), data, np.flatnonzero(graded),
                                args.labels, pe.median_training_magnitude(data, mask))
             folds.append(s)
@@ -2254,6 +2295,8 @@ def main(argv=None):
                               if args.accepted_weight > 0 else None),
             "class_weight_power": args.class_weight_power,
             "gear_weights": gear_weights,
+            "tags": {"include": tag_in, "exclude": tag_out, "weights": tag_w,
+                     "train_ticks": ptg.counts(bits, train_mask)},
             **({"keyframes": keyframe_meta} if keyframe_meta is not None else {}),
             **({"imu_tilt_train_ticks": tilt_ticks} if args.imu_tilt else {}),
             **({"lidar_train_ticks": int((train_mask & data["lidar_present"]).sum())}
@@ -2275,7 +2318,8 @@ def main(argv=None):
             model_rt, data, np.flatnonzero(train_mask), args.labels,
             pe.median_training_magnitude(data, train_mask))
     elif not args.blocks:
-        meta["val"] = pe.score(model_rt, data, val_ids, args.labels, train_mask)
+        meta["val"] = pe.score(model_rt, data, val_ids, args.labels, train_mask,
+                               keep=tag_keep)
     write_sidecar(args.out, meta)
     print(f"{args.representation}: {params} parameters, "
           f"{os.path.getsize(args.out)} bytes, {int(train_mask.sum())} training decisions")

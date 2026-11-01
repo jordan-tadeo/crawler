@@ -112,6 +112,17 @@ without --lidar, which is every one before 2026-10-29, is all not present
 and all zeros, never a made-up scan. The trainer encodes them with
 policy_lidar.encode_many, the function the car's encode() runs.
 
+The tags
+--------
+Every tick carries `tags`, the bit mask (telemetry/tags.BITS: outdoor 1,
+clean 2) of what I said the drive was on the map page then: the newest
+/session/tags at or before it, else the file's metadata record (policy_tags.
+tags_at). A file with neither, every one before the tags, is 0: indoor, not
+clean. Nothing is dropped for a tag here; policy_train.py --include-tags,
+--exclude-tags and --tag-weight choose, and policy_scorecard.py --place
+grades indoor and outdoor apart. meta["tag_bits"] is the bit order and
+meta["session_tags"] each session's (t_ns, mask) changes.
+
 Needs `mcap` and `mcap-protobuf-support`, which are tools for the laptop and
 not dependencies of the car. The alignment below needs neither and is what
 the tests exercise.
@@ -139,6 +150,8 @@ from crawler.autopilot import driver as dv  # noqa: E402
 from crawler.autopilot import policy as pl  # noqa: E402
 import data_paths as dp  # noqa: E402
 import policy_adapters as pa  # noqa: E402
+import policy_tags as ptg  # noqa: E402
+from crawler.telemetry import tags as tg  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
 
@@ -870,6 +883,12 @@ def to_arrays(sessions_ticks):
         "lidar_present": np.array([r[2].lidar is not None for r in rows], dtype=bool),
         "lidar_age_ms": np.array([r[2].lidar_age_ms for r in rows], dtype=np.float32),
     }
+    # What I said each tick's drive was (see "The tags" above).
+    tags = np.zeros(n, np.uint8)
+    for si, (session, _) in enumerate(sessions_ticks):
+        on = a["session"] == si
+        tags[on] = ptg.tags_at(getattr(session, "tags", ()) or (), a["t_ns"][on])
+    a["tags"] = tags
     return a
 
 
@@ -918,7 +937,7 @@ def read_session(path, adapter_name=None):
     and the indexed reader gives up on the whole file. This reads up to the
     cut and stops.
     """
-    from mcap.records import Channel, Message, Schema
+    from mcap.records import Channel, Message, Metadata, Schema
     from mcap.stream_reader import StreamReader
     from mcap_protobuf.decoder import DecoderFactory
 
@@ -927,6 +946,7 @@ def read_session(path, adapter_name=None):
     name = os.path.splitext(os.path.basename(path))[0]
     adapter = None
     pending = []
+    metadata = []
     truncated = False
     summary = summary_topics(path)
 
@@ -951,6 +971,8 @@ def read_session(path, adapter_name=None):
                     schemas[rec.id] = rec
                 elif isinstance(rec, Channel):
                     channels[rec.id] = rec
+                elif isinstance(rec, Metadata):
+                    metadata.append((rec.name, dict(rec.metadata)))
                 elif isinstance(rec, Message):
                     pending.append(rec) if adapter is None else None
                     if adapter is None:
@@ -982,6 +1004,8 @@ def read_session(path, adapter_name=None):
             ch = channels[m.channel_id]
             if ch.topic in adapter.topics:
                 adapter.feed(ch.topic, m.log_time, decode(ch, m.data))
+    for name, values in metadata:
+        adapter.feed_metadata(name, values)
     return adapter.finish(), truncated
 
 
@@ -1277,6 +1301,10 @@ def main(argv=None):
         line += (f"\n    lidar: {len(getattr(session, 'lidar', ()) or ())} /lidar rows, a scan on "
                  f"{len(ages)} of {len(ticks)} kept ticks"
                  + (f" (age ms p50 {_pct(ages, 50):.0f} max {max(ages):.0f})" if ages else ""))
+        tag_bits = ptg.tags_at(getattr(session, "tags", ()) or (), [t.t_ns for t in ticks])
+        line += ("\n    tags: " + (", ".join(f"{k} {v}" for k, v in ptg.counts(tag_bits).items())
+                                  + f" ticks ({len(session.tags)} records)"
+                                  if session.tags else "none recorded: indoor, not clean"))
         flags = mark_flags(ticks, session.marks)
         kinds = Counter(str(m.get("kind", "?")).lower() for _, m in session.marks)
         line += (f"\n    marks: {kinds.get('good', 0)} good, {kinds.get('bad', 0)} bad; "
@@ -1354,6 +1382,11 @@ def main(argv=None):
         "lidar_ticks": int(arrays["lidar_present"].sum()),
         "lidar_sessions": sorted({s.name for s, ticks in kept
                                   if any(t.lidar is not None for t in ticks)}),
+        # The "tags" array's bits, and each session's (t_ns, mask) as
+        # recorded (t_ns 0: the file's metadata record).
+        "tag_bits": {t: tg.BITS[t] for t in tg.TAGS},
+        "session_tags": {s.name: [list(e) for e in (getattr(s, "tags", ()) or ())]
+                         for s, _ in kept},
         "alignment_ms_histogram": {"edges": hist_edges[:-1], "counts": hist},
         "report": report,
     }

@@ -28,8 +28,8 @@ text-decoration:none;font-weight:600}
 #err{background:#2a1414;border:1px solid #6b2020;color:#ff9b9b}
 #wrap{position:relative;flex:1;min-height:0;border-radius:14px;overflow:hidden;
 background:#0a0c10;border:1px solid var(--line)}
-canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;display:block;
-user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;display:block}
+canvas,button{user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 #ov{pointer-events:none}
 #status{position:absolute;left:8px;right:8px;top:8px;display:flex;gap:6px;flex-wrap:wrap;pointer-events:none}
 .chip{background:rgba(23,27,34,.88);border:1px solid var(--line);border-radius:999px;
@@ -48,9 +48,9 @@ font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;text-align:
 #toast.bad{border-color:#6b2020;color:#ff9b9b}
 .bar{display:grid;gap:6px;flex:none}
 .bar.four{grid-template-columns:repeat(4,1fr)}
+#tags{grid-template-columns:1fr 1fr}#tags button{min-height:38px}
 button{border:0;border-radius:11px;background:var(--btn);color:var(--text);font:inherit;
-font-weight:600;min-height:50px;padding:6px 4px;cursor:pointer;user-select:none;
--webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+font-weight:600;min-height:50px;padding:6px 4px;cursor:pointer;touch-action:manipulation}
 button:active{filter:brightness(1.4)}
 button:disabled{opacity:.35}
 button.on{background:#1d2a40;box-shadow:inset 0 0 0 2px var(--blue)}
@@ -97,6 +97,7 @@ max-width:520px;max-height:80%;overflow:auto;padding:14px 14px max(14px,env(safe
 <button id="b_skip">Skip<span class="sub">stuck: off</span></button>
 <button id="b_adj">Nudge<span class="sub">turn or shift</span></button>
 </div>
+<div class="bar" id="tags"><button id="t_outdoor">Outdoor<span class="sub">off</span></button><button id="t_clean">Clean<span class="sub">off</span></button></div>
 <div class="bar four" id="adjust">
 <button id="a_ccw">&#8634;<span class="sub">2&deg;</span></button>
 <button id="a_cw">&#8635;<span class="sub">2&deg;</span></button>
@@ -117,6 +118,7 @@ var POLL_MS=500, MAP_MS=1000;
 var ACK_MS=5000;            // a command the car has not answered in this is not taken
 var STALE_S=3;
 var ROT_STEP=2*Math.PI/180;
+var TAGS=["outdoor","clean"];
 
 var cv=document.getElementById("cv"),ctx=cv.getContext("2d");
 var ov=document.getElementById("ov"),octx=ov.getContext("2d");
@@ -162,11 +164,9 @@ function post(e){
     .catch(function(){fail(e,"no connection to the car");});
   errBar();
 }
-// Only a stroke is kept on screen with a Retry when the car does not take
-// it: it is the finger's work, and sending it again is safe. Anything else
-// (Undo, Delete, a move, Start...) refused is said once and dropped. A
-// refused Undo kept with a Retry was sent again later, after the next loop
-// was drawn, and took that loop back.
+// Refused, only a stroke stays on screen with a Retry: it is the finger's
+// work and safe to send again. Anything else is said once and dropped (an
+// Undo kept with a Retry went again after the next loop and took it back).
 function fail(e,why){if(edits.indexOf(e)<0||e.state==="failed")return;
   if(e.cmd!=="stroke"){edits.splice(edits.indexOf(e),1);toast(why,"warn");}
   else{e.state="failed";e.why=why;}errBar();schedule();}
@@ -209,11 +209,10 @@ $("e_drop").onclick=function(){edits=edits.filter(function(e){return e.state!=="
 
 // ---- view ----
 var hatch=null;
-// The canvas is the map box, and the box changes height without the window
-// resizing: a banner above it (no controller, not ready, an error) comes and
-// goes. With only the window's resize the drawing kept its old height
-// stretched into the new box, so a waypoint showed up to a banner's height
-// above the finger that put it there. The box is watched instead.
+// The map box changes height with no window resize as a banner above it
+// comes or goes; on the window's resize alone the drawing kept its old
+// height and a waypoint landed a banner's height off the finger. So the box
+// is watched.
 function resize(){dpr=window.devicePixelRatio||1;var r=cv.getBoundingClientRect();
   if(!r.width||!r.height)return;
   if(cv.width===Math.round(r.width*dpr)&&cv.height===Math.round(r.height*dpr)&&hatch)return;
@@ -450,10 +449,9 @@ function endStroke(){
   schedule();
 }
 
-// Nothing the browser would do with a finger on the map: no scroll, no
-// zoom, no callout. The pointer handlers below do it all. touch-action:none
-// and a cancelled touchstart cancel the whole touch; a touchmove listener
-// as well would only make every move wait on this thread.
+// No scroll, zoom or callout for a finger on the map: the pointer handlers
+// do it all. touch-action:none and a cancelled touchstart cancel the touch;
+// a touchmove listener too would make every move wait on this thread.
 ["touchstart","touchend"].forEach(function(t){
   cv.addEventListener(t,function(e){if(e.cancelable)e.preventDefault();},{passive:false});});
 document.addEventListener("gesturestart",function(e){e.preventDefault();},{passive:false});
@@ -549,6 +547,8 @@ $("b_explore").onclick=function(){var on=!xon;send("explore",{on:on});if(on)arme
 $("b_skip").onclick=function(){var on=!(st&&st.patrol&&st.patrol.skip_stuck);
   if(on&&!confirm("Skip a waypoint after 20 s without getting closer?"))return;
   send("skip",{on:on});};
+// What the recordings are: outside, and my takeovers clean. Labels only.
+TAGS.forEach(function(k){$("t_"+k).onclick=function(){var o={};o[k]=!(st&&st.patrol&&(st.patrol.tags||{})[k]);send("tags",o);};});
 $("a_ccw").onclick=function(){rotateAbout(ROT_STEP,adjCentre());schedule();};
 $("a_cw").onclick=function(){rotateAbout(-ROT_STEP,adjCentre());schedule();};
 $("a_no").onclick=function(){stopAdjust();};
@@ -622,7 +622,8 @@ function pollState(){
     xon=!!(pt.explore&&pt.explore.on);b=$("b_explore");b.classList.toggle("on",xon);b.lastChild.textContent=xon?"on":"off";
     $("b_adj").innerHTML=pt.pending?"Place<span class=\"sub\">by hand</span>":"Nudge<span class=\"sub\">turn or shift</span>";
     var k=$("b_skip");k.classList.toggle("on",!!pt.skip_stuck);
-    k.innerHTML="Skip<span class=\"sub\">stuck: "+(pt.skip_stuck?"on":"off")+"</span>";
+    k.lastChild.textContent="stuck: "+(pt.skip_stuck?"on":"off");
+    TAGS.forEach(function(t){var on=!!(pt.tags||{})[t];b=$("t_"+t);b.disabled=!pt.tags;b.classList.toggle("on",on);b.lastChild.textContent=on?"on":"off";});
     schedule();
   }).catch(function(e){net={why:String(e&&e.message||e).slice(0,60),n:((net&&net.n)||0)+1};answer();schedule();});
 }

@@ -65,6 +65,7 @@ from crawler.autopilot import driver as dv
 from crawler.autopilot import goal
 from crawler.autopilot import patrol
 from crawler.telemetry import logger as lg
+from crawler.telemetry import tags as tg
 
 MANUAL = "manual"
 AUTO = "auto"
@@ -376,12 +377,15 @@ class RecordSession:
     Going to auto keeps it: auto is about to need it.
     """
 
-    def __init__(self, tele, hub, logger, make_recorder=None, markpad=None):
+    def __init__(self, tele, hub, logger, make_recorder=None, markpad=None, tags=None):
         self.tele = tele
         self.hub = hub
         self.logger = logger
         self.make_recorder = make_recorder
         self.markpad = markpad
+        # The recordings' tags (telemetry/tags.SessionTags), said as a
+        # session starts. None says nothing.
+        self.tags = tags
 
         self.active = False
         self.limits = (0.0, 0.0)
@@ -415,7 +419,8 @@ class RecordSession:
         self._want_camera()
         self._buzz(2, now)
         self._say("info", f"Recording, throttle capped at "
-                  f"{limits[0]:+.2f}/{limits[1]:+.2f}")
+                  f"{limits[0]:+.2f}/{limits[1]:+.2f}"
+                  + (f", tagged {tg.said(self.tags.bits)}" if self.tags is not None else ""))
         return True
 
     def tick(self, now):
@@ -817,8 +822,12 @@ class AutoPilot:
                  fallback_path=None, clicks=None, patrol_store=None,
                  lidar_near=False, path=None, person=None, tilt_veto=True,
                  library=None, fitter=None, skip_stuck=False, patrol_settings=None,
-                 near_pass_m=patrol.NEAR_PASS_M):
+                 near_pass_m=patrol.NEAR_PASS_M, tags=None):
         self.vecon = vecon
+        # The recordings' tags (telemetry/tags.SessionTags), or None: the
+        # patrol takes the map page's tags command into it, and the
+        # telemetry block puts it on /session/tags. Never read to drive.
+        self.tags = tags
         # --no-tilt-veto turns the policy's tilt veto off (driver.TiltVeto).
         # Set on every policy driver this builds.
         self.tilt_veto = bool(tilt_veto)
@@ -856,7 +865,7 @@ class AutoPilot:
                                    map_view=getattr(slam, "map", None),
                                    library=library, fitter=fitter,
                                    skip_stuck=skip_stuck, settings=patrol_settings,
-                                   near_pass_m=near_pass_m)
+                                   near_pass_m=near_pass_m, tags=tags)
                      if clicks is not None else goal.Goal())
         # The patrol itself, under the FollowSwitch if there is one.
         self.patrol = self.goal if clicks is not None else None
@@ -1745,6 +1754,14 @@ def goal_telemetry(tele, autopilot, page, now, pad=True, mode=None):
     the patrol and the planner already hold. Every pass, pad or not: none of
     it drives anything. `pad` and `mode` are for the map page, which says
     when there is no controller to drive with."""
+    # The recordings' tags, with or without --goal: once a second, and on
+    # the pass one changes past the gate.
+    tags = getattr(autopilot, "tags", None)
+    if tags is not None:
+        if tags.pop_changed():
+            tele.offer_now("session_tags", tags.payload(), now)
+        elif tele.wants("session_tags", now):
+            tele.offer("session_tags", tags.payload(), now)
     # --goal: the clicked goal, from the truck, and its disc.
     if getattr(autopilot, "clicks", None) is not None:
         if tele.wants("goal_status", now):
@@ -2367,12 +2384,21 @@ def main(argv=None):
     #
     # The recorder is constructed here and opened on the publisher thread.
     # Constructing it touches no disk.
+    # The tags I set on the map page (telemetry/tags.py), kept across a
+    # restart: before the recorder, whose every file starts with them.
+    tags = tg.SessionTags(store=patrol.Store(lg.log_path(tg.SETTINGS_FILE)),
+                          say=log.log)
+
+    def tags_metadata():
+        return {tg.METADATA_NAME: tags.metadata()}
+
     recorder = None
     if args.record:
         from crawler.telemetry import recording
         recorder = recording.Recorder(
             logger=log,
             directory=args.record_dir or recording.DEFAULT_DIR,
+            metadata=tags_metadata,
         )
 
     # --nav takes its goals off Foxglove's publish tool, so the server has
@@ -2487,7 +2513,8 @@ def main(argv=None):
                           skip_stuck=args.patrol_skip_stuck,
                           near_pass_m=args.patrol_near_pass_m,
                           patrol_settings=(patrol.Store(lg.log_path(PATROL_SETTINGS_FILE))
-                                           if args.goal else None))
+                                           if args.goal else None),
+                          tags=tags)
     buttons = start_buttons(args, tele, goals, log, slam=slam, library=library)
 
     # Who gets the device opened at startup, and who waits for it:
@@ -2529,10 +2556,11 @@ def main(argv=None):
             prefix=recording.SESSION_PREFIX,
             segment_bytes=recording.SESSION_SEGMENT_BYTES,
             max_total_bytes=None,
+            metadata=tags_metadata,
         )
 
     session = RecordSession(tele, hub, log, make_recorder=session_recorder,
-                            markpad=markpad)
+                            markpad=markpad, tags=tags)
     # The driver's own view, so auto rows shrink the frame it scanned.
     tap = fp.FootprintTap(view=hub.view("footprint"), tele=tele,
                           auto_view=hub.view(AUTO_VIEW))
