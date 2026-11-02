@@ -1,15 +1,19 @@
 """What I say a drive is, written into the recording beside it.
 
-One tag, on or off, set from the map page's Clean button ({"cmd": "tags",
-"clean": true} on /patrol/cmd or POST /api/cmd), never from the pad:
+Two tags, each on or off, set from the map page's Outdoor and Clean buttons
+({"cmd": "tags", "outdoor": true, "clean": false} on /patrol/cmd or POST
+/api/cmd), never from the pad:
 
+  outdoor   driving outside. Every model up to now was trained indoors, and
+            an outdoor tick must never be graded or trained on as if it
+            were one more indoor one.
   clean     I am driving instructor-style: the model drives and I take over
             only when it goes wrong, with smooth corrections. Off is every
             session before this existed: takeovers made any old way.
 
-A recording with no tags in it (every one before this) is not clean. Nothing
-here touches the wheels, the mode or any safety rule: a tag is a label on the
-data and that is all.
+A recording with no tags in it (every one before this) is indoor and not
+clean. Nothing here touches the wheels, the mode or any safety rule: a tag
+is a label on the data and that is all.
 
 Kept across a restart in log/session_tags.json, as the patrol's settings
 are (patrol.Store: written off the control thread). How they reach a
@@ -29,15 +33,12 @@ The journal says the tags at boot, at the start of each record session and
 on every change.
 """
 
-TAGS = ("clean",)
+TAGS = ("outdoor", "clean")
 # The other side of each tag, for the tools' filters (--include-tags
-# messy): a tick without the tag has its opposite.
-OPPOSITES = {"clean": "messy"}
+# indoor): a tick without the tag has its opposite.
+OPPOSITES = {"outdoor": "indoor", "clean": "messy"}
 NAMES = TAGS + tuple(OPPOSITES[t] for t in TAGS)
-# Each tag's bit in a mask, fixed: what the datasets hold. Bit 1 stays free
-# for the outdoor tag (on its own branch until the UWB), so it comes back
-# with no change to a mask already recorded.
-BITS = {"clean": 2}
+BITS = {t: 1 << k for k, t in enumerate(TAGS)}
 TOPIC = "/session/tags"
 METADATA_NAME = "crawler.tags"
 SETTINGS_FILE = "log/session_tags.json"
@@ -67,8 +68,8 @@ def names_of(bits):
 
 
 def said(bits):
-    """How the journal and the tools say a mask: "clean", or "messy" for
-    no tags."""
+    """How the journal and the tools say a mask: "outdoor, clean", or what
+    no tags means."""
     on = names_of(bits)
     words = [t if t in on else OPPOSITES[t] for t in TAGS]
     return ", ".join(words)
@@ -114,7 +115,7 @@ class SessionTags:
         return out
 
     def command(self, msg):
-        """{"cmd": "tags", "clean": bool}.
+        """{"cmd": "tags", "outdoor": bool, "clean": bool}, either or both.
         True if taken (a repeat of what is set is taken and changes
         nothing), False if refused, said why."""
         if not isinstance(msg, dict):

@@ -726,7 +726,7 @@ JSON_SCHEMAS = {
     # tag on or off, the ones on as a comma list, and seq, the changes
     # since boot. A tick takes the newest at or before it.
     "session_tags": _schema("crawler.SessionTags", {
-        "clean": _BOOL, "tags": _STR, "seq": _INT,
+        "outdoor": _BOOL, "clean": _BOOL, "tags": _STR, "seq": _INT,
     }),
     "patrol_event": _schema("crawler.PatrolEvent", {
         "seq": _INT, "kind": _STR, "by": _STR, "index": _INT, "next": _INT,

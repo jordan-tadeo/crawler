@@ -5,7 +5,7 @@ Nothing here touches the wheels: a tag is a label on the data. These hold
 that the command goes through the patrol's queue and acks like any other
 map page command, that a change lands on /session/tags the pass it is made
 and the file's metadata as it opens, that a tick takes the newest tags at
-or before it (an untagged file is messy), and that the filters and
+or before it (an untagged file is indoor, messy), and that the filters and
 weights do what their flags say. No torch, no MCAP reader.
 """
 
@@ -32,10 +32,7 @@ import session_tags as st
 from test_policy_tools import S, T0, footprint_session, record
 from test_recording import FakeLogger, fake_sdk, make  # noqa: F401  (fake_sdk is a fixture)
 
-CLEAN = tg.BITS["clean"]
-# The bit kept free for the outdoor tag, on its own branch: a mask with it
-# set means nothing here.
-SPARE = 1
+OUT, CLEAN = tg.BITS["outdoor"], tg.BITS["clean"]
 
 
 class Said:
@@ -52,64 +49,56 @@ def store(tmp_path):
 
 # ---- the car's side -------------------------------------------------------------
 
-def test_clean_is_the_one_tag_and_keeps_its_bit():
-    assert tg.TAGS == ("clean",) and tg.NAMES == ("clean", "messy")
-    assert tg.BITS == {"clean": 2}, "the bit is the datasets' wire format"
-
-
-def test_none_set_is_messy_and_said_at_boot(tmp_path):
+def test_none_set_is_indoor_messy_and_said_at_boot(tmp_path):
     said = Said()
     tags = tg.SessionTags(store=store(tmp_path), say=said)
-    assert tags.bits == 0 and tags.state() == {"clean": False}
-    assert said.lines == [("info", "Tags", "Tags: messy (none set yet)")]
-    assert tags.payload() == {"clean": False, "tags": "", "seq": 0}
-    assert tags.metadata() == {"clean": "false", "tags": ""}
+    assert tags.bits == 0 and tags.state() == {"outdoor": False, "clean": False}
+    assert said.lines == [("info", "Tags", "Tags: indoor, messy (none set yet)")]
+    assert tags.payload() == {"outdoor": False, "clean": False, "tags": "", "seq": 0}
+    assert tags.metadata() == {"outdoor": "false", "clean": "false", "tags": ""}
 
 
 def test_a_tag_set_is_said_kept_and_back_after_a_restart(tmp_path):
     said = Said()
     tags = tg.SessionTags(store=store(tmp_path), say=said)
-    assert tags.command({"cmd": "tags", "clean": True}) is True
-    assert tags.bits == CLEAN and tags.pop_changed() and not tags.pop_changed()
-    assert said.lines[-1] == ("info", "Tags", "Tags now clean")
-    assert json.load(open(tmp_path / "session_tags.json")) == {"clean": True}
-    assert tags.payload() == {"clean": True, "tags": "clean", "seq": 1}
-    assert tags.metadata()["tags"] == "clean"
+    assert tags.command({"cmd": "tags", "outdoor": True}) is True
+    assert tags.bits == OUT and tags.pop_changed() and not tags.pop_changed()
+    assert said.lines[-1] == ("info", "Tags", "Tags now outdoor, messy")
+    assert json.load(open(tmp_path / "session_tags.json")) == {"outdoor": True, "clean": False}
+    # Either tag alone leaves the other as it is.
+    assert tags.command({"cmd": "tags", "clean": True}) and tags.bits == OUT | CLEAN
+    assert tags.payload() == {"outdoor": True, "clean": True, "tags": "outdoor,clean", "seq": 2}
+    assert tags.metadata()["tags"] == "outdoor,clean"
     # The same again is taken and changes nothing: no new line, no resend.
     n = len(said.lines)
+    tags.pop_changed()
     assert tags.command({"cmd": "tags", "clean": True}) is True
-    assert len(said.lines) == n and not tags.pop_changed() and tags.seq == 1
+    assert len(said.lines) == n and not tags.pop_changed() and tags.seq == 2
     # Next boot.
     again = Said()
     back = tg.SessionTags(store=store(tmp_path), say=again)
-    assert back.bits == CLEAN
-    assert again.lines == [("info", "Tags", "Tags: clean (as last set)")]
-    # Off again, and kept off.
-    assert back.command({"cmd": "tags", "clean": False}) and back.bits == 0
-    assert json.load(open(tmp_path / "session_tags.json")) == {"clean": False}
+    assert back.bits == OUT | CLEAN
+    assert again.lines == [("info", "Tags", "Tags: outdoor, clean (as last set)")]
 
 
 def test_a_bad_tags_command_is_refused_and_changes_nothing(tmp_path):
     said = Said()
     tags = tg.SessionTags(store=store(tmp_path), say=said)
     assert tags.command({"cmd": "tags"}) is False
-    assert tags.command({"cmd": "tags", "clean": "yes"}) is False
-    assert tags.command({"cmd": "tags", "clean": 1}) is False
-    # outdoor is no tag here: a command with only it names none.
-    assert tags.command({"cmd": "tags", "outdoor": True}) is False
+    assert tags.command({"cmd": "tags", "outdoor": "yes"}) is False
+    assert tags.command({"cmd": "tags", "outdoor": 1}) is False
     assert tags.command("tags") is False
     assert tags.bits == 0 and not tags.changed
-    assert [line[0] for line in said.lines[1:]] == ["warning"] * 4
+    assert [line[0] for line in said.lines[1:]] == ["warning", "warning", "warning"]
     assert not (tmp_path / "session_tags.json").exists()
 
 
 def test_bits_read_a_message_a_metadata_record_or_nothing():
-    assert tg.bits_of({"clean": True}) == CLEAN
-    assert tg.bits_of({"outdoor": "true", "clean": "true", "tags": "outdoor,clean"}) == CLEAN
-    assert tg.bits_of({"outdoor": True}) == 0
-    assert tg.bits_of({"clean": 1}) == 0 and tg.bits_of(None) == 0 and tg.bits_of([]) == 0
-    assert tg.said(0) == "messy" and tg.said(CLEAN) == "clean"
-    assert tg.names_of(CLEAN) == ["clean"] and tg.names_of(SPARE) == []
+    assert tg.bits_of({"outdoor": True, "clean": False}) == OUT
+    assert tg.bits_of({"outdoor": "false", "clean": "true", "tags": "clean"}) == CLEAN
+    assert tg.bits_of({"outdoor": 1}) == 0 and tg.bits_of(None) == 0 and tg.bits_of([]) == 0
+    assert tg.said(0) == "indoor, messy" and tg.said(OUT | CLEAN) == "outdoor, clean"
+    assert tg.names_of(CLEAN) == ["clean"]
 
 
 def test_the_patrol_takes_the_map_pages_tags_command_and_acks_it(tmp_path):
@@ -117,13 +106,14 @@ def test_the_patrol_takes_the_map_pages_tags_command_and_acks_it(tmp_path):
     said = Said()
     tags = tg.SessionTags(store=store(tmp_path), say=said)
     p = pt.Patrol(say=said, tags=tags)
-    assert "tags" in pt.MAP_COMMANDS and p.page_state()["tags"] == {"clean": False}
-    p.poll(Events(cmd("tags", clean=True, id="a-1")), None)
-    assert tags.bits == CLEAN and p.page_state()["tags"]["clean"] is True
+    assert "tags" in pt.MAP_COMMANDS and p.page_state()["tags"] == {"outdoor": False,
+                                                                    "clean": False}
+    p.poll(Events(cmd("tags", outdoor=True, id="a-1")), None)
+    assert tags.bits == OUT and p.page_state()["tags"]["outdoor"] is True
     assert list(p.acks)[-1] == ["a-1", True, ""]
     # Its line goes to the journal under Tags, and to the page's toasts.
-    assert ("info", "Tags", "Tags now clean") in said.lines
-    assert p.page_state()["said"][-1] == ["info", "Tags now clean"]
+    assert ("info", "Tags", "Tags now outdoor, messy") in said.lines
+    assert p.page_state()["said"][-1] == ["info", "Tags now outdoor, messy"]
     p.poll(Events(cmd("tags", clean="no", id="a-2")), None)
     ack = list(p.acks)[-1]
     assert ack[:2] == ["a-2", False] and "clean is 'no'" in ack[2]
@@ -134,7 +124,7 @@ def test_the_patrol_takes_the_map_pages_tags_command_and_acks_it(tmp_path):
 def test_a_patrol_with_no_tags_refuses_the_command():
     from test_patrol import Events, cmd
     p = pt.Patrol()
-    p.poll(Events(cmd("tags", clean=True, id="b-1")), None)
+    p.poll(Events(cmd("tags", outdoor=True, id="b-1")), None)
     assert list(p.acks)[-1] == ["b-1", False, "Tags refused: this car keeps no tags"]
     assert p.page_state()["tags"] is None
 
@@ -166,7 +156,8 @@ def test_the_tags_go_on_their_channel_once_a_second_and_on_a_change(tmp_path):
     assert tele.offers == [("session_tags", tags.payload())]
     tags.command({"cmd": "tags", "clean": True})
     cm.goal_telemetry(tele, pilot, None, 2.1, pad=False)
-    assert tele.now_offers == [("session_tags", {"clean": True, "tags": "clean", "seq": 1})]
+    assert tele.now_offers == [("session_tags", {"outdoor": False, "clean": True,
+                                                 "tags": "clean", "seq": 1})]
     # Without a SessionTags (an old AutoPilot) nothing is sent.
     cm.goal_telemetry(Tele(["session_tags"]), types.SimpleNamespace(clicks=None), None, 3.0)
     assert tm.JSON_TOPICS["session_tags"] == tg.TOPIC == "/session/tags"
@@ -177,13 +168,13 @@ def test_the_tags_go_on_their_channel_once_a_second_and_on_a_change(tmp_path):
 def test_a_record_session_says_its_tags_as_it_starts(tmp_path):
     from test_record import FakeHub, SessionTele
     tags = tg.SessionTags(store=store(tmp_path))
-    tags.command({"cmd": "tags", "clean": True})
+    tags.command({"cmd": "tags", "outdoor": True})
     log = FakeLogger()
     session = cm.RecordSession(SessionTele(), FakeHub(), log, make_recorder=lambda: "rec",
                                tags=tags)
     driver = types.SimpleNamespace(forward_speed=0.4, reverse_speed=-1.0)
     assert session.begin(0.0, driver)
-    assert any(t.startswith("Recording, throttle capped") and t.endswith("tagged clean")
+    assert any(t.startswith("Recording, throttle capped") and t.endswith("tagged outdoor, messy")
                for _, _, t in log.lines), log.lines
 
 
@@ -214,10 +205,11 @@ def test_every_file_opens_with_the_tags_as_they_are_then(tmp_path, fake_sdk):  #
     fake_sdk_module.open_mcap = open_mcap
     r = make(tmp_path, metadata=lambda: {tg.METADATA_NAME: tags.metadata()})
     assert r.start()
-    assert writers[0].records == [("crawler.tags", {"clean": "false", "tags": ""})]
-    tags.command({"cmd": "tags", "clean": True})
+    assert writers[0].records == [("crawler.tags", {"outdoor": "false", "clean": "false",
+                                                    "tags": ""})]
+    tags.command({"cmd": "tags", "outdoor": True, "clean": True})
     r._rotate()
-    assert writers[1].records[0][1] == {"clean": "true", "tags": "clean"}
+    assert writers[1].records[0][1]["tags"] == "outdoor,clean"
     assert r.metadata_written == 2
     # One that raises costs the record, never the file.
     log = FakeLogger()
@@ -228,24 +220,24 @@ def test_every_file_opens_with_the_tags_as_they_are_then(tmp_path, fake_sdk):  #
 def test_a_real_writer_takes_the_metadata_record(tmp_path):
     pytest.importorskip("foxglove")
     tags = tg.SessionTags()
-    tags.command({"cmd": "tags", "clean": True})
+    tags.command({"cmd": "tags", "outdoor": True})
     r = recording.Recorder(logger=FakeLogger(), directory=str(tmp_path),
                            metadata=lambda: {tg.METADATA_NAME: tags.metadata()})
     assert r.start() and r.metadata_written == 1
     path = r.path
     r.stop()
     body = open(path, "rb").read()
-    assert b"crawler.tags" in body and b"clean" in body
+    assert b"crawler.tags" in body and b"outdoor" in body
 
 
 # ---- the tools' side --------------------------------------------------------------
 
 def test_a_tick_takes_the_newest_tags_at_or_before_it():
-    entries = [(T0 + 5 * S, 0), (0, CLEAN), (T0 + 9 * S, CLEAN)]
+    entries = [(T0 + 5 * S, OUT), (0, CLEAN), (T0 + 9 * S, 0)]
     t = [T0, T0 + 5 * S - 1, T0 + 5 * S, T0 + 8 * S, T0 + 10 * S]
-    assert ptg.tags_at(entries, t).tolist() == [CLEAN, CLEAN, 0, 0, CLEAN]
+    assert ptg.tags_at(entries, t).tolist() == [CLEAN, CLEAN, OUT, OUT, 0]
     # No metadata record: before the first message, the first message's.
-    assert ptg.tags_at([(T0 + 5 * S, CLEAN)], [T0, T0 + 6 * S]).tolist() == [CLEAN, CLEAN]
+    assert ptg.tags_at([(T0 + 5 * S, OUT)], [T0, T0 + 6 * S]).tolist() == [OUT, OUT]
     assert ptg.tags_at([], [T0, T0 + S]).tolist() == [0, 0]
 
 
@@ -253,10 +245,10 @@ def test_the_adapters_read_the_channel_and_the_metadata_record():
     for cls in (pa.FootprintAdapter, pa.LegacyAdapter):
         ad = cls("s")
         assert tg.TOPIC in ad.topics
-        ad.feed(tg.TOPIC, T0 + 3 * S, {"clean": False, "tags": ""})
-        ad.feed_metadata(tg.METADATA_NAME, {"clean": "true"})
-        ad.feed_metadata("something.else", {"clean": "true"})
-        assert ad.finish().tags == ((0, CLEAN), (T0 + 3 * S, 0))
+        ad.feed(tg.TOPIC, T0 + 3 * S, {"outdoor": True, "clean": False, "tags": "outdoor"})
+        ad.feed_metadata(tg.METADATA_NAME, {"outdoor": "false", "clean": "true"})
+        ad.feed_metadata("something.else", {"outdoor": "true"})
+        assert ad.finish().tags == ((0, CLEAN), (T0 + 3 * S, OUT))
     assert pa.Session("s", "x", "c", [], [], [], [], (), False).tags == ()
 
 
@@ -267,34 +259,33 @@ def tagged_dataset(tags):
 
 
 def test_the_dataset_carries_each_ticks_tags_and_untagged_is_zero():
-    _, ticks, a = tagged_dataset(((0, 0), (T0 + 2 * S, CLEAN)))
+    _, ticks, a = tagged_dataset(((0, CLEAN), (T0 + 2 * S, OUT | CLEAN)))
     t = (a["t_ns"] - T0) / S
     assert a["tags"].dtype == np.uint8 and len(a["tags"]) == len(ticks)
-    assert (a["tags"][t < 2] == 0).all() and (a["tags"][t >= 2] == CLEAN).all()
+    assert (a["tags"][t < 2] == CLEAN).all() and (a["tags"][t >= 2] == OUT | CLEAN).all()
     _, _, plain = tagged_dataset(())
     assert not plain["tags"].any()
 
 
 def test_filters_and_weights_name_a_tag_or_its_opposite():
-    # The spare bit (an outdoor tag, recorded on its branch) is neither.
-    bits = np.array([0, SPARE, CLEAN, SPARE | CLEAN], np.uint8)
+    bits = np.array([0, OUT, CLEAN, OUT | CLEAN], np.uint8)
     assert ptg.keep_mask(bits).all()
-    assert ptg.keep_mask(bits, ["clean"]).tolist() == [False, False, True, True]
-    assert ptg.keep_mask(bits, ["messy"]).tolist() == [True, True, False, False]
+    assert ptg.keep_mask(bits, ["outdoor"]).tolist() == [False, True, False, True]
+    assert ptg.keep_mask(bits, ["indoor", "clean"]).tolist() == [False, False, True, False]
     assert ptg.keep_mask(bits, exclude=["messy"]).tolist() == [False, False, True, True]
-    assert ptg.keep_mask(bits, ["clean"], ["clean"]).tolist() == [False] * 4
-    assert ptg.weights(bits, {"clean": 3.0, "messy": 0.5}).tolist() == [0.5, 0.5, 3.0, 3.0]
-    assert ptg.parse_names(" Clean, messy ") == ["clean", "messy"]
+    assert ptg.keep_mask(bits, ["outdoor"], ["clean"]).tolist() == [False, True, False, False]
+    assert ptg.weights(bits, {"clean": 3.0, "outdoor": 0.5}).tolist() == [1.0, 0.5, 3.0, 1.5]
+    assert ptg.place_mask(bits, "indoor").tolist() == [True, False, True, False]
+    assert ptg.parse_names(" Outdoor, clean ") == ["outdoor", "clean"]
     assert ptg.parse_names(None) == [] and ptg.parse_weights(["messy=0"]) == {"messy": 0.0}
-    for bad in (lambda: ptg.parse_names("muddy"), lambda: ptg.parse_names("outdoor"),
-                lambda: ptg.parse_names("indoor"), lambda: ptg.parse_weights(["clean"]),
+    for bad in (lambda: ptg.parse_names("muddy"), lambda: ptg.parse_weights(["clean"]),
                 lambda: ptg.parse_weights(["clean=-1"]), lambda: ptg.parse_weights(["x=2"]),
-                lambda: ptg.parse_weights(["outdoor=2"]), lambda: ptg.parse_weights(["clean=nan"])):
+                lambda: ptg.parse_weights(["clean=nan"]), lambda: ptg.place_mask(bits, "x")):
         with pytest.raises(ValueError):
             bad()
-    assert ptg.counts(bits, [True, False, True, False]) == {"messy": 1, "clean": 1}
-    assert not hasattr(ptg, "place_mask") and not hasattr(ptg, "PLACES")
-    # A dataset built before the tags: all messy.
+    assert ptg.counts(bits, [True, True, False, False]) == {"indoor, messy": 1,
+                                                            "outdoor, messy": 1}
+    # A dataset built before the tags: all indoor, messy.
     assert ptg.tick_tags({"t_ns": np.zeros(3)}).tolist() == [0, 0, 0]
 
 
@@ -335,34 +326,32 @@ def test_the_trainer_and_retrain_take_the_same_flags():
     source = open(ptr.__file__).read()
     for flag in ("--include-tags", "--exclude-tags", "--tag-weight"):
         assert f'add_argument("{flag}"' in source
-    data = {"t_ns": np.zeros(3), "tags": np.array([0, CLEAN, CLEAN], np.uint8)}
+    data = {"t_ns": np.zeros(3), "tags": np.array([0, OUT, CLEAN], np.uint8)}
     assert rt.tag_keep(data, []).all()
-    assert rt.tag_keep(data, ["--include-tags", "clean", "--epochs", "3"]).tolist() == [
-        False, True, True]
-    assert rt.tag_keep(data, ["--exclude-tags=clean"]).tolist() == [True, False, False]
+    assert rt.tag_keep(data, ["--include-tags", "indoor", "--epochs", "3"]).tolist() == [
+        True, False, True]
+    assert rt.tag_keep(data, ["--exclude-tags=clean,outdoor"]).tolist() == [True, False, False]
 
 
-def test_the_scorecard_filters_on_the_tags_and_has_no_place():
-    data = {"t_ns": np.zeros(3), "tags": np.array([0, CLEAN, SPARE], np.uint8)}
-    assert sc.tag_keep(data).all()
-    assert sc.tag_keep(data, ["clean"]).tolist() == [False, True, False]
-    assert sc.tag_keep(data, exclude=["clean"]).tolist() == [True, False, True]
-    assert sc.tag_keep({"t_ns": np.zeros(2)}, ["messy"]).all(), "untagged is messy"
+def test_the_scorecard_grades_one_place_and_says_what_open_means_outdoors():
+    data = {"t_ns": np.zeros(4), "tags": np.array([0, OUT, CLEAN, OUT | CLEAN], np.uint8)}
+    assert sc.tag_keep(data, "indoor").tolist() == [True, False, True, False]
+    assert sc.tag_keep(data, "outdoor").tolist() == [False, True, False, True]
+    assert sc.tag_keep(data, "outdoor", ["clean"]).tolist() == [False, False, False, True]
+    assert sc.tag_keep({"t_ns": np.zeros(2)}, "indoor").all(), "untagged is indoor"
+    assert "open_front" in sc.OUTDOOR_NOTE and "outdoor" in sc.OUTDOOR_NOTE
     assert sc.main(["x.npz", "m.onnx", "--map", "d", "--include-tags", "muddy"]) == 2
-    assert not hasattr(sc, "OUTDOOR_NOTE")
-    with pytest.raises(SystemExit):
-        sc.main(["x.npz", "m.onnx", "--map", "d", "--place", "indoor"])
 
 
 def test_the_list_says_each_sessions_tags_ticks_and_minutes(tmp_path, capsys):
-    s1, t1, a1 = tagged_dataset(((0, 0), (T0 + 2 * S, CLEAN)))
+    s1, t1, a1 = tagged_dataset(((0, 0), (T0 + 2 * S, OUT)))
     data = dict(a1, meta={"sessions": [s1.name]})
     rows = st.dataset_rows(data)
     (name, mixes, n, labelled, minutes), = rows
     assert name == s1.name and n == len(t1) and minutes == pytest.approx(n / 600.0)
-    assert set(mixes) == {"messy", "clean"} and sum(mixes.values()) == n
+    assert set(mixes) == {"indoor, messy", "outdoor, messy"} and sum(mixes.values()) == n
     text = st.format_rows(rows, "ticks")
-    assert "totals by tags" in text and "clean" in text
+    assert "totals by tags" in text and "outdoor, messy" in text
     path = tmp_path / "d.npz"
     np.savez(path, meta=json.dumps(data["meta"]), **{k: v for k, v in a1.items()})
     assert st.main([str(path)]) == 0

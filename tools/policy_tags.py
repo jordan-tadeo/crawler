@@ -1,14 +1,14 @@
 """The recordings' tags (crawler/telemetry/tags.py) on the tools' side.
 
-A dataset's "tags" array is each tick's bit mask (tags.BITS: clean 2), the
-newest /session/tags at or before the tick, else the file's own metadata
-record, else the first /session/tags in it. A file with none (every
-recording before the tags) is 0: not clean. A dataset built before the tags
-has no array and is all 0 the same.
+A dataset's "tags" array is each tick's bit mask (tags.BITS: outdoor 1,
+clean 2), the newest /session/tags at or before the tick, else the file's
+own metadata record, else the first /session/tags in it. A file with none
+(every recording before the tags) is 0: indoor, not clean. A dataset built
+before the tags has no array and is all 0 the same.
 
-A filter or a weight names a tag or its opposite (tags.NAMES): clean or
-messy. policy_train.py's --include-tags keeps a tick that has every one
-named; --exclude-tags drops one that has any; --tag-weight
+A filter or a weight names a tag or its opposite (tags.NAMES): outdoor or
+indoor, clean or messy. policy_train.py's --include-tags keeps a tick that
+has every one named; --exclude-tags drops one that has any; --tag-weight
 TAG=W multiplies a tick's loss weight by W for each named tag it has.
 
 No torch: policy_scorecard.py and tools/session_tags.py use this too.
@@ -22,6 +22,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from crawler.telemetry import tags as tg  # noqa: E402
+
+PLACES = ("indoor", "outdoor")
 
 
 def tags_at(entries, t_ns):
@@ -57,8 +59,8 @@ def has(bits, name):
 
 
 def parse_names(text):
-    """"clean,messy" -> ["clean", "messy"]; ValueError on a name that is
-    not one. None or "" is none."""
+    """"outdoor,clean" -> ["outdoor", "clean"]; ValueError on a name that
+    is not one. None or "" is none."""
     names = [n.strip().lower() for n in (text or "").split(",") if n.strip()]
     for n in names:
         if n not in tg.NAMES:
@@ -67,7 +69,7 @@ def parse_names(text):
 
 
 def parse_weights(items):
-    """["clean=3", "messy=0.5"] -> {"clean": 3.0, "messy": 0.5}."""
+    """["clean=3", "outdoor=0.5"] -> {"clean": 3.0, "outdoor": 0.5}."""
     out = {}
     for item in items or ():
         name, eq, value = str(item).partition("=")
@@ -100,6 +102,13 @@ def weights(bits, by_tag):
     for name, value in by_tag.items():
         w = np.where(has(bits, name), w * np.float32(value), w)
     return w.astype(np.float32)
+
+
+def place_mask(bits, place):
+    """indoor or outdoor ticks."""
+    if place not in PLACES:
+        raise ValueError(f"no place {place!r}; one of {', '.join(PLACES)}")
+    return has(bits, place)
 
 
 def counts(bits, mask=None):

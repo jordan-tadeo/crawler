@@ -99,9 +99,10 @@ never both on: explore on pauses the patrol, and start, pause, a single goal,
 edit or trace turn explore off, holding neutral. /patrol/status, /goal/status
 and the /footprint row say use "explore", state exploring or holding.
 
-Tags (telemetry/tags.py): {"cmd": "tags", "clean": true} (the map page's
-Clean button) labels the recordings from then on. The patrol only passes
-it on to the SessionTags it was given; without one it is refused. Nothing about driving changes with a tag.
+Tags (telemetry/tags.py): {"cmd": "tags", "outdoor": true, "clean": false}
+(the map page's Outdoor and Clean buttons) labels the recordings from then
+on. The patrol only passes it on to the SessionTags it was given; without
+one it is refused. Nothing about driving changes with a tag.
 
 Editing from the map page (telemetry/map.html), on the map the truck is on:
 "stroke" appends a run of points drawn with a finger as one step that

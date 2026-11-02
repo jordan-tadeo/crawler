@@ -342,23 +342,24 @@ versions live on the Mac in `~/crawler/data/models/` as `kblock-X.Y.onnx` +
 `./scripts/models.sh list | register | deploy | rollback | status` is the tool;
 `tools/models.py` says how it works. Nothing in there is ever deleted.
 
-## Tags: clean
+## Tags: outdoor, clean
 
-The map page's Clean button (`{"cmd": "tags", "clean": true}` on
-`/patrol/cmd`) says what a drive is; `crawler/telemetry/tags.py` says how.
-It lives in `log/session_tags.json` across restarts. Every MCAP file opens
+The map page's Outdoor and Clean buttons (`{"cmd": "tags", ...}` on
+`/patrol/cmd`) say what a drive is; `crawler/telemetry/tags.py` says how.
+They live in `log/session_tags.json` across restarts. Every MCAP file opens
 with a metadata record `crawler.tags` (the tags then), and `/session/tags`
 (`crawler.SessionTags`) goes out once a second and on the pass a tag
 changes, so a flip halfway through splits the session there. A recording
-with none, every one before this, is messy (not clean).
+with neither, every one before this, is indoor and messy (not clean).
 
-The dataset's `tags` array is each tick's bit mask (clean 2; bit 1 is kept
-for an outdoor tag later). `policy_train.py --include-tags A,B`,
-`--exclude-tags A,B` and `--tag-weight TAG=W` take clean or messy, and
-filter or weight training, validation, the folds and retrain's grading
-alike; `policy_scorecard.py --include-tags / --exclude-tags` grade the same
-way. `tools/session_tags.py DATA.npz` (or MCAPs) lists each session's tags,
-ticks and minutes.
+The dataset's `tags` array is each tick's bit mask (outdoor 1, clean 2).
+`policy_train.py --include-tags A,B`, `--exclude-tags A,B` and
+`--tag-weight TAG=W` take outdoor, indoor, clean or messy, and filter or
+weight training, validation, the folds and retrain's grading alike.
+`policy_scorecard.py --place indoor|outdoor` (indoor by default) never mixes
+the two; outdoors, open_front reads "no return" as open, which means nothing
+under the sky. `tools/session_tags.py DATA.npz` (or MCAPs) lists each
+session's tags, ticks and minutes.
 
 ## Getting it out
 
