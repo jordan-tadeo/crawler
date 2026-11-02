@@ -48,7 +48,7 @@ font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;text-align:
 #toast.bad{border-color:#6b2020;color:#ff9b9b}
 .bar{display:grid;gap:6px;flex:none}
 .bar.four{grid-template-columns:repeat(4,1fr)}
-#tags{grid-template-columns:1fr 1fr}#tags button{min-height:38px}
+#tags button{min-height:38px}
 button{border:0;border-radius:11px;background:var(--btn);color:var(--text);font:inherit;
 font-weight:600;min-height:50px;padding:6px 4px;cursor:pointer;touch-action:manipulation}
 button:active{filter:brightness(1.4)}
@@ -97,7 +97,7 @@ max-width:520px;max-height:80%;overflow:auto;padding:14px 14px max(14px,env(safe
 <button id="b_skip">Skip<span class="sub">stuck: off</span></button>
 <button id="b_adj">Nudge<span class="sub">turn or shift</span></button>
 </div>
-<div class="bar" id="tags"><button id="t_outdoor">Outdoor<span class="sub">off</span></button><button id="t_clean">Clean<span class="sub">off</span></button></div>
+<div class="bar" id="tags"><button id="t_clean">Clean<span class="sub">off</span></button></div>
 <div class="bar four" id="adjust">
 <button id="a_ccw">&#8634;<span class="sub">2&deg;</span></button>
 <button id="a_cw">&#8635;<span class="sub">2&deg;</span></button>
@@ -118,7 +118,7 @@ var POLL_MS=500, MAP_MS=1000;
 var ACK_MS=5000;            // a command the car has not answered in this is not taken
 var STALE_S=3;
 var ROT_STEP=2*Math.PI/180;
-var TAGS=["outdoor","clean"];
+var TAGS=["clean"];
 
 var cv=document.getElementById("cv"),ctx=cv.getContext("2d");
 var ov=document.getElementById("ov"),octx=ov.getContext("2d");
@@ -547,7 +547,7 @@ $("b_explore").onclick=function(){var on=!xon;send("explore",{on:on});if(on)arme
 $("b_skip").onclick=function(){var on=!(st&&st.patrol&&st.patrol.skip_stuck);
   if(on&&!confirm("Skip a waypoint after 20 s without getting closer?"))return;
   send("skip",{on:on});};
-// What the recordings are: outside, and my takeovers clean. Labels only.
+// What the recordings are: my takeovers clean. Labels only.
 TAGS.forEach(function(k){$("t_"+k).onclick=function(){var o={};o[k]=!(st&&st.patrol&&(st.patrol.tags||{})[k]);send("tags",o);};});
 $("a_ccw").onclick=function(){rotateAbout(ROT_STEP,adjCentre());schedule();};
 $("a_cw").onclick=function(){rotateAbout(-ROT_STEP,adjCentre());schedule();};

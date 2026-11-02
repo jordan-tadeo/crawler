@@ -48,7 +48,7 @@ async function open(b, c) {
         if (!took) c.said.push(["warning", why]);
         if (body.cmd === "start") { c.running = true; c.exploring = false; }
         if (body.cmd === "explore") { c.exploring = body.on; if (body.on) c.running = false; }
-        if (body.cmd === "tags") ["outdoor", "clean"].forEach(k => { if (k in body) c.tags[k] = body[k]; });
+        if (body.cmd === "tags") ["clean"].forEach(k => { if (k in body) c.tags[k] = body[k]; });
         c.acks.push([body.id, took, took ? "" : why]);
       }
       return route.fulfill({ status: 202, contentType: "application/json", body: '{"ok":true,"why":""}' });
@@ -350,31 +350,30 @@ const text = (page, id) => page.evaluate((i) => {
     await ctx.close();
   });
 
-  await check("the_tag_buttons_send_one_tag_and_show_the_cars", async () => {
+  await check("the_clean_button_sends_the_tag_and_shows_the_cars", async () => {
     const off = car(), o = await open(b, off);
-    must(await o.page.evaluate(() => document.getElementById("t_outdoor").disabled
-      && document.getElementById("t_clean").disabled), "enabled on a car that keeps no tags");
+    must(await o.page.evaluate(() => document.getElementById("t_clean").disabled),
+      "enabled on a car that keeps no tags");
     await o.ctx.close();
-    const c = car(); c.tags = { outdoor: false, clean: false };
+    const c = car(); c.tags = { clean: false };
     const { ctx, page } = await open(b, c);
     const look = async (id) => page.evaluate((i) => { const e = document.getElementById(i);
       return (e.classList.contains("on") ? "on " : "off ") + e.querySelector(".sub").textContent; }, id);
-    must(await look("t_outdoor") === "off off" && await look("t_clean") === "off off", "not off at first");
-    await page.tap("#t_outdoor");
-    await page.waitForTimeout(900);
+    must(await page.evaluate(() => !document.getElementById("t_outdoor")), "an Outdoor button");
+    must(await look("t_clean") === "off off", "not off at first");
     await page.tap("#t_clean");
     await page.waitForTimeout(900);
     const sent = c.posts.filter(p => p.cmd === "tags").map(p => { const q = Object.assign({}, p); delete q.id; return q; });
-    must(JSON.stringify(sent) === JSON.stringify([{ cmd: "tags", outdoor: true }, { cmd: "tags", clean: true }]),
+    must(JSON.stringify(sent) === JSON.stringify([{ cmd: "tags", clean: true }]),
       "sent: " + JSON.stringify(sent));
-    must(await look("t_outdoor") === "on on" && await look("t_clean") === "on on", "not shown on");
+    must(await look("t_clean") === "on on", "not shown on");
     // The car's word wins: a tag it says is off shows off.
-    c.tags.outdoor = false;
+    c.tags.clean = false;
     await page.waitForTimeout(900);
-    must(await look("t_outdoor") === "off off", "shows " + await look("t_outdoor"));
-    await page.tap("#t_outdoor");
+    must(await look("t_clean") === "off off", "shows " + await look("t_clean"));
+    await page.tap("#t_clean");
     await page.waitForTimeout(900);
-    must(c.posts.filter(p => p.cmd === "tags").pop().outdoor === true, "a tap sends the other side of the car's");
+    must(c.posts.filter(p => p.cmd === "tags").pop().clean === true, "a tap sends the other side of the car's");
     await ctx.close();
   });
 

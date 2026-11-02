@@ -6,7 +6,7 @@
     python tools/session_tags.py                      # every <data>/mcap/crawler-record-*.mcap
 
 The tags are what I said on the map page (crawler/telemetry/tags.py:
-outdoor, clean); a session with none recorded is indoor, messy. One line a
+clean); a session with none recorded is messy. One line a
 session, and a session whose tags changed partway shows each mix with its
 ticks. Then the totals by mix, which is what --include-tags and
 --exclude-tags on policy_train.py and policy_scorecard.py will see.

@@ -114,14 +114,14 @@ policy_lidar.encode_many, the function the car's encode() runs.
 
 The tags
 --------
-Every tick carries `tags`, the bit mask (telemetry/tags.BITS: outdoor 1,
-clean 2) of what I said the drive was on the map page then: the newest
-/session/tags at or before it, else the file's metadata record (policy_tags.
-tags_at). A file with neither, every one before the tags, is 0: indoor, not
-clean. Nothing is dropped for a tag here; policy_train.py --include-tags,
---exclude-tags and --tag-weight choose, and policy_scorecard.py --place
-grades indoor and outdoor apart. meta["tag_bits"] is the bit order and
-meta["session_tags"] each session's (t_ns, mask) changes.
+Every tick carries `tags`, the bit mask (telemetry/tags.BITS: clean 2) of
+what I said the drive was on the map page then: the newest /session/tags at
+or before it, else the file's metadata record (policy_tags.tags_at). A file
+with neither, every one before the tags, is 0: not clean. Nothing is
+dropped for a tag here; policy_train.py --include-tags, --exclude-tags and
+--tag-weight choose, and policy_scorecard.py's grade the same way.
+meta["tag_bits"] is the bit order and meta["session_tags"] each session's
+(t_ns, mask) changes.
 
 Needs `mcap` and `mcap-protobuf-support`, which are tools for the laptop and
 not dependencies of the car. The alignment below needs neither and is what
@@ -1304,7 +1304,7 @@ def main(argv=None):
         tag_bits = ptg.tags_at(getattr(session, "tags", ()) or (), [t.t_ns for t in ticks])
         line += ("\n    tags: " + (", ".join(f"{k} {v}" for k, v in ptg.counts(tag_bits).items())
                                   + f" ticks ({len(session.tags)} records)"
-                                  if session.tags else "none recorded: indoor, not clean"))
+                                  if session.tags else "none recorded: not clean"))
         flags = mark_flags(ticks, session.marks)
         kinds = Counter(str(m.get("kind", "?")).lower() for _, m in session.marks)
         line += (f"\n    marks: {kinds.get('good', 0)} good, {kinds.get('bad', 0)} bad; "

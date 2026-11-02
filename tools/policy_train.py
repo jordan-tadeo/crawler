@@ -97,10 +97,9 @@ they have, the accepted auto the rest. --accept-after-s is the window before
 a takeover that is not "let stand" (their pre-intervention, weight 0).
 
 Tags (policy_tags, the dataset's "tags" array: what I said each drive was on
-the map page; a session recorded before them is indoor and messy, not
-clean). --include-tags A,B trains only on ticks with every one of them,
---exclude-tags A,B never on a tick with any; the names are outdoor or
-indoor, clean or messy. The ticks left out are graded on by neither --val
+the map page; a session recorded before them is messy, not clean).
+--include-tags A,B trains only on ticks with every one of them,
+--exclude-tags A,B never on a tick with any; the names are clean or messy. The ticks left out are graded on by neither --val
 nor the folds, so a number never mixes what was trained apart.
 --tag-weight TAG=W (again for another tag) multiplies a tick's loss weight
 by W for each tag it has, on top of every other weight (tick_weights):
@@ -1912,7 +1911,7 @@ def main(argv=None):
                          "only the steer loss")
     ap.add_argument("--include-tags", default=None, metavar="A,B",
                     help="train only on ticks with every one of these tags "
-                         "(outdoor, indoor, clean, messy); untagged is indoor, messy")
+                         "(clean or messy); untagged is messy")
     ap.add_argument("--exclude-tags", default=None, metavar="A,B",
                     help="never train on a tick with any of these tags")
     ap.add_argument("--tag-weight", action="append", default=[], metavar="TAG=W",

@@ -40,7 +40,7 @@ LEGACY_TOPICS = {
     "controller": "/controller",       # JSON, 20 Hz
     "marks": "/marks",                 # JSON, one per press
     # What I said the drive was (telemetry/tags.py), in any file recorded
-    # since; none is untagged: indoor, not clean.
+    # since; none is untagged: not clean.
     "tags": tg.TOPIC,
 }
 LEGACY_VEHICLE = {
