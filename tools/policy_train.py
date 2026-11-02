@@ -152,13 +152,19 @@ training: the car never blanks a scan it has. The flip mirrors the scan
 --chunk K widens the gear head to 3K logits and the steer head to K: the
 answer for this decision and the next K-1 (ACT's action chunks). Offset i's
 label is the i-th next decision tick of the same session, every step of the
-chain under policy.CHUNK_LINK_S (chunk_index), with that tick's own masks and
-weight, and the gear and steer losses are averaged over the offsets. Throttle
-and mode stay one step. The car blends the last K answers
+chain under CHUNK_LINK_STEPS decision steps (chunk_index; policy.CHUNK_LINK_S
+at 0.1 s), with that tick's own masks and weight, and the gear and steer
+losses are averaged over the offsets. An offset is one decision step, 100 ms
+at 0.1. Throttle and mode stay one step. The car blends the last K answers
 (policy.ChunkEnsembler) with the weight --ensemble-m sets, so the sidecar says
 chunk, ensemble_m and ensemble_link_s. --chunk 1 is the one-step model, the
 same training step for step and a sidecar with none of the three. The eval
 here grades offset 0 alone.
+
+The decision step is the dataset's (policy_dataset.py --tick-s, meta
+"tick_s", 0.1 for a file from before it), never an option here: the chunk
+link, the IMU window and gap in the sidecar are made off it, and the sidecar
+says tick_s, which the car's decision period has to match.
 """
 
 import argparse
@@ -1103,6 +1109,33 @@ def _weighted(values, w):
     return (values * w).sum() / w.sum()
 
 
+# The decision step a dataset was built at (policy_dataset.py --tick-s,
+# meta["tick_s"]); a file from before the option is 0.1, the car's 10 Hz.
+# A chunk offset is one step, and the chain links ticks under
+# CHUNK_LINK_STEPS steps apart, which is policy.CHUNK_LINK_S at 0.1.
+DEFAULT_TICK_S = 0.1
+CHUNK_LINK_STEPS = 2.5
+
+
+def tick_of(meta_in):
+    """A dataset meta's decision step in seconds: tick_s, 0.1 when absent."""
+    tick_s = float(meta_in.get("tick_s", DEFAULT_TICK_S))
+    if not (np.isfinite(tick_s) and tick_s > 0.0):
+        raise ValueError(f"tick_s {meta_in.get('tick_s')!r} is not a positive step")
+    return tick_s
+
+
+def link_for(tick_s=DEFAULT_TICK_S):
+    """The chunk chain's link gap, seconds, at a tick_s step."""
+    return CHUNK_LINK_STEPS * float(tick_s)
+
+
+def tick_meta(tick_s=DEFAULT_TICK_S):
+    """The step half of the sidecar: the decision step the model was trained
+    at, which the car's decision period has to match."""
+    return {"tick_s": float(tick_s)}
+
+
 def chunk_index(data, k, link_s=pl.CHUNK_LINK_S):
     """(N, k) dataset rows: column i is tick j's i-th next decision tick in
     the same session, every step of the chain under link_s, the gap the car's
@@ -1408,7 +1441,7 @@ def train(data, representation, train_mask, label_mode, uses_prev, epochs, seed,
     if chunk > 1:
         # Offset i's labels: the i-th next decision tick's gear and steer,
         # with that tick's own masks and weight. Offset 0 is the stock loss.
-        fut = chunk_index(data, chunk)[idx]
+        fut = chunk_index(data, chunk, link_for(tick_of(data.get("meta", {}))))[idx]
         fut0 = np.where(fut >= 0, fut, 0)
         bad = pe.bad_marked(data)
         c_action = torch.from_numpy(data["action"][fut0].astype(np.int64))
@@ -1615,15 +1648,18 @@ def export(model, representation, out_path, meta):
     write_sidecar(out_path, meta)
 
 
-def imu_meta(uses_imu, tilt, yaw=True):
-    """The IMU half of the sidecar: what policy.check_imu reads."""
+def imu_meta(uses_imu, tilt, yaw=True, tick_s=DEFAULT_TICK_S):
+    """The IMU half of the sidecar: what policy.check_imu reads. The window
+    and gap are the ones the dataset built at tick_s (policy_imu.window_for,
+    gap_for): 5 and 0.25 at 0.1."""
     if not uses_imu:
         return {}
     return {"uses_imu": True, "imu_features": list(pimu.features(yaw)),
-            "imu_window": pimu.WINDOW, "imu_tilt": bool(tilt), "imu_yaw": bool(yaw),
+            "imu_window": pimu.window_for(tick_s), "imu_tilt": bool(tilt),
+            "imu_yaw": bool(yaw),
             "imu_scales": {"gyro_rad_s": pimu.GYRO_SCALE,
                            "accel_m_s2": pimu.ACCEL_SCALE, "clip": pimu.CLIP,
-                           "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.GAP_S}}
+                           "max_age_ms": pimu.MAX_AGE_MS, "gap_s": pimu.gap_for(tick_s)}}
 
 
 def map_meta(uses_map, dropout=MAP_DROPOUT, act="relu"):
@@ -1707,13 +1743,14 @@ def write_sidecar(out_path, meta):
         json.dump(meta, f, indent=2)
 
 
-def chunk_meta(chunk=1, ensemble_m=0.0):
+def chunk_meta(chunk=1, ensemble_m=0.0, tick_s=DEFAULT_TICK_S):
     """The chunk half of the sidecar: what policy.check_chunk reads. Nothing
-    for a one-step model, as before the chunk heads."""
+    for a one-step model, as before the chunk heads. The link is the one the
+    labels were chained across at tick_s (link_for): CHUNK_LINK_S at 0.1."""
     if chunk <= 1:
         return {}
     return {"chunk": int(chunk), "ensemble_m": float(ensemble_m),
-            "ensemble_link_s": pl.CHUNK_LINK_S}
+            "ensemble_link_s": link_for(tick_s)}
 
 
 def mode_meta(switch_weight=MODE_SWITCH_WEIGHT):
@@ -1965,6 +2002,11 @@ def main(argv=None):
     data = pe.load(args.data)
     meta_in = data["meta"]
     sessions = meta_in["sessions"]
+    try:
+        tick_of(meta_in)
+    except ValueError as e:
+        print(f"{args.data}: {e}")
+        return 1
     if "steer_mode" not in data:
         print(f"{args.data} has no steering-mode labels: rebuild it with policy_dataset.py")
         return 1
@@ -2129,13 +2171,14 @@ def main(argv=None):
         every = training_mask(data, np.zeros(len(data["t_ns"]), bool), labelled)
         k_steer, k_throttle = label_masks(data, args.labels)
         ape, parts = pk.action_prediction_error(data, every, k_steer, k_throttle,
-                                                k=args.keyframe_history)
+                                                k=args.keyframe_history,
+                                                link_s=link_for(tick_of(meta_in)))
         kf_w, keyframe, steer_tick_w = place_keyframes(
             ape, parts, every, args.keyframe_weight, args.keyframe_share,
             args.keyframe_steer_only)
         if steer_tick_w is None:
             data["keyframe_w"] = kf_w
-        past = pk.history_index(data, args.keyframe_history)
+        past = pk.history_index(data, args.keyframe_history, link_for(tick_of(meta_in)))
         print(f"keyframes: {int(keyframe.sum())} of {int(every.sum())} decisions at "
               f"{args.keyframe_weight:g}, {pk.gear_changes(data, keyframe, past)} of them a "
               f"gear change; copycat mean Brier {parts['gear'][every & k_throttle].mean():.3f}, "
@@ -2329,14 +2372,16 @@ def main(argv=None):
 
 def _base_meta(meta_in, args, val_ids, val_names):
     sessions = meta_in["sessions"]
+    tick_s = tick_of(meta_in)
     return {
         "input_contract": meta_in["input_contract"],
+        **tick_meta(tick_s),
         "representation": args.representation,
         "actions": list(pl.ACTIONS),
         "uses_prev_action": bool(args.prev),
         **imu_meta(getattr(args, "imu", False),
                    tilt_of(getattr(args, "imu_tilt", False), meta_in),
-                   not getattr(args, "imu_no_yaw", False)),
+                   not getattr(args, "imu_no_yaw", False), tick_s),
         **lidar_meta(getattr(args, "lidar", False),
                      getattr(args, "lidar_dropout", LIDAR_DROPOUT)),
         **map_meta(bool(getattr(args, "map", None)),
@@ -2348,7 +2393,7 @@ def _base_meta(meta_in, args, val_ids, val_names):
         **steer_meta(getattr(args, "steer_head", pl.STEER_REGRESSION),
                      getattr(args, "straight_band", STRAIGHT_BAND),
                      getattr(args, "stop_gear_s", STOP_GEAR_S)),
-        **chunk_meta(getattr(args, "chunk", 1), getattr(args, "ensemble_m", 0.0)),
+        **chunk_meta(getattr(args, "chunk", 1), getattr(args, "ensemble_m", 0.0), tick_s),
         **pl.lowband_meta(getattr(args, "lowband", None)),
         "steer_scale": pl.STEER_SCALE,
         "labels": args.labels,

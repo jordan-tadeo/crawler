@@ -115,10 +115,29 @@ GYRO_SCALE = 2.0     # rad/s
 ACCEL_SCALE = 10.0   # m/s^2
 CLIP = 3.0
 
-# Half a second of decisions at the 10 Hz tick. A count, as driver.py's IMU
-# windows are, so a slow loop can only make it longer in real time.
-WINDOW = 5
-GAP_S = 0.25
+# Half a second of decisions. A count, as driver.py's IMU windows are, so a
+# slow loop can only make it longer in real time. The count is WINDOW_S over
+# the decision step, so a model trained at another step (the dataset's
+# tick_s) keeps the same half second; WINDOW and GAP_S are the car's 10 Hz
+# step, DECISION_S, which is what the runtime builds with.
+DECISION_S = 0.1
+WINDOW_S = 0.5
+# Rows further apart than this many steps restart the window.
+GAP_STEPS = 2.5
+
+
+def window_for(tick_s=DECISION_S):
+    """The window, in decisions, that covers WINDOW_S at a tick_s step."""
+    return max(1, int(round(WINDOW_S / float(tick_s))))
+
+
+def gap_for(tick_s=DECISION_S):
+    """The gap, in seconds, past which a tick_s stream restarts the window."""
+    return GAP_STEPS * float(tick_s)
+
+
+WINDOW = window_for(DECISION_S)   # 5
+GAP_S = gap_for(DECISION_S)       # 0.25
 # A sample this old at the tick is a stalled stream, not a reading. The hub
 # delivers at ~88 Hz and a recording's imu_age_ms is 0 at p50, 13 ms at p99.
 MAX_AGE_MS = 250.0

@@ -192,6 +192,9 @@ CONTRACT_KEYS = {
     # Action chunks (policy.ChunkEnsembler): how many decisions the gear and
     # steer heads answer for. Before the key, one.
     "chunk": 1,
+    # The decision step it was trained at (policy_dataset --tick-s). Before
+    # the key, the car's 10 Hz.
+    "tick_s": 0.1,
 }
 
 # The scores list shows, off the CV mean or the held-out sessions.

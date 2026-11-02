@@ -19,6 +19,14 @@ before it, which is the frame a decision at that instant could have used.
 The alignment error is that frame's age. In a record-mode recording the row
 and the frame share a seq, and the error is their log-time difference.
 
+10 Hz is the default step, --tick-s 0.1. Another step (0.0625 for 16 Hz)
+moves every tick-sized number with it (step_for: the prev-action gap, the
+recover's settle, the IMU peak window, the sampling of a legacy stream) and
+meta["tick_s"] says which; at 0.1 the file is the one from before the
+option. A footprint row is one decision as the car wrote it, so a session
+recorded at another rate than --tick-s is left out (recorded_step_s, off by
+more than STEP_TOLERANCE), and --any-step keeps it with a warning.
+
 What gets dropped, and what is only left out of training
 --------------------------------------------------------
 Dropped, and counted in the report: a mode that makes no ticks, no frame at
@@ -155,19 +163,51 @@ from crawler.telemetry import tags as tg  # noqa: E402
 from crawler.autopilot import policy_imu as pimu  # noqa: E402
 from crawler.autopilot import policy_lidar as pli  # noqa: E402
 
+# The decision step: 0.1 s, the car's AUTO_TICK_INTERVAL, unless the build
+# says otherwise (--tick-s). Every number below that is "a tick" or "a few
+# ticks" is made off it by step_for(); the module constants are the 0.1 s
+# values, which step_for(TICK_S) reproduces exactly.
 TICK_S = 0.1
 # Slack on the 10 Hz sampling of a 20 Hz channel, so jitter in /vehicle does
-# not turn every other tick into a skipped one.
+# not turn every other tick into a skipped one. Absolute (it is the stream's
+# jitter), but never more than SLACK_SHARE of a step.
 TICK_SLACK_S = 0.02
+SLACK_SHARE = 0.2
 # The legacy depth channel arrives every 130-190 ms (measured), so a frame up
 # to one frame interval plus a tick old is normal there; record mode writes
 # the frame on the row's own log time and anything past a few ms is wrong.
 MAX_AGE_MS = {"legacy": 250.0, "footprint": 20.0}
-# Ticks further apart than this are not consecutive, and get no prev action.
-PREV_GAP_S = 0.25
+# Ticks further apart than this are not consecutive, and get no prev action:
+# two and a half steps, so one dropped tick still links and two do not.
+PREV_GAP_STEPS = 2.5
+PREV_GAP_S = PREV_GAP_STEPS * TICK_S
 # How long after the last reverse tick a stop is the recover's settle phase
 # rather than a decision: SETTLE_SECONDS plus a tick.
 SETTLE_S = dv.SETTLE_SECONDS + TICK_S
+
+
+class Step(NamedTuple):
+    """Everything the build reads off the decision step. step_for() makes one."""
+
+    tick_s: float       # the decision step, seconds
+    slack_s: float      # sample_ticks' jitter allowance
+    prev_gap_s: float   # ticks further apart than this are not consecutive
+    settle_s: float     # the recover's settle phase after a reverse
+    imu_window: int     # policy_imu's peak window, in decisions
+    imu_gap_s: float    # policy_imu's window restart gap
+
+
+def step_for(tick_s=TICK_S):
+    """The Step at a tick_s decision step. step_for(0.1) is the module's
+    constants exactly, so a 0.1 s build is the build from before tick_s."""
+    tick_s = float(tick_s)
+    if not (math.isfinite(tick_s) and tick_s > 0.0):
+        raise ValueError(f"tick_s {tick_s!r} is not a positive number of seconds")
+    return Step(tick_s, min(TICK_SLACK_S, SLACK_SHARE * tick_s), PREV_GAP_STEPS * tick_s,
+                dv.SETTLE_SECONDS + tick_s, pimu.window_for(tick_s), pimu.gap_for(tick_s))
+
+
+STEP = step_for(TICK_S)
 
 # /marks verdicts on a pad-driven tick, as stored in the .npz "mark" array.
 MARK_NONE, MARK_GOOD, MARK_BAD = 0, 1, -1
@@ -287,28 +327,29 @@ def _mode_index(cmd):
     return pl.STEER_MODES.index(pl.SPLIT if _is_split(cmd) else pl.UNIFIED)
 
 
-def toggles_of(commands):
+def toggles_of(commands, step=STEP):
     """[(t_ns, new mode index)]: every L3 flip in a time-ordered row stream.
 
-    A change of mode across a gap longer than PREV_GAP_S is not a flip I can
-    place -- manual writes no rows, so a press there is somewhere in the gap.
+    A change of mode across a gap longer than step.prev_gap_s is not a flip
+    I can place -- manual writes no rows, so a press there is somewhere in
+    the gap.
     """
     out = []
     for a, b in zip(commands, commands[1:]):
-        if (b.t_ns - a.t_ns) / 1e9 <= PREV_GAP_S and _mode_index(a) != _mode_index(b):
+        if (b.t_ns - a.t_ns) / 1e9 <= step.prev_gap_s and _mode_index(a) != _mode_index(b):
             out.append((b.t_ns, _mode_index(b)))
     return out
 
 
-def mode_labels(commands):
+def mode_labels(commands, step=STEP):
     """Per command (mode_in, steer_mode, mode_switch). See the docstring."""
-    flips = toggles_of(commands)
+    flips = toggles_of(commands, step)
     times = [t for t, _ in flips]
     out = []
     for i, cmd in enumerate(commands):
         own = _mode_index(cmd)
         prev = commands[i - 1] if i else None
-        consecutive = prev is not None and (cmd.t_ns - prev.t_ns) / 1e9 <= PREV_GAP_S
+        consecutive = prev is not None and (cmd.t_ns - prev.t_ns) / 1e9 <= step.prev_gap_s
         mode_in = _mode_index(prev) if consecutive else own
         want = own
         k = bisect.bisect_right(times, cmd.t_ns)
@@ -320,14 +361,15 @@ def mode_labels(commands):
     return out
 
 
-def imu_features(commands, yaw=True):
+def imu_features(commands, yaw=True, step=STEP):
     """Per command its policy_imu features, the window run over every row
     in the stream before any is dropped -- the runtime pushes every tick it
     has a frame on, not only the ones it is graded on. Built with tilt; the
     trainer zeroes it (pimu.without_tilt) for a model trained without.
     yaw=False is the no-yaw list (pimu.NO_YAW_FEATURES), its own window.
-    A legacy command has no IMU columns and comes out all zeros."""
-    feats = pimu.ImuFeatures(tilt=True, yaw=yaw)
+    A legacy command has no IMU columns and comes out all zeros. The window
+    is the step's (step.imu_window decisions, restarting past step.imu_gap_s)."""
+    feats = pimu.ImuFeatures(tilt=True, yaw=yaw, window=step.imu_window, gap_s=step.imu_gap_s)
     return [feats.push(dict(zip(pa.FOOTPRINT_ROW["imu_row"], cmd.imu)), cmd.t_ns / 1e9)
             for cmd in commands]
 
@@ -364,7 +406,7 @@ def _throttle_at_rest(cmd):
     return finger and abs(cmd.throttle) <= pa.THROTTLE_DEADBAND
 
 
-def takeover_labels(commands, steer_rest=None):
+def takeover_labels(commands, steer_rest=None, step=STEP):
     """Per command (steer_tail, throttle_tail, held), off the whole stream.
 
     A group stays "pad" for TAKEOVER_RELEASE_SECONDS (0.5 s) after I let go,
@@ -391,7 +433,7 @@ def takeover_labels(commands, steer_rest=None):
                 continue
             j = i
             while (j + 1 < n and commands[j + 1].mode == "auto" and by_pad(commands[j + 1])
-                   and (commands[j + 1].t_ns - commands[j].t_ns) / 1e9 <= PREV_GAP_S):
+                   and (commands[j + 1].t_ns - commands[j].t_ns) / 1e9 <= step.prev_gap_s):
                 j += 1
             k = j
             while k >= i and at_rest(commands[k]):
@@ -421,18 +463,18 @@ def manual_window(stream, window_s=MANUAL_AFTER_AUTO_S, steer_rest=None):
     return out
 
 
-def _seconds(times_ns, gap_s=PREV_GAP_S):
+def _seconds(times_ns, gap_s=PREV_GAP_S, tick_s=TICK_S):
     """Time covered by a set of samples: the gaps between neighbours, a gap
     longer than gap_s counted as one sample's worth (the median gap)."""
     t = np.sort(np.asarray(times_ns, dtype=np.int64)) / 1e9
     if len(t) < 2:
-        return TICK_S * len(t)
+        return tick_s * len(t)
     d = np.diff(t)
     step = float(np.median(d))
     return float(np.where(d <= gap_s, d, step).sum() + step)
 
 
-def intervention_summary(session, rules=None):
+def intervention_summary(session, rules=None, step=STEP):
     """What a session's hand-on-auto data was, before any tick is dropped.
 
     takeover_ticks / takeover_segments: auto rows with either group "pad",
@@ -447,8 +489,9 @@ def intervention_summary(session, rules=None):
     on = [c.mode == "auto" and pa.BY_PAD in (c.steer_by, c.throttle_by) for c in commands]
     segments = sum(1 for i, o in enumerate(on)
                    if o and not (i and on[i - 1]
-                                 and (commands[i].t_ns - commands[i - 1].t_ns) / 1e9 <= PREV_GAP_S))
-    verdicts = takeover_labels(commands, rest)
+                                 and (commands[i].t_ns - commands[i - 1].t_ns) / 1e9
+                                 <= step.prev_gap_s))
+    verdicts = takeover_labels(commands, rest, step)
     pad_s = [c.steer_by == pa.BY_PAD for c in commands]
     pad_t = [c.throttle_by == pa.BY_PAD for c in commands]
     windows = manual_window([(c.t_ns, c.mode, c.throttle, c.front) for c in commands],
@@ -465,7 +508,8 @@ def intervention_summary(session, rules=None):
         "held": int(sum(o and v[2] for o, v in zip(on, verdicts))),
         "manual_rows": int(sum(d for _, d in windows)),
         "manual_driven_s": _seconds([v[0] for v, (_, d) in zip(session.vehicle, vwin) if d],
-                                    gap_s=PREV_GAP_S) if any(d for _, d in vwin) else 0.0,
+                                    gap_s=step.prev_gap_s, tick_s=step.tick_s)
+                           if any(d for _, d in vwin) else 0.0,
         "auto_exits": int(sum(1 for a, b in zip(session.vehicle, session.vehicle[1:])
                               if a[1] == "auto" and b[1] == pa.MANUAL)),
     }
@@ -495,14 +539,52 @@ def _connected_at(connected, t_ns, times=None):
     return connected[i][1] if i >= 0 else connected[0][1]
 
 
-def sample_ticks(commands, tick_s=TICK_S):
-    """A 20 Hz command stream down to the commands at a 10 Hz decision rate."""
+def sample_ticks(commands, tick_s=TICK_S, slack_s=None):
+    """A 20 Hz command stream down to the commands at a tick_s decision rate
+    (10 Hz at the default). A step shorter than the stream's own (50 ms) gets
+    every row: the stream cannot be sampled finer than it was written."""
+    slack_s = step_for(tick_s).slack_s if slack_s is None else slack_s
     out, last = [], None
     for cmd in commands:
-        if last is None or (cmd.t_ns - last) / 1e9 >= tick_s - TICK_SLACK_S:
+        if last is None or (cmd.t_ns - last) / 1e9 >= tick_s - slack_s:
             out.append(cmd)
             last = cmd.t_ns
     return out
+
+
+# A session whose measured step is further than this share off the build's
+# is recorded at another rate: 10 Hz rows are 60% off a 16 Hz build. The
+# recordings up to now measure 0.102-0.111 s a kept tick at 10 Hz.
+STEP_TOLERANCE = 0.25
+STEP_EXCLUDED = "LEFT OUT (step)"
+STEP_WARNING = "WARNING (step)"
+
+
+def recorded_step_s(session, step=STEP):
+    """The median step, seconds, between the rows align() would tick on:
+    a footprint session's own rows (one a decision, at the rate the car
+    recorded), a legacy one's sampled down to step. Gaps past
+    step.prev_gap_s are not steps. None with fewer than two."""
+    commands = (session.commands if session.by_seq
+                else sample_ticks(session.commands, step.tick_s, step.slack_s))
+    t = np.array([c.t_ns for c in commands], dtype=np.int64) / 1e9
+    d = np.diff(t)
+    # Never under the 10 Hz gap, or a 16 Hz build would not see 10 Hz rows
+    # as steps at all and could not tell what it was handed.
+    d = d[(d > 0) & (d <= max(step.prev_gap_s, PREV_GAP_S))]
+    return float(np.median(d)) if len(d) else None
+
+
+def step_verdict(session, step=STEP, allow=False):
+    """"" when the session's rows are at step.tick_s; otherwise a line that
+    starts STEP_EXCLUDED (left out) or, with allow, STEP_WARNING (kept)."""
+    got = recorded_step_s(session, step)
+    if got is None or abs(got / step.tick_s - 1.0) <= STEP_TOLERANCE:
+        return ""
+    head = STEP_WARNING if allow else STEP_EXCLUDED
+    return (f"{head}: {session.name} ticks every {got:.4f} s, the build is at "
+            f"{step.tick_s:g} s (--tick-s); "
+            + ("kept (--any-step)" if allow else "skipped; --any-step keeps it"))
 
 
 def _no_input(t, rules):
@@ -520,7 +602,7 @@ def _runs(times_ns, gap_s):
     return runs
 
 
-def idle_reasons(ticks, record_times_ns, rules=IdleRules()):
+def idle_reasons(ticks, record_times_ns, rules=IdleRules(), step=STEP):
     """Per tick an IDLE_REASONS entry, or "" to keep it.
 
     `ticks` are the session's aligned ticks in time order; only those in
@@ -575,17 +657,17 @@ def idle_reasons(ticks, record_times_ns, rules=IdleRules()):
             flagged.append(k)
     for k in flagged:
         # Spread over the no-input ticks around it, never across an input.
-        for step in (-1, 1):
+        for way in (-1, 1):
             n = k
             while 0 <= n < len(tk) and quiet[n] and abs(t_s[n] - t_s[k]) <= rules.handled_margin_s:
                 mark(n, "handled")
-                n += step
+                n += way
 
     # Parked: a no-input span longer than parked_s, less its two edges. A
-    # span is unbroken no-input ticks, no two further apart than PREV_GAP_S.
+    # span is unbroken no-input ticks, no two further apart than prev_gap_s.
     spans, cur = [], []
     for k in range(len(tk)):
-        if quiet[k] and cur and t_s[k] - t_s[cur[-1]] <= PREV_GAP_S and k == cur[-1] + 1:
+        if quiet[k] and cur and t_s[k] - t_s[cur[-1]] <= step.prev_gap_s and k == cur[-1] + 1:
             cur.append(k)
             continue
         if cur:
@@ -595,7 +677,7 @@ def idle_reasons(ticks, record_times_ns, rules=IdleRules()):
         spans.append(cur)
     for span in spans:
         first, last = t_s[span[0]], t_s[span[-1]]
-        if last - first + TICK_S <= rules.parked_s:
+        if last - first + step.tick_s <= rules.parked_s:
             continue
         for k in span:
             if t_s[k] - first >= rules.parked_edge_s and last - t_s[k] >= rules.parked_edge_s:
@@ -606,11 +688,14 @@ def idle_reasons(ticks, record_times_ns, rules=IdleRules()):
     return out
 
 
-def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
+def align(session, max_age_ms=None, rules=IdleRules(), timeline=None, step=STEP):
     """A Session -> (ticks, drop counts, alignment errors in ms of kept ticks).
 
     rules None turns the not-driving rules off. timeline, if a list, gets
     (t_ns, reason) for every tick that made it to those rules, "" for kept.
+    step is the decision step's Step (step_for). A legacy stream is sampled
+    down to it; a footprint one is one row a decision already, at whatever
+    step the car recorded it, which recorded_step_s() measures.
     """
     if max_age_ms is None:
         max_age_ms = MAX_AGE_MS[session.adapter]
@@ -621,21 +706,22 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     connected_times = [c[0] for c in session.connected]
     seq_index = {f.seq: i for i, f in enumerate(session.frames)} if session.by_seq else {}
 
-    commands = session.commands if session.by_seq else sample_ticks(session.commands)
+    commands = (session.commands if session.by_seq
+                else sample_ticks(session.commands, step.tick_s, step.slack_s))
     fallback = pa.fallback_caps(session)
     last_reverse = None
     prev_was_reverse = False
     prev_t = None
-    modes = mode_labels(commands)
+    modes = mode_labels(commands, step)
     lidar_rows = getattr(session, "lidar", ()) or ()
     lidar_times = [r[0] for r in lidar_rows]
-    imus = imu_features(commands)
-    imus_no_yaw = imu_features(commands, yaw=False)
+    imus = imu_features(commands, step=step)
+    imus_no_yaw = imu_features(commands, yaw=False, step=step)
     # Interventions, off the whole stream before any tick is dropped: a
     # release tail ends where the group went back, wherever that row went.
     footprint = session.adapter == pa.FootprintAdapter.name
     rest = (rules or IdleRules()).steer_rest
-    takeovers = takeover_labels(commands, rest)
+    takeovers = takeover_labels(commands, rest, step)
     windows = manual_window([(c.t_ns, c.mode, c.throttle, c.front) for c in commands],
                             steer_rest=rest)
     for cmd, (mode_in, steer_mode, mode_switch), imu, imu_no_yaw, verdict, window in zip(
@@ -698,14 +784,14 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
         asked = _asked(cmd) if cmd.mode == "auto" and verdict[2] else None
         label_throttle = cmd.throttle if asked is None else asked
         action = pa.action_of(label_throttle)
-        consecutive = prev_t is not None and (cmd.t_ns - prev_t) / 1e9 <= PREV_GAP_S
+        consecutive = prev_t is not None and (cmd.t_ns - prev_t) / 1e9 <= step.prev_gap_s
         if cmd.mode in pa.PAD_MODES:
             decision = True
         elif action == pl.REVERSE:
             decision = not (consecutive and prev_was_reverse)
             last_reverse = cmd.t_ns
         elif (action == pl.STOP and last_reverse is not None
-              and (cmd.t_ns - last_reverse) / 1e9 <= SETTLE_S):
+              and (cmd.t_ns - last_reverse) / 1e9 <= step.settle_s):
             decision = False
         else:
             decision = True
@@ -740,7 +826,7 @@ def align(session, max_age_ms=None, rules=IdleRules(), timeline=None):
     if rules is not None:
         record_times = [c.t_ns for c in commands if c.mode in rules.modes
                         and not (footprint and c.mode == pa.MANUAL)]
-        why = idle_reasons(ticks, record_times, rules)
+        why = idle_reasons(ticks, record_times, rules, step)
         if timeline is not None:
             timeline.extend((t.t_ns, w) for t, w in zip(ticks, why)
                             if t.mode in rules.modes and t.source != SOURCE_MANUAL)
@@ -808,12 +894,12 @@ def mark_flags(ticks, marks):
     return flags
 
 
-def prev_inputs(ticks):
+def prev_inputs(ticks, step=STEP):
     """(N, PREV_SIZE): each tick's previous tick as the model would see it."""
     out = np.zeros((len(ticks), pl.PREV_SIZE), dtype=np.float32)
     for i in range(1, len(ticks)):
         a, b = ticks[i - 1], ticks[i]
-        if (b.t_ns - a.t_ns) / 1e9 <= PREV_GAP_S:
+        if (b.t_ns - a.t_ns) / 1e9 <= step.prev_gap_s:
             out[i] = pl.encode_prev(a.action, a.magnitude, a.steer)[0]
         else:
             out[i] = pl.encode_prev(pl.STOP, 0.0, 0.0)[0]
@@ -822,14 +908,14 @@ def prev_inputs(ticks):
     return out
 
 
-def to_arrays(sessions_ticks):
+def to_arrays(sessions_ticks, step=STEP):
     """[(Session, ticks)] -> the dict of arrays the .npz holds."""
     # Only the frames some tick points at. A legacy file is mostly manual
     # driving with the camera up, and those frames have no label.
     frames, rows = [], []
     for si, (session, ticks) in enumerate(sessions_ticks):
         index = {}
-        prev = prev_inputs(ticks)
+        prev = prev_inputs(ticks, step)
         flags = mark_flags(ticks, session.marks)
         for t, p, f in zip(ticks, prev, flags):
             if t.frame not in index:
@@ -1199,6 +1285,11 @@ def main(argv=None):
                     help="comma list of recorded modes to label from "
                          "(default: auto for legacy files, record for new ones)")
     ap.add_argument("--max-age-ms", type=float, default=None)
+    ap.add_argument("--tick-s", type=float, default=TICK_S, metavar="S",
+                    help=f"the decision step in seconds ({TICK_S}, the car's 10 Hz); every "
+                         f"tick-sized number is made off it (step_for) and the meta records it")
+    ap.add_argument("--any-step", action="store_true",
+                    help="keep a session whose rows are not at --tick-s (a warning, not a skip)")
     ap.add_argument("--exclude-file", default=EXCLUDE_FILE,
                     help=f"sessions never to learn from, one name prefix a line ({EXCLUDE_FILE})")
     ap.add_argument("--uncompressed", action="store_true",
@@ -1227,6 +1318,10 @@ def main(argv=None):
     idle.add_argument("--handled-margin-s", type=float, default=d.handled_margin_s,
                       help=f"spread either side of a handled tick, over no-input ticks ({d.handled_margin_s})")
     args = ap.parse_args(argv)
+    try:
+        step = step_for(args.tick_s)
+    except ValueError as e:
+        ap.error(str(e))
     if not args.mcaps:
         args.mcaps = default_mcaps()
         if not args.mcaps:
@@ -1272,13 +1367,19 @@ def main(argv=None):
             report.append(verdict)
         if verdict.startswith(CAPS_EXCLUDED):
             continue
+        stepped = step_verdict(session, step, args.any_step)
+        if stepped:
+            print(stepped)
+            report.append(stepped)
+        if stepped.startswith(STEP_EXCLUDED):
+            continue
         caps_by_session[session.name] = [list(c) for c in caps]
         timeline = []
-        ticks, drops, errors = align(session, args.max_age_ms, rules, timeline)
+        ticks, drops, errors = align(session, args.max_age_ms, rules, timeline, step)
         ticks, cut = drop_excluded_windows(session.name, ticks, excludes)
         for why, n in cut.items():
             drops[f"excluded window: {why}"] += n
-        toggles_by_session[session.name] = [t for t, _ in toggles_of(session.commands)]
+        toggles_by_session[session.name] = [t for t, _ in toggles_of(session.commands, step)]
         splits = sum(1 for c in session.commands if _is_split(c))
         front_only = sum(1 for c in session.commands if _rear_off_pair(c))
         line = (f"{session.name}: {session.adapter}, {len(session.frames)} frames, "
@@ -1311,7 +1412,7 @@ def main(argv=None):
                  f"pad ticks dropped by BAD {int((flags == MARK_BAD).sum())}, "
                  f"upweighted by GOOD {int((flags == MARK_GOOD).sum())}")
         if session.adapter == pa.FootprintAdapter.name:
-            summary = intervention_summary(session, rules)
+            summary = intervention_summary(session, rules, step)
             line += "\n" + format_interventions(summary, ticks)
         if timeline:
             judged = len(timeline)
@@ -1337,11 +1438,14 @@ def main(argv=None):
         print(f"mixed input contracts {sorted(contracts)}; build them separately")
         return 1
 
-    arrays = to_arrays(kept)
+    arrays = to_arrays(kept, step)
     hist_edges = [0, 25, 50, 100, 150, 200, 250, 1e9]
     hist = np.histogram(all_errors, bins=hist_edges)[0].tolist()
     meta = {
         "input_contract": contracts.pop(),
+        # The decision step every tick-sized number was made off (step_for);
+        # the trainer carries it into the sidecar. A file without it is 0.1.
+        "tick_s": step.tick_s,
         "actions": list(pl.ACTIONS),
         "sessions": [s.name for s, _ in kept],
         "steer_scale": pa.STEER_SCALE,
@@ -1364,7 +1468,7 @@ def main(argv=None):
         # before GAME_ROTATION_VECTOR).
         "imu_features": list(pimu.FEATURES),
         "imu_no_yaw_features": list(pimu.NO_YAW_FEATURES),
-        "imu_window": pimu.WINDOW,
+        "imu_window": step.imu_window,
         # Where each tick came from: the "source" array indexes this.
         # Intervention ticks are my hand correcting auto; policy_train.py
         # --takeover-weight weights them.

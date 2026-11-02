@@ -143,15 +143,16 @@ def session_folds(sessions, n_folds=FOLDS, seed=0):
 
 
 def action_prediction_error(data, fit_mask, steer_ok, throttle_ok, k=HISTORY,
-                            n_folds=FOLDS, seed=0, epochs=EPOCHS):
+                            n_folds=FOLDS, seed=0, epochs=EPOCHS, link_s=pl.CHUNK_LINK_S):
     """(ape, parts) on every tick: the APE (module doc) of each fit_mask tick
     off a copycat trained on the other folds' fit_mask ticks, 0 elsewhere.
-    parts: {"gear": raw Brier, "steer": raw squared error} the same way."""
+    parts: {"gear": raw Brier, "steer": raw squared error} the same way.
+    link_s is history_index's, the dataset step's chain gap."""
     n = len(data["t_ns"])
     fit_mask = np.asarray(fit_mask, bool)
     steer_ok = np.asarray(steer_ok, bool) & fit_mask
     throttle_ok = np.asarray(throttle_ok, bool) & fit_mask
-    past = history_index(data, k)
+    past = history_index(data, k, link_s)
     rows = np.flatnonzero(fit_mask)
     session = np.asarray(data["session"])
     fold_of, folds = session_folds(session[rows], n_folds, seed)
