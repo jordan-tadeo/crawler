@@ -113,6 +113,14 @@ sudo ./deploy/install-pad-lst.sh                # once
 journalctl -u 'crawler-pad-lst@*'               # one line per connection
 ```
 
+An Xbox pad remembers one host, so pairing it with the PC leaves the Pi with a
+stale bond (connects fail with errno 52). The phone's `/pad` page fixes that
+with no laptop: hold the pair button on top of the pad until the light flashes
+fast, tap Re-pair controller, and the car removes the old bond, scans up to
+90 s for the pad by name, then pairs, trusts and connects it
+(`crawler/hardware/pad_pair.py`). Refused in auto; the wheels hold neutral
+while the pad is away, as for any pad loss.
+
 The OAK-D's udev rule is already on the car and the installer does not touch
 it. The comment at the top of `deploy/install-service.sh` says what it is.
 

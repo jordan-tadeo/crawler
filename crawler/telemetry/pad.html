@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>Crawler pad</title>
+<style>
+:root{--bg:#0e1116;--card:#171b22;--line:#262c36;--text:#e8ecf2;--dim:#8a94a6;
+--go:#16a874;--hold:#d98c0b;--blue:#3b7be0;--red:#d44848;--btn:#222833;--btn2:#2b3240}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);
+font:16px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{padding:max(12px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right))
+max(16px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+main{max-width:520px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+.tabs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;background:var(--card);
+border:1px solid var(--line);border-radius:12px;padding:4px}
+.tab{display:block;text-align:center;padding:10px 0;border-radius:9px;color:var(--dim);
+text-decoration:none;font-weight:600}
+.tab.on{background:var(--btn2);color:var(--text)}
+section{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;
+display:flex;flex-direction:column;gap:12px}
+h2{font-size:13px;margin:0;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);font-weight:600}
+button{border:0;border-radius:12px;background:var(--blue);color:#fff;font:inherit;font-weight:600;
+font-size:20px;min-height:88px;width:100%;cursor:pointer;touch-action:manipulation}
+button:active{transform:scale(.97)}
+button:disabled{opacity:.4;cursor:default;transform:none}
+.how{margin:0;color:var(--dim);font-size:14px}
+#state{font-size:17px;font-weight:600;margin:0}
+#state.ok{color:var(--go)}#state.bad{color:#ff9b9b}#state.busy{color:var(--hold)}
+#why{margin:0;font-size:13px;color:var(--dim);min-height:17px;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<main>
+<nav class="tabs"><a class="tab" href="/">Buttons</a><a class="tab" href="/map">Map</a><a class="tab on" href="/pad">Pad</a></nav>
+<section>
+<h2>Controller</h2>
+<p class="how">Hold the pair button on top of the pad until the light flashes fast, then tap below. Stop auto first; the car holds neutral while the pad is away.</p>
+<button id="go">Re-pair controller</button>
+<p id="state">No status yet</p>
+<p id="why"></p>
+</section>
+</main>
+<script>
+"use strict";
+var SAY={idle:["Not running",""],removing:["Forgetting the old pairing","busy"],
+waiting:["Waiting for the pad in pairing mode","busy"],pairing:["Pairing with the pad","busy"],
+connected:["Connected. Ready to drive","ok"],failed:["Failed","bad"],timed_out:["Timed out","bad"]};
+var go=document.getElementById("go"),st=document.getElementById("state"),why=document.getElementById("why");
+var said="";
+function show(s){
+  var k=SAY[s.state]||[s.state||"Unknown",""],t=k[0];
+  if(s.state==="waiting"&&s.left_s!=null)t+=" · "+s.left_s+" s left";
+  st.textContent=t;st.className=k[1];
+  why.textContent=said||(s.state==="pairing"?"":s.why||"");
+  go.disabled=!!s.running;
+}
+function poll(){
+  if(document.hidden)return;
+  fetch("/api/pad",{cache:"no-store"}).then(function(r){return r.json();}).then(show)
+  .catch(function(){st.textContent="Car not answering";st.className="bad";});
+}
+go.addEventListener("click",function(){
+  said="";go.disabled=true;
+  fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({cmd:"repair_pad"})})
+  .then(function(r){return r.json();}).then(function(j){
+    if(!j.ok){said=j.why||"Refused";why.textContent=said;go.disabled=false;}
+    poll();})
+  .catch(function(){said="Car not answering";why.textContent=said;go.disabled=false;});
+});
+setInterval(poll,1000);poll();
+document.addEventListener("visibilitychange",poll);
+</script>
+</body>
+</html>

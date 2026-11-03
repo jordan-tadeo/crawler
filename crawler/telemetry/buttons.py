@@ -3,9 +3,11 @@ browser, nothing installed.
 
     http://jtpi.local:8080       the buttons (or 192.168.68.57, or 10.42.0.1 on the hotspot)
     http://jtpi.local:8080/map   the map
+    http://jtpi.local:8080/pad   re-pair the pad (hardware/pad_pair.py)
 
-Two static files next to this one, buttons.html and map.html, each with a
-Buttons / Map tab bar at the top, and nothing from the internet.
+Three static files next to this one, buttons.html, map.html and pad.html,
+each with a Buttons / Map / Pad tab bar at the top, and nothing from the
+internet.
 
 The buttons page does not talk to this server again after it has loaded.
 It opens the Foxglove WebSocket on the telemetry port itself (subprotocol
@@ -47,6 +49,20 @@ messages in a phone, and it only asks while it is open and on screen:
                       it drew until then. The loop takes them with or
                       without a pad (__main__.padless_pass).
 
+The pad page is its own page and not a button on the map, because the map
+page is held under 40,000 bytes and had 47 of them left, and because the pad
+wants re-pairing on a car with no SLAM map too: /pad and its two calls are
+served whenever there is a PadRepair, map page or not.
+
+  GET  /api/pad       JSON, PadRepair.status(): the state, why, the pad's
+                      address once one is found, the seconds of scan left.
+                      The same dict is /api/state's pad_repair.
+  POST /api/cmd       {"cmd": "repair_pad"} starts the re-pair. Answered at
+                      once, 202 started or 400 with the reason ("Stop auto
+                      first", "Already re-pairing"). Not a patrol command
+                      and never queued: it goes to the PadRepair, which runs
+                      on a thread of its own and never touches the wheels.
+
 Why stdlib http.server and not something in the WebSocket server: the
 foxglove SDK's server speaks WebSocket and nothing else, and every other
 option is a dependency. A thread a connection (ThreadingHTTPServer, at most
@@ -74,6 +90,8 @@ DEFAULT_PORT = 8080
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = os.path.join(HERE, "buttons.html")
 MAP_PAGE = os.path.join(HERE, "map.html")
+PAD_PAGE = os.path.join(HERE, "pad.html")
+REPAIR_COMMAND = "repair_pad"
 # The page reads the WebSocket port from this tag; it ships with the default.
 PORT_TAG = '<meta name="ws-port" content="8765">'
 POLL_S = 1.0
@@ -105,6 +123,11 @@ def page_bytes(ws_port=8765):
 
 def map_page_bytes():
     with open(MAP_PAGE, encoding="utf-8") as f:
+        return f.read().encode("utf-8")
+
+
+def pad_page_bytes():
+    with open(PAD_PAGE, encoding="utf-8") as f:
         return f.read().encode("utf-8")
 
 
@@ -179,6 +202,13 @@ def _handler(page):
             if path in ("/", "/index.html"):
                 return self._send(200, page.body, "text/html; charset=utf-8",
                                   head_only=head_only)
+            if page.pad_body is not None:
+                if path in ("/pad", "/pad.html"):
+                    return self._send(200, page.pad_body, "text/html; charset=utf-8",
+                                      head_only=head_only)
+                if path == "/api/pad":
+                    return self._send(200, page.pad_json(), "application/json",
+                                      head_only=head_only)
             if page.map_body is not None:
                 if path in ("/map", "/map.html"):
                     return self._send(200, page.map_body, "text/html; charset=utf-8",
@@ -211,7 +241,8 @@ def _handler(page):
             self._get(True)
 
         def do_POST(self):
-            if self.path.split("?", 1)[0] != "/api/cmd" or page.map_body is None:
+            if self.path.split("?", 1)[0] != "/api/cmd" or (
+                    page.map_body is None and page.pad_body is None):
                 self.send_error(404)
                 return
             try:
@@ -237,11 +268,13 @@ class ButtonPage:
     goals: the nav/click.ClickGoals the map page's commands go into; with
     none there is no map page. map_source: a callable for the newest
     runner.MapView (SlamRunner.map). library: the tracks.Library whose
-    names the page lists. turn_radius_m: the drive line's radius."""
+    names the page lists. turn_radius_m: the drive line's radius.
+    repair: the hardware/pad_pair.PadRepair behind /pad; with none there is
+    no pad page."""
 
     def __init__(self, logger=None, host="0.0.0.0", port=DEFAULT_PORT, ws_port=8765,
                  goals=None, map_source=None, library=None, turn_radius_m=None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, repair=None):
         self.logger = logger
         self.host, self.port, self.ws_port = host, int(port), int(ws_port)
         self.goals, self.map_source, self.library = goals, map_source, library
@@ -250,6 +283,8 @@ class ButtonPage:
         self.error = None
         self.body = b""
         self.map_body = None
+        self.repair = repair
+        self.pad_body = None
         self._server = None
         self._thread = None
         self._lock = threading.Lock()
@@ -303,11 +338,22 @@ class ButtonPage:
                 patrol["pending"] = pending
             snap["patrol"] = patrol
             out.update(snap)
+        if self.repair is not None:
+            out["pad_repair"] = self._repair_status()
         try:
             out["tracks"] = self.library.names() if self.library is not None else []
         except Exception:
             out["tracks"] = []
         return json.dumps(out, separators=(",", ":")).encode("utf-8")
+
+    def _repair_status(self):
+        try:
+            return self.repair.status()
+        except Exception as e:
+            return {"state": "failed", "why": str(e), "running": False}
+
+    def pad_json(self):
+        return json.dumps(self._repair_status(), separators=(",", ":")).encode("utf-8")
 
     def pending_json(self):
         with self._lock:
@@ -349,6 +395,13 @@ class ButtonPage:
         msg = ck.parse_command(body)
         if msg is None:
             return False, "not a command"
+        if msg["cmd"] == REPAIR_COMMAND:
+            if self.repair is None:
+                return False, "no re-pair on this car"
+            try:
+                return self.repair.start()
+            except Exception as e:
+                return False, str(e)
         if msg["cmd"] not in pt.COMMANDS:
             return False, f"{msg['cmd']!r} is not a patrol command"
         if self.goals is None or not self.goals.push("cmd", msg):
@@ -361,6 +414,7 @@ class ButtonPage:
         try:
             self.body = page_bytes(self.ws_port)
             self.map_body = map_page_bytes() if self.goals is not None else None
+            self.pad_body = pad_page_bytes() if self.repair is not None else None
             server = _Server((self.host, self.port), _handler(self))
             server.timeout = REQUEST_TIMEOUT_S
         except Exception as e:
@@ -373,7 +427,8 @@ class ButtonPage:
         self._thread = threading.Thread(target=self._serve, name="buttons", daemon=True)
         self._thread.start()
         self._log("info", f"Button page on http://{self.host}:{self.port}"
-                  + (", the map on /map" if self.map_body is not None else ""))
+                  + (", the map on /map" if self.map_body is not None else "")
+                  + (", the pad on /pad" if self.pad_body is not None else ""))
         return True
 
     def _serve(self):

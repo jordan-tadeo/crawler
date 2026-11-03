@@ -27,6 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DRIVE = os.path.join(ROOT, "deploy", "foxglove-drive.json")
 HTML = open(bt.PAGE, encoding="utf-8").read()
 MAP_HTML = open(bt.MAP_PAGE, encoding="utf-8").read()
+PAD_HTML = open(bt.PAD_PAGE, encoding="utf-8").read()
 
 
 def page_commands():
@@ -64,13 +65,13 @@ def test_the_page_only_ever_sends_patrol_and_follow_commands():
         click.PATROL_TOPIC, click.FOLLOW_TOPIC}
 
 
-@pytest.mark.parametrize("html", [HTML, MAP_HTML], ids=["buttons", "map"])
+@pytest.mark.parametrize("html", [HTML, MAP_HTML, PAD_HTML], ids=["buttons", "map", "pad"])
 def test_the_pages_load_nothing_from_anywhere(html):
     # On the car's own hotspot there is no internet: no CDN, no web font.
-    # The only links are the two tabs, to this server's own pages.
+    # The only links are the three tabs, to this server's own pages.
     assert not re.search(r"""https?://|["'(]//""", html)
     assert not re.search(r"""\bsrc\s*=""", html)
-    assert set(re.findall(r"""\bhref\s*=\s*"([^"]*)\"""", html)) == {"/", "/map"}
+    assert set(re.findall(r"""\bhref\s*=\s*"([^"]*)\"""", html)) == {"/", "/map", "/pad"}
     assert "@import" not in html and "url(" not in html
     assert len(html.encode()) < 40_000
 

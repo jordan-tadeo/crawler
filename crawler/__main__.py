@@ -2897,11 +2897,12 @@ def nav_goals(args, log):
         return None, None
 
 
-def start_buttons(args, tele, goals, log, slam=None, library=None):
+def start_buttons(args, tele, goals, log, slam=None, library=None, repair=None):
     """The phone pages (telemetry/buttons.ButtonPage), or None. Only when the
     Foxglove server is up and takes client commands, since the buttons go
     through it; --buttons-port 0 is off. The map page as well when there is
-    a SLAM map to draw."""
+    a SLAM map to draw, and the pad page whenever there is a `repair`
+    (hardware/pad_pair.PadRepair)."""
     port = getattr(args, "buttons_port", 0)
     if not port or goals is None or not getattr(tele, "serving", False):
         return None
@@ -2910,7 +2911,7 @@ def start_buttons(args, tele, goals, log, slam=None, library=None):
     page = bt.ButtonPage(logger=log, host=tele.host, port=port, ws_port=tele.port,
                          goals=goals if slam is not None else None,
                          map_source=getattr(slam, "map", None), library=library,
-                         turn_radius_m=truck.DRIVEN_TURN_RADIUS_M)
+                         turn_radius_m=truck.DRIVEN_TURN_RADIUS_M, repair=repair)
     return page if page.start() else None
 
 
@@ -3198,7 +3199,14 @@ def main(argv=None):
                           patrol_settings=(patrol.Store(lg.log_path(PATROL_SETTINGS_FILE))
                                            if args.goal else None),
                           tags=tags)
-    buttons = start_buttons(args, tele, goals, log, slam=slam, library=library)
+    # Re-pairing the pad from the phone's /pad. Its own thread when pressed,
+    # and nothing at all until then. It reads the mode to refuse in auto and
+    # writes nothing the control loop reads: the pad it drops and brings back
+    # is the control loop's ordinary pad loss and Joystick.try_connect.
+    from crawler.hardware import pad_pair
+    repair = pad_pair.PadRepair(mode=lambda: modes.mode, logger=log)
+    buttons = start_buttons(args, tele, goals, log, slam=slam, library=library,
+                            repair=repair)
 
     # Who gets the device opened at startup, and who waits for it:
     #

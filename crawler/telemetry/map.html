@@ -13,7 +13,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--text);overflow:h
 font:15px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 body{display:flex;flex-direction:column;padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right))
 max(8px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));gap:6px}
-.tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--card);
+.tabs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;background:var(--card);
 border:1px solid var(--line);border-radius:12px;padding:4px;flex:none}
 .tab{display:block;text-align:center;padding:9px 0;border-radius:9px;color:var(--dim);
 text-decoration:none;font-weight:600}
@@ -73,7 +73,7 @@ max-width:520px;max-height:80%;overflow:auto;padding:14px 14px max(14px,env(safe
 </style>
 </head>
 <body>
-<nav class="tabs"><a class="tab" href="/">Buttons</a><a class="tab on" href="/map">Map</a></nav>
+<nav class="tabs"><a class="tab" href="/">Buttons</a><a class="tab on" href="/map">Map</a><a class="tab" href="/pad">Pad</a></nav>
 <div class="banner" id="nr"><span class="msg" id="nr_msg"></span></div>
 <div class="banner" id="err"><span class="msg" id="err_msg"></span><button id="e_retry">Retry</button><button id="e_drop">Discard</button></div>
 <div id="wrap">
