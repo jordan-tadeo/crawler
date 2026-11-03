@@ -189,15 +189,63 @@ UNKNOWN = "unknown"
 # lot harder and may buzz above it. UNVERIFIED at 0.4.
 GYRO_MOVING_MIN = 0.010  # rad/s
 
+# ---- the decision clock -----------------------------------------------------
+#
+# Every window below was tuned as a count of decisions at the 0.1 s decision
+# (main.AUTO_TICK_INTERVAL, which the driver cannot import). They are seconds
+# now, so a faster decision keeps the same real-time windows and a late one
+# cannot stretch them: a count of ten spans 0.9 s at 10 Hz, 0.56 s at 16 Hz
+# and 1.8 s on a 0.2 s step.
+#
+# Each window is the time a run of evidence spans, first sample to newest, so
+# N samples at DECISION_S span (N - 1) x DECISION_S. The line is a hair under
+# (N - 1) x FASTEST_DECISION_S (run_window_s): at exactly 0.1 s it fires on
+# the same sample the count did (N - 2 steps never reach it, N - 1 always
+# do), and on any step down to the fastest measured it fires on that sample
+# or an earlier one, so never a later STUCK or stop than the count at 10 Hz.
+# On a slow step it fires on fewer samples than the count did: 0.81 s of
+# stillness on a 0.2 s step is five intervals, where the count waited for
+# nine (1.8 s). That is the choice made where the two differ. The count could
+# only ever fire late, and a late STUCK is a car left pushing.
+#
+# The time is evidence time. A sample's step is the time since the reading
+# before it was asked for, so a decision with no reading (UNKNOWN) adds
+# nothing, exactly as it added nothing to a count; the reading after it adds
+# one step.
+#
+# FASTEST_DECISION_S is the bottom of the decision periods measured in auto
+# (90-200 ms, off the /footprint stamps of the 10-30 and 10-31 runs). The
+# scheduler today never runs a decision early (next = now + interval), so the
+# driver's own steps are 0.1 s or longer and every window here fires on the
+# count's sample or sooner.
+DECISION_S = 0.1
+FASTEST_DECISION_S = 0.09
+# Under the line by a millisecond, so a float sum of 90 ms steps still reaches
+# it. Far smaller than the 10 ms between N - 2 steps of 0.1 and the line.
+WINDOW_SLACK_S = 0.001
+
+
+def run_window_s(decisions) -> float:
+    """A run of `decisions` samples as a window line, in seconds: (n - 1)
+    fastest steps less WINDOW_SLACK_S. Sample n reaches it at DECISION_S,
+    sample n - 1 does not, and at any step of FASTEST_DECISION_S or longer
+    sample n or an earlier one does. Pure."""
+    return (int(decisions) - 1) * FASTEST_DECISION_S - WINDOW_SLACK_S
+
+
 # How much evidence before the car is allowed to call itself stuck. At the 10 Hz
 # tick this is a full second of consecutive confident no-motion readings, every
-# one of them taken while forward throttle was already up.
+# one of them taken while forward throttle was already up: ten samples, 0.9 s
+# first to last.
 #
-# A count of ticks on purpose, not a wall-clock duration. The control loop does
-# not always make its 100 Hz -- I have watched it sit at 75 Hz with a 190 ms
-# stall in it -- and a count can only ever make confirming a stick take longer
-# in real time, never make it fire early. A deadline would do the opposite.
+# It was a count of ticks on purpose, so that a decision that ran late could
+# only make confirming a stick take longer, never fire early. It is a span now
+# (see "the decision clock"): STUCK_CONFIRM_S of unbroken stillness, never
+# less, on however many samples that takes. On a slow step that is fewer
+# samples and sooner than the count, never later. STUCK_CONFIRM_SAMPLES is
+# what it was in decisions; the driver times it, the tests count with it.
 STUCK_CONFIRM_SAMPLES = 10
+STUCK_CONFIRM_S = run_window_s(STUCK_CONFIRM_SAMPLES)   # 0.809 s
 
 # And how long forward throttle must have been commanded before the stuck check
 # arms at all. A car that has just been handed the wheels has not been given a
@@ -226,10 +274,26 @@ STUCK_ARM_SECONDS = 1.0
 # plus 0.4 s of confirmation, eight distinct IMU readings all agreeing. Going
 # to five would buy 10% more confidence for half of the time saved.
 #
-# A count of ticks and not a deadline, for the same reason STUCK_CONFIRM_SAMPLES
-# is: the loop does not always make its rate, and a count can only ever take
-# longer in real time, never fire early.
+# It was a count of ticks for the same reason STUCK_CONFIRM_SAMPLES was, and
+# it is a span now for the same reason: four samples at 0.1 s span 0.3 s, and
+# REVERSE_STALL_S fires on the fourth at 0.1 s and on the fourth or sooner on
+# any slower step (see "the decision clock"). The window it waits for is
+# IMU_WINDOW_FULL_S.
 REVERSE_STALL_SAMPLES = 4
+REVERSE_STALL_S = run_window_s(REVERSE_STALL_SAMPLES)   # 0.269 s
+
+# The smoothing window both IMU magnitudes are averaged over: five samples at
+# the 0.1 s decision. A sample stays in it while its evidence age (the steps
+# taken since it) is under IMU_WINDOW_S, which holds five at 0.1 s and five
+# at the fastest step, 90 ms, where a sixth is 0.45 s old. So never more
+# samples than the count at 10 Hz, and a stop reads STILL no later. A slow
+# step holds fewer (three at 0.2 s), which reads a stop sooner. The window is
+# full, and the rear bumper may count, once it has collected
+# IMU_WINDOW_FULL_S of evidence since it was emptied: the fifth sample at
+# 0.1 s, sooner on a slow step.
+IMU_WINDOW_DECISIONS = 5
+IMU_WINDOW_S = IMU_WINDOW_DECISIONS * FASTEST_DECISION_S - WINDOW_SLACK_S  # 0.449 s
+IMU_WINDOW_FULL_S = run_window_s(IMU_WINDOW_DECISIONS)                      # 0.359 s
 
 # What "not shaking" means to the rear bumper, which is not what it means to
 # the forward detector. Off my drives: a car held at -0.3, which does not move
@@ -1151,13 +1215,17 @@ REVERSE_MOVING_FLOOR = 0.40
 # This is the one line to change; REAR_STOP_CLEAR_MM follows it.
 ESCAPE_SPEED = -0.60
 
-# The ease-in, counted in decisions (10 Hz, AUTO_TICK_INTERVAL), not loop
-# ticks: half, then all of ESCAPE_SPEED. The first step is under the moving
-# floor and does not move the car; that is the cost of not stepping the ESC
-# straight to the escape pulse, and it is 0.1 s. There is no ease-off at the
-# other end: ESCAPE_SPEED is already slow, so slowing for the exit would be
-# next to stopping, and the exit is a stop anyway.
+# The ease-in, in decisions, not loop ticks: half, then all of ESCAPE_SPEED.
+# The first step is under the moving floor and does not move the car; that
+# is the cost of not stepping the ESC straight to the escape pulse, and it is
+# 0.1 s. There is no ease-off at the other end: ESCAPE_SPEED is already slow,
+# so slowing for the exit would be next to stopping, and the exit is a stop
+# anyway. Timed off the back-out's start (see "the decision clock"): half
+# until ESCAPE_RAMP_S, which is the first decision only at 0.1 s or any
+# slower step, and the first two at 16 Hz, so the half step stays about
+# 0.1 s long.
 ESCAPE_RAMP_DECISIONS = 2
+ESCAPE_RAMP_S = run_window_s(ESCAPE_RAMP_DECISIONS)   # 0.089 s
 
 
 def auto_reverse_throttle(throttle) -> float:
@@ -1498,8 +1566,11 @@ class TiltVeto:
 BACKOUT_OPEN_MM = 600.0
 
 # Open for this many decisions in a row before the reverse ends: one frame
-# of a doorway is not a doorway. 0.3 s.
+# of a doorway is not a doorway. 0.3 s at 10 Hz. Timed as a span (see "the
+# decision clock"): the third open decision in a row at 0.1 s, the third or
+# sooner on a slower step.
 BACKOUT_OPEN_DECISIONS = 3
+BACKOUT_OPEN_S = run_window_s(BACKOUT_OPEN_DECISIONS)   # 0.179 s
 
 # The shortest reverse, so a fan that reads open on the first frame does not
 # make the car twitch backwards and straight back in. STUCK gets longer: a
@@ -1827,8 +1898,9 @@ CREEP_FLOOR_MM = CREEP_STOP_CLEAR_MM + LENS_TO_FRONT_BUMPER_MM
 LIDAR_NEAR_FIELD = False
 LIDAR_NEAR_MAX_AGE_S = 0.12
 LIDAR_REVOLUTION_S = 0.1
-# A decision's length, main.AUTO_TICK_INTERVAL (the driver cannot import it).
-DECISION_S = 0.1
+# A decision's length is DECISION_S ("the decision clock"), the nominal 0.1 s.
+# Taken at the fastest measured step (FASTEST_DECISION_S) instead, this line
+# would be 2 mm longer; it stays on the nominal, so nothing moves at 10 Hz.
 LIDAR_EXTRA_AGE_MM = max(0.0, ((LIDAR_REVOLUTION_S + LIDAR_NEAR_MAX_AGE_S)
                                - (FRAME_AGE_S + DECISION_S))
                          * ground_speed_mm_s(CREEP_SPEED))
@@ -2160,13 +2232,30 @@ class Driver:
         self.recovery_cooldown = 5.0  # seconds before the stuck check re-arms
         self.imu_history = []
         self.gyro_history = []
-        self.imu_window_size = 5  # window for smoothing both magnitudes
+        # The smoothing window in decisions at the 0.1 s step. The driver
+        # times it (IMU_WINDOW_S); the tests count ticks with this.
+        self.imu_window_size = IMU_WINDOW_DECISIONS
+        # The decision clock's bookkeeping (see there). _sample_steps is the
+        # step each sample in the histories was taken on, oldest first;
+        # _window_evidence_s is the evidence collected since the windows were
+        # last emptied; _evidence_step is this reading's step, 0.0 for an
+        # UNKNOWN; _evidence_at is when a reading was last asked for, and
+        # _evidence_now is the decision's time, set by whoever asks.
+        self._sample_steps = []
+        self._window_evidence_s = 0.0
+        self._evidence_step = 0.0
+        self._evidence_at = None
+        self._evidence_now = None
 
         # Stuck detection state. _throttle_since is when forward throttle was
         # first commanded in the current unbroken run of commanding it, and
         # None whenever the driver is not asking the car to go anywhere.
+        # _still_s is the evidence time the run of _still_samples spans; a
+        # run of zero samples spans nothing whatever _still_s says, which is
+        # how a reset of the count alone (nav, the policy) still resets it.
         self._throttle_since = None
         self._still_samples = 0
+        self._still_s = 0.0
 
         # Rear bumper state, and it is its own counter on purpose. The forward
         # detector and the reverse bumper ask the same question of the same
@@ -2176,6 +2265,7 @@ class Driver:
         # evidence up. _throttle_since in particular is gated on FORWARD
         # throttle and nothing in here writes it.
         self._reverse_still_samples = 0
+        self._reverse_still_s = 0.0
 
         # Tunable parameters. The two speeds are the module's FORWARD_SPEED
         # and REVERSE_SPEED -- see there for why they are what they are. The
@@ -2223,6 +2313,10 @@ class Driver:
         self._backout_min_s = BACKOUT_MIN_S
         self._backout_decisions = 0
         self._backout_open = 0
+        # The span of that run of open decisions, and when the back-out last
+        # decided, for BACKOUT_OPEN_S.
+        self._backout_open_s = 0.0
+        self._backout_at = 0.0
         self._backout_throttle = 0.0
         self._backout_exit = ""
         self._backout_reverse_s = 0.0
@@ -2277,7 +2371,7 @@ class Driver:
         # a random lock under a car I am driving. So under my throttle the arm
         # is dropped on every tick, and after I let go it has to be earned
         # again: STUCK_ARM_SECONDS of the driver's own forward command, then
-        # STUCK_CONFIRM_SAMPLES of stillness.
+        # STUCK_CONFIRM_S of stillness.
         self.human_throttle = False
 
     def motion_evidence(self, imu) -> str:
@@ -2311,6 +2405,7 @@ class Driver:
         reason, which is the failure being fixed. The number still wants a pass
         on the bench with the wheels up before I treat it as a feel number.
         """
+        step = self._evidence_clock()
         if imu is None:
             return UNKNOWN
 
@@ -2320,19 +2415,54 @@ class Driver:
         except (KeyError, TypeError):
             return UNKNOWN
 
+        self._sync_sample_steps()
+        if self.gyro_history:
+            self._window_evidence_s += step
         self.imu_history.append(float(np.linalg.norm(accel)))
-        if len(self.imu_history) > self.imu_window_size:
-            self.imu_history.pop(0)
-
         self.gyro_history.append(float(np.linalg.norm(gyro)))
-        if len(self.gyro_history) > self.imu_window_size:
+        self._sample_steps.append(step)
+        # Out of the window once the steps since a sample reach IMU_WINDOW_S,
+        # the newest always staying: a window of one on a very slow step.
+        while (len(self._sample_steps) > 1
+               and sum(self._sample_steps[1:]) >= IMU_WINDOW_S):
+            self.imu_history.pop(0)
             self.gyro_history.pop(0)
+            self._sample_steps.pop(0)
+        self._evidence_step = step
 
         if (np.mean(self.gyro_history) > GYRO_MOVING_MIN
                 or np.mean(self.imu_history) > self.stuck_threshold):
             return MOVING
 
         return STILL
+
+    def _evidence_clock(self) -> float:
+        """This reading's step, seconds: the time since a reading was last
+        asked for, off _evidence_now (stuck() and the back-out set it). The
+        first one, or one asked with no clock, is a nominal DECISION_S. Never
+        negative. Leaves _evidence_step at 0.0 until a reading lands, so an
+        UNKNOWN adds nothing to any span."""
+        now = self._evidence_now
+        prev = self._evidence_at
+        step = DECISION_S
+        if now is not None:
+            if prev is not None:
+                step = max(0.0, float(now) - float(prev))
+            self._evidence_at = now
+        self._evidence_step = 0.0
+        return step
+
+    def _sync_sample_steps(self):
+        """Keep _sample_steps as long as the histories, should anything have
+        set those directly: missing steps are nominal ones, at the old end."""
+        n = min(len(self.gyro_history), len(self.imu_history))
+        del self.gyro_history[:len(self.gyro_history) - n]
+        del self.imu_history[:len(self.imu_history) - n]
+        steps = self._sample_steps
+        if len(steps) > n:
+            del steps[:len(steps) - n]
+        elif len(steps) < n:
+            steps[:0] = [DECISION_S] * (n - len(steps))
 
     def _clear_motion_evidence(self):
         """Forget everything the IMU said. Called whenever the car stops.
@@ -2349,8 +2479,12 @@ class Driver:
         """
         self.imu_history.clear()
         self.gyro_history.clear()
+        self._sample_steps.clear()
+        self._window_evidence_s = 0.0
         self._still_samples = 0
+        self._still_s = 0.0
         self._reverse_still_samples = 0
+        self._reverse_still_s = 0.0
         self._throttle_since = None
 
     def stuck(self, imu, now) -> bool:
@@ -2362,9 +2496,10 @@ class Driver:
           because a motion check on a car nobody asked to move measures
           nothing;
 
-          STUCK_CONFIRM_SAMPLES samples in a row have come back STILL, with an
-          UNKNOWN holding the count where it is rather than adding to it, so a
-          dropped packet can never contribute to the verdict;
+          a run of STILL samples in a row spans STUCK_CONFIRM_S (ten at the
+          0.1 s decision), with an UNKNOWN holding the run where it is rather
+          than adding to it, so a dropped packet can never contribute to the
+          verdict;
 
           and the cooldown has expired.
 
@@ -2373,30 +2508,40 @@ class Driver:
         every false positive, so the car recovered on a flat 5 s metronome --
         the journal shows STUCK at :47, :52, :57, :02, :07. The clock can only
         be restamped by a stick the car actually confirmed now, and confirming
-        one costs a second of commanded throttle plus a second of unbroken
-        stillness.
+        one costs a second of commanded throttle plus most of a second of
+        unbroken stillness.
         """
-        evidence = self.motion_evidence(imu)
+        self._evidence_now = now
+        try:
+            evidence = self.motion_evidence(imu)
+        finally:
+            self._evidence_now = None
 
         armed = (self._throttle_since is not None
                  and now - self._throttle_since >= STUCK_ARM_SECONDS)
 
         if evidence == MOVING or not armed:
             self._still_samples = 0
+            self._still_s = 0.0
             return False
 
         if evidence == STILL:
+            # The first sample of a run spans nothing; each after it adds its
+            # step (see "the decision clock").
+            self._still_s = (self._still_s + self._evidence_step
+                             if self._still_samples > 0 else 0.0)
             self._still_samples += 1
         # UNKNOWN falls through on purpose: no evidence is not evidence of no
-        # motion, and it must not be able to walk the counter up on its own.
+        # motion, and it must not be able to walk the run up on its own.
 
-        if self._still_samples < STUCK_CONFIRM_SAMPLES:
+        if self._still_samples == 0 or self._still_s < STUCK_CONFIRM_S:
             return False
 
         if now - self.last_recovery_time <= self.recovery_cooldown:
             return False
 
         self._still_samples = 0
+        self._still_s = 0.0
         return True
 
     def scan_footprint(self, depth_frame, threshold_mm=CLEARANCE_MM) -> FootprintScan:
@@ -2495,6 +2640,8 @@ class Driver:
         self._backout_min_s = min_s
         self._backout_decisions = 0
         self._backout_open = 0
+        self._backout_open_s = 0.0
+        self._backout_at = now
         self._backout_exit = ""
         self._backout_reverse_s = 0.0
         self._handback_side = 0.0
@@ -2521,7 +2668,7 @@ class Driver:
             self.rear_stop = True
             self._end_reverse(now, EXIT_REAR)
             return
-        self._backout_drive()
+        self._backout_drive(now)
 
     def read_rear(self):
         """This decision's rear clearance off the newest fresh lidar scan,
@@ -2568,18 +2715,20 @@ class Driver:
             "front_lidar_clearance_mm": float(f) if f is not None else -1.0,
         }
 
-    def _backout_drive(self):
-        """One decision's reverse throttle, on the ease-in. Never non-finite:
-        both factors are constants and a count."""
+    def _backout_drive(self, now):
+        """One decision's reverse throttle, on the ease-in: the first step
+        until ESCAPE_RAMP_S into the back-out, then all of it. Never
+        non-finite: both factors are constants."""
         self._backout_decisions += 1
-        ramp = min(1.0, self._backout_decisions / float(ESCAPE_RAMP_DECISIONS))
+        ramp = (1.0 if now - self._backout_since >= ESCAPE_RAMP_S
+                else 1.0 / float(ESCAPE_RAMP_DECISIONS))
         throttle = float(ESCAPE_SPEED) * ramp
         if not math.isfinite(throttle):
             throttle = 0.0
         self._backout_throttle = throttle
         self.controller.set_throttle(throttle)
 
-    def _rear_bumper_hit(self) -> bool:
+    def _rear_bumper_hit(self, now) -> bool:
         """Has the car reversed into something?
 
         There is no camera pointed backwards, so a reverse is blind -- but
@@ -2594,25 +2743,29 @@ class Driver:
         but the counts are separate and both are cleared at every stop, so
         neither phase can walk the other's evidence up.
 
-        A sample only counts once the smoothing window is full.
-        begin_recover() empties it, so the first ticks of a reverse are a mean
-        over one or two readings taken while the ESC was still spinning up,
-        and those read STILL on a car that is about to move off perfectly
-        well. Waiting for the five samples is also the half second that stops
-        this firing before the car has had a chance to go anywhere, which is
-        why there is no separate arm delay.
+        A sample only counts once the smoothing window is full
+        (IMU_WINDOW_FULL_S). begin_recover() empties it, so the first ticks
+        of a reverse are a mean over one or two readings taken while the ESC
+        was still spinning up, and those read STILL on a car that is about to
+        move off perfectly well. Waiting for the five samples (at 0.1 s) is
+        also the half second that stops this firing before the car has had a
+        chance to go anywhere, which is why there is no separate arm delay.
 
         UNKNOWN holds the count where it is and never adds to it, exactly as
         in the forward detector: a dropped packet is not evidence of no
         motion, and a blind reverse is the worst place to start guessing.
         """
-        return self._rear_bumper_counts(
-            self.motion_evidence(self.camera.get_imu_sample()))
+        self._evidence_now = now
+        try:
+            evidence = self.motion_evidence(self.camera.get_imu_sample())
+        finally:
+            self._evidence_now = None
+        return self._rear_bumper_counts(evidence)
 
     def _rear_bumper_counts(self, evidence) -> bool:
         """_rear_bumper_hit()'s count, off evidence already taken this tick:
         the policy's reverse commit asks it of the sample stuck() took."""
-        if len(self.gyro_history) < self.imu_window_size:
+        if self._window_evidence_s < IMU_WINDOW_FULL_S:
             return False
 
         # The same windows, judged against the reverse's own gyro line
@@ -2626,12 +2779,17 @@ class Driver:
 
         if evidence == MOVING:
             self._reverse_still_samples = 0
+            self._reverse_still_s = 0.0
             return False
 
         if evidence == STILL:
+            # As stuck(): the first of a run spans nothing.
+            self._reverse_still_s = (self._reverse_still_s + self._evidence_step
+                                     if self._reverse_still_samples > 0 else 0.0)
             self._reverse_still_samples += 1
 
-        return self._reverse_still_samples >= REVERSE_STALL_SAMPLES
+        return (self._reverse_still_samples > 0
+                and self._reverse_still_s >= REVERSE_STALL_S)
 
     def _backout_scan(self):
         """This decision's scan during a back-out, or None with no usable
@@ -2661,8 +2819,8 @@ class Driver:
                                     there is with no fresh scan
           past the cap              EXIT_CAP (REVERSE_SECONDS, or
                                     ESCALATED_REVERSE_SECONDS)
-          open BACKOUT_OPEN_DECISIONS
-          in a row, past the min    EXIT_OPENED
+          open BACKOUT_OPEN_S in a
+          row, past the min         EXIT_OPENED
 
         Every one of those commands throttle 0 on the decision it fires, then
         the settle holds 0 for SETTLE_SECONDS with the steering already
@@ -2674,14 +2832,21 @@ class Driver:
         if self._phase == _PHASE_REVERSE:
             # The bumper is asked every decision, before anything can end the
             # reverse, because it is accumulating evidence.
-            hit = self._rear_bumper_hit()
+            hit = self._rear_bumper_hit(now)
             scan = self._backout_scan()
             rear = rear_blocked(self.read_rear())
             elapsed = now - self._backout_since
             if scan is not None and backout_opened(scan, -self._backout_side):
+                # A span, as the bumper's: the first open decision spans
+                # nothing, each after it its step.
+                self._backout_open_s = (
+                    self._backout_open_s + max(0.0, now - self._backout_at)
+                    if self._backout_open > 0 else 0.0)
                 self._backout_open += 1
             else:
                 self._backout_open = 0
+                self._backout_open_s = 0.0
+            self._backout_at = now
 
             if scan is None:
                 exit_reason = EXIT_NO_FRAME
@@ -2694,11 +2859,12 @@ class Driver:
                 exit_reason = EXIT_BUMPER
             elif now >= self._phase_until:
                 exit_reason = EXIT_CAP
-            elif (self._backout_open >= BACKOUT_OPEN_DECISIONS
+            elif (self._backout_open > 0
+                    and self._backout_open_s >= BACKOUT_OPEN_S
                     and elapsed >= self._backout_min_s - 1e-3):
                 exit_reason = EXIT_OPENED
             else:
-                self._backout_drive()
+                self._backout_drive(now)
                 return True
 
             self._end_reverse(now, exit_reason)

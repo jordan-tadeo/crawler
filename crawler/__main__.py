@@ -2474,13 +2474,15 @@ def main(argv=None):
         hub.depth_listeners.append(voxels.on_depth)
         hub.imu_listeners.append(voxels.on_imu)
         log.log("info", "Voxel", "Mapping the OAK-D's depth")
-    if args.nav:
-        # The navigator plans on a thread of this process (ThreadPlanner),
-        # and a search is pure Python for seconds on the Pi, so it holds the
-        # GIL against this 100 Hz loop. Measured on the Pi, a pass woke 22 ms
-        # late at p99 during a plan at the default 5 ms switch interval and
-        # 12 ms at 1 ms, with the plans no slower.
-        sys.setswitchinterval(NAV_SWITCH_INTERVAL_S)
+    # Always, not only with --nav. The navigator plans on a thread of this
+    # process (ThreadPlanner), and a search is pure Python for seconds on the
+    # Pi, so it holds the GIL against this 100 Hz loop. Measured on the Pi, a
+    # pass woke 22 ms late at p99 during a plan at the default 5 ms switch
+    # interval and 12 ms at 1 ms, with the plans no slower. Without --nav
+    # there are still threads holding it: the path planner, the lidar and
+    # camera readers, telemetry; the loop's GIL wait is what holds auto at
+    # 17-30 Hz with the Pi a third idle.
+    sys.setswitchinterval(NAV_SWITCH_INTERVAL_S)
     if args.goal:
         if slam is None:
             log.log("warning", "Goal", "--goal needs --slam: a click has no map "
