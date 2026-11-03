@@ -12,9 +12,10 @@ function car() {
   // The car's side: the patrol's points and acks, and what it was sent.
   const c = { points: [], acks: [], said: [], posts: [], gets: [], ready: true, pad: true,
     apply: true, refuse: false, down: false, running: false, strokes: [], refuseUndo: false,
-    exploring: false, tags: null };
+    exploring: false, tags: null, mode: "manual", decisions: null };
   c.state = () => c.ready ? {
-    ready: true, age_s: 0.2, turn_radius_m: 0.7, tracks: [], pad: c.pad, mode: "manual",
+    ready: true, age_s: 0.2, turn_radius_m: 0.7, tracks: [], pad: c.pad, mode: c.mode,
+    decisions: c.decisions,
     patrol: { frame: 0, present: true, pose: [0, 0, 0], use: "patrol", state: "editing", mode: "loop",
       running: c.running, index: 0, points: c.points.slice(), name: null, dirty: true, stuck_s: 0,
       skip_stuck: false, strokes: c.strokes.length, pending: null, fit: {}, said: c.said.slice(), acks: c.acks.slice(),
@@ -299,6 +300,23 @@ const text = (page, id) => page.evaluate((i) => {
     await page.waitForTimeout(1300);
     msg = await text(page, "nr");
     must(/No connection to the car/.test(msg), "down: " + msg);
+    await ctx.close();
+  });
+
+  await check("auto_decisions_that_gave_up_say_so", async () => {
+    const c = car(); c.mode = "auto";
+    c.decisions = { state: "late", why: "Auto decisions are late. Holding neutral until one lands.", age_s: 0.4 };
+    const { ctx, page } = await open(b, c);
+    let msg = await text(page, "nr");
+    must(/decisions are late/.test(msg), "late: " + msg);
+    c.decisions = { state: "gave up", why: "Auto decisions keep crashing (ValueError: x). Holding neutral in auto; START out of auto and back in to try again.", age_s: null };
+    await page.waitForTimeout(800);
+    msg = await text(page, "nr");
+    must(/keep crashing/.test(msg), "gave up: " + msg);
+    must(/bad/.test(await page.evaluate(() => document.getElementById("nr").className)), "not loud");
+    c.decisions = { state: "ok", why: "", age_s: 0.05 };
+    await page.waitForTimeout(800);
+    must(await text(page, "nr") === "", "ok still says: " + await text(page, "nr"));
     await ctx.close();
   });
 

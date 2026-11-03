@@ -623,9 +623,19 @@ def test_the_tap_is_never_handed_anything_that_can_command():
         assert name not in body, name
 
     main_source = pathlib.Path(mn.__file__).read_text()
-    call = main_source.split("tap.after_drive(", 1)[1].split("steering_mode=")[0]
-    assert "vecon.last_throttle" in call
-    assert "vecon," not in call and "vecon)" not in call
+    calls = [c.split("steering_mode=")[0]
+             for c in main_source.split("tap.after_drive(")[1:]]
+    # Two: the control loop's (record), and the AutoPilot's auto row, which
+    # is handed what the control loop read back off the controller when it
+    # wrote that decision (_Applied).
+    assert len(calls) == 2
+    record, auto = sorted(calls, key=lambda c: "applied.command" in c)
+    assert "vecon.last_throttle" in record
+    assert "applied.command" in auto
+    applied = main_source.split("applied = _Applied(", 1)[1].split("steering_mode)")[0]
+    assert "self.vecon.last_throttle" in applied
+    for call in calls:
+        assert "vecon," not in call and "vecon)" not in call
 
 
 def test_an_exception_in_the_tap_costs_a_row_and_not_a_tick(monkeypatch):

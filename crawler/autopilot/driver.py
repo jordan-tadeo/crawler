@@ -214,11 +214,30 @@ GYRO_MOVING_MIN = 0.010  # rad/s
 # one step.
 #
 # FASTEST_DECISION_S is the bottom of the decision periods measured in auto
-# (90-200 ms, off the /footprint stamps of the 10-30 and 10-31 runs). The
-# scheduler today never runs a decision early (next = now + interval), so the
-# driver's own steps are 0.1 s or longer and every window here fires on the
-# count's sample or sooner.
+# (90-200 ms, off the /footprint stamps of the 10-30 and 10-31 runs). Those
+# were measured under the old scheduler (next = now + interval), which never
+# ran a decision early. The scheduler is on a fixed phase now
+# (next_decision_at): a decision that went out late is followed by one on the
+# phase, so one step can be short (a 50 ms late tick, then one 50 ms later).
+# The windows are time, so a short step cannot fire one early; the cost is
+# that a run whose first sample was late by more than 90 ms over its last one
+# waits one more sample than the count would have.
 DECISION_S = 0.1
+
+
+def next_decision_at(due, now, interval=DECISION_S):
+    """When the decision after the one due at `due`, made at `now`, is due.
+
+    On a fixed phase: `due` plus one interval, whatever `now` was, so a late
+    pass does not push every decision after it later (next = now + interval
+    drifted the 10 Hz to 8.8-9.3 Hz). More than one interval behind -- a
+    stall, or the first decision after a resume, whose `due` is 0 -- and it
+    starts the phase again from `now` instead of firing a burst of decisions
+    to catch up. Pure."""
+    due = float(due) + interval
+    if due < now - interval:
+        due = now + interval
+    return due
 FASTEST_DECISION_S = 0.09
 # Under the line by a millisecond, so a float sum of 90 ms steps still reaches
 # it. Far smaller than the 10 ms between N - 2 steps of 0.1 and the line.

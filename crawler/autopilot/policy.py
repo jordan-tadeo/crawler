@@ -241,6 +241,7 @@ import importlib
 import json
 import math
 import os
+import threading
 import time
 from typing import NamedTuple
 
@@ -1639,6 +1640,12 @@ class PolicyDriver(dv.Driver):
         # Whether the car has arrived: the only thing that lets a model stop
         # be committed (goal.py). Asked every tick.
         self.goal = goal if goal is not None else gl.Goal()
+        # Held round every call this driver makes into the goal (and the
+        # path planner, which moves the patrol on: pathgoal._pick calls
+        # source.passed). main.AutoPilot hands in the one lock its control
+        # loop takes for goal_step, so a tick on the decision thread and the
+        # clicks drained on the control loop never move the patrol at once.
+        self.goal_lock = threading.RLock()
         self.goal_reached = False
         # --goal's path planner (pathgoal.PathPlanner), or None: which point
         # the goal input is the encoding of, the goal or one along a path
@@ -1664,6 +1671,10 @@ class PolicyDriver(dv.Driver):
         # Read-only bookkeeping, like last_scan and last_verdict.
         self.last_decision = None
         self.last_infer_ms = 0.0
+        # (frame, its downsample, the function that made it) off the last
+        # tick that ran the model, or None. footprint.policy_small takes the
+        # picture off this instead of shrinking the same frame twice.
+        self.last_small = None
         # What the last tick cost, by stage (TickTimer), and how old each
         # input was at the tick's `now`, in ms: None for one it did not have.
         # depth_age is off the OAK-D's capture stamp, depth_slot off when the
@@ -1960,6 +1971,7 @@ class PolicyDriver(dv.Driver):
         self.timer.start()
         self.depth_age_ms = self.depth_slot_ms = None
         self.lidar_age_ms = self.crop_age_ms = None
+        self.last_small = None
         try:
             self._sync_mode(now)
             self._tick(now)
@@ -2158,10 +2170,11 @@ class PolicyDriver(dv.Driver):
         timer.begin("goal")
         # A clicked goal (goal.ClickGoal) checks arrival off the newest crop
         # first: the hold is the safety layer's, so it is judged every tick.
-        observe = getattr(self.goal, "observe", None)
-        if observe is not None and self.slam is not None:
-            observe(self.slam.crop())
-        self.goal_reached = bool(self.goal.reached())
+        with self.goal_lock:
+            observe = getattr(self.goal, "observe", None)
+            if observe is not None and self.slam is not None:
+                observe(self.slam.crop())
+            self.goal_reached = bool(self.goal.reached())
         timer.end()
         if self.goal_reached != was:
             print("Goal reached - stopping." if self.goal_reached
@@ -2326,7 +2339,9 @@ class PolicyDriver(dv.Driver):
         pitch = (lowband_pitch(lowband, pimu.up_of(imu_row))
                  if lowband == cp.LOWBAND_FLOOR else 0.0)
         self.last_lowband_pitch = pitch
-        x = encode_input(self.model.representation, self.downsample(depth), lowband, pitch)
+        small = self.downsample(depth)
+        self.last_small = (depth, small, self.downsample)
+        x = encode_input(self.model.representation, small, lowband, pitch)
         prev = (encode_prev(*self._prev) if self.model.uses_prev
                 else np.zeros((1, PREV_SIZE), dtype=np.float32))
         mode = encode_mode(self.mode.split) if self.has_mode else None
@@ -2351,12 +2366,13 @@ class PolicyDriver(dv.Driver):
             timer.begin("path")
             # The goal off the same crop the map input is, and only with that
             # crop going in: no map is no goal, as the model was trained.
-            if not present:
-                g = pg.missing()
-            elif self.path is not None:
-                g = self.path.encode(crop, self.goal)
-            else:
-                g = self.goal.encode(crop)
+            with self.goal_lock:
+                if not present:
+                    g = pg.missing()
+                elif self.path is not None:
+                    g = self.path.encode(crop, self.goal)
+                else:
+                    g = self.goal.encode(crop)
             self.last_goal_present = bool(g[0, pg.PRESENT] > 0)
             self.last_goal_fed = ((self.path.fed if self.path is not None else "goal")
                                   if self.last_goal_present else "none")

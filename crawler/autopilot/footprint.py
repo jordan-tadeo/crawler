@@ -33,6 +33,19 @@ The rate
 10 Hz, which is AUTO_TICK_INTERVAL: the autopilot's decision rate, not the
 camera's 16 fps and not the control loop's 100 Hz. A row is a decision, and
 a policy trained at one rate and run at another is learning the wrong thing.
+Record rows are on the same fixed phase the decisions are
+(driver.next_decision_at): a late pass makes a late row, not a later phase,
+so a recording is 10 rows a second and not the 8.8-9.3 the old
+next = now + 0.1 drifted to. In auto the AutoPilot hands over one call per
+decision (decision=True), from the thread that made it.
+
+Threads
+-------
+Record rows come from the control loop, auto rows from the decision thread
+(main.AutoPilot), and the IMU is polled off the control loop every pass. A
+lock round each, so a mode change that has both threads in here at once
+cannot interleave two rows' bookkeeping. Neither is ever held across
+anything that waits.
 
 The cost
 --------
@@ -40,14 +53,16 @@ In record the scan runs here, on the control loop, at 10 Hz -- the same scan,
 on the same thread, at the same rate auto has always run it. The JSON is built
 here and encoded on the publisher thread like every other channel. In auto the
 scan is the driver's and this adds a read_the_gradient() call, which is a few
-dozen comparisons. In both, the policy picture is shrunk here, on the control
-loop, once a tick: 2.8 ms p50 and 5.0 ms p99 on the Pi 4, measured. It is
-not handed to another thread to shrink because the car will shrink it on this
-thread at inference, and the recording should cost what driving will. The
-PNG encode is on the publisher thread.
+dozen comparisons. In record the policy picture is shrunk here, on the control
+loop, once a tick: 2.8 ms p50 and 5.0 ms p99 on the Pi 4, measured. In auto
+under a policy that drives on depth_small, the policy has already shrunk the
+very frame the row is off, and the row takes its picture (the same array,
+by identity of the frame) instead of shrinking it a second time. The PNG
+encode is on the publisher thread.
 """
 
 import math
+import threading
 import time
 
 from crawler.autopilot import driver as dv
@@ -301,6 +316,23 @@ def feature_row(scan, verdict, command, mode, source, shape, scan_ms=0.0,
     }
 
 
+def policy_small(driver, depth):
+    """The policy's own depth_small() of `depth`, if it made one, else None.
+
+    Only when it is the very frame (`is`, not equal) and the policy shrank it
+    with policy_input.depth_small itself -- a legacy-contract model's input is
+    a different picture, and is never handed back as this one."""
+    if depth is None or driver is None:
+        return None
+    try:
+        src, small, fn = getattr(driver, "last_small", None) or (None, None, None)
+    except Exception:
+        return None
+    if src is depth and fn is policy_input.depth_small and small is not None:
+        return small
+    return None
+
+
 def imu_fields(sample, sampled_at, now):
     """The IMU part of a row: a camera.get_imu_sample() dict, flattened.
 
@@ -340,10 +372,23 @@ class FootprintTap:
         self._failed = False
         self._imu = None
         self._imu_at = 0.0
+        # Pictures taken off the policy instead of shrunk here (1e).
+        self.reused_small = 0
+        self._lock = threading.RLock()
+        self._imu_lock = threading.Lock()
+
+    def poll_imu(self, now):
+        """Keep the newest IMU sample. The control loop's call on a pass that
+        makes no row of its own (auto, where the rows come with the
+        decisions). Never raises."""
+        try:
+            self._poll_imu(now)
+        except Exception:
+            pass
 
     def after_drive(self, now, mode, command, driver=None, pad_throttle=None,
                     limits=None, steering_mode="", steer_by=None,
-                    throttle_by=None, takeover=False):
+                    throttle_by=None, takeover=False, decision=False):
         """Called by the control loop once a pass, after the drive call.
 
         `command` is (throttle, front, rear) as the controller holds it after
@@ -351,21 +396,25 @@ class FootprintTap:
         my hand has taken over, because that is what reached the hardware.
         `steer_by` and `throttle_by` say whose each group was; left out they
         are the pad in record and the driver in auto. `takeover` is True while
-        either group is mine in auto. Returns the row offered, or None. Never
+        either group is mine in auto. `decision` True says this call is one
+        decision's (the AutoPilot's, once per tick), so an auto row needs no
+        rate gate of its own. Returns the row offered, or None. Never
         raises: a recording is never worth a tick, and this runs after the
         wheels have already been told what to do.
         """
         try:
             self._poll_imu(now)
-            if mode == AUTO:
-                return self._auto(now, command, driver, steering_mode,
-                                  steer_by or DRIVER, throttle_by or DRIVER,
-                                  takeover, pad_throttle, limits)
-            if mode == RECORD:
-                return self._record(now, command, pad_throttle, limits,
-                                    steering_mode, steer_by or PAD,
-                                    throttle_by or PAD)
-            return None
+            with self._lock:
+                if mode == AUTO:
+                    return self._auto(now, command, driver, steering_mode,
+                                      steer_by or DRIVER, throttle_by or DRIVER,
+                                      takeover, pad_throttle, limits,
+                                      gated=not decision)
+                if mode == RECORD:
+                    return self._record(now, command, pad_throttle, limits,
+                                        steering_mode, steer_by or PAD,
+                                        throttle_by or PAD)
+                return None
         except Exception as e:
             if not self._failed:
                 self._failed = True
@@ -377,14 +426,15 @@ class FootprintTap:
         if self.view is None:
             return
         get = getattr(self.view, "get_imu_sample", None)
-        sample = get() if get is not None else None
-        if sample is not None:
-            self._imu, self._imu_at = sample, now
+        with self._imu_lock:
+            sample = get() if get is not None else None
+            if sample is not None:
+                self._imu, self._imu_at = sample, now
 
     # ---- auto: the driver's own decision ---------------------------------
 
     def _auto(self, now, command, driver, steering_mode, steer_by,
-              throttle_by, takeover, pad_throttle, limits):
+              throttle_by, takeover, pad_throttle, limits, gated=True):
         """A row on every pass where the driver made a new scan.
 
         The driver's tick is already gated at 10 Hz, so this is too. A back-out
@@ -393,7 +443,9 @@ class FootprintTap:
         recover with no new scan of the driver's and my hand on a group still
         makes a row: what my hand does there is a correction, the most useful
         label there is, so the row comes off our own view at the decision rate,
-        exactly as in record, marked source "tap".
+        exactly as in record, marked source "tap". Called once a decision
+        (`gated` False) that is every decision's; called every pass, the
+        rate gate makes it one a decision.
         """
         if driver is None or self.tele is None:
             return None
@@ -402,12 +454,12 @@ class FootprintTap:
             if takeover and getattr(driver, "_phase", None) is not None:
                 return self._own_row(now, command, AUTO, pad_throttle, limits,
                                      steering_mode, steer_by, throttle_by,
-                                     driver)
+                                     driver, gated=gated)
             return None
         self._last_driver_scan = scan
         # One rate for both kinds of row, so the tap's first row in a recover
         # comes a decision after the driver's last one and not a pass after.
-        self._next_at = now + self.interval
+        self._next_at = dv.next_decision_at(self._next_at, now, self.interval)
         if not self.tele.wants("footprint", now):
             return None
 
@@ -420,7 +472,7 @@ class FootprintTap:
             steering_mode=steering_mode, steer_by=steer_by,
             throttle_by=throttle_by, pad_throttle=pad_throttle,
             limits=limits, autopilot=autopilot_fields(driver, now))
-        return self._offer(row, now, depth)
+        return self._offer(row, now, depth, small=policy_small(driver, depth))
 
     # ---- record: our own scan, my hands' command -------------------------
 
@@ -430,19 +482,22 @@ class FootprintTap:
                              steering_mode, steer_by, throttle_by)
 
     def _own_row(self, now, command, mode, pad_throttle, limits,
-                 steering_mode, steer_by, throttle_by, driver=None):
+                 steering_mode, steer_by, throttle_by, driver=None,
+                 gated=True):
         """A row off our own view and our own scan, at the decision rate.
         The raw frame rides along on every raw_every-th one in record only."""
         if self.view is None or self.tele is None:
             return None
-        if now < self._next_at:
+        if gated and now < self._next_at:
             return None
         depth = self.view.get_depth_frame()
         if depth is None:
             # Camera still coming up, or no frame since the last row. The
             # gate does not advance, so the next pass with a frame is a row.
             return None
-        self._next_at = now + self.interval
+        # On the fixed phase: the next row is due one interval after this
+        # one was due, not after this pass happened to run.
+        self._next_at = dv.next_decision_at(self._next_at, now, self.interval)
 
         if not self.tele.wants("footprint", now):
             return None
@@ -468,19 +523,25 @@ class FootprintTap:
         self._record_rows += 1
         return self._offer(row, now, depth)
 
-    def _offer(self, row, now, depth=None):
+    def _offer(self, row, now, depth=None, small=None):
         """The row, its IMU snapshot and its policy picture, all at `now`.
 
         The picture goes first and carries frame_id "footprint/<seq>", so a
         reader can pair it to its row by log time or by seq, and the two can
-        never disagree.
+        never disagree. `small` is that picture already made, off `depth`, by
+        the policy (policy_small); None shrinks it here.
         """
         self.seq += 1
         row["seq"] = self.seq
-        row.update(imu_fields(self._imu, self._imu_at, now))
+        with self._imu_lock:
+            imu, imu_at = self._imu, self._imu_at
+        row.update(imu_fields(imu, imu_at, now))
         if depth is not None and self.tele.wants("depth_small", now):
             try:
-                small = policy_input.depth_small(depth)
+                if small is not None:
+                    self.reused_small += 1
+                else:
+                    small = policy_input.depth_small(depth)
             except ValueError as e:
                 # A frame the policy could not take. The row still goes,
                 # saying it has no picture.

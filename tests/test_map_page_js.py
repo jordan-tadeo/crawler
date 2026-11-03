@@ -67,6 +67,7 @@ def results(tmp_path_factory):
     "a_refused_undo_never_comes_back_for_the_next_loop",
     "a_finger_down_never_times_out_a_stroke_the_car_took",
     "the_not_ready_banner_says_why",
+    "auto_decisions_that_gave_up_say_so",
     "unknown_is_drawn_apart_from_free",
     "explore_is_a_toggle_next_to_start_and_draws_its_target",
     "the_clean_button_sends_the_tag_and_shows_the_cars",

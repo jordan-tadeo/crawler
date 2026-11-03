@@ -414,7 +414,8 @@ def test_without_my_hand_auto_writes_what_the_driver_asks(monkeypatch):
     for n in range(passes):
         now = n * STEP
         if now >= next_tick:
-            next_tick = now + mn.AUTO_TICK_INTERVAL
+            # The fixed phase the AutoPilot decides on.
+            next_tick = dv.next_decision_at(next_tick, now, mn.AUTO_TICK_INTERVAL)
             cam.frame = scene(n)
             ctl.n = n
             before = len(ctl.calls)
@@ -792,8 +793,12 @@ def test_a_correction_during_a_recover_is_still_a_row(monkeypatch):
     assert first["source"] == "driver"
     assert during
     times = [now for _, now in during]
-    assert times[0] - start >= fp.INTERVAL
-    assert all(b - a >= fp.INTERVAL for a, b in zip(times, times[1:]))
+    assert times[0] - start >= fp.INTERVAL - STEP
+    # One a decision, on the fixed phase: a pass either side of 0.1 s apart
+    # (passes are 1/64 s here), and 0.1 s apart on average.
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert all(fp.INTERVAL - STEP <= g <= fp.INTERVAL + STEP for g in gaps)
+    assert sum(gaps) / len(gaps) == pytest.approx(fp.INTERVAL, abs=STEP / 2)
     during = [row for row, _ in during]
     assert all(row["source"] == "driver" and row["mode"] == "auto"
                and row["steer_by"] == mn.PAD and not row["depth_raw"]

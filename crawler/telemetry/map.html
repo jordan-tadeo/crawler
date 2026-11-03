@@ -403,6 +403,7 @@ function notReady(){
   if(!st)return null;
   if(!st.ready)return ["warn","Car not ready: the control loop has not sent the map any state yet. The service may be starting; if this stays, it is stuck."];
   if(st.age_s>STALE_S&&pollsSinceUp>=2)return ["warn","Car not ready: no fresh state for "+st.age_s.toFixed(0)+" s. The control loop is not answering."];
+  var dc=st.decisions;if(dc&&st.mode==="auto"&&dc.why)return [dc.state==="gave up"?"bad":"warn",dc.why];
   if(!st.patrol||st.patrol.frame===null||st.patrol.frame===undefined)return ["warn","Car not ready: no SLAM map yet, so waypoints have nowhere to go."];
   if(st.pad===false)return ["info",(st.patrol.running?"Patrol armed. ":xon?"Explore armed. ":"No controller. Drawing and editing work. ")+"Connect the controller to drive."];
   return null;

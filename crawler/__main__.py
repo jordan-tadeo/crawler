@@ -30,9 +30,12 @@ toggle, not a hold, and it survives a lap in auto.
 A marks the moment as a good call and B marks it as a bad one, in either mode.
 That is for the review loop and not for driving: see marks.py.
 
-One thread owns the ESC and the servos. Auto mode is not a thread of its own,
-it is a step() call on this loop, so a mode switch can never leave two owners
-writing opposing commands to the same hardware.
+One thread owns the ESC and the servos: the control loop. Auto's decisions
+are made on a thread of their own (AutoPilot, "the decision thread"), which
+only ever publishes a command; the write is a step() call on this loop, so a
+mode switch can never leave two owners writing opposing commands to the same
+hardware, and a slow decision never holds up the pad or a servo write. A
+decision that is late holds the autopilot's wheels at neutral, in auto.
 
 The heavy imports (depthai, PyQt5) are deferred on purpose: manual driving is
 the mode that has to come up on a headless boot, and it must not depend on
@@ -59,6 +62,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 
 from crawler.hardware import camera
 from crawler.autopilot import driver as dv
@@ -126,6 +130,45 @@ LOOP_INTERVAL = 0.01
 # map page and the status channels, the wheels held at neutral every pass.
 PADLESS_INTERVAL = 0.1
 AUTO_TICK_INTERVAL = 0.1
+
+# The decisions, off the control loop (AutoPilot, "the decision thread").
+#
+# DECISION_STALE_S: how old the newest decision may be before the wheels the
+# autopilot owns are held at neutral, in auto, until a fresh one lands. Three
+# decisions' worth, as driver.FLOOR_SCAN_MAX_AGE is three ticks of picture
+# age. A decision's age is from the `now` it was made at, so a tick that
+# takes 150 ms on the fixed phase is 0.25 s old at worst and holds nothing; a
+# 455 ms tick (the worst measured) is a hold. Late is never manual: that is
+# the owner's ruling, and the pad is the way to take the car.
+DECISION_STALE_S = 0.3
+# A decision thread that raised or died is started again at most this often,
+# the wheels held at neutral in auto meanwhile...
+DECISION_RESTART_S = 1.0
+# ...and after this many restarts inside DECISION_RESTART_WINDOW_S, no more:
+# neutral, still auto, said in the journal and on the map page, until START
+# goes round again (out of auto and back in).
+DECISION_MAX_RESTARTS = 3
+DECISION_RESTART_WINDOW_S = 10.0
+# How long the decision thread waits for the control loop to write its
+# command before the /footprint row goes without it. A pass or two.
+DECISION_ROW_WAIT_S = 0.05
+
+# Who runs the decisions (AutoPilot's `decisions`):
+#   thread    the decision thread. What the car runs.
+#   inline    a step() that comes due ticks before it writes, on the control
+#             loop -- the old way, kept for the tests that drive the loop on a
+#             fake clock and want each tick on a known pass.
+#   external  nobody: a test calls AutoPilot.decide(now) itself, which is the
+#             decision thread's iteration, to stall or crash it on cue.
+THREAD = "thread"
+INLINE = "inline"
+EXTERNAL = "external"
+
+# The decisions' state (AutoPilot.decision_status, /diagnostics, map page).
+DECISIONS_OK = "ok"
+DECISIONS_LATE = "late"
+DECISIONS_DOWN = "down"
+DECISIONS_GAVE_UP = "gave up"
 # The interpreter's GIL switch interval with --nav (see main()): CPython's
 # default is 5 ms.
 NAV_SWITCH_INTERVAL_S = 0.001
@@ -638,6 +681,92 @@ class DriverCommand:
         return new
 
 
+class PublishedCommand:
+    """The newest decision as the control loop reads it. Locked.
+
+    DriverCommand is the driver's draft: it writes it all through a tick on
+    the decision thread, and nothing else reads it. At the end of a tick the
+    decision thread publishes it here in one step, with the decision's
+    sequence number and the `now` it was made at, so the control loop never
+    sees half a tick (a steering of one decision with the throttle of the
+    one before). The new-flags accumulate until the control loop takes them,
+    so an ask is never lost between two of its passes.
+
+    `epoch` is which engage of auto this belongs to. pause() and resume()
+    move it on with reset(), and publish() refuses a decision from an epoch
+    that has gone: a tick still running when START parked auto cannot land
+    its command on the next lap.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.epoch = 0
+        self._clear()
+
+    def _clear(self):
+        self.throttle = 0.0
+        self.front = 0.0
+        self.rear = 0.0
+        self.steering_new = False
+        self.throttle_new = False
+        self.seq = 0
+        self.at = None
+
+    def reset(self, epoch):
+        with self._lock:
+            self.epoch = epoch
+            self._clear()
+
+    def publish(self, draft, seq, at, epoch) -> bool:
+        """The draft's command and its new-flags, as decision `seq` made at
+        `at`. False, and nothing changed, for an epoch that has gone."""
+        with self._lock:
+            if epoch != self.epoch:
+                return False
+            steering_new, throttle_new = draft.take()
+            self.throttle = draft.throttle
+            self.front = draft.front
+            self.rear = draft.rear
+            self.steering_new = self.steering_new or steering_new
+            self.throttle_new = self.throttle_new or throttle_new
+            self.seq = seq
+            self.at = at
+            return True
+
+    def take(self):
+        """(steering_new, throttle_new, throttle, front, rear, seq, at), and
+        forget the two flags."""
+        with self._lock:
+            out = (self.steering_new, self.throttle_new, self.throttle,
+                   self.front, self.rear, self.seq, self.at)
+            self.steering_new = self.throttle_new = False
+            return out
+
+    def peek(self):
+        """(seq, at), for the status. Takes nothing."""
+        with self._lock:
+            return self.seq, self.at
+
+
+class _Applied:
+    """What the control loop wrote for one decision: the command as it went
+    out (read back off the controller) and whose each group was. The
+    /footprint row for that decision is built off this."""
+
+    __slots__ = ("seq", "command", "steer_by", "throttle_by", "takeover",
+                 "pad_throttle", "steering_mode")
+
+    def __init__(self, seq, command, steer_by, throttle_by, takeover,
+                 pad_throttle, steering_mode):
+        self.seq = seq
+        self.command = command
+        self.steer_by = steer_by
+        self.throttle_by = throttle_by
+        self.takeover = takeover
+        self.pad_throttle = pad_throttle
+        self.steering_mode = steering_mode
+
+
 class _Group:
     """One group's ownership. Taken past its outer edge, given back after
     release_seconds inside its inner one."""
@@ -812,9 +941,36 @@ class AutoPilot:
     is up yet. If it is not, auto refuses for now and manual keeps the wheels,
     and pressing START again a couple of seconds later gets me auto.
 
-    step() still runs on the control loop's own thread. Driver.tick() never
-    blocks, so ticking it at 10 Hz from inside a 100 Hz loop is a timestamp
-    comparison.
+    The decision thread. driver.tick() used to run inside step(), on the
+    control loop, and a policy tick is 86-116 ms p50 and 455 ms at worst on
+    the Pi: that long with no pad read and no servo write. Now (decisions
+    THREAD, what main() builds) a thread of its own makes the decisions, on
+    the fixed phase (driver.next_decision_at), and step() only writes:
+
+      decision thread   waits for the phase, snapshots what the control loop
+                        last said about my hand (_inputs), takes the driver
+                        lock, ticks, publishes the result (PublishedCommand,
+                        stamped with a seq and its `now`), then makes that
+                        decision's /footprint row off what the control loop
+                        wrote for it.
+      control loop      reads the pad and the takeover every pass and writes
+                        in _write(), at its own rate. The only thread that
+                        touches vecon.
+
+    A decision older than DECISION_STALE_S, or a decision thread that is
+    down, is held at NEUTRAL on whatever group the autopilot owns, and auto
+    stays auto: the next fresh decision drives again. A thread that raised
+    is started again at most once a DECISION_RESTART_S, and after
+    DECISION_MAX_RESTARTS in DECISION_RESTART_WINDOW_S it is not, until
+    START goes round. Never manual on any of it (the owner's ruling). My hand
+    is read and written every pass whatever the decisions are doing.
+
+    Shared with the tick, and how: the driver (driver_lock: the tick, pause's
+    abort, a row; the control loop only ever tries it), the goal and the
+    patrol (goal_lock, which the policy driver takes round its own goal
+    calls; the control loop only ever tries it, in goal_step and the goal
+    telemetry), my hand's state (_inputs, one tuple swapped under a lock),
+    the command (PublishedCommand), the tap (its own locks).
     """
 
     def __init__(self, vecon, logger, hub=None, policy_path=None, lidar=None,
@@ -822,8 +978,57 @@ class AutoPilot:
                  fallback_path=None, clicks=None, patrol_store=None,
                  lidar_near=False, path=None, person=None, tilt_veto=True,
                  library=None, fitter=None, skip_stuck=False, patrol_settings=None,
-                 near_pass_m=patrol.NEAR_PASS_M, tags=None):
+                 near_pass_m=patrol.NEAR_PASS_M, tags=None,
+                 decisions=INLINE, clock=time.monotonic):
         self.vecon = vecon
+        # Who runs the decisions: THREAD, INLINE or EXTERNAL (see THREAD).
+        self.decisions = decisions
+        # The decision thread's clock, the control loop's: one time base for
+        # a decision's stamp and the pass that reads its age.
+        self.clock = clock
+        self.driver_lock = threading.RLock()
+        self.goal_lock = threading.RLock()
+        # The newest decision, published (see PublishedCommand), and what the
+        # control loop wrote for it, for its /footprint row.
+        self.published = PublishedCommand()
+        self._applied = None
+        self._applied_cond = threading.Condition()
+        # The tap the rows go to (control_loop attaches its own), or None.
+        self.tap = None
+        # What the control loop said about my hand on its last pass:
+        # (human_throttle, pad_throttle, human_steering, pad_split). One
+        # tuple, swapped under the lock, so a tick reads one pass's worth.
+        self._inputs_lock = threading.Lock()
+        self._inputs = (False, None, False, False)
+        # Engaged or not, and which engage (PublishedCommand.epoch).
+        self._active = False
+        self._epoch = 0
+        # Asked of the driver by pause()/resume() and done under the driver
+        # lock, now if it is free and by the decision thread if not.
+        self._pending_abort = False
+        self._pending_reset = False
+        self._seq = 0
+        # The phase: when the next decision is due, and for which epoch.
+        self._phase_epoch = None
+        self._row_seq = None
+        # The decisions' health. _state is DECISIONS_OK, _DOWN or _GAVE_UP;
+        # late is worked out per pass off the newest decision's age.
+        self._state = DECISIONS_OK
+        self._crash = None          # the last crash, said once
+        self._last_start = None     # when the decisions were last (re)started
+        self._restarts = []         # restart times inside the window
+        self._engaged_at = None     # first pass of this engage
+        self._holding = None        # why the wheels are held, or None
+        self._hold_since = None
+        self._thread = None
+        self._generation = 0
+        self._kick = threading.Event()
+        self._halt = threading.Event()
+        # Counted since boot, for /diagnostics.
+        self.late_episodes = 0
+        self.down_episodes = 0
+        self.decision_restarts = 0
+        self.decisions_made = 0
         # The recordings' tags (telemetry/tags.SessionTags), or None: the
         # patrol takes the map page's tags command into it, and the
         # telemetry block puts it on /session/tags. Never read to drive.
@@ -839,6 +1044,7 @@ class AutoPilot:
         self.driver = None
         self.unavailable = False
         self._next_tick = 0.0
+        self.interval = AUTO_TICK_INTERVAL
         # The shared camera, or None if this process was started without one.
         self.hub = hub
         # What the driver is handed as its controller. See DriverCommand: the
@@ -899,6 +1105,10 @@ class AutoPilot:
         and the arrival latch. Every pass, any mode. Never raises."""
         if self.clicks is None:
             return
+        # Tried, never waited for: a tick on the decision thread holds the
+        # lock round its goal calls, and the clicks keep for the next pass.
+        if not self.goal_lock.acquire(blocking=False):
+            return
         try:
             crop = self.slam.crop() if self.slam is not None else None
             self.goal.poll(self.clicks, crop)
@@ -907,6 +1117,8 @@ class AutoPilot:
                 self.path.update(crop, self.goal)
         except Exception as e:
             print(f"[goal] {e}", file=sys.stderr)
+        finally:
+            self.goal_lock.release()
 
     def goal_marker(self):
         """/goal/marker's payload: the goal on the map the truck is on now,
@@ -997,11 +1209,309 @@ class AutoPilot:
                 print(f"[auto] unavailable: {e}", file=sys.stderr)
                 return False
 
-        self._next_tick = 0.0  # tick on the next step
         # Every way into auto has just put the wheels at neutral. A scan left
         # over from an earlier lap is of no known age, so it clears nothing.
-        self.command.reset()
+        # The draft is the decision thread's, so the reset is done under the
+        # driver lock: now if it is free, else before its next tick.
+        self._pending_reset = True
+        self._try_pending()
+        # START again is the try again after the decisions gave up.
+        self._state = DECISIONS_OK
+        self._crash = None
+        self._restarts = []
+        self._last_start = None
+        self._new_epoch()           # the first decision on the next pass
+        self._active = True
+        if self.decisions == THREAD:
+            self._start_thread()
         return True
+
+    # ---- the decisions ----------------------------------------------------
+
+    def _new_epoch(self, hold_over=False):
+        """A fresh engage: nothing published, the phase from scratch, and
+        the age of 'no decision yet' counted from the next pass. A restart
+        is `hold_over`: the hold it is in goes on until a decision lands."""
+        self._epoch += 1
+        self.published.reset(self._epoch)
+        self._engaged_at = None
+        self._row_seq = None
+        if not hold_over:
+            self._holding = None
+            self._hold_since = None
+        self._kick.set()
+
+    def _try_pending(self):
+        """pause()'s abort and resume()'s reset, under the driver lock if
+        it is free this instant. Never waits: a tick holding it does them
+        itself once it is done (_apply_pending)."""
+        if self.driver_lock.acquire(blocking=False):
+            try:
+                self._apply_pending()
+            finally:
+                self.driver_lock.release()
+
+    def _apply_pending(self):
+        """With the driver lock held."""
+        if self._pending_abort:
+            self._pending_abort = False
+            if self.driver is not None:
+                self.driver.abort()
+                self.driver.human_throttle = False
+        if self._pending_reset:
+            self._pending_reset = False
+            self.command.reset()
+
+    def _set_inputs(self, takeover, split):
+        human_throttle = bool(takeover is not None and takeover.throttle)
+        inputs = (human_throttle,
+                  # What my trigger is putting on the wheels, for the tilt
+                  # veto's which-way-was-it-going (policy.PolicyDriver).
+                  self._pad_throttle(takeover) if human_throttle else None,
+                  bool(takeover is not None and takeover.steering),
+                  bool(split))
+        with self._inputs_lock:
+            self._inputs = inputs
+
+    def decide(self, now):
+        """One decision as the decision thread makes it, made by the caller:
+        decisions EXTERNAL's hook, for a test to make a decision (or stall,
+        or crash one) on the pass it chooses. Its row is made on the next
+        step(), after the write. The seq, or None."""
+        seq = self._decide_safely(now)
+        if seq is not None:
+            self._row_seq = seq
+        return seq
+
+    def _decide(self, now):
+        """One decision: the tick, under the driver lock, published. Returns
+        its seq, or None when auto is not engaged or was parked while it
+        ticked. Raises whatever the tick raised (see _decide_safely)."""
+        with self.driver_lock:
+            self._apply_pending()
+            if not self._active or self.driver is None:
+                return None
+            epoch = self._epoch
+            with self._inputs_lock:
+                human_throttle, pad_throttle, human_steering, split = self._inputs
+            d = self.driver
+            d.human_throttle = human_throttle
+            d.pad_throttle = pad_throttle
+            # The pad's side of a learned driver's steering mode (see
+            # policy.PolicyDriver): my SteerMode, and whether my hand has
+            # the steering. The rules driver never reads either.
+            d.human_steering = human_steering
+            d.pad_split = split
+            d.tick(now)
+            # pause() or resume() landed during the tick: do what they asked
+            # and drop the decision, which belongs to an engage that is over.
+            self._apply_pending()
+            if epoch != self._epoch or not self._active:
+                return None
+            seq = self._seq + 1
+            if not self.published.publish(self.command, seq, now, epoch):
+                return None
+            self._seq = seq
+            self.decisions_made += 1
+            return seq
+
+    def _decide_safely(self, now):
+        """decide(), its next one put on the phase, and a raise turned into
+        the decisions being down (held at neutral, restarted by
+        _supervise). The seq, or None."""
+        if self._state != DECISIONS_OK:
+            return None
+        if self._phase_epoch != self._epoch:
+            self._phase_epoch = self._epoch
+            self._next_tick = 0.0
+        try:
+            seq = self._decide(now)
+        except Exception as e:
+            self._crashed(e, traceback.format_exc())
+            return None
+        self._next_tick = dv.next_decision_at(self._next_tick, now, self.interval)
+        return seq
+
+    def _due(self, now):
+        if self._phase_epoch != self._epoch:
+            return True
+        return now >= self._next_tick
+
+    def _crashed(self, error, report):
+        """The tick raised (or the thread died): down until _supervise
+        starts it again. Said by whoever has the time -- the decision thread
+        at once, the control loop after its write."""
+        self._state = DECISIONS_DOWN
+        self._crash = (f"{type(error).__name__}: {error}" if error is not None
+                       else "the decision thread died", report, False)
+        if self.decisions == THREAD:
+            self._say_crash()
+
+    def _say_crash(self):
+        crash = self._crash
+        if crash is None or crash[2]:
+            return
+        what, report, _ = crash
+        self._crash = (what, report, True)
+        self.logger.log("error", "Auto",
+                        f"Decisions crashed ({what}): holding neutral in auto, "
+                        f"restarting in {DECISION_RESTART_S:.0f} s")
+        if report:
+            print(f"[auto] decisions crashed:\n{report}", file=sys.stderr)
+
+    def _supervise(self, now):
+        """The control loop's look at the decisions, every auto pass: a
+        thread that died without a word is down, and down is started again
+        at most once a DECISION_RESTART_S -- unless it has been restarted
+        DECISION_MAX_RESTARTS times in DECISION_RESTART_WINDOW_S, which is
+        given up on (neutral, auto, said loudly) until START goes round."""
+        if self._last_start is None:
+            self._last_start = now
+        if (self.decisions == THREAD and self._state == DECISIONS_OK
+                and self._active
+                and (self._thread is None or not self._thread.is_alive())):
+            self._crashed(None, "")
+        if self._state != DECISIONS_DOWN:
+            return
+        if self.decisions != THREAD:
+            self._say_crash()
+        if now - self._last_start < DECISION_RESTART_S:
+            return
+        self._restarts = [t for t in self._restarts
+                          if now - t < DECISION_RESTART_WINDOW_S]
+        if len(self._restarts) >= DECISION_MAX_RESTARTS:
+            self._state = DECISIONS_GAVE_UP
+            what = self._crash[0] if self._crash else "unknown"
+            self.logger.log("error", "Auto",
+                            f"Decisions keep crashing ({len(self._restarts)} "
+                            f"restarts in {DECISION_RESTART_WINDOW_S:.0f} s, last: "
+                            f"{what}): holding neutral in auto. No more restarts; "
+                            "START out of auto and back in to try again")
+            print(f"[auto] DECISIONS GAVE UP: {what}", file=sys.stderr)
+            return
+        self._restarts.append(now)
+        self._last_start = now
+        self.decision_restarts += 1
+        # From a clean slate: no recover half done, nothing standing in the
+        # draft, the phase from scratch (the wheels have been at neutral).
+        self._pending_abort = self._pending_reset = True
+        self._try_pending()
+        self._new_epoch(hold_over=True)
+        self._state = DECISIONS_OK
+        self.logger.log("warning", "Auto",
+                        f"Decisions restarted ({len(self._restarts)} of "
+                        f"{DECISION_MAX_RESTARTS} in {DECISION_RESTART_WINDOW_S:.0f} s)")
+        if self.decisions == THREAD:
+            self._start_thread()
+
+    # ---- the decision thread ------------------------------------------------
+
+    def _start_thread(self):
+        """A decision thread, unless one of this generation is running."""
+        if self._thread is not None and self._thread.is_alive():
+            if self._state == DECISIONS_OK:
+                self._kick.set()
+                return
+        self._generation += 1
+        self._halt.clear()
+        self._thread = threading.Thread(target=self._run,
+                                        args=(self._generation,),
+                                        name="decisions", daemon=True)
+        self._thread.start()
+
+    def _run(self, generation):
+        """The decision thread. Ends on a raise (the control loop starts the
+        next one), on stop(), and when a newer generation has started."""
+        while not self._halt.is_set() and generation == self._generation:
+            if not self._active or self._state != DECISIONS_OK:
+                self._kick.wait(0.1)
+                self._kick.clear()
+                continue
+            now = self.clock()
+            if not self._due(now):
+                self._kick.wait(max(0.0, self._next_tick - now))
+                self._kick.clear()
+                continue
+            seq = self._decide_safely(now)
+            if self._state != DECISIONS_OK:
+                return
+            if seq is not None:
+                self._row(seq, now, wait=True)
+
+    def _row(self, seq, now, wait=False):
+        """Decision `seq`'s /footprint row, off what the control loop wrote
+        for it. On the decision thread that is a wait of a pass or two; a
+        decision never written (auto parked, a hold) makes no row."""
+        tap = self.tap
+        if tap is None:
+            return
+        with self._applied_cond:
+            if wait:
+                self._applied_cond.wait_for(
+                    lambda: (self._applied is not None and self._applied.seq >= seq)
+                    or not self._active, DECISION_ROW_WAIT_S)
+            applied = self._applied
+        if applied is None or applied.seq != seq or not self._active:
+            return
+        try:
+            with self.driver_lock, self.goal_lock:
+                tap.after_drive(
+                    now, AUTO, applied.command, driver=self.driver,
+                    pad_throttle=applied.pad_throttle,
+                    # Every auto row carries the caps auto is driving at,
+                    # whoever had the throttle.
+                    limits=auto_speed_limits(self.driver),
+                    steering_mode=applied.steering_mode,
+                    steer_by=applied.steer_by, throttle_by=applied.throttle_by,
+                    takeover=applied.takeover, decision=True)
+        except Exception as e:
+            print(f"[auto] row: {e}", file=sys.stderr)
+
+    def attach_tap(self, tap):
+        """The FootprintTap the auto rows go to. control_loop's."""
+        self.tap = tap
+
+    # ---- what the status says ----------------------------------------------
+
+    def decision_status(self, now=None):
+        """{"state", "why", "age_s"}: off, ok, late, down or gave up."""
+        if not self._active:
+            return {"state": "off", "why": "", "age_s": None}
+        seq, at = self.published.peek()
+        age = None
+        if now is not None and at is not None:
+            age = round(max(0.0, now - at), 3)
+        if self._state == DECISIONS_GAVE_UP:
+            why = self._crash[0] if self._crash else ""
+            return {"state": DECISIONS_GAVE_UP, "age_s": age,
+                    "why": f"Auto decisions keep crashing ({why}). Holding "
+                           "neutral in auto; START out of auto and back in to "
+                           "try again."}
+        if self._state == DECISIONS_DOWN:
+            why = self._crash[0] if self._crash else ""
+            return {"state": DECISIONS_DOWN, "age_s": age,
+                    "why": f"Auto decisions crashed ({why}), restarting. "
+                           "Holding neutral."}
+        if self._holding is not None:
+            # Late, or restarted and nothing fresh yet: either way, waiting.
+            return {"state": DECISIONS_LATE, "age_s": age,
+                    "why": "Auto decisions are late. Holding neutral until "
+                           "one lands."}
+        return {"state": DECISIONS_OK, "why": "", "age_s": age}
+
+    def decision_fields(self, now=None):
+        """The decisions' part of /diagnostics."""
+        st = self.decision_status(now)
+        return {
+            "decisions_state": st["state"],
+            "decisions_holding": self._holding is not None,
+            "decisions_age_ms": (None if st["age_s"] is None
+                                 else round(st["age_s"] * 1000.0, 1)),
+            "decisions_made": int(self.decisions_made),
+            "decisions_late_episodes": int(self.late_episodes),
+            "decisions_down_episodes": int(self.down_episodes),
+            "decisions_restarts": int(self.decision_restarts),
+        }
 
     def _build_driver(self, view):
         """The autopilot, or with --policy the learned one on the same chassis.
@@ -1061,6 +1571,7 @@ class AutoPilot:
                             "model drives as it always has")
         d = policy.PolicyDriver(self.command, view, model, goal=self.goal,
                                 lidar=self.lidar, slam=self.slam, fallback=fallback)
+        d.goal_lock = self.goal_lock
         d.path = self.path if model.uses_goal else None
         if d.path is not None:
             # The lookahead the model's path goals were drawn at, so the point
@@ -1082,24 +1593,24 @@ class AutoPilot:
         return d
 
     def step(self, now, takeover=None, split=False):
-        """One pass of auto mode. False means hand the wheels back to manual.
+        """One pass of auto mode, on the control loop. False means hand the
+        wheels back to manual, which is only ever for no driver at all or a
+        write to the hardware that raised: never for the decisions.
 
-        The driver still decides at AUTO_TICK_INTERVAL. What changed is that it
-        no longer writes the hardware: it asks, into self.command, and this
-        writes. On a pass where I own nothing that is exactly the driver's own
-        writes, in the driver's own order (steering, then throttle), and on
-        passes between its ticks it is nothing at all -- the same calls the
-        driver used to make on the VehicleController itself, except that two
-        steering asks inside one tick, which the end of a recover makes, now
-        reach the servos as the last of the two.
+        The driver decides at AUTO_TICK_INTERVAL, on the fixed phase, into
+        its draft (DriverCommand); a decision is published whole
+        (PublishedCommand) and this writes it. With decisions THREAD the
+        deciding is the decision thread's and this pass only writes; INLINE
+        ticks here first when one is due, as the loop always used to.
 
         `takeover` is a Takeover already polled this pass, or None. A group it
         owns replaces that field of the driver's command, every pass rather
-        than every tick, because my hand at 10 Hz would be a hand with 100 ms
-        of lag in it. A group it handed back this pass gets the driver's
-        standing command written straight away, so letting go puts the
-        autopilot's own command on the wheels and never a straight or a stop
-        of its own.
+        than every decision, because my hand at 10 Hz would be a hand with
+        100 ms of lag in it. A group it handed back this pass gets the
+        driver's standing command written straight away, so letting go puts
+        the autopilot's own command on the wheels and never a straight or a
+        stop of its own -- unless the decisions are late or down, when what
+        the autopilot owns is held at neutral.
 
         `split` is SteerMode.split this pass. A learned driver with a mode
         head starts from it when auto engages, follows it while my hand has
@@ -1109,22 +1620,23 @@ class AutoPilot:
             return False
 
         try:
-            if now >= self._next_tick:
-                self._next_tick = now + AUTO_TICK_INTERVAL
-                self.driver.human_throttle = bool(
-                    takeover is not None and takeover.throttle)
-                # What my trigger is putting on the wheels, for the tilt
-                # veto's which-way-was-it-going (policy.PolicyDriver).
-                self.driver.pad_throttle = (self._pad_throttle(takeover)
-                                            if self.driver.human_throttle else None)
-                # The pad's side of a learned driver's steering mode (see
-                # policy.PolicyDriver): my SteerMode, and whether my hand has
-                # the steering. The rules driver never reads either.
-                self.driver.human_steering = bool(
-                    takeover is not None and takeover.steering)
-                self.driver.pad_split = bool(split)
-                self.driver.tick(now)
-            self._write(now, takeover)
+            if self._engaged_at is None:
+                self._engaged_at = now
+            self._set_inputs(takeover, split)
+            self._supervise(now)
+            decided = None
+            if (self.decisions == INLINE and self._state == DECISIONS_OK
+                    and self._active and self._due(now)):
+                decided = self._decide_safely(now)
+            self._write(now, takeover, SPLIT if split else UNIFIED)
+            if self.decisions != THREAD:
+                # A crash on this pass is said after the wheels were told.
+                self._say_crash()
+                if decided is not None:
+                    self._row_seq = decided
+                if self._row_seq is not None:
+                    seq, self._row_seq = self._row_seq, None
+                    self._row(seq, now)
         except Exception as e:
             # Stop the car BEFORE writing anything down. Logging opens, writes
             # and flushes a file on this same thread, and the throttle does
@@ -1140,25 +1652,97 @@ class AutoPilot:
 
         return True
 
-    def _write(self, now, takeover):
+    def _hold_reason(self, now, seq, at):
+        """Why the autopilot's groups are held at neutral this pass, or None."""
+        if self._state == DECISIONS_GAVE_UP:
+            return DECISIONS_GAVE_UP
+        if self._state == DECISIONS_DOWN:
+            return DECISIONS_DOWN
+        # Before this engage's first decision, its age counts from the first
+        # pass of the engage: a thread that never answers is late too.
+        since = at if seq else self._engaged_at
+        if since is not None and now - since > DECISION_STALE_S:
+            return DECISIONS_LATE
+        return None
+
+    def _write(self, now, takeover, steering_mode=UNIFIED):
         """The mixed command, in at most one set_steering and one
-        set_throttle. Steering first, as the driver always ordered them."""
-        cmd = self.command
-        steering_new, throttle_new = cmd.take()
+        set_throttle. Steering first, as the driver always ordered them.
+
+        Held (late, down, gave up): my groups are still mine, and the
+        autopilot's are neutral -- the throttle at 0 on every pass, the
+        steering centred when the hold begins. The first fresh decision after
+        a hold writes both of its groups, its standing command."""
+        (steering_new, throttle_new, throttle, front, rear,
+         seq, at) = self.published.take()
         released = takeover.released if takeover is not None else ()
+        mine_steering = takeover is not None and takeover.steering
+        mine_throttle = takeover is not None and takeover.throttle
 
-        if takeover is not None and takeover.steering:
+        if self._engaged_at is None:
+            self._engaged_at = now
+        reason = self._hold_reason(now, seq, at)
+        if reason is None and self._holding is not None and not seq:
+            # Restarted, and nothing fresh to drive on yet: still held.
+            reason = self._holding
+        began = reason is not None and self._holding is None
+        back = reason is None and self._holding is not None
+        held_for = (now - self._hold_since
+                    if back and self._hold_since is not None else 0.0)
+
+        if mine_steering:
             self.vecon.set_steering(*takeover.pad_steering())
-        elif steering_new or STEERING in released:
-            self.vecon.set_steering(cmd.front, cmd.rear)
+        elif reason is not None:
+            if began or STEERING in released:
+                self.vecon.set_steering(0.0, 0.0)
+        elif steering_new or back or STEERING in released:
+            self.vecon.set_steering(front, rear)
 
-        if takeover is not None and takeover.throttle:
-            throttle = self._pad_throttle(takeover)
-        elif throttle_new or THROTTLE in released:
-            throttle = cmd.throttle
-        else:
-            return
-        self.vecon.set_throttle(throttle)
+        if mine_throttle:
+            self.vecon.set_throttle(self._pad_throttle(takeover))
+        elif reason is not None:
+            # Every pass: pigpio latches, and this is commanded, not assumed.
+            self.vecon.set_throttle(0.0)
+        elif throttle_new or back or THROTTLE in released:
+            self.vecon.set_throttle(throttle)
+
+        if reason is None and seq:
+            applied = _Applied(
+                seq,
+                (float(self.vecon.last_throttle or 0.0),
+                 float(self.vecon.last_steering_front or 0.0),
+                 float(self.vecon.last_steering_rear or 0.0)),
+                PAD if mine_steering else DRIVER,
+                PAD if mine_throttle else DRIVER,
+                bool(mine_steering or mine_throttle),
+                takeover.intent[0] if mine_throttle else None,
+                steering_mode)
+            with self._applied_cond:
+                if self._applied is None or self._applied.seq != seq:
+                    self._applied = applied
+                    self._applied_cond.notify_all()
+
+        # Said after the wheels were told, once an episode.
+        if began:
+            self._holding = reason
+            self._hold_since = now
+            if reason == DECISIONS_LATE:
+                self.late_episodes += 1
+                age = now - (at if seq else self._engaged_at)
+                self.logger.log("warning", "Auto",
+                                f"Decisions late: holding neutral (newest is "
+                                f"{age:.2f} s old, the limit is "
+                                f"{DECISION_STALE_S:.2f} s)")
+            else:
+                self.down_episodes += 1
+        elif reason is not None and reason != self._holding:
+            self._holding = reason
+        elif back:
+            self._holding = None
+            self._hold_since = None
+            self.logger.log("info", "Auto",
+                            f"Decisions back: driving again after "
+                            f"{held_for:.2f} s at neutral")
 
     def _pad_throttle(self, takeover):
         """My trigger at record's scaling. Never nan.
@@ -1179,22 +1763,38 @@ class AutoPilot:
                               auto_speed_limits(self.driver))
 
     def pause(self):
-        """Hand the wheels back. Drops a recover in progress on the floor."""
-        if self.driver is not None:
-            self.driver.abort()
-            self.driver.human_throttle = False
-            # abort() asks for a stop; it goes out ahead of the neutral, as
-            # it did when the driver wrote the controller itself.
-            self._write(0.0, None)
+        """Hand the wheels back. Drops a recover in progress on the floor.
+
+        Neutral first, before anything that could wait. Then the decisions
+        are off, any decision still being made is dropped (the epoch moves
+        on), and the driver's abort and the draft's reset are done under the
+        driver lock -- now if it is free, else by the decision thread the
+        moment its tick ends. Never waits for a tick: this is on the control
+        loop, and START, a lost pad and a pad fault all come through here."""
         self.vecon.return_neutral()
-        self.command.reset()
+        self._active = False
+        self._new_epoch()
+        with self._applied_cond:
+            self._applied_cond.notify_all()
+        if self.driver is not None:
+            self._pending_abort = True
+        self._pending_reset = True
+        self._try_pending()
 
     def stop(self):
         """Give up the driver. The camera is not mine to close.
 
         main owns the hub and closes it, because the camera outlives auto
-        mode now -- telemetry is still publishing frames in manual.
+        mode now -- telemetry is still publishing frames in manual. The
+        decision thread is told to end and given a moment; it never writes
+        the hardware, so the wheels do not wait on it.
         """
+        self._active = False
+        self._halt.set()
+        self._kick.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
         self.driver = None
 
     # ---- what telemetry asks about the camera ----------------------------
@@ -1338,9 +1938,10 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                  page=None):
     """Poll the controller and drive whichever mode is current.
 
-    Only one mode ever has the wheels: auto runs as a step() on this thread
+    Only one mode ever has the wheels: auto's write is a step() on this
+    thread (its decisions are the decision thread's, which writes nothing)
     and manual writes nothing while auto is up, so a switch can never leave
-    the car rolling under two owners.
+    the car rolling under two owners. A pass starts every LOOP_INTERVAL.
 
     `tele` is a telemetry.Telemetry, or None. A Telemetry that failed to start
     is already a complete no-op -- wants() is False for every channel -- so
@@ -1374,6 +1975,11 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                                 markpad=markpad)
     if tap is None:
         tap = fp.FootprintTap(tele=tele)
+    # Auto's rows are made with the decisions, off the thread that made
+    # them; the AutoPilot is handed the tap for that.
+    attach_tap = getattr(autopilot, "attach_tap", None)
+    if attach_tap is not None:
+        attach_tap(tap)
     if record_button is None:
         record_button = RecordButton()
 
@@ -1410,10 +2016,18 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     # See telemetry.PassWindow.
     passes = tm.PassWindow()
     last_pump = None
+    # The fixed period: a pass starts every LOOP_INTERVAL, the wait being
+    # what is left of it once the work is done. It used to wait the whole
+    # LOOP_INTERVAL after the work, so the period was the work plus 10 ms.
+    # A pass that overran starts the next at once, from where it is: no
+    # burst of passes to catch up.
+    next_pass = None
 
     try:
         while not stop_event.is_set():
             now = clock()
+            if next_pass is None:
+                next_pass = now
             pygame.event.pump()
 
             joystick.update_connection_status()
@@ -1465,6 +2079,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 # vecon.close().
                 stop_event.wait(PADLESS_INTERVAL)
                 last_pump = None   # no pad was read; no latency to measure
+                next_pass = None
                 continue
 
             if not was_connected:
@@ -1594,26 +2209,33 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             # The decision record. Handed the command as three floats read
             # back off the controller AFTER this pass commanded it -- never
             # the controller -- so it is what reached the ESC and nothing in
-            # there can send anything back. footprint.py never raises.
-            tap.after_drive(
-                now, modes.mode,
-                (float(vecon.last_throttle or 0.0),
-                 float(vecon.last_steering_front or 0.0),
-                 float(vecon.last_steering_rear or 0.0)),
-                driver=autopilot.driver if modes.mode == AUTO else None,
-                pad_throttle=pad_throttle,
-                # Every auto row carries the caps auto is driving at, whoever
-                # had the throttle: a row the autopilot drove is measured
-                # against them as much as one my trigger did. -1 is left for
-                # manual, which writes no rows.
-                limits=(session.limits if modes.mode == RECORD
-                        else auto_speed_limits(autopilot.driver)
-                        if modes.mode == AUTO else None),
-                steering_mode=steer.name,
-                steer_by=takeover.steer_by if modes.mode == AUTO else PAD,
-                throttle_by=takeover.throttle_by if modes.mode == AUTO else PAD,
-                takeover=modes.mode == AUTO and (takeover.steering
-                                                 or takeover.throttle))
+            # there can send anything back. footprint.py never raises. In
+            # auto the AutoPilot makes the rows, one a decision, off what
+            # this loop wrote for each; this pass only keeps the IMU.
+            if modes.mode == AUTO and attach_tap is not None:
+                poll_imu = getattr(tap, "poll_imu", None)
+                if poll_imu is not None:
+                    poll_imu(now)
+            else:
+                tap.after_drive(
+                    now, modes.mode,
+                    (float(vecon.last_throttle or 0.0),
+                     float(vecon.last_steering_front or 0.0),
+                     float(vecon.last_steering_rear or 0.0)),
+                    driver=autopilot.driver if modes.mode == AUTO else None,
+                    pad_throttle=pad_throttle,
+                    # Every auto row carries the caps auto is driving at, whoever
+                    # had the throttle: a row the autopilot drove is measured
+                    # against them as much as one my trigger did. -1 is left for
+                    # manual, which writes no rows.
+                    limits=(session.limits if modes.mode == RECORD
+                            else auto_speed_limits(autopilot.driver)
+                            if modes.mode == AUTO else None),
+                    steering_mode=steer.name,
+                    steer_by=takeover.steer_by if modes.mode == AUTO else PAD,
+                    throttle_by=takeover.throttle_by if modes.mode == AUTO else PAD,
+                    takeover=modes.mode == AUTO and (takeover.steering
+                                                     or takeover.throttle))
 
             # Telemetry. Every one of these is the same shape: ask whether
             # anybody is watching the channel and whether its rate gate has
@@ -1700,6 +2322,9 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     # Two ints off the MarkPad. Same idea: the receipt that the
                     # button I just pressed did something.
                     **markpad.counts(),
+                    # The decisions: their state, the newest one's age, and
+                    # every late, crashed and restarted since boot.
+                    **_decision_fields(autopilot, now),
                 }, now)
                 tick_max_ms = 0.0
                 tick_count = 0
@@ -1732,7 +2357,12 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             passes.add_pass(tick_ms)
             tick_count += 1
 
-            stop_event.wait(LOOP_INTERVAL)
+            next_pass += LOOP_INTERVAL
+            left = next_pass - clock()
+            if left < 0.0:
+                next_pass -= left        # overran: from here, no catch-up
+                left = 0.0
+            stop_event.wait(min(left, LOOP_INTERVAL))
     except KeyboardInterrupt:
         pass
     finally:
@@ -1765,11 +2395,40 @@ def boot_mode(modes, joystick, autopilot, log):
         log.log("warning", "Mode", "Auto refused to start, booting into manual")
 
 
+def _decision_fields(autopilot, now):
+    """AutoPilot.decision_fields for /diagnostics, or nothing for one that
+    has none. Never raises."""
+    fields = getattr(autopilot, "decision_fields", None)
+    if fields is None:
+        return {}
+    try:
+        return fields(now)
+    except Exception:
+        return {}
+
+
 def goal_telemetry(tele, autopilot, page, now, pad=True, mode=None):
     """--goal's status channels and the map page's state, off what the goal,
     the patrol and the planner already hold. Every pass, pad or not: none of
     it drives anything. `pad` and `mode` are for the map page, which says
-    when there is no controller to drive with."""
+    when there is no controller to drive with.
+
+    The goal and the patrol are read under the AutoPilot's goal lock, tried
+    and never waited for: a decision that holds it has them half moved on,
+    and the rate gates come round again next pass."""
+    lock = getattr(autopilot, "goal_lock", None)
+    if lock is None:
+        _goal_telemetry(tele, autopilot, page, now, pad, mode)
+        return
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        _goal_telemetry(tele, autopilot, page, now, pad, mode)
+    finally:
+        lock.release()
+
+
+def _goal_telemetry(tele, autopilot, page, now, pad=True, mode=None):
     # The recordings' tags, with or without --goal: once a second, and on
     # the pass one changes past the gate.
     tags = getattr(autopilot, "tags", None)
@@ -1808,7 +2467,7 @@ def goal_telemetry(tele, autopilot, page, now, pad=True, mode=None):
         # The map page (telemetry/buttons.py), only while it is open.
         if (page is not None and getattr(autopilot, "patrol", None) is not None
                 and page.wants_state(now)):
-            page.offer_state(map_page_state(autopilot, pad=pad, mode=mode), now)
+            page.offer_state(map_page_state(autopilot, pad=pad, mode=mode, now=now), now)
         # Following a person: who, where, and the goal input fed.
         if hasattr(autopilot.goal, "follow_status"):
             if tele.wants("follow_status", now):
@@ -2279,11 +2938,15 @@ def track_library(args, slam, log):
     return library, fitter
 
 
-def map_page_state(autopilot, pad=True, mode=None):
+def map_page_state(autopilot, pad=True, mode=None, now=None):
     """The map page's snapshot, built on the control loop's thread: the
     patrol's page_state(), the planner's path, and whether there is a pad to
     drive with (the page says so when there is not) and the mode."""
     out = {"patrol": autopilot.patrol.page_state(), "pad": bool(pad), "mode": mode}
+    status = getattr(autopilot, "decision_status", None)
+    if status is not None:
+        # Late, crashed or given up: the page puts it above the map.
+        out["decisions"] = status(now)
     path = getattr(autopilot, "path", None)
     if path is not None:
         m = path.marker()
@@ -2518,6 +3181,7 @@ def main(argv=None):
     pantilt = start_pantilt(args, vecon, tele if channels_live else None, log)
     library, fitter = track_library(args, slam, log)
     autopilot = AutoPilot(vecon, log, hub=hub, policy_path=args.policy,
+                          decisions=THREAD,
                           fallback_path=args.fallback_policy,
                           lidar=lidar, slam=slam, nav=args.nav,
                           map_source=nav_map_source(args, slam, lidar, voxels, log),
