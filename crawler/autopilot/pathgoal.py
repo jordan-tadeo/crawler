@@ -69,9 +69,21 @@ has cut the corner and gone by, and source.passed() is told. A goal the path
 comes back from the way it went (the end of a there-and-back, a dead end)
 is never passed this way: both are the same distance off.
 
-On a thread, never in the control loop: every PLAN_EVERY_S at most (2 Hz),
-when the map, the truck (REPLAN_MOVE_M) or the goal has changed since the
-last plan; a new goal is planned at once.
+In a process of its own, never in the control loop: every PLAN_EVERY_S at
+most (2 Hz), when the map, the truck (REPLAN_MOVE_M) or the goal has changed
+since the last plan; a new goal is planned at once. A plan is 44-49 ms of
+pure Python on the Pi, and on a thread of the service it held the GIL
+against the control loop and took 101-139 ms of wall time for it (the
+2026-10-30 drives); a process has its own GIL, at WORKER_NICE, one BLAS
+thread (workers.start), as SLAM, the voxels and the detector are. Only the
+search goes over: the SLAM pump hands it every MapView, update() the goal
+and the truck (REQ_EVERY_S at most, a new goal at once), and the plan,
+cost map and all, comes back to a thread here. The point fed, the line of
+sight and the patrol's passing stay in the control loop, on the plan's own
+cost map. If the process dies it is said, started again, and the last plan
+is used meanwhile, until it goes STALE_S old and the goal itself is fed.
+MODE_THREAD plans on a thread as before (the fallback if a process cannot
+be started); background=False plans in the caller, for tests.
 
 The point fed
 -------------
@@ -127,12 +139,14 @@ tools/fed_goals.py) is moved to the bearing fed, the point the model got.
 """
 
 import math
+import queue
 import threading
 import time
 from typing import NamedTuple, Optional, Protocol
 
 import numpy as np
 
+from crawler import workers
 from crawler.autopilot import policy_goal as pg
 from crawler.nav import costmap as cmap
 from crawler.nav import truck as tk
@@ -209,6 +223,21 @@ GOAL_MOVED_M = 0.05
 # Points on /path: every Nth of the 10 cm path, the ends always.
 MARKER_EVERY = 2
 MAX_PATH_CELLS = 4000
+
+# Where the plan is made with background on (the docstring's "The plan").
+MODE_THREAD = "thread"
+MODE_PROCESS = "process"
+MODES = (MODE_THREAD, MODE_PROCESS)
+# The planner process: as nice as the voxel worker, the goal and the truck
+# sent to it no more often than this (update() runs every control pass),
+# messages it has not read yet (a MapView twice a second, a request at 20 Hz:
+# it reads them between plans), and started again no sooner than this after
+# it dies.
+WORKER_NICE = 10
+REQ_EVERY_S = 0.05
+INBOX = 16
+RESTART_WAIT_S = 1.0
+CLOSE_WAIT_S = 1.0
 
 # The map's codes (mapping/grid.py), here so this does not import the mapper.
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
@@ -499,15 +528,107 @@ class _Request(NamedTuple):
     route: tuple = ()       # goal, then the source's goals after it
 
 
+class _Search:
+    """The half of planning that goes over to the planner process: when a
+    plan is due, and making it. The same in the caller, on a thread and in
+    the process; `now` is the planner's clock, passed in."""
+
+    def __init__(self, lookahead_m, every_s):
+        self.lookahead_m = float(lookahead_m)
+        self.every_s = float(every_s)
+        self.done = None           # (seq, pose, map_t, made) of the last plan made
+        self.last = None           # the last Plan handed out, made or said
+
+    def step(self, req, view, now):
+        """(Plan, counted) if there is one to hand out for `req` on `view`,
+        else None. counted False for one only saying there is no map yet."""
+        if req is None:
+            return None
+        if view is None or float(view.t) < req.frame_since:
+            why = "no map yet" if view is None else "no map on this frame yet"
+            plan = self.last
+            if plan is None or plan.goal != req.goal or plan.why != why:
+                # Said, not counted as a plan: the first map is planned on at once.
+                self.last = Plan(req.goal, req.pose[:2], now, -1.0, None, None,
+                                 None, why, 0.0, 0.0, (req.goal,), ())
+                self.done = None
+                return self.last, False
+            return None
+        if not self._due(req, view, now):
+            return None
+        t0, c0 = time.perf_counter(), time.thread_time()
+        pts, cum, cm, why, route, vias = plan_route(view, req.pose[:2],
+                                                    req.route or (req.goal,),
+                                                    self.lookahead_m)
+        ms = (time.perf_counter() - t0) * 1000.0
+        cpu = (time.thread_time() - c0) * 1000.0
+        self.last = Plan(req.goal, req.pose[:2], now, float(view.t), pts, cum, cm, why,
+                         ms, cpu, route, vias)
+        self.done = (req.seq, req.pose, float(view.t), now)
+        return self.last, True
+
+    def _due(self, req, view, now):
+        done = self.done
+        if done is None or done[0] != req.seq:
+            return True
+        _, pose, map_t, made = done
+        if now - made < self.every_s - 1e-6:
+            return False
+        moved = math.hypot(req.pose[0] - pose[0], req.pose[1] - pose[1]) > REPLAN_MOVE_M
+        return moved or float(view.t) != map_t or now - made > STALE_S / 2
+
+
+def _serve(inbox, outbox, lookahead_m, every_s, nice=0):
+    """The planner process. In: ("map", MapView), ("req", id, _Request, now),
+    None to end. Each time it has read all there is, if a request came, the
+    newest is looked at against the newest map, and ("done", id, (Plan,
+    counted) or None, error or "") goes out."""
+    if nice:
+        workers.lower_priority(nice)
+    search = _Search(lookahead_m, every_s)
+    view = None
+    while True:
+        batch = [inbox.get()]
+        try:
+            while True:
+                batch.append(inbox.get_nowait())
+        except queue.Empty:
+            pass
+        ask = None
+        for msg in batch:
+            if msg is None:
+                return
+            if msg[0] == "map":
+                view = msg[1]
+            elif msg[0] == "req":
+                ask = msg
+        if ask is None:
+            continue
+        _, rid, req, now = ask
+        try:
+            out, err = search.step(req, view, now), ""
+        except Exception as e:      # a bad map costs that plan
+            out, err = None, repr(e)
+        try:
+            outbox.put(("done", rid, out, err), timeout=1.0)
+        except Exception:
+            pass
+
+
 class PathPlanner:
     """Plans to the goal the autopilot holds and picks the point the goal
     model is fed. update() and encode() are the control loop's and only
-    ever take a lock and do arithmetic; the plan is made on a thread of its
-    own (background=False makes it in the caller when due, for tests)."""
+    ever take a lock and do arithmetic; the plan is made in a process of
+    its own (mode MODE_THREAD: on a thread; background=False: in the caller
+    when due, for tests). With a SlamRunner, its pump hands the process
+    each MapView (on_map) as it comes."""
 
     def __init__(self, slam, lookahead_m=LOOKAHEAD_M, every_s=PLAN_EVERY_S,
                  background=True, clock=time.monotonic, say=None,
-                 stage_deg=STAGE_DEG, behind_deg=BEHIND_DEG, aim_rate_dps=AIM_RATE_DPS):
+                 stage_deg=STAGE_DEG, behind_deg=BEHIND_DEG, aim_rate_dps=AIM_RATE_DPS,
+                 mode=MODE_PROCESS):
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
         self.slam = slam
         self.lookahead_m = float(lookahead_m)
         # None turns staging, or the rate limit, off.
@@ -536,7 +657,21 @@ class PathPlanner:
         self._seq = 0
         self._last_goal = None
         self._last_route = ()
-        self._done = None          # (seq, pose, map_t, made) of the last plan made
+        self._search = _Search(self.lookahead_m, self.every_s)
+        # The planner process (mode MODE_PROCESS): its queues, what has been
+        # sent it, and what it has answered.
+        self.mode = mode
+        self._proc = None
+        self._inbox = None
+        self._outbox = None
+        self._q_lock = threading.Lock()
+        self._answered = threading.Condition()
+        self._sent_view = None     # the MapView it has, or None
+        self._req_id = 0           # the last request sent
+        self._req_at = None        # clock time it was sent
+        self._acked = 0            # the last request answered
+        self.restarts = 0          # the process died and was started again
+        self.dropped = 0           # messages it had no room for
         # The last decision's choice, for /path/status and /path.
         self.fed = "none"          # "subgoal" | "goal" | "none"
         self.why = "no goal"
@@ -572,15 +707,22 @@ class PathPlanner:
             new = True
         else:
             new = False
+        req = _Request(g, (float(crop.x), float(crop.y), float(crop.yaw)),
+                       self._frame_since, self._seq, route)
         with self._lock:
-            self._req = _Request(g, (float(crop.x), float(crop.y), float(crop.yaw)),
-                                 self._frame_since, self._seq, route)
-        if self.background:
-            self._ensure_thread()
-            if new:
-                self._wake.set()
-        else:
+            self._req = req
+        if not self.background:
             self._step()
+            return
+        self._ensure_thread()
+        if self.mode == MODE_PROCESS:
+            now = float(self.clock())
+            if new or self._req_at is None or now - self._req_at >= REQ_EVERY_S - 1e-9:
+                self._req_at = now
+                self.on_map(self._map_now())
+                self._send_req(req, now)
+        elif new:
+            self._wake.set()
 
     def encode(self, crop, source):
         """The goal input this decision: the encoding of the point along the
@@ -739,17 +881,23 @@ class PathPlanner:
             except Exception:
                 pass
 
-    # ---- the planning thread -----------------------------------------------------
+    # ---- the planning thread, or the planner process --------------------------------
 
     def _ensure_thread(self):
+        """Start the planning thread, or (MODE_PROCESS) the thread here that
+        starts the planner process and takes its plans. Cheap once done."""
         if self._thread is None:
-            self._thread = threading.Thread(target=self._loop, name="path-planner",
-                                            daemon=True)
+            target, name = ((self._loop, "path-planner") if self.mode == MODE_THREAD
+                            else (self._take_loop, "path-plans"))
+            self._thread = threading.Thread(target=target, name=name, daemon=True)
             self._thread.start()
 
     def stop(self):
         self._stop.set()
         self._wake.set()
+        with self._answered:
+            self._answered.notify_all()
+        self._end_proc(wait=True)
 
     def _loop(self):
         while not self._stop.is_set():
@@ -761,15 +909,11 @@ class PathPlanner:
                 self.failed += 1
                 print(f"[path] {e!r}")
 
-    def _due(self, req, view):
-        done = self._done
-        if done is None or done[0] != req.seq:
-            return True
-        _, pose, map_t, made = done
-        if float(self.clock()) - made < self.every_s - 1e-6:
-            return False
-        moved = math.hypot(req.pose[0] - pose[0], req.pose[1] - pose[1]) > REPLAN_MOVE_M
-        return moved or float(view.t) != map_t or float(self.clock()) - made > STALE_S / 2
+    def _map_now(self):
+        try:
+            return self.slam.map() if self.slam is not None else None
+        except Exception:
+            return None
 
     def _step(self):
         """One look: plan if the goal is new, or the map or the truck have
@@ -778,43 +922,157 @@ class PathPlanner:
             req = self._req
         if req is None:
             return
-        try:
-            view = self.slam.map() if self.slam is not None else None
-        except Exception:
-            view = None
-        now = float(self.clock())
-        if view is None or float(view.t) < req.frame_since:
-            why = "no map yet" if view is None else "no map on this frame yet"
-            with self._lock:
-                plan = self._plan
-            if plan is None or plan.goal != req.goal or plan.why != why:
-                # Said, not counted as a plan: the first map is planned on at once.
-                with self._lock:
-                    self._plan = Plan(req.goal, req.pose[:2], now, -1.0, None, None,
-                                      None, why, 0.0, 0.0, (req.goal,), ())
-                self._done = None
-            return
-        if not self._due(req, view):
-            return
-        t0, c0 = time.perf_counter(), time.thread_time()
-        pts, cum, cm, why, route, vias = plan_route(view, req.pose[:2],
-                                                    req.route or (req.goal,),
-                                                    self.lookahead_m)
-        ms = (time.perf_counter() - t0) * 1000.0
-        cpu = (time.thread_time() - c0) * 1000.0
-        self._set(Plan(req.goal, req.pose[:2], now, float(view.t), pts, cum, cm, why,
-                       ms, cpu, route, vias), req, float(view.t))
+        out = self._search.step(req, self._map_now(), float(self.clock()))
+        if out is not None:
+            self._set(*out)
 
-    def _set(self, plan, req, map_t):
-        self.plans += 1
-        if plan.points is None:
-            self.failed += 1
-        self.ms_total += plan.ms
-        self.cpu_total += plan.cpu_ms
-        self.ms_max = max(self.ms_max, plan.ms)
-        self._done = (req.seq, req.pose, map_t, plan.made)
+    def _set(self, plan, counted=True):
+        if counted:
+            self.plans += 1
+            if plan.points is None:
+                self.failed += 1
+            self.ms_total += plan.ms
+            self.cpu_total += plan.cpu_ms
+            self.ms_max = max(self.ms_max, plan.ms)
         with self._lock:
             self._plan = plan
+
+    def on_map(self, view):
+        """A new MapView (SlamRunner's pump, as each comes, and update()):
+        handed to the planner process if it has not got it. Never raises."""
+        if view is None or self.mode != MODE_PROCESS or not self.background:
+            return
+        with self._q_lock:
+            if view is self._sent_view or self._inbox is None:
+                return
+            try:
+                self._inbox.put_nowait(("map", view))
+                self._sent_view = view
+            except Exception:
+                self.dropped += 1
+
+    def _send_req(self, req, now):
+        with self._q_lock:
+            self._req_id += 1
+            if self._inbox is None:
+                return
+            try:
+                self._inbox.put_nowait(("req", self._req_id, req, now))
+            except Exception:
+                self.dropped += 1
+
+    def settle(self, timeout=10.0):
+        """Wait until the planner process has answered every request sent so
+        far (MODE_PROCESS; at once otherwise). True if it has. For tests and
+        replays: the control loop never waits on it."""
+        if self.mode != MODE_PROCESS or not self.background:
+            return True
+        deadline = time.monotonic() + float(timeout)
+        with self._answered:
+            while self._acked < self._req_id and not self._stop.is_set():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._answered.wait(min(left, 0.1))
+            return self._acked >= self._req_id
+
+    def _start_proc(self):
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        inbox, outbox = ctx.Queue(maxsize=INBOX), ctx.Queue(maxsize=INBOX)
+        proc = ctx.Process(target=_serve, name="path-planner", daemon=True,
+                           args=(inbox, outbox, self.lookahead_m, self.every_s,
+                                 WORKER_NICE))
+        workers.start(proc)
+        with self._q_lock:
+            self._proc, self._inbox, self._outbox = proc, inbox, outbox
+            self._sent_view = None
+        # What it missed: the newest map, and the request still wanted.
+        self.on_map(self._map_now())
+        with self._lock:
+            req = self._req
+        if req is not None:
+            self._send_req(req, float(self.clock()))
+        else:
+            with self._answered:
+                self._acked = self._req_id
+
+    def _end_proc(self, wait=False):
+        with self._q_lock:
+            proc, inbox, outbox = self._proc, self._inbox, self._outbox
+            self._proc = self._inbox = self._outbox = None
+            self._sent_view = None
+        if proc is None:
+            return
+        try:
+            if wait and proc.is_alive():
+                inbox.put(None, timeout=0.2)
+                proc.join(timeout=CLOSE_WAIT_S)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1.0)
+        except Exception:
+            pass
+        for q in (inbox, outbox):
+            try:
+                q.cancel_join_thread()
+                q.close()
+            except Exception:
+                pass
+
+    def _take_loop(self):
+        """MODE_PROCESS: start the planner process, take its plans, and start
+        it again if it dies (no sooner than RESTART_WAIT_S apart), the last
+        plan used meanwhile. If it cannot be started, plan on this thread."""
+        started = None
+        while not self._stop.is_set():
+            proc = self._proc
+            if proc is None or not proc.is_alive():
+                if proc is not None:
+                    code = proc.exitcode
+                    self._end_proc()
+                    self.restarts += 1
+                    self._log("warning", f"The path planner's process died (exit "
+                              f"code {code}); starting it again, the last plan "
+                              "is used meanwhile")
+                wait = 0.0 if started is None else started + RESTART_WAIT_S - time.monotonic()
+                if wait > 0:
+                    self._stop.wait(wait)
+                    continue
+                started = time.monotonic()
+                try:
+                    self._start_proc()
+                except Exception as e:
+                    self._end_proc()
+                    self._log("warning", f"The path planner's process would not "
+                              f"start ({e!r}); planning on a thread instead")
+                    self.mode = MODE_THREAD
+                    self._loop()
+                    return
+                continue
+            outbox = self._outbox
+            try:
+                msg = outbox.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            except Exception:       # closed under it: the process is going
+                self._stop.wait(0.05)
+                continue
+            try:
+                self._take(msg)
+            except Exception as e:
+                print(f"[path] {e!r}")
+
+    def _take(self, msg):
+        _, rid, out, err = msg
+        if err:
+            self.failed += 1
+            print(f"[path] {err}")
+        if out is not None:
+            self._set(*out)
+        with self._answered:
+            self._acked = max(self._acked, int(rid))
+            self._answered.notify_all()
 
     # ---- out ----------------------------------------------------------------------
 

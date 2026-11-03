@@ -22,7 +22,8 @@ when _work makes one (map_interval) and /slam/path at its INTERVALS. The pump ne
 telemetry's offer() is drop-oldest.
 
 Nothing here commands the truck. latest(), pose() and map() are the reads a
-planner will make; see crawler/mapping/__init__.py.
+planner will make; see crawler/mapping/__init__.py. map_listeners are told
+of each MapView as it comes (the path planner's process is handed it so).
 """
 
 import math
@@ -471,6 +472,11 @@ class SlamRunner:
         self._latest = None
         self._latest_at = None
         self._map = None
+        # Called with each MapView as the pump takes it, on the pump's
+        # thread: autopilot/pathgoal.PathPlanner.on_map hands it to the
+        # planner process. Each must return at once; one that raises is
+        # skipped for that view.
+        self.map_listeners = []
         self._nav_map = None
         self._crop = None
         self._path = []
@@ -685,6 +691,11 @@ class SlamRunner:
             self._crop = item[1]
         elif kind == "map":
             self._map = item[1]
+            for listener in list(self.map_listeners):
+                try:
+                    listener(item[1])
+                except Exception:
+                    pass
             tele = self.tele
             if tele is not None and tele.wants("map", now):
                 tele.offer("map", item[1], now)
