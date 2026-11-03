@@ -2493,6 +2493,7 @@ def main(argv=None):
     if args.goal and slam is not None and not args.no_path:
         from crawler.autopilot import pathgoal
         path_planner = pathgoal.PathPlanner(slam, say=log.log)
+        slam.map_listeners.append(path_planner.on_map)
         log.log("info", "Path", "The goal model is fed a point "
                 f"{pathgoal.LOOKAHEAD_M:g} m along a path round the walls to "
                 "the goal, planned on the SLAM map (--no-path for the goal itself)")

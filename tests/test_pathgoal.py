@@ -394,12 +394,12 @@ class HeldSlam(MapSlam):
         return self.view
 
 
-def test_the_plan_is_made_on_its_own_thread_and_update_returns_at_once():
+def test_on_a_thread_the_plan_is_made_on_its_own_and_update_returns_at_once():
     # Synchronised, not timed, so a loaded machine cannot fail it: the map
     # is held, so update() can only have returned without the plan if it
     # never waits on it; and the planning thread is seen inside it.
     slam = HeldSlam(world([WALL]))
-    p = pgo.PathPlanner(slam, every_s=0.05)
+    p = pgo.PathPlanner(slam, every_s=0.05, mode=pgo.MODE_THREAD)
     src = Source((4.0, 0.0, 0))
     try:
         p.update(crop_at(0.0, 0.0), src)
