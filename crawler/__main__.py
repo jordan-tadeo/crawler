@@ -1403,6 +1403,13 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
     tick_max_ms = 0.0
     tick_count = 0
     window_started = clock()
+    # Every pass's time this window, for its p50 and p99 next to the max,
+    # and the pad-to-write latency: from the event pump that read the pad
+    # to the end of the drive call that commanded off it, and from the pump
+    # before (an event can land just after a pump and wait a whole pass).
+    # See telemetry.PassWindow.
+    passes = tm.PassWindow()
+    last_pump = None
 
     try:
         while not stop_event.is_set():
@@ -1457,6 +1464,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 # TimeoutStopSec runs out and systemd SIGKILLs us past
                 # vecon.close().
                 stop_event.wait(PADLESS_INTERVAL)
+                last_pump = None   # no pad was read; no latency to measure
                 continue
 
             if not was_connected:
@@ -1566,6 +1574,9 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 vecon.return_neutral()
                 last_error = "auto gave up"
                 log.log("warning", "Mode", "Auto gave up, dropping to manual")
+            wrote = clock()
+            passes.add_pad(wrote - now, None if last_pump is None else wrote - last_pump)
+            last_pump = now
             if modes.mode != AUTO:
                 takeover.drop()
             elif takeover.throttle:
@@ -1678,6 +1689,9 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                     "last_error": last_error,
                     "loop_hz": (tick_count / elapsed) if elapsed > 0 else 0.0,
                     "loop_tick_max_ms": tick_max_ms,
+                    # The window's passes, their p50 and p99, and the pad's
+                    # pump-to-write p50, p99 and worst (telemetry.PassWindow).
+                    **passes.fields(),
                     "camera_open_s": _camera_open_s(autopilot),
                     # Four attribute reads off the Recorder. This is how I
                     # check from Studio that the run I am watching is also
@@ -1690,6 +1704,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
                 tick_max_ms = 0.0
                 tick_count = 0
                 window_started = now
+                passes.clear()
 
             # Reading the state is three pigpio and I2C round trips, and this
             # loop runs at 100 Hz. Doing it every tick was about 54 MB of log
@@ -1714,6 +1729,7 @@ def control_loop(joystick, vecon, autopilot, modes, log, stop_event, tele=None,
             tick_ms = (clock() - now) * 1000.0
             if tick_ms > tick_max_ms:
                 tick_max_ms = tick_ms
+            passes.add_pass(tick_ms)
             tick_count += 1
 
             stop_event.wait(LOOP_INTERVAL)

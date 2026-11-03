@@ -128,6 +128,13 @@ class StreamView:
         # it to shrink exactly the frame the driver just scanned, without a
         # second take that would steal the driver's next one.
         self.last_depth = None
+        # When that frame got here and when it was taken, as (arrived,
+        # captured) in time.monotonic() seconds, either None if unknown. It
+        # travels in the same slot as the frame, (frame, arrived, captured),
+        # one assignment, so a take can never pair a frame with the times of
+        # the one before it. captured is the OAK-D's own stamp (oakd.py
+        # capture_time), the steady clock depthai syncs to the host.
+        self.last_depth_times = (None, None)
 
         # Per-view, because it is per-view state: the dashboard's smoothing
         # should not depend on how often telemetry asked for a frame.
@@ -135,9 +142,9 @@ class StreamView:
 
     # ---- the hub's side --------------------------------------------------
 
-    def _put(self, stream, frame):
+    def _put(self, stream, frame, arrived=None, captured=None):
         if stream == "depth":
-            self._depth = frame
+            self._depth = (frame, arrived, captured)
         elif stream == "disparity":
             self._disparity = frame
         elif stream == "rectified_left":
@@ -155,9 +162,12 @@ class StreamView:
         return frame
 
     def get_depth_frame(self):
-        frame = self._take("_depth")
-        if frame is not None:
-            self.last_depth = frame
+        slot = self._take("_depth")
+        if slot is None:
+            return None
+        frame, arrived, captured = slot
+        self.last_depth = frame
+        self.last_depth_times = (arrived, captured)
         return frame
 
     def get_disparity_frame(self):
@@ -485,11 +495,19 @@ class CameraHub:
 
                 if packet is None:
                     continue
+                captured = None
                 if stream == "depth":
                     last_depth = now
+                    # A dict lookup on the device, for every depth packet:
+                    # the views keep it so the driver can say how old the
+                    # frame it decided on was, listeners or not.
+                    try:
+                        captured = oakd.capture_time("depth")
+                    except Exception:
+                        captured = None
 
                 for view in self._view_list:
-                    view._put(stream, packet)
+                    view._put(stream, packet, now, captured)
 
                 if stream == "imu":
                     for listener in self.imu_listeners:
@@ -498,10 +516,6 @@ class CameraHub:
                         except Exception:
                             pass
                 elif stream == "depth" and self.depth_listeners:
-                    try:
-                        captured = oakd.capture_time("depth")
-                    except Exception:
-                        captured = None
                     for listener in self.depth_listeners:
                         try:
                             listener(now, packet, captured)
