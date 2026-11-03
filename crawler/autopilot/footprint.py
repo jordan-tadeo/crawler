@@ -69,6 +69,11 @@ RAW_DEPTH_EVERY = 5
 RECORD = "record"
 AUTO = "auto"
 
+# len(policy.POLICY_STAGES). Written here, not imported: policy pulls in
+# the goal, lidar and map code, and this file is loaded by every recording,
+# policy or not. A test holds the two equal.
+STAGE_COUNT = 10
+
 # Who had each group on a row's tick: "pad" is my hand, "driver" the
 # autopilot. main.DRIVER and main.PAD are the same strings.
 DRIVER = "driver"
@@ -137,7 +142,26 @@ AUTOPILOT_FIELDS = {
     # With --goal: where the patrol is this decision (patrol.ROW_FIELDS), so
     # tools/lap_report.py can put every row in its lap and segment.
     **patrol_mod.ROW_FIELDS,
+    # What the policy's tick cost (policy.TickTimer): wall and thread-CPU ms
+    # per policy.POLICY_STAGES, and the whole tick's. Then how old each input
+    # was at the tick's `now`: the depth frame by the OAK-D's capture stamp
+    # and by when the reader handed it over, the roof lidar scan and the
+    # egomap crop. All in NULLABLE_FIELDS: None, not 0, when there is none,
+    # so a missing number never reads as a fast one.
+    "policy_stage_ms": [None] * STAGE_COUNT,
+    "policy_stage_cpu_ms": [None] * STAGE_COUNT,
+    "tick_wall_ms": None,
+    "tick_cpu_ms": None,
+    "depth_age_ms": None,
+    "depth_slot_ms": None,
+    "lidar_age_ms": None,
+    "crop_age_ms": None,
 }
+
+# The fields above whose "none" is None (JSON null) and not a number.
+NULLABLE_FIELDS = frozenset(key for key, value in AUTOPILOT_FIELDS.items()
+                            if value is None or (isinstance(value, list)
+                                                 and value and value[0] is None))
 
 
 def _driver_fields(driver, now):
@@ -170,7 +194,9 @@ def autopilot_fields(driver, now=None):
         if getattr(driver, "policy_fields", None) is not None:
             out["autopilot"] = "policy"
         for key, value in _driver_fields(driver, now).items():
-            if key in out:
+            if key in NULLABLE_FIELDS:
+                out[key] = _nullable(value, AUTOPILOT_FIELDS[key])
+            elif key in out:
                 if isinstance(out[key], bool):
                     out[key] = bool(value)
                 elif isinstance(out[key], str):
@@ -203,6 +229,20 @@ def _num(value, fallback=-1.0) -> float:
     except Exception:
         return fallback
     return value if math.isfinite(value) else fallback
+
+
+def _nullable(value, default):
+    """A NULLABLE_FIELDS value: a finite number or None, or a fixed-width
+    list of them (None for any that is not one, all None at a wrong width)."""
+    if isinstance(default, list):
+        try:
+            value = list(value)
+        except Exception:
+            return list(default)
+        if len(value) != len(default):
+            return list(default)
+        return [_num(v, None) for v in value]
+    return _num(value, None)
 
 
 def _sweep_clears(scan, side) -> bool:

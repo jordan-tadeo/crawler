@@ -1514,6 +1514,109 @@ class PolicyModel:
         return dict(zip(self.output_names, values))
 
 
+# ---- what a decision costs, stage by stage --------------------------------
+
+# The stages of PolicyDriver._tick, in the order /footprint's
+# policy_stage_ms and policy_stage_cpu_ms carry them. "imu" is the sample,
+# the tilt veto and the IMU windows; "crop" the mapper's crop, em.encode and
+# the map-lost switch; "encode" the downsample and encode_input with the
+# prev, mode and IMU vectors; "path" the goal input; "post" everything after
+# the model answers, up to the command. Whatever is in none of them (the
+# rear read, stuck) is the tick's wall less their sum.
+POLICY_STAGES = ("goal", "frame", "imu", "scan", "crop", "encode",
+                 "lidar", "path", "infer", "post")
+
+
+class TickTimer:
+    """Wall and thread-CPU milliseconds per stage of one tick, and the tick's.
+
+    Wall is time.perf_counter and CPU is time.thread_time, this thread's
+    own. Wall less CPU is time the thread could have run and did not: the
+    GIL, or the kernel running something else. A stage begun twice adds up.
+    begin() closes the stage before it, so a stage left open by an early
+    return is closed by finish(), which tick() calls whatever happened.
+    Reads only clocks; nothing here can change what the tick decides.
+    """
+
+    __slots__ = ("wall", "cpu", "tick_wall_ms", "tick_cpu_ms",
+                 "_open", "_w", "_c", "_w0", "_c0")
+
+    def __init__(self):
+        self.wall = {}
+        self.cpu = {}
+        self.tick_wall_ms = None
+        self.tick_cpu_ms = None
+        self._open = None
+        self._w = self._c = self._w0 = self._c0 = 0.0
+
+    def start(self):
+        self.wall = {}
+        self.cpu = {}
+        self.tick_wall_ms = None
+        self.tick_cpu_ms = None
+        self._open = None
+        self._w0 = time.perf_counter()
+        self._c0 = time.thread_time()
+
+    def begin(self, stage):
+        self.end()
+        self._open = stage
+        self._w = time.perf_counter()
+        self._c = time.thread_time()
+
+    def end(self):
+        stage = self._open
+        if stage is None:
+            return
+        w, c = time.perf_counter(), time.thread_time()
+        self.wall[stage] = self.wall.get(stage, 0.0) + (w - self._w) * 1000.0
+        self.cpu[stage] = self.cpu.get(stage, 0.0) + (c - self._c) * 1000.0
+        self._open = None
+
+    def finish(self):
+        self.end()
+        self.tick_wall_ms = (time.perf_counter() - self._w0) * 1000.0
+        self.tick_cpu_ms = (time.thread_time() - self._c0) * 1000.0
+
+    def stage_ms(self):
+        """[wall ms per POLICY_STAGES], None for a stage this tick skipped."""
+        return [self.wall.get(s) for s in POLICY_STAGES]
+
+    def stage_cpu_ms(self):
+        return [self.cpu.get(s) for s in POLICY_STAGES]
+
+
+def age_ms(now, then):
+    """(now - then) in ms, or None when either is missing or not a number."""
+    try:
+        age = (float(now) - float(then)) * 1000.0
+    except (TypeError, ValueError):
+        return None
+    return age if math.isfinite(age) else None
+
+
+def lidar_scan_time(reader, now):
+    """The newest scan's t off a LidarReader, stale or not, or None. A read
+    of an attribute; never raises."""
+    if reader is None:
+        return None
+    try:
+        scan = reader.latest(now, math.inf)
+    except TypeError:
+        try:
+            scan = reader.latest()
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return getattr(scan, "t", None) if scan is not None else None
+
+
+def _ms(value):
+    """A row's milliseconds: rounded to 10 us, None stays None."""
+    return None if value is None else round(float(value), 2)
+
+
 class PolicyDriver(dv.Driver):
     """Driver, with the verdict coming from a model instead of the gradient.
 
@@ -1561,6 +1664,16 @@ class PolicyDriver(dv.Driver):
         # Read-only bookkeeping, like last_scan and last_verdict.
         self.last_decision = None
         self.last_infer_ms = 0.0
+        # What the last tick cost, by stage (TickTimer), and how old each
+        # input was at the tick's `now`, in ms: None for one it did not have.
+        # depth_age is off the OAK-D's capture stamp, depth_slot off when the
+        # reader thread handed the frame over, so their difference is the
+        # camera and USB and depth_slot alone is the wait for this tick.
+        self.timer = TickTimer()
+        self.depth_age_ms = None
+        self.depth_slot_ms = None
+        self.lidar_age_ms = None
+        self.crop_age_ms = None
         self.last_split_p = -1.0    # the head's p(split); -1 with no head
         self.last_steer_dir_p = NO_STEER_DIR_P  # [left, straight, right]
         # The IMU input. The newest sample and when it was taken, held as
@@ -1844,12 +1957,17 @@ class PolicyDriver(dv.Driver):
         """One pass. Anything that raises commands neutral first."""
         if now is None:
             now = time.monotonic()
+        self.timer.start()
+        self.depth_age_ms = self.depth_slot_ms = None
+        self.lidar_age_ms = self.crop_age_ms = None
         try:
             self._sync_mode(now)
             self._tick(now)
         except Exception:
             self._neutral("exception")
             raise
+        finally:
+            self.timer.finish()
 
     def _neutral(self, reason, pair=(0, 0), steer=0.0):
         """Throttle to zero, steering to centre, evidence forgotten.
@@ -1956,6 +2074,18 @@ class PolicyDriver(dv.Driver):
             # none), and whether the model's answer was the blocked one.
             **self.tilt_veto.fields(),
             "policy_tilt_masked": bool(d.tilt_masked) if d is not None else False,
+            # What the last tick cost: wall and thread-CPU ms per stage, in
+            # POLICY_STAGES order (None for a stage it skipped), and for the
+            # whole tick. Wall less CPU is the wait for the GIL or a core.
+            "policy_stage_ms": [_ms(v) for v in self.timer.stage_ms()],
+            "policy_stage_cpu_ms": [_ms(v) for v in self.timer.stage_cpu_ms()],
+            "tick_wall_ms": _ms(self.timer.tick_wall_ms),
+            "tick_cpu_ms": _ms(self.timer.tick_cpu_ms),
+            # How old each input was at the tick's `now`; None without one.
+            "depth_age_ms": _ms(self.depth_age_ms),
+            "depth_slot_ms": _ms(self.depth_slot_ms),
+            "lidar_age_ms": _ms(self.lidar_age_ms),
+            "crop_age_ms": _ms(self.crop_age_ms),
         }
 
     def _recover(self, now, reason):
@@ -2024,12 +2154,15 @@ class PolicyDriver(dv.Driver):
         # First, so every row says it, whichever path the tick takes. A goal
         # that raises is the exception path: neutral, and auto parks.
         was = self.goal_reached
+        timer = self.timer
+        timer.begin("goal")
         # A clicked goal (goal.ClickGoal) checks arrival off the newest crop
         # first: the hold is the safety layer's, so it is judged every tick.
         observe = getattr(self.goal, "observe", None)
         if observe is not None and self.slam is not None:
             observe(self.slam.crop())
         self.goal_reached = bool(self.goal.reached())
+        timer.end()
         if self.goal_reached != was:
             print("Goal reached - stopping." if self.goal_reached
                   else "Goal no longer reached - driving on.")
@@ -2037,10 +2170,12 @@ class PolicyDriver(dv.Driver):
             # The back-out returns before the frame and the IMU are read, so
             # read the IMU here: off a stale up the veto would read no tilt
             # and let go of the very reverse it is for.
+            timer.begin("imu")
             imu = self.camera.get_imu_sample()
             if imu is not None:
                 self._imu_sample, self._imu_at = imu, now
             self._tilt_update(now)
+            timer.end()
             if (self._phase == dv._PHASE_REVERSE and self._tilt_blocked() == REVERSE):
                 # The hand rules' back-out is a reverse the veto has blocked:
                 # it ends here, at 0, and settles as any other end does.
@@ -2074,11 +2209,18 @@ class PolicyDriver(dv.Driver):
         if self.human_throttle:
             self._reset_standoff()
 
+        timer.begin("frame")
         depth = self.camera.get_depth_frame()
         if depth is None or getattr(depth, "ndim", 0) != 2:
+            timer.end()
             self._neutral("no frame")
             return
+        arrived, captured = getattr(self.camera, "last_depth_times", None) or (None, None)
+        self.depth_age_ms = age_ms(now, captured)
+        self.depth_slot_ms = age_ms(now, arrived)
+        self.lidar_age_ms = age_ms(now, lidar_scan_time(self.lidar, now))
 
+        timer.begin("imu")
         imu = self.camera.get_imu_sample()
         if imu is not None:
             self._imu_sample, self._imu_at = imu, now
@@ -2093,11 +2235,13 @@ class PolicyDriver(dv.Driver):
         for slot in self._slots.values():
             feats = slot["imu_features"]
             imu_out[id(feats)] = feats.push(dict(imu_row), now)
+        timer.begin("scan")
         scan = self.scan_footprint(depth)
         # Every scan, blind ones too: a blind scan is exactly the one the
         # latch is for. The cap is read each tick, as the throttle is.
         self.floor_veto.forward_speed = self.forward_speed
         self.floor_veto.observe(scan, now)
+        timer.end()
 
         if all(r == dv.NO_RETURN for r in scan.reason):
             self._neutral("blind")
@@ -2138,6 +2282,7 @@ class PolicyDriver(dv.Driver):
         crop = None
         present = False
         if self.uses_map:
+            timer.begin("crop")
             alive = self._slam_alive()
             present = False
             lost = None
@@ -2145,6 +2290,7 @@ class PolicyDriver(dv.Driver):
                 lost = "mapper down"
             else:
                 crop = self.slam.crop()
+                self.crop_age_ms = age_ms(now, getattr(crop, "t", None))
                 ego = em.encode(crop, now)
                 present = bool(ego[0, em.PRESENT, 0, 0] > 0)
                 if self._map_lost(crop.t if present else None, now):
@@ -2152,6 +2298,7 @@ class PolicyDriver(dv.Driver):
             self.last_map_present = present
             if self.fallback is None:
                 if lost is not None:
+                    timer.end()
                     self.ensembler.reset()
                     self._neutral(lost)
                     return
@@ -2168,11 +2315,13 @@ class PolicyDriver(dv.Driver):
                 elif (self.on_fallback and self._map_ok_since is not None
                         and now - self._map_ok_since >= MAP_BACK_S - 1e-3):
                     self._switch(MAP_SLOT, now, "")
+            timer.end()
         imu_x = imu_out[id(self.imu_features)]
 
         # The lower band only for a model that has one, and the IMU's pitch
         # only for the one that reads it: every other model is fed what it
         # always was, at the cost it always was.
+        timer.begin("encode")
         lowband = getattr(self.model, "lowband", None)
         pitch = (lowband_pitch(lowband, pimu.up_of(imu_row))
                  if lowband == cp.LOWBAND_FLOOR else 0.0)
@@ -2185,17 +2334,21 @@ class PolicyDriver(dv.Driver):
         if self.uses_imu:
             self.last_imu = encode_imu(imu_x)
             extra["imu"] = self.last_imu
+        timer.end()
         if self.uses_lidar:
+            timer.begin("lidar")
             # Missing when there is no --lidar, no fresh scan or a reader
             # that throws: the model drives on the camera, as trained to.
             bins = pli.live_bins(self.lidar)
             self.last_lidar_present = bins is not None
             extra["lidar"] = pli.encode(bins)
+            timer.end()
         if self.uses_map and not self.on_fallback:
             extra["map"] = ego
         self.last_goal_present = False
         self.last_goal_fed = "none"
         if self.uses_goal and not self.on_fallback:
+            timer.begin("path")
             # The goal off the same crop the map input is, and only with that
             # crop going in: no map is no goal, as the model was trained.
             if not present:
@@ -2208,6 +2361,8 @@ class PolicyDriver(dv.Driver):
             self.last_goal_fed = ((self.path.fed if self.path is not None else "goal")
                                   if self.last_goal_present else "none")
             extra["goal"] = g
+            timer.end()
+        timer.begin("infer")
         started = time.perf_counter()
         if extra:
             outputs = self.model.run(x, prev, mode, **extra)
@@ -2216,6 +2371,8 @@ class PolicyDriver(dv.Driver):
         else:
             outputs = self.model.run(x, prev)
         self.last_infer_ms = (time.perf_counter() - started) * 1000.0
+        # Everything from here to the command; tick() closes it on any return.
+        timer.begin("post")
         # Before anything reads the answer: a chunk model's last K, blended.
         outputs = self.ensembler.apply(outputs, now, self.mode.split if self.has_mode else None)
 

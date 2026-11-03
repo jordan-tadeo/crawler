@@ -64,6 +64,7 @@ VehicleController at all.
 """
 
 import json
+import math
 import os
 import queue
 import threading
@@ -288,6 +289,9 @@ _NUM = {"type": "number"}
 _INT = {"type": "integer"}
 _STR = {"type": "string"}
 _BOOL = {"type": "boolean"}
+# A number that is null when there is none to give, rather than a -1 or a 0
+# that would read as a real one.
+_NUM_OR_NULL = {"type": ["number", "null"]}
 
 # The project-specific channels. There is no well-known Foxglove schema for
 # any of this -- and, worth writing down because it is not what I assumed,
@@ -356,6 +360,17 @@ JSON_SCHEMAS = {
         "last_error": _STR,
         "loop_hz": _NUM,
         "loop_tick_max_ms": _NUM,
+        # The window's passes (telemetry.PassWindow): how many, their p50 and
+        # p99 ms; and the pad-to-write ms, from the event pump that read the
+        # pad to the end of the drive call (p50, p99: the least an event
+        # waited) and from the pump before (worst: the most). Null with no
+        # pass in the window, and absent from a padless row.
+        "loop_passes": _INT,
+        "loop_tick_p50_ms": _NUM_OR_NULL,
+        "loop_tick_p99_ms": _NUM_OR_NULL,
+        "pad_to_write_p50_ms": _NUM_OR_NULL,
+        "pad_to_write_p99_ms": _NUM_OR_NULL,
+        "pad_to_write_worst_ms": _NUM_OR_NULL,
         # Whether this run is being written to an MCAP file, and which one.
         # In the file itself this is how a replay says who wrote it; live in
         # Studio it is how I check recording is actually on without sshing
@@ -600,6 +615,24 @@ JSON_SCHEMAS = {
         "patrol_use": _STR, "patrol_state": _STR, "patrol_track": _STR,
         "patrol_index": _INT, "patrol_count": _INT, "patrol_lap": _INT,
         "patrol_stuck_s": _NUM,
+        # What a policy tick cost (autopilot/policy.py, TickTimer), null
+        # where it does not apply (record, the rules, a skipped stage). Wall
+        # and thread-CPU ms for each of policy.POLICY_STAGES in that order:
+        # goal, frame, imu, scan, crop, encode, lidar, path, infer, post.
+        # Then the whole tick's; wall less CPU is the wait for the GIL or a
+        # core. Then how old each input was at the tick's now, in ms: the
+        # depth frame by the OAK-D's capture stamp and by when the camera
+        # reader handed it over, the newest roof lidar scan, the egomap crop.
+        "policy_stage_ms": {"type": "array", "items": _NUM_OR_NULL,
+                            "minItems": 10, "maxItems": 10},
+        "policy_stage_cpu_ms": {"type": "array", "items": _NUM_OR_NULL,
+                                "minItems": 10, "maxItems": 10},
+        "tick_wall_ms": _NUM_OR_NULL,
+        "tick_cpu_ms": _NUM_OR_NULL,
+        "depth_age_ms": _NUM_OR_NULL,
+        "depth_slot_ms": _NUM_OR_NULL,
+        "lidar_age_ms": _NUM_OR_NULL,
+        "crop_age_ms": _NUM_OR_NULL,
     }),
     # One revolution of the roof lidar, see crawler/hardware/lidar.py. bins
     # is lidar.BINS nearest ranges in mm from the middle of the car, bin i
@@ -1669,6 +1702,69 @@ class Telemetry:
             except Exception:
                 pass
         print(f"[telemetry] {subject}: {message}")
+
+
+# Most passes a PassWindow keeps: 10 s of the loop at 100 Hz, if nothing
+# takes /diagnostics for a while. 4 Hz windows hold 4 to 25.
+PASS_WINDOW_MAX = 1000
+
+
+def _percentile(sorted_values, q):
+    """Nearest-rank percentile of an ascending list, or None if it is empty."""
+    if not sorted_values:
+        return None
+    i = min(len(sorted_values) - 1, max(0, math.ceil(q / 100.0 * len(sorted_values)) - 1))
+    return sorted_values[i]
+
+
+class PassWindow:
+    """The control loop's passes between two /diagnostics rows, for their
+    p50 and p99 next to loop_tick_max_ms, and the pad-to-write latency.
+
+    add_pass() takes a pass's ms, as loop_tick_max_ms is measured.
+    add_pad() takes, in seconds, the time from this pass's event pump to the
+    end of its drive call (the least an event read there waited for its
+    write) and from the pump before (the most: an event that landed just
+    after that pump), None for the first pass. A few list appends a pass;
+    the sorting is once a window, on the diagnostics row.
+    """
+
+    def __init__(self, cap=PASS_WINDOW_MAX):
+        self.cap = cap
+        self.clear()
+
+    def clear(self):
+        self._pass = []
+        self._pad = []
+        self._pad_worst = None
+
+    def add_pass(self, ms):
+        if len(self._pass) < self.cap:
+            self._pass.append(ms)
+
+    def add_pad(self, pump_to_write_s, prev_pump_to_write_s=None):
+        if len(self._pad) < self.cap:
+            self._pad.append(pump_to_write_s * 1000.0)
+        if prev_pump_to_write_s is not None:
+            worst = prev_pump_to_write_s * 1000.0
+            if self._pad_worst is None or worst > self._pad_worst:
+                self._pad_worst = worst
+
+    def fields(self):
+        """The /diagnostics fields; None for a number with no pass behind it."""
+        passes = sorted(self._pass)
+        pad = sorted(self._pad)
+
+        def num(v):
+            return None if v is None else round(float(v), 3)
+        return {
+            "loop_passes": len(self._pass),
+            "loop_tick_p50_ms": num(_percentile(passes, 50)),
+            "loop_tick_p99_ms": num(_percentile(passes, 99)),
+            "pad_to_write_p50_ms": num(_percentile(pad, 50)),
+            "pad_to_write_p99_ms": num(_percentile(pad, 99)),
+            "pad_to_write_worst_ms": num(self._pad_worst),
+        }
 
 
 def controller_sample(joystick, throttle, steering_front, steering_rear):
