@@ -37,6 +37,15 @@ WorkingDirectory=@REPO_DIR@
 # not the magic.
 Environment=SDL_VIDEODRIVER=dummy
 Environment=PYTHONUNBUFFERED=1
+# One BLAS thread for this process too, read when numpy is imported, so it
+# has to be here and not in Python. Uncapped, numpy's OpenBLAS starts nproc - 1
+# pool threads that spin between small matrix products; in the voxel worker
+# that was about five times the CPU for a slower update (crawler/workers.py),
+# and the workers are already capped. OMP_NUM_THREADS is OpenBLAS's fallback
+# and anything OpenMP's; onnxruntime does not read it and keeps the one
+# thread its SessionOptions give it (autopilot/policy.py).
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
 # After=pigpiod only means the unit was started, not that the socket is
 # listening yet. VehicleController raises outright if it cannot connect, and
 # with Restart=on-failure that turns into a restart loop at boot. No shell

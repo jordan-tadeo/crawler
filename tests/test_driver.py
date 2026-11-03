@@ -180,43 +180,61 @@ def test_the_counter_is_held_down_while_the_check_is_unarmed(d):
 
 # --- stuck: the confirmed case ----------------------------------------------
 
+def tick_at(k):
+    """Decision k's clock at the 0.1 s step the windows were tuned at,
+    rounded to the millisecond so a long run does not drift."""
+    return round(100.0 + 0.1 * k, 3)
+
+
 def test_a_confirmed_stick_takes_a_full_run_of_still_samples(d):
     d._throttle_since = 0.0
     for i in range(dv.STUCK_CONFIRM_SAMPLES - 1):
-        assert d.stuck(STILL_IMU, 100.0) is False, f"fired early on sample {i + 1}"
-    assert d.stuck(STILL_IMU, 100.0) is True
+        assert d.stuck(STILL_IMU, tick_at(i)) is False, f"fired early on sample {i + 1}"
+    assert d.stuck(STILL_IMU, tick_at(dv.STUCK_CONFIRM_SAMPLES - 1)) is True
 
 
 def test_one_moving_reading_resets_the_whole_run(d):
     """Evidence has to be consecutive. A car that moves at all is not stuck."""
     d._throttle_since = 0.0
-    for _ in range(dv.STUCK_CONFIRM_SAMPLES - 1):
-        d.stuck(STILL_IMU, 100.0)
-    assert d.stuck(MOVING_IMU, 100.0) is False
+    k = 0
+    for k in range(dv.STUCK_CONFIRM_SAMPLES - 1):
+        d.stuck(STILL_IMU, tick_at(k))
+    assert d.stuck(MOVING_IMU, tick_at(k + 1)) is False
     assert d._still_samples == 0
-    assert d.stuck(STILL_IMU, 100.0) is False
+    assert d._still_s == 0.0
+    assert d.stuck(STILL_IMU, tick_at(k + 2)) is False
 
 
 def test_a_confirmed_stick_clears_its_own_evidence(d):
     """Otherwise the tick after a recover starts one sample from firing again."""
     d._throttle_since = 0.0
-    for _ in range(dv.STUCK_CONFIRM_SAMPLES):
-        d.stuck(STILL_IMU, 100.0)
+    for k in range(dv.STUCK_CONFIRM_SAMPLES):
+        d.stuck(STILL_IMU, tick_at(k))
     assert d._still_samples == 0
+    assert d._still_s == 0.0
 
 
 def test_the_cooldown_blocks_a_second_recover(d):
     d._throttle_since = 0.0
     d.last_recovery_time = 99.0
-    for _ in range(dv.STUCK_CONFIRM_SAMPLES * 3):
+    for k in range(dv.STUCK_CONFIRM_SAMPLES * 3):
+        assert d.stuck(STILL_IMU, tick_at(k)) is False
+
+
+def test_a_still_run_at_one_instant_spans_nothing(d):
+    """The window is time now: any number of readings stamped at the same
+    instant is no time at all, and confirms nothing."""
+    d._throttle_since = 0.0
+    for _ in range(dv.STUCK_CONFIRM_SAMPLES * 5):
         assert d.stuck(STILL_IMU, 100.0) is False
 
 
-def test_confirming_a_stick_costs_a_second_of_throttle_and_a_second_of_stillness(d):
-    """STUCK_CONFIRM_SAMPLES is a count of ticks and not a wall-clock deadline
-    on purpose: the loop does not always make its rate, and a count can only
-    make confirming a stick take longer in real time, never fire early."""
+def test_confirming_a_stick_costs_a_second_of_throttle_and_most_of_a_second_of_stillness(d):
+    """STUCK_CONFIRM_S was a count of ten ticks, 0.9 s first to last at the
+    10 Hz decision. As a span it is just under nine of the fastest measured
+    steps, so a late decision can no longer stretch it (see test_decision_clock)."""
     assert dv.STUCK_CONFIRM_SAMPLES == 10          # a second at the 10 Hz tick
+    assert dv.STUCK_CONFIRM_S == pytest.approx(0.809)
     assert dv.STUCK_ARM_SECONDS == 1.0
 
 
