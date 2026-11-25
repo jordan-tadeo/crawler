@@ -1,7 +1,7 @@
 # crawler
 
 Control for my RC rock crawler. It boots into hand driving off a Bluetooth
-pad, and START hands the car to the OAK-D for auto mode: either the
+Xbox controller, and START hands the car to the OAK-D for auto mode: either the
 hand-written rules or a small learned policy. Every run is recorded, so a
 drive can be read back afterwards instead of remembered.
 
@@ -15,20 +15,20 @@ drive can be read back afterwards instead of remembered.
 - OAK-D: stereo depth and the IMU, computed on the camera.
 - LDRobot STL-19P 2D lidar (the D500 kit) on the roof, arrow to the truck's
   right. Read and recorded with `--lidar`; nothing drives on it yet.
-- An Xbox pad over Bluetooth, driven by xpadneo.
+- An Xbox controller over Bluetooth, driven by xpadneo.
 
 ## Layout
 
 ```
 crawler/            the code that runs on the car, one package
   __main__.py       the app: `python -m crawler`
-  hardware/         ESC and servos, the pad, the OAK-D, the camera hub
+  hardware/         ESC and servos, the Xbox controller, the OAK-D, the camera hub
   autopilot/        the rules driver, the learned policy and its inputs, marks
   vision/           person detector and tracker (unused: its pan/tilt camera is off the car)
   telemetry/        Foxglove channels, MCAP recording, the log, the dashboard
 tools/              dev-machine tools: dataset, training, eval, the models registry
 scripts/            run.sh, models.sh, pull-recordings.sh; scratch/ for one-off checks
-deploy/             the systemd unit and its installer, the pad timeout, car-side tools
+deploy/             the systemd unit and its installer, the controller timeout, car-side tools
 docs/               TRAINING_DATA.md, the recording schema
 tests/              pytest, runs on any computer with no hardware
 ```
@@ -102,7 +102,7 @@ In a shell instead, with the log on screen:
 exists, then `.venv/bin/python`. `CRAWLER_PYTHON=...` or `--python PATH`
 overrides that.
 
-The pad's Bluetooth link timeout is cut to 5 s on every connection, so a pad
+The Xbox controller's Bluetooth link timeout is cut to 5 s on every connection, so a controller
 that dies quietly puts the car at neutral in about 6 s instead of 20:
 
 ```sh
@@ -110,13 +110,13 @@ sudo ./deploy/install-pad-lst.sh                # once
 journalctl -u 'crawler-pad-lst@*'               # one line per connection
 ```
 
-An Xbox pad remembers one host, so pairing it with the PC leaves the Pi with a
+An Xbox controller remembers one host, so pairing it with the PC leaves the Pi with a
 stale bond (connects fail with errno 52). The phone's `/pad` page fixes that
-with no computer: hold the pair button on top of the pad until the light flashes
+with no computer: hold the pair button on top of the Xbox controller until the light flashes
 fast, tap Re-pair controller, and the car removes the old bond, scans up to
-90 s for the pad by name, then pairs, trusts and connects it
+90 s for the Xbox controller by name, then pairs, trusts and connects it
 (`crawler/hardware/pad_pair.py`). Refused in auto; the wheels hold neutral
-while the pad is away, as for any pad loss.
+while the Xbox controller is away, as for any lost connection to it.
 
 The OAK-D's udev rule is already on the car and the installer does not touch
 it. The comment at the top of `deploy/install-service.sh` says what it is.
@@ -178,7 +178,7 @@ every recording.
   released once.
 
 A mark is a window, 4 s back and 1 s ahead of the press. It goes to the MCAP
-on `/marks`, to the journal, and to `log/marks.csv`. The pad buzzes once for
+on `/marks`, to the journal, and to `log/marks.csv`. The Xbox controller buzzes once for
 A and twice for B.
 
 ## Watching and recording
@@ -233,11 +233,11 @@ once each, then switch between them from the Layouts menu.
   internet. It sends the same messages over the same WebSocket, shows the
   patrol and follow state, and **Clear** wants a hold. Waypoints are still
   placed in Foxglove's map. `--buttons-port 0` turns it off.
-- `foxglove-telemetry.json`: commands, ESC, pad axes, IMU, loop health, SLAM
+- `foxglove-telemetry.json`: commands, ESC, Xbox controller axes, IMU, loop health, SLAM
   fit and cost, the mode and SLAM state strips, and `/footprint` and
   `/diagnostics` raw.
 
-Pictures, lidar and the map only come while a pad is connected.
+Pictures, lidar and the map only come while the Xbox controller is connected.
 
 Every run is written to `log/mcap/` from service start, in 128 MiB segments,
 with the oldest deleted past 8 GiB and recording stopped under 4 GiB free.
@@ -329,6 +329,6 @@ came back. The docstring in `tools/models.py` has the rules.
 uv run pytest
 ```
 
-A few seconds on any computer. Nothing needs pigpio, a pad or the OAK-D: the
+A few seconds on any computer. Nothing needs pigpio, an Xbox controller or the OAK-D: the
 hardware is faked in `tests/conftest.py`. Most tests pin something that has
 already gone wrong on the car once.
