@@ -8,17 +8,14 @@ drive can be read back afterwards instead of remembered.
 ## Hardware
 
 - Raspberry Pi 4, Raspberry Pi OS Bookworm 64-bit, Python 3.11. This is the
-  only machine that drives; a laptop checkout is for editing, tests and
-  training.
+  only machine that drives; a checkout on any other computer is for
+  editing, tests and training.
 - Quicrun 880 ESC on GPIO 18 through pigpio. Neutral is 1575 us.
 - Front and rear steering servos on a PCA9685 over I2C.
 - OAK-D: stereo depth and the IMU, computed on the camera.
 - LDRobot STL-19P 2D lidar (the D500 kit) on the roof, arrow to the truck's
   right. Read and recorded with `--lidar`; nothing drives on it yet.
 - An Xbox pad over Bluetooth, driven by xpadneo.
-- A USB webcam (Suyin "HD Camera", 1e45:8022) on the hood, on two pan/tilt
-  servos on the same PCA9685. `--pantilt` turns it to follow a person; it
-  never drives.
 
 ## Layout
 
@@ -27,13 +24,13 @@ crawler/            the code that runs on the car, one package
   __main__.py       the app: `python -m crawler`
   hardware/         ESC and servos, the pad, the OAK-D, the camera hub
   autopilot/        the rules driver, the learned policy and its inputs, marks
-  vision/           the hood camera's person detector and pan/tilt tracker
+  vision/           person detector and tracker (unused: its pan/tilt camera is off the car)
   telemetry/        Foxglove channels, MCAP recording, the log, the dashboard
-tools/              laptop tools: dataset, training, eval, the models registry
+tools/              dev-machine tools: dataset, training, eval, the models registry
 scripts/            run.sh, models.sh, pull-recordings.sh; scratch/ for one-off checks
 deploy/             the systemd unit and its installer, the pad timeout, car-side tools
 docs/               TRAINING_DATA.md, the recording schema
-tests/              pytest, runs on the laptop with no hardware
+tests/              pytest, runs on any computer with no hardware
 ```
 
 Models (`models/`), logs (`log/`) and recordings never go in the repo. On the
@@ -41,7 +38,7 @@ car they sit at the checkout root, untracked.
 
 ### Where things go
 
-- Laptop: one folder, `~/crawler/`, holding `repo/` (this checkout), `data/`
+- Dev machine: one folder, `~/crawler/`, holding `repo/` (this checkout), `data/`
   (recordings, models, cache, retrain runs), `train/` (the training venv) and
   `worktrees/<name>`. `tools/data_paths.py` finds `data/` and `train/` beside
   the checkout; `CRAWLER_DATA` and `CRAWLER_TRAIN` override them. A new
@@ -115,7 +112,7 @@ journalctl -u 'crawler-pad-lst@*'               # one line per connection
 
 An Xbox pad remembers one host, so pairing it with the PC leaves the Pi with a
 stale bond (connects fail with errno 52). The phone's `/pad` page fixes that
-with no laptop: hold the pair button on top of the pad until the light flashes
+with no computer: hold the pair button on top of the pad until the light flashes
 fast, tap Re-pair controller, and the car removes the old bond, scans up to
 90 s for the pad by name, then pairs, trusts and connects it
 (`crawler/hardware/pad_pair.py`). Refused in auto; the wheels hold neutral
@@ -153,38 +150,6 @@ sits on the cab roof on the centre line, which is the frame's origin, so its off
 0, 0. Then add `--lidar` to the
 service's ExecStart with `sudo systemctl edit crawler`, and `/lidar` is in
 every recording.
-
-## The hood camera
-
-`--pantilt` points the hood camera at the nearest person and keeps them in
-the middle of the picture. It never commands throttle or steering: the only
-thing it moves is the mount, and it refuses the steering channels. The
-detector is a YOLO model on onnxruntime in a process of its own, at a rate
-that backs off when the Pi is busy (`crawler/vision/person.py` says why this
-one, and what it should cost). `/pantilt` has the angles and the person's
-bearing off the truck, `/pantilt/image` the picture with the boxes on, and
-the drive layout shows it under the OAK-D's three.
-
-Once, on the Mac, export the model and copy it over (it is not in the repo):
-
-```sh
-uvx --python 3.11 --from 'ultralytics==8.3.40' --with onnx --with onnxslim \
-    --with 'torch<2.6' --with 'torchvision<0.21' \
-    yolo export model=yolo11n.pt format=onnx imgsz=256,320 opset=12
-scp yolo11n.onnx jt@jtpi.local:Documents/py/crawler/models/person.onnx
-```
-
-On the car, find the servos' centre, limits and direction. It writes only
-the two pan/tilt channels and is safe with the service running:
-
-```sh
-./.venv/bin/python tools/pantilt_cal.py --pan-channel 10 --tilt-channel 11
-```
-
-`save` writes `models/pantilt.json`, which is untracked like the model, so
-the checkout stays clean for the next pull. Then add
-`--pantilt models/pantilt.json` to the service's ExecStart with
-`sudo systemctl edit crawler`.
 
 ## Modes and controls
 
@@ -283,7 +248,7 @@ the car if it fails.
 ## Record, pull, train, deploy
 
 1. **Record.** Hold Y in manual and drive.
-2. **Pull**, on the Mac. Recordings go to `~/crawler/data/mcap`, never into a
+2. **Pull**, on the dev machine. Recordings go to `~/crawler/data/mcap`, never into a
    git tree (the repo is public and a recording is video of my house):
 
    ```sh
@@ -339,7 +304,7 @@ a hand on START. The numbers only say it agrees with me on recorded frames.
 
 ## Models registry
 
-Models live on the Mac in `~/crawler/data/models`, listed in `registry.json`.
+Models live on the dev machine in `~/crawler/data/models`, listed in `registry.json`.
 A new model is a candidate with no number. `promote` gives it the next
 `kblock X.Y` only when it beats the latest release on held-out folds and I say
 it drove well. `deploy` and `rollback` refuse unless the car is parked.
@@ -364,6 +329,6 @@ came back. The docstring in `tools/models.py` has the rules.
 uv run pytest
 ```
 
-A few seconds on the laptop. Nothing needs pigpio, a pad or the OAK-D: the
+A few seconds on any computer. Nothing needs pigpio, a pad or the OAK-D: the
 hardware is faked in `tests/conftest.py`. Most tests pin something that has
 already gone wrong on the car once.
